@@ -38,6 +38,10 @@ The integration works locally, but connection to Tuya BLE device requires device
 
 * Smart Locks (category_id 'ms')
   + Smart Lock (product_id 'ludzroix', 'isk2p555').
+  + V1 Smart Lock / Lock P1 (product_id '7a4xvbtt').
+
+* Smart Locks (category_id 'jtmspro')
+  + S1-TY-BLE-PRO (product_id 'xqeob8h6').
 
 * Climate (category_id 'wk')
   + Thermostatic Radiator Valve (product_ids 'drlajpqc', 'nhj2j7su').
@@ -48,6 +52,41 @@ The integration works locally, but connection to Tuya BLE device requires device
 * Irrigation computer (category_id 'ggq')
   + Irrigation computer (product_id '6pahkcau')
 
+### V1 Smart Lock / Lock P1
+
+The `ms/7a4xvbtt` product has product-specific local BLE mappings for the
+following entities:
+
+| Entity | Datapoint | Home Assistant semantics |
+| --- | ---: | --- |
+| Battery | 8 | Diagnostic percentage sensor; `-1` is reported as unknown |
+| Alarm | 21 | Diagnostic enum: wrong fingerprint, wrong password, wrong card, or low battery |
+| Last Unlock Method | 12, 13, 14, 15, 19, 55, 62 | Diagnostic enum based on the latest evidenced unlock event |
+| Auto-Lock | 33 | Configuration switch |
+| Auto-Lock Delay | 36 | Configuration number from 5 to 1800 seconds |
+| Motor State | 47 | Read-only diagnostic binary sensor |
+| Manual Lock | 46 | Stateless button that writes `true` once |
+| Signal Strength | BLE RSSI | Existing diagnostic sensor, disabled by default |
+
+DP 47 is exposed only as motor status. The available diagnostics do not prove
+that either boolean value is a durable physical locked/unlocked state.
+
+Local unlock is deliberately not implemented for this product. Its evidenced
+DP 60/61 flow requires a separately paired remote-unlock key that this
+integration cannot derive from the available device credentials. A reference
+implementation reports that toggling DP 33 can move some Lock P1 hardware, but
+that behaviour is experimental and conflicts with the product metadata, which
+defines DP 33 as the Auto-Lock setting. This integration therefore never uses
+DP 33 as a lock/unlock command and does not expose a misleading V1 LockEntity.
+
+DP 31 sound/beep control is not supported for this product. Sound and LED
+controls were not present in its product diagnostics. Temporary-password and
+offline-password management are also not implemented.
+
+For initial physical validation, keep the door open and keep another
+mechanical or otherwise authorized access method available. Verify the
+read-only entities first before triggering Manual Lock.
+
 ## Support project
 
 I am working on this integration in Ukraine. Our country was subjected to brutal aggression by Russia. The war still continues. The capital of Ukraine - Kyiv, where I live, and many other cities and villages are constantly under threat of rocket attacks. Our air defense forces are doing wonders, but they also need support. So if you want to help the development of this integration, donate some money and I will spend it to support our air defense.
@@ -55,4 +94,3 @@ I am working on this integration in Ukraine. Our country was subjected to brutal
 <p align="center">
   <a href="https://www.buymeacoffee.com/3PaK6lXr4l"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy me an air defense"></a>
 </p>
-

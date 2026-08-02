@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.1.11] - 2026-08-02
+
+### Added
+
+- Added product-specific local BLE support for the V1 Smart Lock / Lock P1
+  (`ms/7a4xvbtt`): battery, alarm, last-unlock method, Auto-Lock, Auto-Lock
+  delay, read-only motor status, and a momentary Manual Lock action.
+- Added focused mapping and S1 regression tests for Home Assistant 2026.7.4.
+
+### Fixed
+
+- Made `TuyaBLENumber` inherit Home Assistant's `NumberEntity` base class.
+
+### Security
+
+- Deliberately left V1 unlock unsupported because no verifiable DP 60/61
+  pairing-key source is available; DP 33 remains exclusively Auto-Lock.
+
 ## [0.1.0] - 2023-04-22
 
 - Initial release

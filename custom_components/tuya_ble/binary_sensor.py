@@ -52,6 +52,13 @@ class TuyaBLECategoryBinarySensorMapping:
     mapping: list[TuyaBLEBinarySensorMapping] | None = None
 
 
+def v1_motor_state_getter(self: TuyaBLEBinarySensor) -> None:
+    """Expose V1 DP 47 without inferring physical lock state."""
+    datapoint = self._device.datapoints[47]
+    value = datapoint.value if datapoint is not None else None
+    self._attr_is_on = value if isinstance(value, bool) else None
+
+
 mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
     "wk": TuyaBLECategoryBinarySensorMapping(
         products={
@@ -69,7 +76,22 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
         },
     ),
     "ms": TuyaBLECategoryBinarySensorMapping(
-        products={},
+        products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLEBinarySensorMapping(
+                    dp_id=47,
+                    # Diagnostics identify this only as motor status. Do not
+                    # infer a durable physical locked/unlocked state here.
+                    description=BinarySensorEntityDescription(
+                        key="lock_motor_state",
+                        icon="mdi:engine",
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=v1_motor_state_getter,
+                ),
+            ],
+        },
     ),
 }
 

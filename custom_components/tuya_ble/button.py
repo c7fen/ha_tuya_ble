@@ -31,6 +31,7 @@ class TuyaBLEButtonMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     is_available: TuyaBLEButtonIsAvailable = None
+    press_value: bool | None = None
 
 
 def is_fingerbot_in_push_mode(self: "TuyaBLEButton", product: TuyaBLEProductInfo) -> bool:
@@ -62,6 +63,22 @@ class TuyaBLECategoryButtonMapping:
 
 
 mapping: dict[str, TuyaBLECategoryButtonMapping] = {
+    "ms": TuyaBLECategoryButtonMapping(
+        products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLEButtonMapping(
+                    dp_id=46,
+                    description=ButtonEntityDescription(
+                        key="manual_lock",
+                        icon="mdi:lock-plus",
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    # DP 46 true is the evidenced momentary lock command.
+                    press_value=True,
+                ),
+            ],
+        },
+    ),
     "szjqr": TuyaBLECategoryButtonMapping(
         products={
             **dict.fromkeys(
@@ -133,13 +150,23 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
         self._mapping = mapping
 
     def press(self) -> None:
+        initial_value = (
+            self._mapping.press_value
+            if self._mapping.press_value is not None
+            else False
+        )
         datapoint = self._device.datapoints.get_or_create(
             self._mapping.dp_id,
-            TuyaBLEDataPointType.DT_BOOL,
-            False,
+            self._mapping.dp_type or TuyaBLEDataPointType.DT_BOOL,
+            initial_value,
         )
         if datapoint:
-            self._hass.create_task(datapoint.set_value(not bool(datapoint.value)))
+            value = (
+                self._mapping.press_value
+                if self._mapping.press_value is not None
+                else not bool(datapoint.value)
+            )
+            self._hass.create_task(datapoint.set_value(value))
 
     @property
     def is_available(self) -> bool:

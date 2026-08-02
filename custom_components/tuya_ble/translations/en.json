@@ -24,22 +24,31 @@
                     "password": "Password",
                     "username": "Account"
                 },
-                "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+                "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to the Home Assistant Tuya integration documentation to retrieve the cloud credentials.\n\nEnter your Tuya credentials."
             }
         }
     },
     "entity": {
         "binary_sensor": {
+            "lock_motor_state": {
+                "name": "Motor State"
+            },
             "low_battery": {
                 "name": "Battery"
             }
         },
         "button": {
+            "manual_lock": {
+                "name": "Manual Lock"
+            },
             "push": {
                 "name": "Push"
             }
         },
         "number": {
+            "auto_lock_time": {
+                "name": "Auto-Lock Delay"
+            },
             "brightness": {
                 "name": "Brightness"
             },
@@ -96,7 +105,13 @@
         },
         "sensor": {
             "alarm_lock": {
-                "name": "Alarm"
+                "name": "Alarm",
+                "state": {
+                    "low_battery": "Low battery",
+                    "wrong_card": "Wrong card",
+                    "wrong_finger": "Wrong fingerprint",
+                    "wrong_password": "Wrong password"
+                }
             },
             "battery": {
                 "name": "Battery"
@@ -130,6 +145,18 @@
             "humidity": {
                 "name": "Humidity"
             },
+            "last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "ble": "Bluetooth",
+                    "card": "Card",
+                    "dynamic": "Dynamic password",
+                    "fingerprint": "Fingerprint",
+                    "password": "Password",
+                    "phone_remote": "Phone remote",
+                    "temporary": "Temporary password"
+                }
+            },
             "low_battery": {
                 "name": "Low Battery"
             },
@@ -161,6 +188,9 @@
         "switch": {
             "antifreeze": {
                 "name": "Antifreeze"
+            },
+            "automatic_lock": {
+                "name": "Auto-Lock"
             },
             "carbon_dioxide_alarm_switch": {
                 "name": "Alarm enabled"
@@ -229,7 +259,7 @@
                     "password": "Password",
                     "username": "Account"
                 },
-                "description": "Refer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+                "description": "Refer to the Home Assistant Tuya integration documentation to retrieve the cloud credentials.\n\nEnter your Tuya credentials."
             }
         }
     }

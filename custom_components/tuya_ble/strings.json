@@ -24,7 +24,7 @@
           "password": "[%key:common::config_flow::data::password%]",
           "username": "Account"
         },
-        "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+        "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to the Home Assistant Tuya integration documentation to retrieve the cloud credentials.\n\nEnter your Tuya credentials."
       }
     }
   },
@@ -49,6 +49,9 @@
       },
       "hold_time": {
         "name": "Hold time"
+      },
+      "auto_lock_time": {
+        "name": "Auto-Lock Delay"
       },
       "reporting_period": {
         "name": "Reporting period"
@@ -101,6 +104,9 @@
     "binary_sensor": {
       "low_battery": {
         "name": "[%key:component::sensor::entity_component::battery::name%]"
+      },
+      "lock_motor_state": {
+        "name": "Motor State"
       }
     },
     "sensor": {
@@ -152,7 +158,25 @@
           "name": "Battery"
       },
       "alarm_lock": {
-          "name": "Alarm"
+        "name": "Alarm",
+        "state": {
+          "wrong_finger": "Wrong fingerprint",
+          "wrong_password": "Wrong password",
+          "wrong_card": "Wrong card",
+          "low_battery": "Low battery"
+        }
+      },
+      "last_unlock_method": {
+        "name": "Last Unlock Method",
+        "state": {
+          "fingerprint": "Fingerprint",
+          "password": "Password",
+          "dynamic": "Dynamic password",
+          "card": "Card",
+          "ble": "Bluetooth",
+          "temporary": "Temporary password",
+          "phone_remote": "Phone remote"
+        }
       },
       "wrong_finger": {
           "name": "Wrong Fingerprint"
@@ -219,6 +243,9 @@
       "lock_motor_state": {
           "name": "Motor State"
       },
+      "automatic_lock": {
+        "name": "Auto-Lock"
+      },
       "water_valve": {
           "name": "Irrigation valve"
       },
@@ -250,7 +277,7 @@
           "password": "[%key:common::config_flow::data::password%]",
           "username": "Account"
         },
-        "description": "Refer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+        "description": "Refer to the Home Assistant Tuya integration documentation to retrieve the cloud credentials.\n\nEnter your Tuya credentials."
       }
     }
   }

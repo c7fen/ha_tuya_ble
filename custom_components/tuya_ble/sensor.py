@@ -96,10 +96,27 @@ def battery_enum_getter(self: TuyaBLESensor) -> None:
             self._attr_native_value = value * 20
         except (ValueError, TypeError):
             self._attr_native_value = None
+
+
+def v1_battery_getter(self: TuyaBLESensor) -> None:
+    """Return the V1 battery percentage, treating the documented -1 as unknown."""
+    datapoint = self._device.datapoints[8]
+    value = datapoint.value if datapoint is not None else None
+    self._attr_native_value = (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
+        else None
+    )
+
+
 @dataclass
 class TuyaBLECategorySensorMapping:
-    products: dict[str, list[TuyaBLESensorMapping|TuyaBLELastUnlockSensorMapping]] | None = None
-    mapping: list[TuyaBLESensorMapping|TuyaBLELastUnlockSensor] | None = None
+    products: (
+        dict[str, list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping]] | None
+    ) = None
+    mapping: list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping] | None = None
+
+
 mapping: dict[str, TuyaBLECategorySensorMapping] = {
     "co2bj": TuyaBLECategorySensorMapping(
         products={
@@ -186,7 +203,56 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                         63: "voice_remote"
                     }
                 ),
-            ]
+            ],
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLESensorMapping(
+                    dp_id=21,
+                    description=SensorEntityDescription(
+                        key="alarm_lock",
+                        icon="mdi:alert",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "wrong_finger",
+                            "wrong_password",
+                            "wrong_card",
+                            "low_battery",
+                        ],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+                TuyaBLEBatteryMapping(
+                    dp_id=8,
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=v1_battery_getter,
+                ),
+                TuyaBLELastUnlockSensorMapping(
+                    unlock_methods={
+                        12: "fingerprint",
+                        13: "password",
+                        14: "dynamic",
+                        15: "card",
+                        19: "ble",
+                        55: "temporary",
+                        62: "phone_remote",
+                    },
+                    description=SensorEntityDescription(
+                        key="last_unlock_method",
+                        icon="mdi:account-lock-open",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "fingerprint",
+                            "password",
+                            "dynamic",
+                            "card",
+                            "ble",
+                            "temporary",
+                            "phone_remote",
+                        ],
+                    ),
+                ),
+            ],
         }
     ),
     "jtmspro": TuyaBLECategorySensorMapping(
@@ -437,7 +503,9 @@ rssi_mapping = TuyaBLESensorMapping(
     ),
     getter=rssi_getter,
 )
-def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLESensorMapping]:
+def get_mapping_by_device(
+    device: TuyaBLEDevice,
+) -> list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping]:
     category = mapping.get(device.category)
     if category is not None and category.products is not None:
         product_mapping = category.products.get(device.product_id)

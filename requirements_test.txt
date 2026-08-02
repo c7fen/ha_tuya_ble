@@ -1,0 +1,10 @@
+homeassistant==2026.7.4
+tuya-iot-py-sdk>=0.6.6
+pycountry>23.0.0
+
+# Runtime requirements of Home Assistant's Bluetooth/USB import path.
+aiousbwatcher==1.1.2
+serialx==1.8.2
+aioesphomeapi==45.3.1
+
+pytest>=9.0.0

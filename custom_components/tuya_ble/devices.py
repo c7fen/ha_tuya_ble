@@ -357,6 +357,15 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
                     unlock_password=13,
                 ),
             ),
+            "7a4xvbtt": TuyaBLEProductInfo(
+                name="V1 Smart Lock",
+                lock=TuyaBLELockInfo(
+                    alarm_lock=21,
+                    unlock_ble=19,
+                    unlock_fingerprint=12,
+                    unlock_password=13,
+                ),
+            ),
         },
     ),
     "szjqr": TuyaBLECategoryInfo(

@@ -168,6 +168,17 @@ def set_fingerbot_program_position(
             self._hass.create_task(datapoint.set_value(new_value))
 
 
+def get_v1_auto_lock_time(
+    self: TuyaBLENumber, product: TuyaBLEProductInfo
+) -> float | None:
+    """Return a V1 Auto-Lock delay only inside the documented range."""
+    datapoint = self._device.datapoints[36]
+    value = datapoint.value if datapoint is not None else None
+    if isinstance(value, int) and not isinstance(value, bool) and 5 <= value <= 1800:
+        return float(value)
+    return None
+
+
 @dataclass
 class TuyaBLEDownPositionDescription(NumberEntityDescription):
     key: str = "down_position"
@@ -243,6 +254,27 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                         native_step=100,
                         entity_category=EntityCategory.CONFIG,
                     ),
+                ),
+            ],
+        },
+    ),
+    "ms": TuyaBLECategoryNumberMapping(
+        products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=5,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_v1_auto_lock_time,
+                    mode=NumberMode.BOX,
                 ),
             ],
         },
@@ -522,15 +554,8 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLENumberMapping]:
     return result
 
 
-class TuyaBLENumber(TuyaBLEEntity):
+class TuyaBLENumber(TuyaBLEEntity, BaseNumberEntity):
     """Representation of a Tuya BLE Number."""
-
-    _attr_entity_category = None
-    _attr_native_min_value = None
-    _attr_native_max_value = None
-    _attr_native_step = None
-    _attr_native_unit_of_measurement = None
-    _attr_mode = None
 
     def __init__(
         self,

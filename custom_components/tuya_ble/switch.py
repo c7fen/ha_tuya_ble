@@ -110,6 +110,16 @@ def lock_switch_setter(self: TuyaBLESwitch, product: TuyaBLEProductInfo, value: 
             self._hass.create_task(datapoint.set_value(True))
 
 
+def get_v1_automatic_lock(
+    self: TuyaBLESwitch, product: TuyaBLEProductInfo
+) -> bool | None:
+    """Return V1 Auto-Lock only when DP 33 contains an evidenced boolean."""
+    datapoint = self._device.datapoints[33]
+    if datapoint is not None and isinstance(datapoint.value, bool):
+        return datapoint.value
+    return None
+
+
 @dataclass
 class TuyaBLEFingerbotSwitchMapping(TuyaBLESwitchMapping):
     description: SwitchEntityDescription = field(
@@ -196,7 +206,21 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     ),
                     setter=lock_switch_setter,
                 ),
-            ]
+            ],
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLESwitchMapping(
+                    dp_id=33,
+                    # Product metadata defines DP 33 as this setting. It must
+                    # not also be used as the experimental lock-state toggle.
+                    description=SwitchEntityDescription(
+                        key="automatic_lock",
+                        icon="mdi:lock-clock",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=get_v1_automatic_lock,
+                ),
+            ],
         }
     ),
     "jtmspro": TuyaBLECategorySwitchMapping(
@@ -385,7 +409,7 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
 }
 
 
-def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategorySwitchMapping]:
+def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLESwitchMapping]:
     category = mapping.get(device.category)
     if category is not None and category.products is not None:
         product_mapping = category.products.get(device.product_id)
@@ -414,7 +438,7 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
         self._mapping = mapping
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if switch is on."""
 
         if self._mapping.getter:
