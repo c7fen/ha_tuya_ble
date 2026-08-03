@@ -179,6 +179,17 @@ def get_v1_auto_lock_time(
     return None
 
 
+def get_s1_auto_lock_time(
+    self: TuyaBLENumber, product: TuyaBLEProductInfo
+) -> float | None:
+    """Return an S1 Auto-Lock delay only inside its product-specific range."""
+    datapoint = self._device.datapoints[36]
+    value = datapoint.value if datapoint is not None else None
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 1800:
+        return float(value)
+    return None
+
+
 @dataclass
 class TuyaBLEDownPositionDescription(NumberEntityDescription):
     key: str = "down_position"
@@ -274,6 +285,27 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     getter=get_v1_auto_lock_time,
+                    mode=NumberMode.BOX,
+                ),
+            ],
+        },
+    ),
+    "jtmspro": TuyaBLECategoryNumberMapping(
+        products={
+            "xqeob8h6": [
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=1,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_s1_auto_lock_time,
                     mode=NumberMode.BOX,
                 ),
             ],

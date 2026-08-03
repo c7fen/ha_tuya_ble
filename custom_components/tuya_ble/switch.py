@@ -120,6 +120,16 @@ def get_v1_automatic_lock(
     return None
 
 
+def get_s1_automatic_lock(
+    self: TuyaBLESwitch, product: TuyaBLEProductInfo
+) -> bool | None:
+    """Return S1 Auto-Lock only when DP 33 contains a reported boolean."""
+    datapoint = self._device.datapoints[33]
+    if datapoint is not None and isinstance(datapoint.value, bool):
+        return datapoint.value
+    return None
+
+
 @dataclass
 class TuyaBLEFingerbotSwitchMapping(TuyaBLESwitchMapping):
     description: SwitchEntityDescription = field(
@@ -233,6 +243,16 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                         icon="mdi:lock",
                     ),
                     setter=lock_switch_setter,
+                ),
+                TuyaBLESwitchMapping(
+                    dp_id=33,
+                    description=SwitchEntityDescription(
+                        key="automatic_lock",
+                        icon="mdi:lock-clock",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=get_s1_automatic_lock,
                 ),
             ],
         },

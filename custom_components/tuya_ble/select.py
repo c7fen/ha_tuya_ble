@@ -152,6 +152,25 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
             ],
         },
     ),
+    "jtmspro": TuyaBLECategorySelectMapping(
+        products={
+            "xqeob8h6": [
+                TuyaBLESelectMapping(
+                    dp_id=34,
+                    description=SelectEntityDescription(
+                        key="unlock_switch",
+                        icon="mdi:account-key",
+                        options=[
+                            "single_unlock",
+                            "finger_card",
+                        ],
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+            ],
+        },
+    ),
     "szjqr": TuyaBLECategorySelectMapping(
         products={
             **dict.fromkeys(

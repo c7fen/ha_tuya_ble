@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [Unreleased]
+
+### Added
+
+- Added product-specific S1-TY-BLE-PRO (`jtmspro/xqeob8h6`) entities for
+  Auto-Lock, the 1-to-1800-second Auto-Lock delay, authentication mode, the
+  complete alarm enum, last-unlock method, and read-only Door State.
+
+### Changed
+
+- Kept the existing S1 DP 47 Motor State switch pending a deterministic,
+  customization-preserving entity-registry migration to a read-only platform.
+- Left the existing S1 DP 46 lock and DP 70/71 unlock paths unchanged.
+
 ## [0.1.11] - 2026-08-02
 
 ### Added

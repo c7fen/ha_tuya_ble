@@ -101,6 +101,13 @@
             },
             "temperature_unit": {
                 "name": "Temperature unit"
+            },
+            "unlock_switch": {
+                "name": "Authentication Mode",
+                "state": {
+                    "finger_card": "Fingerprint and card",
+                    "single_unlock": "Single authentication"
+                }
             }
         },
         "sensor": {
@@ -157,6 +164,14 @@
                     "temporary": "Temporary password"
                 }
             },
+            "closed_opened": {
+                "name": "Door State",
+                "state": {
+                    "closed": "Closed",
+                    "open": "Open",
+                    "unknown": "Unknown"
+                }
+            },
             "low_battery": {
                 "name": "Low Battery"
             },
@@ -168,6 +183,36 @@
             },
             "signal_strength": {
                 "name": "Signal strength"
+            },
+            "s1_alarm_lock": {
+                "name": "Alarm",
+                "state": {
+                    "defense": "Armed alarm",
+                    "key_in": "Key inserted",
+                    "low_battery": "Low battery",
+                    "power_off": "Power loss",
+                    "pry": "Tamper detected",
+                    "shock": "Shock detected",
+                    "tongue_bad": "Latch fault",
+                    "tongue_not_out": "Latch not extended",
+                    "too_hot": "Temperature too high",
+                    "unclosed_time": "Door left open",
+                    "wrong_card": "Wrong card",
+                    "wrong_face": "Wrong face",
+                    "wrong_finger": "Wrong fingerprint",
+                    "wrong_password": "Wrong password"
+                }
+            },
+            "s1_last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "ble": "Bluetooth",
+                    "card": "Card",
+                    "fingerprint": "Fingerprint",
+                    "key": "Mechanical key",
+                    "phone_remote": "Phone remote",
+                    "voice_remote": "Voice remote"
+                }
             },
             "temperature": {
                 "name": "Temperature"

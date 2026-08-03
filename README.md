@@ -52,6 +52,44 @@ The integration works locally, but connection to Tuya BLE device requires device
 * Irrigation computer (category_id 'ggq')
   + Irrigation computer (product_id '6pahkcau')
 
+### S1-TY-BLE-PRO
+
+The `jtmspro/xqeob8h6` product has the following product-specific local BLE
+entities:
+
+| Entity | Datapoint | Home Assistant semantics |
+| --- | ---: | --- |
+| Lock | 46, 70, 71 | Existing local LockEntity: DP 46 locks; the existing DP 70/71 sequence unlocks |
+| Battery | 8 | Diagnostic percentage sensor |
+| Alarm | 21 | Diagnostic enum with the complete 14-value product-specific order |
+| Last Unlock Method | 12, 15, 16, 19, 62, 63 | Diagnostic enum for fingerprint, card, mechanical key, BLE, phone remote, or voice remote |
+| Auto-Lock | 33 | Configuration switch |
+| Auto-Lock Delay | 36 | Configuration number from 1 to 1800 seconds |
+| Authentication Mode | 34 | Configuration select: single authentication or combined fingerprint-and-card authentication |
+| Door State | 40 | Read-only diagnostic enum (`unknown`, `open`, `closed`), disabled by default |
+| Motor State | 47 | Existing legacy writable switch; see the migration note below |
+| Signal Strength | BLE RSSI | Existing diagnostic sensor, disabled by default |
+
+The existing S1 lock and unlock implementation is unchanged. In particular,
+the `finger_card` authentication mode means fingerprint **and** card, not one
+or the other. Door State reflects the product's reported status value; some
+hardware or installations may continue to report `unknown`, and it is not used
+as the LockEntity state.
+
+DP 47 is defined by the product metadata as a status value, but existing
+installations already have it registered as a writable switch. Moving it to a
+binary-sensor platform without a complete entity-registry migration would risk
+leaving an orphaned switch and losing user customizations. The legacy switch is
+therefore retained in this change. A follow-up may migrate it only with tested
+cross-platform registry handling.
+
+Sound, voice, LED, and other optical controls were not present in the supplied
+product-specific diagnostics and are not added. S1 iBeacon functionality is
+also deliberately deferred.
+
+Perform initial Auto-Lock and delay testing with the physical door open, and
+keep another mechanical or otherwise authorized access method available.
+
 ### V1 Smart Lock / Lock P1
 
 The `ms/7a4xvbtt` product has product-specific local BLE mappings for the
