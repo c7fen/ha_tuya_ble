@@ -475,4 +475,4 @@ def test_s1_translations_and_manifest_contract() -> None:
         )
         assert entities["sensor"]["closed_opened"]["state"] == expected_door_states
 
-    assert manifest["version"] == "0.1.11"
+    assert manifest["version"] == "0.1.11b1"

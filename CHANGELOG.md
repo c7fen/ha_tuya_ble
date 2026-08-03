@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning].
 
 ## [Unreleased]
 
+## [0.1.11b1] - 2026-08-03
+
 ### Added
 
 - Added product-specific S1-TY-BLE-PRO (`jtmspro/xqeob8h6`) entities for
