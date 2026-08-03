@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -63,9 +64,18 @@ def _mapping_by_key(items):
 class FakeDatapoint:
     """Synthetic datapoint that records local write values."""
 
-    def __init__(self, value=None, *, timestamp=None) -> None:
+    def __init__(
+        self,
+        value=None,
+        *,
+        timestamp=None,
+        dp_id=None,
+        changed_by_device=False,
+    ) -> None:
+        self.id = dp_id
         self.value = value
         self.timestamp = timestamp
+        self.changed_by_device = changed_by_device
         self.writes = []
 
     async def set_value(self, value) -> None:
@@ -173,16 +183,19 @@ def test_s1_alarm_enum_decoding_preserves_unknown_values(raw_value, expected) ->
     assert fake_sensor._attr_native_value == expected
 
 
-def test_s1_last_unlock_starts_unknown_and_uses_existing_change_detection() -> None:
-    """No method is invented before an observed S1 unlock counter changes."""
-    datapoints = FakeDatapoints(
-        {dp_id: FakeDatapoint() for dp_id in S1_LAST_UNLOCK_METHODS}
+def test_s1_last_unlock_starts_unknown_and_uses_current_update_batch() -> None:
+    """No method is invented before an S1 unlock datapoint callback arrives."""
+    coordinator = SimpleNamespace(
+        available=True,
+        last_update_datapoints=(),
+        last_update_sequence=0,
     )
     writes = []
-    fake_sensor = SimpleNamespace(
+    fake_sensor: Any = SimpleNamespace(
         _unlock_methods=S1_LAST_UNLOCK_METHODS,
-        _device=SimpleNamespace(datapoints=datapoints),
-        _last_values={dp_id: None for dp_id in S1_LAST_UNLOCK_METHODS},
+        _coordinator=coordinator,
+        _last_update_sequence=0,
+        _last_coordinator_available=True,
         _attr_native_value=None,
         _attr_extra_state_attributes={},
         async_write_ha_state=lambda: writes.append(True),
@@ -192,11 +205,14 @@ def test_s1_last_unlock_starts_unknown_and_uses_existing_change_detection() -> N
     assert fake_sensor._attr_native_value is None
     assert fake_sensor._attr_extra_state_attributes == {}
 
-    datapoints.values[16].value = 1
+    coordinator.last_update_sequence = 1
+    coordinator.last_update_datapoints = (
+        FakeDatapoint(1, dp_id=16, changed_by_device=True),
+    )
     sensor.TuyaBLELastUnlockSensor._handle_coordinator_update(fake_sensor)
     assert fake_sensor._attr_native_value == "key"
     assert fake_sensor._attr_extra_state_attributes == {"method": "key", "value": 1}
-    assert len(writes) == 2
+    assert len(writes) == 1
 
 
 def test_s1_auto_lock_switch_contract_and_writes() -> None:

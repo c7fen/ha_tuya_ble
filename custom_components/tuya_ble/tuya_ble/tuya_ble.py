@@ -935,11 +935,7 @@ class TuyaBLEDevice:
             case _:
                 raise TuyaBLEDataFormatError()
 
-        _LOGGER.debug(
-            "%s: Received timestamp: %s",
-            self.address,
-            time.ctime(timestamp),
-        )
+        _LOGGER.debug("Datapoint timestamp decoded")
         return (timestamp, end_pos)
 
     def _parse_datapoints_v3(
@@ -972,17 +968,12 @@ class TuyaBLEDevice:
                 case TuyaBLEDataPointType.DT_STRING:
                     value = raw_value.decode()
 
-            _LOGGER.debug(
-                "%s: Received datapoint update, id: %s, type: %s: value: %s",
-                self.address,
-                id,
-                type.name,
-                value,
-            )
+            _LOGGER.debug("Datapoint decoded id=%s type=%s", id, type.name)
             self._datapoints._update_from_device(id, timestamp, flags, type, value)
             datapoints.append(self._datapoints[id])
             pos = next_pos
 
+        _LOGGER.debug("Datapoint batch decoded count=%s", len(datapoints))
         self._fire_callbacks(datapoints)
 
     def _handle_command_or_response(
@@ -1012,7 +1003,7 @@ class TuyaBLEDevice:
                     raise TuyaBLEDataLengthError()
                 result = data[0]
                 if result == 2:
-                    _LOGGER.debug("%s: Device is already paired", self.address)
+                    _LOGGER.debug("Device is already paired")
                     result = 0
                 self._is_paired = result == 0
 
@@ -1075,8 +1066,7 @@ class TuyaBLEDevice:
             future = self._input_expected_responses.pop(response_to, None)
             if future:
                 _LOGGER.debug(
-                    "%s: Received expected response to #%s, result: %s",
-                    self.address,
+                    "Received expected response to #%s, result: %s",
                     response_to,
                     result,
                 )
@@ -1091,66 +1081,54 @@ class TuyaBLEDevice:
         self._input_expected_length = 0
 
     def _parse_input(self) -> None:
+        input_length = (
+            len(self._input_buffer)
+            if isinstance(self._input_buffer, (bytes, bytearray))
+            else None
+        )
+        phase = "start"
         try:
-            _LOGGER.warning(
-                "JTMSPRO PARSE START address=%s input_len=%s input_hex=%s",
-                self.address,
-                len(self._input_buffer) if self._input_buffer is not None else None,
-                self._input_buffer.hex()
-                if isinstance(self._input_buffer, (bytes, bytearray))
-                else self._input_buffer,
-            )
+            _LOGGER.debug("JTMSPRO parse start input_len=%s", input_length)
 
             if self._input_buffer is None or len(self._input_buffer) < 17:
                 raise TuyaBLEDataLengthError()
 
+            phase = "key-selection"
             security_flag = self._input_buffer[0]
             key = self._get_key(security_flag)
             iv = self._input_buffer[1:17]
             encrypted = self._input_buffer[17:]
 
-            _LOGGER.warning(
-                "JTMSPRO PARSE PRE-DECRYPT address=%s security_flag=%s key_present=%s iv=%s encrypted_len=%s encrypted_hex=%s",
-                self.address,
+            _LOGGER.debug(
+                "JTMSPRO parse metadata security_flag=%s key_present=%s "
+                "encrypted_len=%s",
                 security_flag,
                 key is not None,
-                iv.hex(),
                 len(encrypted),
-                encrypted.hex(),
             )
 
             if key is None:
                 raise TuyaBLEDataFormatError()
 
             if len(encrypted) == 0 or (len(encrypted) % 16) != 0:
-                _LOGGER.warning(
-                    "JTMSPRO PARSE INVALID ENCRYPTED LENGTH address=%s encrypted_len=%s",
-                    self.address,
-                    len(encrypted),
-                )
                 raise TuyaBLEDataLengthError()
 
+            phase = "decrypt"
             cipher = AES.new(key, AES.MODE_CBC, iv)
             raw = cipher.decrypt(encrypted)
-
-            _LOGGER.warning(
-                "JTMSPRO PARSE DECRYPTED address=%s raw_len=%s raw_hex=%s",
-                self.address,
-                len(raw),
-                raw.hex(),
-            )
+            _LOGGER.debug("JTMSPRO decrypt complete decrypted_len=%s", len(raw))
 
             if len(raw) < 12:
                 raise TuyaBLEDataLengthError()
 
+            phase = "header"
             seq_num, response_to, _code, length = unpack(">IIHH", raw[:12])
 
-            _LOGGER.warning(
-                "JTMSPRO PARSE HEADER address=%s seq_num=%s response_to=%s code=%s length=%s",
-                self.address,
+            _LOGGER.debug(
+                "JTMSPRO header seq_num=%s response_to=%s code=%#06x data_len=%s",
                 seq_num,
                 response_to,
-                hex(_code),
+                _code,
                 length,
             )
 
@@ -1158,92 +1136,73 @@ class TuyaBLEDevice:
             raw_length = len(raw)
 
             if raw_length < data_end_pos:
-                _LOGGER.warning(
-                    "JTMSPRO PARSE SHORT RAW address=%s raw_length=%s data_end_pos=%s",
-                    self.address,
-                    raw_length,
-                    data_end_pos,
-                )
                 raise TuyaBLEDataLengthError()
 
             if raw_length > data_end_pos:
+                phase = "crc"
                 calc_crc = self._calc_crc16(raw[:data_end_pos])
-                (data_crc,) = unpack(">H", raw[data_end_pos:data_end_pos + 2])
-
-                _LOGGER.warning(
-                    "JTMSPRO PARSE CRC address=%s calc_crc=%s data_crc=%s",
-                    self.address,
-                    hex(calc_crc),
-                    hex(data_crc),
-                )
-
+                (data_crc,) = unpack(">H", raw[data_end_pos : data_end_pos + 2])
                 if calc_crc != data_crc:
+                    _LOGGER.debug("JTMSPRO CRC result=failed")
                     raise TuyaBLEDataCRCError()
+                _LOGGER.debug("JTMSPRO CRC result=passed")
 
             data = raw[12:data_end_pos]
 
+            phase = "command"
             try:
                 code = TuyaBLECode(_code)
             except ValueError:
                 _LOGGER.warning(
-                    "JTMSPRO UNKNOWN CODE address=%s seq_num=%s code=%s response_to=%s data_hex=%s",
-                    self.address,
+                    "JTMSPRO unknown command seq_num=%s code=%#06x "
+                    "response_to=%s data_len=%s",
                     seq_num,
-                    hex(_code),
+                    _code,
                     response_to,
-                    data.hex(),
+                    len(data),
                 )
                 self._clean_input()
                 return
 
-            if response_to != 0:
-                _LOGGER.debug(
-                    "%s: Received: #%s %s, response to #%s",
-                    self.address,
-                    seq_num,
-                    code.name,
-                    response_to,
-                )
-            else:
-                _LOGGER.debug(
-                    "%s: Received: #%s %s",
-                    self.address,
-                    seq_num,
-                    code.name,
-                )
+            _LOGGER.debug(
+                "JTMSPRO command seq_num=%s code=%s response_to=%s data_len=%s",
+                seq_num,
+                code.name,
+                response_to,
+                len(data),
+            )
 
             self._clean_input()
+            phase = "dispatch"
             self._handle_command_or_response(seq_num, response_to, code, data)
 
-        except Exception as err:
+        except Exception:
             _LOGGER.exception(
-                "JTMSPRO PARSE FAIL address=%s input_buffer=%s err=%s",
-                self.address,
-                self._input_buffer.hex()
-                if isinstance(self._input_buffer, (bytes, bytearray))
-                else self._input_buffer,
-                err,
+                "JTMSPRO parse failed phase=%s input_len=%s",
+                phase,
+                input_length,
             )
             self._clean_input()
             raise
 
     def _notification_handler(self, _sender: int, data: bytearray) -> None:
-        _LOGGER.warning(
-            "JTMSPRO RAW NOTIFY address=%s sender=%s len=%s data=%s",
-            self.address,
-            _sender,
-            len(data) if data is not None else None,
-            data.hex() if isinstance(data, (bytes, bytearray)) else data,
+        notification_length = (
+            len(data) if isinstance(data, (bytes, bytearray)) else None
         )
-
+        phase = "start"
         pos = 0
 
         try:
+            _LOGGER.debug(
+                "JTMSPRO notification start notification_len=%s",
+                notification_length,
+            )
+            phase = "packet-number"
             packet_num, pos = self._unpack_int(data, pos)
 
-            _LOGGER.warning(
-                "JTMSPRO NOTIFY PACKET address=%s packet_num=%s pos_after_packet_num=%s expected_packet_num=%s",
-                self.address,
+            _LOGGER.debug(
+                "JTMSPRO notification packet packet_num=%s packet_header_len=%s "
+                "expected_packet_num=%s",
                 packet_num,
                 pos,
                 self._input_expected_packet_num,
@@ -1251,8 +1210,7 @@ class TuyaBLEDevice:
 
             if packet_num < self._input_expected_packet_num:
                 _LOGGER.error(
-                    "%s: Unexpected packet (number %s) in notifications, expected %s",
-                    self.address,
+                    "JTMSPRO notification packet repeated packet_num=%s expected=%s",
                     packet_num,
                     self._input_expected_packet_num,
                 )
@@ -1260,33 +1218,32 @@ class TuyaBLEDevice:
 
             if packet_num == self._input_expected_packet_num:
                 if packet_num == 0:
+                    phase = "header"
                     self._input_buffer = bytearray()
                     self._input_expected_length, pos = self._unpack_int(data, pos)
                     proto_byte = data[pos] if pos < len(data) else None
                     pos += 1
 
-                    _LOGGER.warning(
-                        "JTMSPRO NOTIFY START address=%s expected_length=%s proto_byte=%s pos=%s",
-                        self.address,
+                    _LOGGER.debug(
+                        "JTMSPRO notification header expected_length=%s "
+                        "protocol_byte=%s header_len=%s",
                         self._input_expected_length,
-                        hex(proto_byte) if proto_byte is not None else None,
+                        proto_byte,
                         pos,
                     )
 
+                phase = "buffer"
                 self._input_buffer += data[pos:]
                 self._input_expected_packet_num += 1
 
-                _LOGGER.warning(
-                    "JTMSPRO NOTIFY BUFFER address=%s current_buffer_len=%s expected_length=%s buffer_hex=%s",
-                    self.address,
+                _LOGGER.debug(
+                    "JTMSPRO notification buffer current_length=%s expected_length=%s",
                     len(self._input_buffer),
                     self._input_expected_length,
-                    self._input_buffer.hex(),
                 )
             else:
                 _LOGGER.error(
-                    "%s: Missing packet (number %s) in notifications, received %s",
-                    self.address,
+                    "JTMSPRO notification packet missing expected=%s received=%s",
                     self._input_expected_packet_num,
                     packet_num,
                 )
@@ -1295,22 +1252,21 @@ class TuyaBLEDevice:
 
             if len(self._input_buffer) > self._input_expected_length:
                 _LOGGER.error(
-                    "%s: Unexpected length of data in notifications, received %s expected %s",
-                    self.address,
+                    "JTMSPRO notification length exceeded received=%s expected=%s",
                     len(self._input_buffer),
                     self._input_expected_length,
                 )
                 self._clean_input()
                 return
             elif len(self._input_buffer) == self._input_expected_length:
+                phase = "parse"
                 self._parse_input()
 
-        except Exception as err:
+        except Exception:
             _LOGGER.exception(
-                "JTMSPRO NOTIFY HANDLER FAIL address=%s data=%s err=%s",
-                self.address,
-                data.hex() if isinstance(data, (bytes, bytearray)) else data,
-                err,
+                "JTMSPRO notification failed phase=%s notification_len=%s",
+                phase,
+                notification_length,
             )
             self._clean_input()
             raise
@@ -1321,11 +1277,10 @@ class TuyaBLEDevice:
             dp = self._datapoints[dp_id]
             value = dp._get_value()
             _LOGGER.debug(
-                "%s: Sending datapoint update, id: %s, type: %s: value: %s",
-                self.address,
+                "Sending datapoint update id=%s type=%s encoded_len=%s",
                 dp.id,
                 dp.type.name,
-                dp.value,
+                len(value),
             )
             data += pack(">BBB", dp.id, int(dp.type.value), len(value))
             data += value

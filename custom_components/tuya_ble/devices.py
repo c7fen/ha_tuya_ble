@@ -8,11 +8,7 @@ from homeassistant.const import CONF_ADDRESS, CONF_DEVICE_ID
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.entity import (
-    DeviceInfo,
-    EntityDescription,
-    generate_entity_id,
-)
+from homeassistant.helpers.entity import DeviceInfo, EntityDescription
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -89,9 +85,7 @@ class TuyaBLEEntity(PassiveBluetoothCoordinatorEntity):
         self._attr_has_entity_name = True
         self._attr_device_info = get_device_info(self._device)
         self._attr_unique_id = f"{self._device.device_id}-{description.key}"
-        self.entity_id = generate_entity_id(
-            "sensor.{}", self._attr_unique_id, hass=hass
-        )
+        self._attr_suggested_object_id = self._attr_unique_id
 
     @property
     def available(self) -> bool:
@@ -221,9 +215,21 @@ class TuyaBLEPassiveCoordinator(PassiveBluetoothDataUpdateCoordinator):
         self._device = device
         self._disconnected: bool = True
         self._unsub_disconnect: CALLBACK_TYPE | None = None
+        self._last_update_datapoints: tuple[TuyaBLEDataPoint, ...] = ()
+        self._last_update_sequence = 0
         device.register_connected_callback(self._async_handle_connect)
         device.register_callback(self._async_handle_update)
         device.register_disconnected_callback(self._async_handle_disconnect)
+
+    @property
+    def last_update_datapoints(self) -> tuple[TuyaBLEDataPoint, ...]:
+        """Return only the datapoints received in the latest device callback."""
+        return self._last_update_datapoints
+
+    @property
+    def last_update_sequence(self) -> int:
+        """Return the monotonically increasing device callback sequence."""
+        return self._last_update_sequence
 
     @property
     def connected(self) -> bool:
@@ -239,6 +245,8 @@ class TuyaBLEPassiveCoordinator(PassiveBluetoothDataUpdateCoordinator):
 
     @callback
     def _async_handle_update(self, updates: list[TuyaBLEDataPoint]) -> None:
+        self._last_update_datapoints = tuple(updates)
+        self._last_update_sequence += 1
         self._async_handle_connect()
         self.async_update_listeners()
         info = get_device_product_info(self._device)

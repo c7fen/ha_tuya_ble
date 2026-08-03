@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning].
   customization-preserving entity-registry migration to a read-only platform.
 - Left the existing S1 DP 46 lock and DP 70/71 unlock paths unchanged.
 
+### Fixed
+
+- Detect Last Unlock Method only from the current device callback batch, so
+  full status snapshots no longer invent or overwrite an unlock method.
+- Preserve repeated unlock events that report the same method and credential
+  identifier while rejecting ambiguous multi-method callback batches.
+- Let Home Assistant assign platform-specific entity domains while retaining
+  the existing integration unique IDs for entity-registry matching.
+
+### Security
+
+- Removed raw, encrypted, and decrypted JTMSPRO payload data from logs.
+- Moved routine successful JTMSPRO parser and notification metadata from
+  `WARNING` to payload-free `DEBUG` messages.
+
 ## [0.1.11] - 2026-08-02
 
 ### Added

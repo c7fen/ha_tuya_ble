@@ -1,8 +1,9 @@
 """The Tuya BLE integration."""
 from __future__ import annotations
-from dataclasses import dataclass, field
+
 import logging
-from typing import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -35,8 +36,13 @@ from .const import (
     CO2_LEVEL_NORMAL,
     DOMAIN,
 )
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo, TuyaBLEPassiveCoordinator
-from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEPassiveCoordinator,
+    TuyaBLEProductInfo,
+)
+from .tuya_ble import TuyaBLEDataPoint, TuyaBLEDataPointType, TuyaBLEDevice
 _LOGGER = logging.getLogger(__name__)
 SIGNAL_STRENGTH_DP_ID = -1
 TuyaBLESensorIsAvailable = Callable[["TuyaBLESensor", TuyaBLEProductInfo], bool] | None
@@ -634,8 +640,31 @@ class TuyaBLESensor(RestoreSensor, SensorEntity, TuyaBLEEntity):
         if self._mapping.icons is not None and 0 <= value < len(self._mapping.icons):
             self._attr_icon = self._mapping.icons[value]
 
+
+def _select_last_unlock_datapoint(
+    unlock_methods: Mapping[int, str],
+    update_batch: Sequence[TuyaBLEDataPoint],
+) -> TuyaBLEDataPoint | None:
+    """Select an unambiguous unlock event from one device callback batch."""
+    candidates = [
+        datapoint for datapoint in update_batch if datapoint.id in unlock_methods
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        changed_candidates = [
+            datapoint for datapoint in candidates if datapoint.changed_by_device
+        ]
+        if len(changed_candidates) == 1:
+            return changed_candidates[0]
+    return None
+
+
 class TuyaBLELastUnlockSensor(SensorEntity, TuyaBLEEntity):
     """Sensor reflecting the last unlock method and its data."""
+
+    _attr_force_update = True
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -648,33 +677,39 @@ class TuyaBLELastUnlockSensor(SensorEntity, TuyaBLEEntity):
         self._unlock_methods = mapping.unlock_methods
         self._attr_native_value = None
         self._attr_extra_state_attributes = {}
-        self._last_values = {dp_id: None for dp_id in mapping.unlock_methods.keys()}
+        self._last_update_sequence = coordinator.last_update_sequence
+        self._last_coordinator_available = coordinator.available
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        last_method = None
-        last_value = None
-        last_time = None
-        for dp_id in self._unlock_methods.keys():
-            if self._device.datapoints.has_id(dp_id):
-                dp = self._device.datapoints[dp_id]
-                if dp is not None:
-                    dp_value = getattr(dp, 'value', None)
-                    dp_time = getattr(dp, 'timestamp', None)
-                    if dp_time is not None:
-                        if last_time is None or dp_time > last_time:
-                            last_time = dp_time
-                            last_method = self._unlock_methods.get(dp_id, str(dp_id))
-                            last_value = dp_value
-                    elif dp_value is not None:
-                        if self._last_values[dp_id] != dp_value:
-                            last_method = self._unlock_methods.get(dp_id, str(dp_id))
-                            last_value = dp_value
-                            self._last_values[dp_id] = dp_value
-        if last_method is not None:
-            self._attr_native_value = last_method
-            self._attr_extra_state_attributes = {"method": last_method, "value": last_value}
+        update_sequence = self._coordinator.last_update_sequence
+        coordinator_available = self._coordinator.available
+        if update_sequence == self._last_update_sequence:
+            if coordinator_available != self._last_coordinator_available:
+                self._last_coordinator_available = coordinator_available
+                self.async_write_ha_state()
+            return
+
+        self._last_update_sequence = update_sequence
+        availability_changed = coordinator_available != self._last_coordinator_available
+        self._last_coordinator_available = coordinator_available
+        datapoint = _select_last_unlock_datapoint(
+            self._unlock_methods,
+            self._coordinator.last_update_datapoints,
+        )
+        if datapoint is None:
+            if availability_changed:
+                self.async_write_ha_state()
+            return
+
+        method = self._unlock_methods[datapoint.id]
+        attributes: dict[str, str | int] = {"method": method}
+        if isinstance(datapoint.value, int) and not isinstance(datapoint.value, bool):
+            attributes["value"] = datapoint.value
+        self._attr_native_value = method
+        self._attr_extra_state_attributes = attributes
         self.async_write_ha_state()
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
