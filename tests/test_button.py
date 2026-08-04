@@ -1,9 +1,17 @@
 """Test for tuya_ble button."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock, AsyncMock
+
 from homeassistant.core import HomeAssistant
 from homeassistant.components.button import ButtonEntityDescription
-from custom_components.tuya_ble.button import TuyaBLEButton, TuyaBLEButtonMapping
+import pytest
+
+from custom_components.tuya_ble.button import (
+    TuyaBLEButton,
+    TuyaBLEButtonMapping,
+    get_mapping_by_device,
+)
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType
 
 from . import *
@@ -20,7 +28,7 @@ CONFIG = {
                 "id": "71",
                 "platform": "button",
                 "restore_on_reconnect": False,
-                "address": "12:23:44"
+                "address": "12:23:44",
             }
         ],
     }
@@ -32,7 +40,12 @@ async def test_button(hass: HomeAssistant) -> None:
     from pytest_homeassistant_custom_component.common import MockConfigEntry
     from custom_components.tuya_ble.const import DOMAIN
     from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
-    from custom_components.tuya_ble.devices import TuyaBLEDevice, TuyaBLEProductInfo, TuyaBLECoordinator, TuyaBLEData
+    from custom_components.tuya_ble.devices import (
+        TuyaBLECoordinator,
+        TuyaBLEData,
+        TuyaBLEDevice,
+        TuyaBLEProductInfo,
+    )
     from bleak.backends.device import BLEDevice
 
     entry = MockConfigEntry(
@@ -74,9 +87,7 @@ async def test_button(hass: HomeAssistant) -> None:
         ),
         force_add=True,
     )
-    entity = TuyaBLEButton(
-        hass, coordinator, device, product_info, mapping
-    )
+    entity = TuyaBLEButton(hass, coordinator, device, product_info, mapping)
     entity.async_write_ha_state = Mock()
 
     assert entity.available is False
@@ -95,3 +106,25 @@ async def test_button(hass: HomeAssistant) -> None:
     dp = device.datapoints[71]
     assert dp is not None
     assert dp.value is True
+
+
+@pytest.mark.parametrize("product_id", ("hs21i377", "kholoaew"))
+def test_device_specific_raw_unlock_buttons_are_not_exposed(product_id: str) -> None:
+    """Do not expose buttons backed by complete device-specific RAW payloads."""
+    device = SimpleNamespace(category="jtmspro", product_id=product_id)
+
+    mappings = get_mapping_by_device(device)
+
+    assert all(item.description.key != "bluetooth_unlock" for item in mappings)
+    assert not hasattr(TuyaBLEButton, f"_run_{product_id}_unlock")
+
+
+def test_kholoaew_retains_manual_lock_button() -> None:
+    """Removing the unsafe unlock path must retain unrelated product support."""
+    device = SimpleNamespace(category="jtmspro", product_id="kholoaew")
+
+    mappings = get_mapping_by_device(device)
+
+    assert [(item.dp_id, item.description.key) for item in mappings] == [
+        (46, "manual_lock")
+    ]

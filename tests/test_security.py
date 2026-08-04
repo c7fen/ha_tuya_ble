@@ -1,5 +1,6 @@
 """Tests for Tuya BLE classic and protocol-v2 security."""
 
+import logging
 from unittest.mock import AsyncMock, Mock
 
 from bleak.backends.device import BLEDevice
@@ -134,8 +135,10 @@ def test_device_info_uses_protocol_v2_session_derivation() -> None:
 
 async def test_sec_key_is_loaded_from_saved_device_options(
     hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The optional device SecKey reaches the runtime credentials object."""
+    caplog.set_level(logging.DEBUG, logger="custom_components.tuya_ble.cloud")
     data = {
         CONF_UUID: "1234567890abcdef",
         CONF_LOCAL_KEY: LOCAL_KEY,
@@ -153,6 +156,10 @@ async def test_sec_key_is_loaded_from_saved_device_options(
 
     assert credentials is not None
     assert credentials.sec_key == SEC_KEY
+    assert data[CONF_UUID] not in caplog.text
+    assert data[CONF_LOCAL_KEY] not in caplog.text
+    assert data[CONF_DEVICE_ID] not in caplog.text
+    assert data[CONF_SEC_KEY] not in caplog.text
 
 
 async def test_login_flow_preserves_optional_sec_key() -> None:
@@ -201,6 +208,8 @@ def test_credentials_and_diagnostics_redact_both_keys() -> None:
     for rendered in (str(credentials), repr(credentials)):
         assert LOCAL_KEY not in rendered
         assert SEC_KEY not in rendered
+        assert credentials.uuid not in rendered
+        assert credentials.device_id not in rendered
     material = TuyaBLESecurityMaterial(LOCAL_KEY, SEC_KEY)
     for rendered in (str(material), repr(material)):
         assert LOCAL_KEY not in rendered

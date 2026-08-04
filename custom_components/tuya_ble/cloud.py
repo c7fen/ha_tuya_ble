@@ -146,7 +146,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
         )
 
         if self._is_login_success(response):
-            _LOGGER.debug("Successful login for %s", data[CONF_USERNAME])
+            _LOGGER.debug("Tuya cloud login succeeded")
             if add_to_cache:
                 auth_type = data[CONF_AUTH_TYPE]
                 if isinstance(auth_type, AuthType):
@@ -324,7 +324,11 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                 credentials.get(CONF_STATUS_RANGE, []),
                 sec_key=sec_key,
             )
-            _LOGGER.debug("Retrieved: %s", result)
+            _LOGGER.debug(
+                "Retrieved Tuya BLE credentials for category=%s product=%s",
+                result.category,
+                result.product_id,
+            )
             if save_data:
                 if item:
                     self._data.update(item.login)

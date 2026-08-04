@@ -211,12 +211,12 @@ See a device marked Experimental you have? We could use real world testing feedb
     <tr>
       <td>Smart Cylinder Lock (LVD11_BK)</td>
       <td><code>hs21i377</code></td>
-      <td>—</td>
+      <td>Partial. Bluetooth unlock is intentionally unavailable because the inherited device-derived payload was removed.</td>
     </tr>
     <tr>
       <td>Smart Lock</td>
       <td><code>kholoaew</code></td>
-      <td>Partial.</td>
+      <td>Partial. Manual lock remains available; Bluetooth unlock is intentionally unavailable because the inherited device-derived payload was removed.</td>
     </tr>
     <tr>
       <td>CentralAcesso</td>
