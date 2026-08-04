@@ -18,8 +18,7 @@ from custom_components.tuya_ble.devices import (
     TuyaBLEProductInfo,
 )
 from custom_components.tuya_ble.lock import (
-    S1_DP70_LENGTH,
-    S1_DP71_LENGTH,
+    S1_DP71_MIN_LENGTH,
     S1_DP71_TIMESTAMP,
     S1_STORE_KEY,
     S1_STORE_VERSION,
@@ -37,11 +36,12 @@ from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
 
 SYNTHETIC_DEVICE_ID = "synthetic-s1-device"
 SYNTHETIC_OTHER_DEVICE_ID = "synthetic-other-device"
+SYNTHETIC_DP70_SAMPLE_LENGTH = 16
 SYNTHETIC_DP70 = hashlib.shake_256(b"tuya-ble-test-only:synthetic-s1-dp70").digest(
-    S1_DP70_LENGTH
+    SYNTHETIC_DP70_SAMPLE_LENGTH
 )
 SYNTHETIC_DP71 = hashlib.shake_256(b"tuya-ble-test-only:synthetic-s1-dp71").digest(
-    S1_DP71_LENGTH
+    S1_DP71_MIN_LENGTH
 )
 SYNTHETIC_TIMESTAMP = 1_700_000_123
 
@@ -231,7 +231,7 @@ async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> Non
     assert writes[0][2] == SYNTHETIC_DP70
     dp71_payload = writes[1][2]
     assert isinstance(dp71_payload, bytes)
-    assert len(dp71_payload) == S1_DP71_LENGTH
+    assert len(dp71_payload) == S1_DP71_MIN_LENGTH
     assert (
         dp71_payload[: S1_DP71_TIMESTAMP.start]
         == SYNTHETIC_DP71[: S1_DP71_TIMESTAMP.start]
@@ -269,7 +269,7 @@ async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> Non
         },
         {
             SYNTHETIC_DEVICE_ID: {
-                "dp70_b64": _encoded(SYNTHETIC_DP70 + b"x"),
+                "dp70_b64": _encoded(b""),
                 "dp71_b64": _encoded(SYNTHETIC_DP71),
             }
         },
@@ -311,6 +311,53 @@ async def test_s1_unlock_fails_closed_before_writing(
     assert _encoded(SYNTHETIC_DP70) not in rendered
     assert entity.is_unlocking is False
     assert backing_store.delayed_saves == []
+
+
+async def test_s1_unlock_accepts_variable_length_legacy_templates(
+    hass: HomeAssistant,
+) -> None:
+    """Valid b2 templates retain variable lengths and the complete DP71 suffix."""
+    extended_dp70 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-variable-dp70"
+    ).digest(23)
+    extended_dp71 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-variable-dp71"
+    ).digest(S1_DP71_MIN_LENGTH + 8)
+    stored_data = {
+        SYNTHETIC_DEVICE_ID: {
+            "dp70_b64": _encoded(extended_dp70),
+            "dp71_b64": _encoded(extended_dp71),
+        }
+    }
+    entity, device, _ = _make_entity(hass, stored_data)
+    writes: list[tuple[int, bytes]] = []
+
+    async def record_send(datapoint_ids: list[int]) -> None:
+        datapoint_id = datapoint_ids[0]
+        writes.append((datapoint_id, bytes(device.datapoints[datapoint_id].value)))
+
+    device._send_datapoints.side_effect = record_send
+    with (
+        patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()),
+        patch(
+            "custom_components.tuya_ble.lock.time.time",
+            return_value=SYNTHETIC_TIMESTAMP,
+        ),
+    ):
+        await entity.async_unlock()
+
+    assert writes[0] == (70, extended_dp70)
+    assert writes[1][0] == 71
+    rebuilt_dp71 = writes[1][1]
+    assert len(rebuilt_dp71) == len(extended_dp71)
+    assert (
+        rebuilt_dp71[: S1_DP71_TIMESTAMP.start]
+        == extended_dp71[: S1_DP71_TIMESTAMP.start]
+    )
+    assert (
+        rebuilt_dp71[S1_DP71_TIMESTAMP.stop :]
+        == extended_dp71[S1_DP71_TIMESTAMP.stop :]
+    )
 
 
 async def test_s1_unlock_rejects_non_raw_transport_slot_before_writing(

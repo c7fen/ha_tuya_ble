@@ -10,8 +10,7 @@ from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant
 
 from custom_components.tuya_ble.lock import (
-    S1_DP70_LENGTH,
-    S1_DP71_LENGTH,
+    S1_DP71_MIN_LENGTH,
     TuyaBLES1TemplateStore,
 )
 from custom_components.tuya_ble.tuya_ble import (
@@ -20,11 +19,12 @@ from custom_components.tuya_ble.tuya_ble import (
 )
 
 SYNTHETIC_DEVICE_ID = "synthetic-s1-device"
+SYNTHETIC_DP70_SAMPLE_LENGTH = 16
 SYNTHETIC_DP70 = hashlib.shake_256(b"tuya-ble-test-only:synthetic-store-dp70").digest(
-    S1_DP70_LENGTH
+    SYNTHETIC_DP70_SAMPLE_LENGTH
 )
 SYNTHETIC_DP71 = hashlib.shake_256(b"tuya-ble-test-only:synthetic-store-dp71").digest(
-    S1_DP71_LENGTH
+    S1_DP71_MIN_LENGTH
 )
 
 
@@ -77,7 +77,7 @@ async def test_local_datapoints_are_not_inbound_provenance() -> None:
 def test_capture_persists_only_valid_inbound_device_templates(
     hass: HomeAssistant,
 ) -> None:
-    """Only exact-length raw inbound values enter the device-scoped v1 store."""
+    """Only structurally valid raw inbound values enter the device-scoped store."""
     device = _make_device()
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
@@ -132,7 +132,7 @@ def test_capture_rejects_wrong_type_length_and_empty_device_id(
         1.0,
         0,
         TuyaBLEDataPointType.DT_RAW,
-        SYNTHETIC_DP70 + b"x",
+        b"",
     )
     device.datapoints._update_from_device(
         71,
@@ -145,6 +145,37 @@ def test_capture_rejects_wrong_type_length_and_empty_device_id(
     assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, updates) is False
     assert template_store.capture_inbound("", updates) is False
     assert backing_store.delayed_saves == []
+
+
+def test_capture_accepts_variable_length_inbound_templates(
+    hass: HomeAssistant,
+) -> None:
+    """Live capture preserves valid nonempty DP70 and extended DP71 templates."""
+    device = _make_device()
+    backing_store = _BackingStore()
+    template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
+    extended_dp70 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-capture-variable-dp70"
+    ).digest(29)
+    extended_dp71 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-capture-variable-dp71"
+    ).digest(S1_DP71_MIN_LENGTH + 11)
+
+    device.datapoints._update_from_device(
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp70
+    )
+    device.datapoints._update_from_device(
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp71
+    )
+
+    assert template_store.capture_inbound(
+        SYNTHETIC_DEVICE_ID,
+        [device.datapoints[70], device.datapoints[71]],
+    )
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID) == (
+        extended_dp70,
+        extended_dp71,
+    )
 
 
 def test_capture_accepts_separate_batches_for_the_same_device_only(

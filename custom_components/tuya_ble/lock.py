@@ -37,8 +37,8 @@ S1_DP_LOCK = 46
 S1_DP_MOTOR_STATE = 47
 S1_DP_UNLOCK_REQUEST = 70
 S1_DP_UNLOCK_CONFIRM = 71
-S1_DP70_LENGTH = 16
-S1_DP71_LENGTH = 19
+S1_DP70_MIN_LENGTH = 1
+S1_DP71_MIN_LENGTH = 19
 S1_DP71_TIMESTAMP = slice(13, 17)
 S1_UNLOCK_DELAY = 0.8
 
@@ -48,7 +48,7 @@ S1_RUNTIME_STORE_KEY = "__s1_lock_template_store_v1"
 S1_UNLOCK_ERROR_TRANSLATION_KEY = "s1_unlock_templates_unavailable"
 
 
-def _strict_decode_template(value: object, expected_length: int) -> bytes | None:
+def _strict_decode_template(value: object, minimum_length: int) -> bytes | None:
     """Decode one canonical, strictly validated base64 template."""
     if not isinstance(value, str) or not value:
         return None
@@ -56,7 +56,7 @@ def _strict_decode_template(value: object, expected_length: int) -> bytes | None
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError):
         return None
-    if len(decoded) != expected_length:
+    if len(decoded) < minimum_length:
         return None
     if base64.b64encode(decoded).decode("ascii") != value:
         return None
@@ -109,8 +109,8 @@ class TuyaBLES1TemplateStore:
         ):
             return None
 
-        dp70 = _strict_decode_template(device_data.get("dp70_b64"), S1_DP70_LENGTH)
-        dp71 = _strict_decode_template(device_data.get("dp71_b64"), S1_DP71_LENGTH)
+        dp70 = _strict_decode_template(device_data.get("dp70_b64"), S1_DP70_MIN_LENGTH)
+        dp71 = _strict_decode_template(device_data.get("dp71_b64"), S1_DP71_MIN_LENGTH)
         if dp70 is None or dp71 is None:
             return None
         return dp70, dp71
@@ -133,12 +133,12 @@ class TuyaBLES1TemplateStore:
             raw_value = bytes(datapoint.value)
             if (
                 datapoint.id == S1_DP_UNLOCK_REQUEST
-                and len(raw_value) == S1_DP70_LENGTH
+                and len(raw_value) >= S1_DP70_MIN_LENGTH
             ):
                 captured["dp70_b64"] = base64.b64encode(raw_value).decode("ascii")
             elif (
                 datapoint.id == S1_DP_UNLOCK_CONFIRM
-                and len(raw_value) == S1_DP71_LENGTH
+                and len(raw_value) >= S1_DP71_MIN_LENGTH
             ):
                 captured["dp71_b64"] = base64.b64encode(raw_value).decode("ascii")
 
