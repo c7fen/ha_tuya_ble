@@ -68,8 +68,17 @@ The transport can distinguish inbound data from local cache mutation:
 
 - inbound parsing marks a datapoint as `received_from_device`;
 - `set_value()` clears that marker before sending a local write;
-- device callbacks deliver the current inbound batch through the coordinator;
-- reconnect and disconnect clear the transient batch.
+- inbound parsing constructs a fresh callback-list batch and delivers it
+  synchronously through the device callbacks;
+- the coordinator exposes that batch only while synchronously notifying its
+  listeners and clears its `last_updates` reference afterward and at connection
+  state boundaries.
+
+The cached datapoint object is a different lifetime. Reconnect and disconnect
+do not clear its persistent `received_from_device` marker. A waiter must consume
+and copy a matching datapoint from the fresh callback argument itself; it must
+never infer freshness by rereading a cached datapoint whose marker survived a
+connection boundary.
 
 This is sufficient to reject a locally mutated DP value as confirmation. It is
 not sufficient to prove that the product accepts the candidate command or to
@@ -189,8 +198,11 @@ Static inspection of official `tuya-iot-py-sdk` 0.6.6 and
 `tuya-device-sharing-sdk` 0.2.14 found only generic command/path APIs, not a
 lock-specific persistent-key, provisioning, or local-BLE unlock API. Their
 generic logging paths are also not designed to redact these key/ticket fields.
-The official Android Smart Lock SDK keeps the direct BLE versus gateway split
-behind high-level APIs and does not accept caller-supplied DP60 key material.
+The inspected public high-level Android Smart Lock API and official sample keep
+the direct BLE versus gateway split behind high-level operations and expose no
+caller-supplied DP60 key material. This bounded public-API observation is not a
+claim that every internal or generic Android SDK surface was exhaustively
+proven absent.
 
 ## Candidate wire structures, not selected runtime formats
 
@@ -228,9 +240,9 @@ with it. The sanitized product facts do not establish which layout applies, so
 neither length is selected for runtime use.
 
 Candidate response: 1-byte status followed by the 2-byte member ID. The
-Bluetooth family documents success, generic failure, invalid key/member, use
-count exhausted, outside validity, key mismatch, and electronic-lockout
-rejection.
+Bluetooth family documents success, generic failure, an invalid or expired key,
+use count exhausted, outside validity, key mismatch, and electronic-lockout
+rejection. It does not define a distinct member-ID-mismatch status.
 
 No value is selected for member ownership, method, or administrator authority.
 No complete payload is included in this record.
