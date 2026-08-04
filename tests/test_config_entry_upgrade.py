@@ -136,6 +136,7 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
         )
         managers: list[HASSTuyaBLEDeviceManager] = []
         setup_order: list[str] = []
+        bluetooth_lookup = Mock(return_value=object())
 
         def make_manager(fake_hass, data):
             manager = HASSTuyaBLEDeviceManager(fake_hass, data)
@@ -153,7 +154,7 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
             patch.object(
                 integration.bluetooth,
                 "async_ble_device_from_address",
-                return_value=object(),
+                new=bluetooth_lookup,
             ),
             patch.object(
                 integration, "HASSTuyaBLEDeviceManager", side_effect=make_manager
@@ -180,6 +181,7 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
         assert entry.unique_id == ADDRESS
         assert entry.version == 1
         assert entry.minor_version == 1
+        bluetooth_lookup.assert_called_once_with(hass, ADDRESS.upper(), True)
         config_entries.async_update_entry.assert_not_called()
         config_entries.async_init.assert_not_awaited()
 

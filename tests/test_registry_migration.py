@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
@@ -22,7 +22,9 @@ from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.entity import EntityCategory
 
 from custom_components import tuya_ble as integration
+from custom_components.tuya_ble import binary_sensor, button
 from custom_components.tuya_ble.const import DOMAIN
+from custom_components.tuya_ble.devices import TuyaBLEData, get_product_info_by_ids
 
 ADDRESS = "00:11:22:33:44:55"
 MOTOR_UNIQUE_ID = "synthetic-device-lock_motor_state"
@@ -137,6 +139,196 @@ def _create_old_motor_entry(
         labels={context.label.label_id},
         name="Garage motor",
     )
+
+
+def _synthetic_runtime_device(
+    category: str,
+    product_id: str,
+    device_id: str,
+) -> SimpleNamespace:
+    """Return the minimum synthetic device used by platform setup."""
+    return SimpleNamespace(
+        address=ADDRESS,
+        category=category,
+        datapoints=SimpleNamespace(has_id=Mock(return_value=False)),
+        device_id=device_id,
+        device_version="synthetic-device-version",
+        hardware_version="synthetic-hardware-version",
+        name="Synthetic lock",
+        product_id=product_id,
+        product_model="Synthetic lock model",
+        protocol_version="4.0",
+    )
+
+
+def _assert_entity_device_reuses_registry_identity(
+    context: SimpleNamespace,
+    entity,
+) -> None:
+    """Assert an entity's emitted device identity reuses the legacy device."""
+    device_info = entity.device_info
+    assert device_info is not None
+    assert device_info["identifiers"] == {(DOMAIN, ADDRESS)}
+
+    reused = context.device_registry.async_get_or_create(
+        config_entry_id=context.entry.entry_id,
+        connections=device_info["connections"],
+        identifiers=device_info["identifiers"],
+    )
+
+    assert reused.id == context.device_entry.id
+    assert [
+        entry.id
+        for entry in dr.async_entries_for_config_entry(
+            context.device_registry, context.entry.entry_id
+        )
+    ] == [context.device_entry.id]
+
+
+def _register_runtime_entity(context: SimpleNamespace, entity):
+    """Register an emitted entity using its stable integration identity."""
+    return context.registry.async_get_or_create(
+        entity.platform,
+        DOMAIN,
+        entity.unique_id,
+        suggested_object_id=entity.unique_id,
+        config_entry=context.entry,
+        device_id=context.device_entry.id,
+    )
+
+
+def test_s1_repeated_platform_setup_reuses_migrated_registry_entries(
+    tmp_path,
+) -> None:
+    """S1 setup reuses the legacy device and the migrated Motor State entity."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "s1-platform-setup")
+        old_entry = _create_old_motor_entry(context)
+        integration._async_migrate_s1_motor_state_entity(
+            context.hass, context.entry, context.device
+        )
+
+        device = _synthetic_runtime_device("jtmspro", "xqeob8h6", "synthetic-device")
+        product = get_product_info_by_ids(device.category, device.product_id)
+        assert product is not None
+        context.hass.data.setdefault(DOMAIN, {})[context.entry.entry_id] = TuyaBLEData(
+            title=context.entry.title,
+            device=device,
+            product=product,
+            manager=Mock(),
+            coordinator=SimpleNamespace(connected=False),
+        )
+
+        setup_batches = []
+        for _ in range(2):
+            entities = []
+            await binary_sensor.async_setup_entry(
+                context.hass, context.entry, entities.extend
+            )
+            setup_batches.append(entities)
+
+        assert context.registry.async_get(old_entry.entity_id) is None
+        assert [len(entities) for entities in setup_batches] == [1, 1]
+        assert all(
+            isinstance(entities[0], binary_sensor.TuyaBLEBinarySensor)
+            for entities in setup_batches
+        )
+        emitted_entities = [entities[0] for entities in setup_batches]
+        assert [entity.unique_id for entity in emitted_entities] == [
+            MOTOR_UNIQUE_ID,
+            MOTOR_UNIQUE_ID,
+        ]
+
+        migrated_entity_id = context.registry.async_get_entity_id(
+            Platform.BINARY_SENSOR, DOMAIN, MOTOR_UNIQUE_ID
+        )
+        assert migrated_entity_id is not None
+        registered = [
+            _register_runtime_entity(context, entity) for entity in emitted_entities
+        ]
+        assert [entry.entity_id for entry in registered] == [
+            migrated_entity_id,
+            migrated_entity_id,
+        ]
+        assert [
+            (entry.domain, entry.unique_id)
+            for entry in er.async_entries_for_config_entry(
+                context.registry, context.entry.entry_id
+            )
+        ] == [(Platform.BINARY_SENSOR, MOTOR_UNIQUE_ID)]
+
+        for entity in emitted_entities:
+            _assert_entity_device_reuses_registry_identity(context, entity)
+
+    asyncio.run(exercise())
+
+
+def test_v1_repeated_platform_setup_reuses_manual_lock_registry_entry(
+    tmp_path,
+) -> None:
+    """V1 setup keeps the b2 manual_lock identity without duplicate entries."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-platform-setup")
+        device = _synthetic_runtime_device("ms", "7a4xvbtt", "synthetic-v1-device")
+        product = get_product_info_by_ids(device.category, device.product_id)
+        assert product is not None
+        expected_unique_id = "synthetic-v1-device-manual_lock"
+        legacy_entry = context.registry.async_get_or_create(
+            Platform.BUTTON,
+            DOMAIN,
+            expected_unique_id,
+            suggested_object_id="legacy_manual_lock",
+            config_entry=context.entry,
+            device_id=context.device_entry.id,
+        )
+        context.hass.data.setdefault(DOMAIN, {})[context.entry.entry_id] = TuyaBLEData(
+            title=context.entry.title,
+            device=device,
+            product=product,
+            manager=Mock(),
+            coordinator=SimpleNamespace(connected=False),
+        )
+
+        setup_batches = []
+        for _ in range(2):
+            entities = []
+            await button.async_setup_entry(context.hass, context.entry, entities.extend)
+            setup_batches.append(entities)
+
+        assert [len(entities) for entities in setup_batches] == [1, 1]
+        assert all(
+            isinstance(entities[0], button.TuyaBLEButton) for entities in setup_batches
+        )
+        emitted_entities = [entities[0] for entities in setup_batches]
+        assert [entity.unique_id for entity in emitted_entities] == [
+            expected_unique_id,
+            expected_unique_id,
+        ]
+        assert all(
+            entity.entity_description.key == "manual_lock"
+            for entity in emitted_entities
+        )
+
+        registered = [
+            _register_runtime_entity(context, entity) for entity in emitted_entities
+        ]
+        assert [entry.entity_id for entry in registered] == [
+            legacy_entry.entity_id,
+            legacy_entry.entity_id,
+        ]
+        assert [
+            (entry.domain, entry.unique_id)
+            for entry in er.async_entries_for_config_entry(
+                context.registry, context.entry.entry_id
+            )
+        ] == [(Platform.BUTTON, expected_unique_id)]
+
+        for entity in emitted_entities:
+            _assert_entity_device_reuses_registry_identity(context, entity)
+
+    asyncio.run(exercise())
 
 
 def test_migration_preserves_customization_collision_and_idempotency(tmp_path) -> None:
