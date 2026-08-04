@@ -294,4 +294,4 @@ def test_v1_translation_and_manifest_contract() -> None:
         "phone_remote",
         "temporary",
     }
-    assert manifest["version"] == "0.1.11b1"
+    assert manifest["version"] == "0.1.11b2"

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning].
 
 ## [Unreleased]
 
+## [0.1.11b2] - 2026-08-04
+
 ### Changed
 
 - Aligned lock entity names, icons, and categories between S1 and V1.
