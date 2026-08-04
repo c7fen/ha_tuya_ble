@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import ast
 import base64
-from collections.abc import Iterable
 import hashlib
 import logging
-from pathlib import Path
 import string
+from collections.abc import Iterable
+from pathlib import Path
 from struct import pack
 
 from bleak.backends.device import BLEDevice
@@ -19,7 +19,6 @@ from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDevice,
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
-
 
 KNOWN_UNSAFE_PAYLOAD_FINGERPRINTS = frozenset(
     {

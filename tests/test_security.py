@@ -3,6 +3,7 @@
 import logging
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.const import (
     CONF_COUNTRY_CODE,
@@ -11,7 +12,6 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
-import pytest
 
 from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
 from custom_components.tuya_ble.config_flow import _try_login
@@ -35,7 +35,6 @@ from custom_components.tuya_ble.tuya_ble import (
 )
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.security import TuyaBLESecurityMaterial
-
 
 # Split obvious test-only values so generic secret scanners do not mistake them
 # for captured credentials while the protocol derivation fixtures stay stable.
@@ -107,11 +106,9 @@ def test_protocol_v2_packets_use_security_levels_14_and_15() -> None:
     device._session_key = material.session_key(DEVICE_RANDOM)
     device._protocol_version = 2
 
-    login_packets = device._build_packets(
-        1, TuyaBLECode.FUN_SENDER_DEVICE_INFO, bytes()
-    )
+    login_packets = device._build_packets(1, TuyaBLECode.FUN_SENDER_DEVICE_INFO, b"")
     session_packets = device._build_packets(
-        2, TuyaBLECode.FUN_SENDER_DEVICE_STATUS, bytes()
+        2, TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b""
     )
 
     assert login_packets[0][3] == 14

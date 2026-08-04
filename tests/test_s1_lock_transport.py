@@ -8,10 +8,10 @@ import hashlib
 import logging
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
-import pytest
 
 from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
