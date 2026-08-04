@@ -187,6 +187,9 @@ def test_v1_manual_lock_button_only_writes_true() -> None:
     assert len(mapping) == 1
     manual_lock = mapping[0]
     assert manual_lock.description.key == "manual_lock"
+    assert manual_lock.description.translation_key == "lock"
+    assert manual_lock.description.icon == "mdi:lock"
+    assert manual_lock.description.entity_category is None
     assert manual_lock.dp_id == 46
     assert manual_lock.dp_type is TuyaBLEDataPointType.DT_BOOL
     assert manual_lock.press_value is True

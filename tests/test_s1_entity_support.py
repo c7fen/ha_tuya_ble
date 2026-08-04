@@ -220,7 +220,7 @@ def test_s1_auto_lock_switch_contract_and_writes() -> None:
     mapping_items = switch.get_mapping_by_device(S1_DEVICE)
     assert sum(item.description.key == "automatic_lock" for item in mapping_items) == 1
     mappings = _mapping_by_key(mapping_items)
-    assert set(mappings) == {"automatic_lock", "lock_motor_state"}
+    assert set(mappings) == {"automatic_lock"}
 
     auto_lock = mappings["automatic_lock"]
     assert auto_lock.dp_id == 33
@@ -343,13 +343,19 @@ def test_door_state_does_not_drive_s1_lock_state() -> None:
     assert lock.TuyaBLELock.is_locked.fget(fake_lock) is None
 
 
-def test_s1_motor_migration_is_deferred_without_duplicate_entity() -> None:
-    """The legacy DP 47 switch remains and no binary-sensor duplicate exists."""
-    switch_mappings = _mapping_by_key(switch.get_mapping_by_device(S1_DEVICE))
-    motor = switch_mappings["lock_motor_state"]
+def test_s1_motor_state_is_read_only_without_duplicate_entity() -> None:
+    """S1 DP 47 is one read-only diagnostic binary sensor."""
+    assert "lock_motor_state" not in _mapping_by_key(
+        switch.get_mapping_by_device(S1_DEVICE)
+    )
+    binary_mappings = _mapping_by_key(binary_sensor.get_mapping_by_device(S1_DEVICE))
+    assert set(binary_mappings) == {"lock_motor_state"}
+    motor = binary_mappings["lock_motor_state"]
     assert motor.dp_id == 47
-    assert motor.setter is switch.lock_switch_setter
-    assert binary_sensor.get_mapping_by_device(S1_DEVICE) == []
+    assert motor.dp_type is TuyaBLEDataPointType.DT_BOOL
+    assert motor.description.icon == "mdi:engine"
+    assert motor.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert motor.getter is binary_sensor.motor_state_getter
 
 
 def test_s1_excludes_out_of_scope_and_security_datapoints() -> None:
@@ -364,7 +370,7 @@ def test_s1_excludes_out_of_scope_and_security_datapoints() -> None:
         )
         for item in platform_mapping
     }
-    assert writable_dp_ids == {33, 34, 36, 47}
+    assert writable_dp_ids == {33, 34, 36}
     assert not writable_dp_ids & {22, 24, 25, 31, 44, 70, 71, 73, 86, 87, 88, 90}
 
 
@@ -372,7 +378,7 @@ def test_preexisting_s1_entity_keys_remain_stable() -> None:
     """Existing S1 entities keep their exact unique IDs."""
     descriptions = [
         lock.get_mapping_by_device(S1_DEVICE)[0].description,
-        _mapping_by_key(switch.get_mapping_by_device(S1_DEVICE))[
+        _mapping_by_key(binary_sensor.get_mapping_by_device(S1_DEVICE))[
             "lock_motor_state"
         ].description,
     ]

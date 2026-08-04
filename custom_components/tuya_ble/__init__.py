@@ -11,7 +11,9 @@ from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackM
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import EntityCategory
 
 from .tuya_ble import TuyaBLEDevice
 
@@ -38,6 +40,155 @@ PLATFORMS: list[Platform] = [
 
 _LOGGER = logging.getLogger(__name__)
 
+S1_CATEGORY = "jtmspro"
+S1_PRODUCT_ID = "xqeob8h6"
+MOTOR_STATE_KEY = "lock_motor_state"
+
+
+@callback
+def _async_migrate_s1_motor_state_entity(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    device: TuyaBLEDevice,
+) -> None:
+    """Move the S1 Motor State registry entry to the read-only platform."""
+    if device.category != S1_CATEGORY or device.product_id != S1_PRODUCT_ID:
+        return
+
+    unique_id = f"{device.device_id}-{MOTOR_STATE_KEY}"
+    registry = er.async_get(hass)
+    old_entity_id = registry.async_get_entity_id(
+        Platform.SWITCH, DOMAIN, unique_id
+    )
+    old_entries = [
+        registry_entry
+        for registry_entry in er.async_entries_for_config_entry(
+            registry, entry.entry_id
+        )
+        if registry_entry.domain == Platform.SWITCH
+        and registry_entry.platform == DOMAIN
+        and registry_entry.unique_id.endswith(f"-{MOTOR_STATE_KEY}")
+    ]
+    if not old_entries and old_entity_id is None:
+        return
+    if (
+        len(old_entries) != 1
+        or old_entity_id is None
+        or old_entries[0].entity_id != old_entity_id
+    ):
+        raise ConfigEntryError(
+            "Cannot safely migrate the S1 Motor State entity because its "
+            "switch registry entry is ambiguous"
+        )
+
+    old_entry = old_entries[0]
+    if old_entry.config_entry_id != entry.entry_id:
+        raise ConfigEntryError(
+            "Cannot safely migrate the S1 Motor State entity because its "
+            "switch registry entry is not owned by this config entry"
+        )
+
+    new_entity_id = registry.async_get_entity_id(
+        Platform.BINARY_SENSOR, DOMAIN, unique_id
+    )
+    new_entry = registry.async_get(new_entity_id) if new_entity_id else None
+    if new_entry is not None:
+        if new_entry.config_entry_id not in (None, entry.entry_id):
+            raise ConfigEntryError(
+                "Cannot safely migrate the S1 Motor State entity because its "
+                "binary-sensor registry entry belongs to another config entry"
+            )
+        if (
+            old_entry.device_id is not None
+            and new_entry.device_id is not None
+            and old_entry.device_id != new_entry.device_id
+        ):
+            raise ConfigEntryError(
+                "Cannot safely migrate the S1 Motor State entity because the "
+                "old and new registry entries refer to different devices"
+            )
+
+    created_entity_id: str | None = None
+    try:
+        if new_entry is None:
+            new_entry = registry.async_get_or_create(
+                Platform.BINARY_SENSOR,
+                DOMAIN,
+                unique_id,
+                suggested_object_id=old_entry.entity_id.partition(".")[2],
+                disabled_by=old_entry.disabled_by,
+                hidden_by=old_entry.hidden_by,
+                get_initial_options=lambda: old_entry.options,
+                config_entry=entry,
+                config_subentry_id=old_entry.config_subentry_id,
+                device_id=old_entry.device_id,
+                entity_category=EntityCategory.DIAGNOSTIC,
+                has_entity_name=True,
+                original_icon="mdi:engine",
+                translation_key=MOTOR_STATE_KEY,
+            )
+            created_entity_id = new_entry.entity_id
+
+        if created_entity_id is not None:
+            aliases = list(old_entry.aliases)
+            area_id = old_entry.area_id
+            categories = dict(old_entry.categories)
+            device_class = old_entry.device_class
+            disabled_by = old_entry.disabled_by
+            hidden_by = old_entry.hidden_by
+            icon = old_entry.icon
+            labels = set(old_entry.labels)
+            name = old_entry.name
+        else:
+            aliases = list(new_entry.aliases)
+            aliases.extend(
+                alias for alias in old_entry.aliases if alias not in aliases
+            )
+            area_id = new_entry.area_id or old_entry.area_id
+            categories = {**old_entry.categories, **new_entry.categories}
+            device_class = new_entry.device_class or old_entry.device_class
+            disabled_by = new_entry.disabled_by or old_entry.disabled_by
+            hidden_by = new_entry.hidden_by or old_entry.hidden_by
+            icon = new_entry.icon or old_entry.icon
+            labels = new_entry.labels | old_entry.labels
+            name = new_entry.name or old_entry.name
+
+        registry.async_update_entity(
+            new_entry.entity_id,
+            aliases=aliases,
+            area_id=area_id,
+            categories=categories,
+            config_entry_id=entry.entry_id,
+            config_subentry_id=(
+                new_entry.config_subentry_id or old_entry.config_subentry_id
+            ),
+            device_class=device_class,
+            device_id=new_entry.device_id or old_entry.device_id,
+            disabled_by=disabled_by,
+            entity_category=EntityCategory.DIAGNOSTIC,
+            hidden_by=hidden_by,
+            icon=icon,
+            has_entity_name=True,
+            labels=labels,
+            name=name,
+            original_device_class=None,
+            original_icon="mdi:engine",
+            original_name=None,
+            supported_features=0,
+            translation_key=MOTOR_STATE_KEY,
+            unit_of_measurement=None,
+        )
+    except Exception:  # noqa: BLE001 - rollback must retain the old entry
+        if created_entity_id is not None:
+            registry.async_remove(created_entity_id)
+        _LOGGER.error("Unable to safely migrate the S1 Motor State entity")
+        raise ConfigEntryError(
+            "Unable to safely migrate the S1 Motor State entity"
+        ) from None
+
+    registry.async_remove(old_entry.entity_id)
+    _LOGGER.info("Migrated the S1 Motor State entity to binary_sensor")
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tuya BLE from a config entry."""
@@ -56,6 +207,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if product_info is None:
         raise ConfigEntryNotReady(f"Could not determine product info for Tuya BLE device with address {address}")
 
+    _async_migrate_s1_motor_state_entity(hass, entry, device)
     coordinator = TuyaBLEPassiveCoordinator(hass, _LOGGER, address, device)
 
     '''

@@ -237,14 +237,6 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
         products={
             "xqeob8h6": [
                 TuyaBLESwitchMapping(
-                    dp_id=47,
-                    description=SwitchEntityDescription(
-                        key="lock_motor_state",
-                        icon="mdi:lock",
-                    ),
-                    setter=lock_switch_setter,
-                ),
-                TuyaBLESwitchMapping(
                     dp_id=33,
                     description=SwitchEntityDescription(
                         key="automatic_lock",

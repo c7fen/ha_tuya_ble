@@ -70,7 +70,8 @@ mapping: dict[str, TuyaBLECategoryButtonMapping] = {
                     dp_id=46,
                     description=ButtonEntityDescription(
                         key="manual_lock",
-                        icon="mdi:lock-plus",
+                        translation_key="lock",
+                        icon="mdi:lock",
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     # DP 46 true is the evidenced momentary lock command.

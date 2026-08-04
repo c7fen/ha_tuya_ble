@@ -105,6 +105,26 @@ feature is exposed.
 - Irrigation computer (category ID `ggq`)
   - Irrigation computer (product IDs `6pahkcau`, `hfgdqhho`).
 
+### Smart-lock entity presentation
+
+The S1 and V1 use the same translated names, icons, and entity categories for
+shared concepts. Their real control capabilities remain intentionally
+different: S1 provides a stateful, bidirectional `LockEntity`, while V1
+provides a one-way `ButtonEntity` that only sends the lock command.
+
+| Visible name | S1 platform | V1 platform | Icon | Home Assistant section |
+| --- | --- | --- | --- | --- |
+| Lock | `lock` (Lock and Unlock) | `button` (Lock only) | `mdi:lock` | Controls |
+| Authentication Mode | `select` | — | `mdi:account-key` | Configuration |
+| Auto-Lock | `switch` | `switch` | `mdi:lock-clock` | Configuration |
+| Auto-Lock Delay | `number` | `number` | `mdi:timer-lock` | Configuration |
+| Alarm | `sensor` | `sensor` | `mdi:alert` | Diagnostics |
+| Battery | `sensor` | `sensor` | Battery device-class icon | Diagnostics |
+| Door State | `sensor` | — | `mdi:door` | Diagnostics; disabled by default |
+| Last Unlock Method | `sensor` | `sensor` | `mdi:account-lock-open` | Diagnostics |
+| Motor State | `binary_sensor` | `binary_sensor` | `mdi:engine` | Diagnostics |
+| Signal Strength | `sensor` | `sensor` | Signal-strength device-class icon | Diagnostics; disabled by default |
+
 ### S1-TY-BLE-PRO
 
 The `jtmspro/xqeob8h6` product has the following product-specific local BLE
@@ -112,7 +132,7 @@ entities:
 
 | Entity | Datapoint | Home Assistant semantics |
 | --- | ---: | --- |
-| Lock | 46, 70, 71 | DP 46 locks; the existing DP 70/71 sequence unlocks |
+| Lock | 46, 70, 71 | Stateful control: DP 46 locks; the existing DP 70/71 sequence unlocks |
 | Battery | 8 | Diagnostic percentage sensor |
 | Alarm | 21 | Complete 14-value product-specific diagnostic enum |
 | Last Unlock Method | 12, 15, 16, 19, 62, 63 | Current-batch enum |
@@ -120,7 +140,7 @@ entities:
 | Auto-Lock Delay | 36 | Configuration number from 1 to 1800 seconds |
 | Authentication Mode | 34 | Single or fingerprint-and-card select |
 | Door State | 40 | Read-only enum; disabled by default |
-| Motor State | 47 | Legacy writable switch; migration deferred |
+| Motor State | 47 | Read-only diagnostic binary sensor |
 | Signal Strength | BLE RSSI | Existing diagnostic sensor, disabled by default |
 
 The existing S1 lock and unlock implementation is unchanged. In particular,
@@ -131,12 +151,21 @@ as the LockEntity state. Its possible values are `unknown`, `open`, and
 `closed`. Last Unlock Method covers fingerprint, card, mechanical key, BLE,
 phone remote, and voice remote.
 
-DP 47 is defined by the product metadata as a status value, but existing
-installations already have it registered as a writable switch. Moving it to a
-binary-sensor platform without a complete entity-registry migration would risk
-leaving an orphaned switch and losing user customizations. The legacy switch is
-therefore retained. A follow-up may migrate it only with tested cross-platform
-registry handling.
+DP 47 is exposed only as read-only motor status; it cannot be operated through
+Home Assistant switch services. During S1 setup, an existing Tuya BLE Motor
+State registry entry is migrated from `switch` to `binary_sensor` before the
+new platform entity is registered. The integration unique ID remains
+unchanged, and Home Assistant reuses the object-ID portion when it is
+collision-free. User-assigned name, icon, area, disabled and hidden state,
+labels, aliases, and supported registry customization are retained. If both
+old and new entries exist after a partial migration, the binary-sensor entry
+is kept and missing customization is merged from the old entry before the old
+switch entry is removed.
+
+The entity domain necessarily changes, for example from
+`switch.s1_motor_state` to `binary_sensor.s1_motor_state`. Automations,
+scripts, dashboards, or voice-assistant configuration that directly reference
+the old S1 Motor State `switch.*` entity ID may need to be updated.
 
 Sound, voice, LED, and other optical controls were not present in the supplied
 product-specific diagnostics and are not added. S1 iBeacon functionality is
@@ -155,7 +184,7 @@ following entities:
 | Auto-Lock | 33 | Configuration switch |
 | Auto-Lock Delay | 36 | Configuration number from 5 to 1800 seconds |
 | Motor State | 47 | Read-only diagnostic binary sensor |
-| Manual Lock | 46 | Stateless button that writes `true` once |
+| Lock | 46 | One-way stateless button that writes `true` once |
 | Signal Strength | BLE RSSI | Existing diagnostic sensor, disabled by default |
 
 For both smart-lock mappings, a full status snapshot alone does not invent or
@@ -185,7 +214,7 @@ offline-password management are also not implemented.
 - Review and sanitize Home Assistant diagnostics and logs before sharing them.
 - Test lock, Auto-Lock, authentication-mode, and motor commands with the door
   open and another authorized access method available.
-- V1 supports local locking through its momentary Manual Lock action, but it
+- V1 supports local locking through its momentary Lock action, but it
   does not support local unlock. Undocumented datapoints are not exposed as
   controls.
 

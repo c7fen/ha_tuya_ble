@@ -56,8 +56,8 @@ mapping: dict[str, TuyaBLECategoryLockMapping] = {
                 TuyaBLELockMapping(
                     description=LockEntityDescription(
                         key="ble_unlock_lock",
-                        name="S1-TY-BLE-PRO Lock",
-                        icon="mdi:lock-smart",
+                        translation_key="lock",
+                        icon="mdi:lock",
                     ),
                     force_add=True,
                 ),

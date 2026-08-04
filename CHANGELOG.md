@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning].
 
 ## [Unreleased]
 
+### Changed
+
+- Aligned lock entity names, icons, and categories between S1 and V1.
+- Renamed the visible V1 Manual Lock action to Lock.
+- Renamed the visible S1 lock entity to Lock.
+
+### Fixed
+
+- Replaced the writable S1 Motor State switch with a read-only diagnostic
+  BinarySensor.
+- Added an entity-registry migration that prevents duplicate or orphaned S1
+  Motor State entities while preserving supported user customization.
+
 ## [0.1.11b1] - 2026-08-03
 
 ### Added
