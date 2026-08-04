@@ -114,10 +114,10 @@ contract:
   reproducible keyed unlock.
 - Upstream PR #185 copied the older V1 mapping into the active upstream. It did
   not add a DP60/DP61 protocol or prove bidirectional V1 hardware behavior.
-- `make-all/tuya-local` documents a standard keyed lock pattern and recommends
-  capturing the app's keyed command during pairing. That is evidence that the
-  key is device-specific; it is not evidence for Home Assistant generating and
-  provisioning a replacement key locally.
+- `make-all/tuya-local` documents that the eight-digit code is set during
+  pairing and says it can later be obtained by observing cloud unlock traffic.
+  That is evidence that the key is device-specific; it is not evidence for Home
+  Assistant generating and provisioning a replacement key locally.
 
 The reported jpmreis DP33 behavior conflicts with the supplied product metadata,
 which identifies DP33 as `automatic_lock`. It remains a rejected workaround.
