@@ -87,12 +87,17 @@ class TuyaBLEDataPoint:
         flags: int,
         type: TuyaBLEDataPointType,
         value: bytes | bool | int | str,
+        *,
+        received_from_device: bool = False,
     ) -> None:
         self._owner = owner
         self._id = id
+        self._timestamp = timestamp
+        self._flags = flags
+        self._type = type
         self._value = value
         self._changed_by_device = False
-        self._update_from_device(timestamp, flags, type, value)
+        self._received_from_device = received_from_device
 
     def __repr__(self) -> str:
         return (
@@ -113,6 +118,7 @@ class TuyaBLEDataPoint:
         self._type = type
         self._changed_by_device = self._value != value
         self._value = value
+        self._received_from_device = True
 
     def _get_value(self) -> bytes:
         match self._type:
@@ -156,6 +162,11 @@ class TuyaBLEDataPoint:
     def changed_by_device(self) -> bool:
         return self._changed_by_device
 
+    @property
+    def received_from_device(self) -> bool:
+        """Return whether the current value came from an inbound device update."""
+        return self._received_from_device
+
     def __str__(self) -> str:
         return repr(self)
 
@@ -178,6 +189,7 @@ class TuyaBLEDataPoint:
                 self._value = str(value)
 
         self._changed_by_device = False
+        self._received_from_device = False
         await self._owner._update_from_user(self._id)
 
 
@@ -248,7 +260,13 @@ class TuyaBLEDataPoints:
             dp._update_from_device(timestamp, flags, type, value)
         else:
             self._datapoints[dp_id] = TuyaBLEDataPoint(
-                self, dp_id, timestamp, flags, type, value
+                self,
+                dp_id,
+                timestamp,
+                flags,
+                type,
+                value,
+                received_from_device=True,
             )
 
     async def _update_from_user(self, dp_id: int) -> None:
@@ -1685,6 +1703,7 @@ class TuyaBLEDevice:
             elif dp.type == TuyaBLEDataPointType.DT_STRING:
                 dp._value = str(value)
             dp._changed_by_device = False
+            dp._received_from_device = False
             updated_dps.append(dp)
 
         if not updated_dps:
