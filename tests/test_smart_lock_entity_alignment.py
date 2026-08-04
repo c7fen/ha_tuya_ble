@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components import switch as ha_switch
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.lock import LockEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
-from homeassistant.components.switch import SwitchEntity
+from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import SOURCE_USER, ConfigEntries, ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import (
+    ATTR_DEVICE_CLASS,
+    ATTR_ENTITY_ID,
+    SERVICE_TOGGLE,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    Platform,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import (
@@ -31,11 +45,13 @@ from homeassistant.helpers import (
     label_registry as lr,
 )
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_platform import EntityPlatform
 
 from custom_components import tuya_ble as integration
 from custom_components.tuya_ble import (
     binary_sensor,
     button,
+    devices,
     lock,
     number,
     select,
@@ -288,6 +304,128 @@ def test_product_specific_entities_and_options_remain_distinct() -> None:
     )
 
 
+class RuntimeDatapoints:
+    """Synthetic smart-lock datapoints that record attempted writes."""
+
+    def __init__(self) -> None:
+        self.values = {
+            33: SimpleNamespace(value=True, type=TuyaBLEDataPointType.DT_BOOL),
+            47: SimpleNamespace(value=True, type=TuyaBLEDataPointType.DT_BOOL),
+        }
+        self.write_attempts: list[tuple[int, TuyaBLEDataPointType, object]] = []
+
+    def __getitem__(self, dp_id: int):
+        return self.values.get(dp_id)
+
+    def has_id(self, dp_id: int, dp_type=None) -> bool:
+        return dp_id in self.values
+
+    def get_or_create(
+        self,
+        dp_id: int,
+        dp_type: TuyaBLEDataPointType,
+        initial_value: object,
+    ):
+        self.write_attempts.append((dp_id, dp_type, initial_value))
+        raise AssertionError("A Motor State switch service resolved unexpectedly")
+
+
+class RuntimeCoordinator:
+    """Minimal available coordinator for real Home Assistant entities."""
+
+    available = True
+    last_update_datapoints = ()
+    last_update_sequence = 0
+
+    def async_add_listener(self, update_callback, context=None):
+        return lambda: None
+
+
+def _runtime_device(datapoints: RuntimeDatapoints) -> SimpleNamespace:
+    return SimpleNamespace(
+        address="synthetic:smart-lock:runtime",
+        category="jtmspro",
+        product_id="xqeob8h6",
+        device_id="unit-test-device",
+        name="Synthetic S1",
+        product_model="Synthetic S1",
+        hardware_version="test",
+        device_version="test",
+        protocol_version="test",
+        datapoints=datapoints,
+    )
+
+
+def _new_entity_platform(hass: HomeAssistant, domain: str) -> EntityPlatform:
+    return EntityPlatform(
+        hass=hass,
+        logger=logging.getLogger(f"test.{domain}"),
+        domain=domain,
+        platform_name=DOMAIN,
+        platform=None,
+        scan_interval=timedelta(seconds=30),
+        entity_namespace=None,
+    )
+
+
+def test_motor_state_runtime_state_has_no_switch_device_class(tmp_path) -> None:
+    """The real S1 BinarySensor emits a generic Boolean state."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "runtime-state")
+        old_entry = _create_old_motor_entry(
+            context, device_class=SwitchDeviceClass.OUTLET
+        )
+        context.registry.async_update_entity(
+            old_entry.entity_id,
+            disabled_by=None,
+            hidden_by=None,
+        )
+        integration._async_migrate_s1_motor_state_entity(
+            context.hass, context.entry, context.product
+        )
+        datapoints = RuntimeDatapoints()
+        device = _runtime_device(datapoints)
+        product = devices.get_product_info_by_ids("jtmspro", "xqeob8h6")
+        assert product is not None
+        motor_mapping = _mapping_by_key(binary_sensor.get_mapping_by_device(device))[
+            "lock_motor_state"
+        ]
+        entity = binary_sensor.TuyaBLEBinarySensor(
+            context.hass,
+            RuntimeCoordinator(),
+            device,
+            product,
+            motor_mapping,
+        )
+        platform = _new_entity_platform(context.hass, Platform.BINARY_SENSOR)
+        platform.config_entry = context.entry
+        await platform._async_add_entity(
+            entity,
+            False,
+            context.registry,
+            None,
+        )
+        assert entity.entity_id is not None
+
+        motor_mapping.getter(entity)
+        entity.async_write_ha_state()
+
+        state = context.hass.states.get(entity.entity_id)
+        assert state is not None
+        registry_entry = context.registry.async_get(entity.entity_id)
+        assert registry_entry is not None
+        assert state.state == "on"
+        assert entity.device_class is None
+        assert registry_entry.device_class is None
+        assert registry_entry.original_device_class is None
+        assert ATTR_DEVICE_CLASS not in state.attributes
+        assert "switch" not in state.attributes.values()
+        assert "outlet" not in state.attributes.values()
+
+    asyncio.run(exercise())
+
+
 async def _registry_context(tmp_path: Path, suffix: str = "primary") -> SimpleNamespace:
     hass = HomeAssistant(str(tmp_path / suffix))
     hass.config_entries = ConfigEntries(hass, {})
@@ -333,7 +471,11 @@ async def _registry_context(tmp_path: Path, suffix: str = "primary") -> SimpleNa
     )
 
 
-def _create_old_motor_entry(context: SimpleNamespace):
+def _create_old_motor_entry(
+    context: SimpleNamespace,
+    *,
+    device_class: SwitchDeviceClass = SwitchDeviceClass.SWITCH,
+):
     old_entry = context.registry.async_get_or_create(
         Platform.SWITCH,
         DOMAIN,
@@ -348,6 +490,7 @@ def _create_old_motor_entry(context: SimpleNamespace):
         aliases=[er.COMPUTED_NAME, "Motor alias"],
         area_id=context.area.id,
         categories={"synthetic_scope": "lock"},
+        device_class=device_class,
         disabled_by=er.RegistryEntryDisabler.USER,
         hidden_by=er.RegistryEntryHider.USER,
         icon="mdi:cog",
@@ -386,7 +529,10 @@ def test_registry_migration_preserves_customization_and_is_idempotent(tmp_path) 
         assert new_entry.labels == {context.label.label_id}
         assert new_entry.aliases == [er.COMPUTED_NAME, "Motor alias"]
         assert new_entry.categories == {"synthetic_scope": "lock"}
-        assert new_entry.options == {"switch": {"synthetic_option": True}}
+        assert new_entry.device_class is None
+        assert new_entry.original_device_class is None
+        assert new_entry.options == {}
+        assert "switch" not in new_entry.options
         assert new_entry.entity_category is EntityCategory.DIAGNOSTIC
         assert new_entry.translation_key == "lock_motor_state"
         assert new_entry.original_icon == "mdi:engine"
@@ -403,6 +549,36 @@ def test_registry_migration_preserves_customization_and_is_idempotent(tmp_path) 
             )
             is None
         )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "old_device_class",
+    (SwitchDeviceClass.SWITCH, SwitchDeviceClass.OUTLET),
+    ids=("switch", "outlet"),
+)
+def test_registry_migration_drops_switch_device_class(
+    tmp_path, old_device_class: SwitchDeviceClass
+) -> None:
+    """Switch-domain device classes never cross into the BinarySensor."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, f"device-class-{old_device_class}")
+        old_entry = _create_old_motor_entry(context, device_class=old_device_class)
+        assert old_entry.device_class is old_device_class
+
+        integration._async_migrate_s1_motor_state_entity(
+            context.hass, context.entry, context.product
+        )
+
+        new_entity_id = context.registry.async_get_entity_id(
+            Platform.BINARY_SENSOR, DOMAIN, MOTOR_UNIQUE_ID
+        )
+        new_entry = context.registry.async_get(new_entity_id)
+        assert new_entry is not None
+        assert new_entry.device_class is None
+        assert new_entry.original_device_class is None
 
     asyncio.run(exercise())
 
@@ -510,12 +686,16 @@ def test_registry_migration_converges_existing_old_and_new_entries(tmp_path) -> 
             DOMAIN,
             MOTOR_UNIQUE_ID,
             suggested_object_id="existing_binary_motor",
+            get_initial_options=lambda: {
+                "binary_sensor": {"synthetic_target_option": True}
+            },
             config_entry=context.entry,
             device_id=context.device_entry.id,
         )
         current = context.registry.async_update_entity(
             current.entity_id,
             aliases=[er.COMPUTED_NAME, "Binary alias"],
+            device_class=BinarySensorDeviceClass.RUNNING,
             labels={second_label.label_id},
             name="Existing binary name",
         )
@@ -539,6 +719,10 @@ def test_registry_migration_converges_existing_old_and_new_entries(tmp_path) -> 
             "Motor alias",
         ]
         assert merged.categories == {"synthetic_scope": "lock"}
+        assert merged.device_class is BinarySensorDeviceClass.RUNNING
+        assert merged.original_device_class is None
+        assert merged.options == {"binary_sensor": {"synthetic_target_option": True}}
+        assert "switch" not in merged.options
         entries = [
             item
             for item in er.async_entries_for_config_entry(
@@ -547,6 +731,71 @@ def test_registry_migration_converges_existing_old_and_new_entries(tmp_path) -> 
             if item.unique_id == MOTOR_UNIQUE_ID
         ]
         assert entries == [merged]
+
+    asyncio.run(exercise())
+
+
+def test_s1_motor_state_is_not_resolved_by_switch_services(tmp_path) -> None:
+    """Actual HA switch services cannot resolve either Motor State entity ID."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "switch-services")
+        old_entry = _create_old_motor_entry(context)
+        integration._async_migrate_s1_motor_state_entity(
+            context.hass, context.entry, context.product
+        )
+        new_entity_id = context.registry.async_get_entity_id(
+            Platform.BINARY_SENSOR, DOMAIN, MOTOR_UNIQUE_ID
+        )
+        assert new_entity_id is not None
+
+        await ha_switch.async_setup(context.hass, {})
+        component = context.hass.data[Platform.SWITCH]
+        datapoints = RuntimeDatapoints()
+        device = _runtime_device(datapoints)
+        product = devices.get_product_info_by_ids("jtmspro", "xqeob8h6")
+        assert product is not None
+        auto_lock_mapping = _mapping_by_key(switch.get_mapping_by_device(device))[
+            "automatic_lock"
+        ]
+        auto_lock_entity = switch.TuyaBLESwitch(
+            context.hass,
+            RuntimeCoordinator(),
+            device,
+            product,
+            auto_lock_mapping,
+        )
+        auto_lock_entity.add_to_platform_finish = AsyncMock()
+        platform = _new_entity_platform(context.hass, Platform.SWITCH)
+        platform.config_entry = context.entry
+        await platform._async_add_entity(
+            auto_lock_entity,
+            False,
+            context.registry,
+            None,
+        )
+
+        assert auto_lock_entity.entity_id is not None
+        assert component.get_entity(auto_lock_entity.entity_id) is auto_lock_entity
+        assert component.get_entity(old_entry.entity_id) is None
+        assert component.get_entity(new_entity_id) is None
+        assert (
+            context.registry.async_get_entity_id(
+                Platform.SWITCH, DOMAIN, MOTOR_UNIQUE_ID
+            )
+            is None
+        )
+
+        for target_entity_id in (old_entry.entity_id, new_entity_id):
+            for service in (SERVICE_TURN_ON, SERVICE_TURN_OFF, SERVICE_TOGGLE):
+                await context.hass.services.async_call(
+                    Platform.SWITCH,
+                    service,
+                    {ATTR_ENTITY_ID: target_entity_id},
+                    blocking=True,
+                )
+
+        assert datapoints.write_attempts == []
 
     asyncio.run(exercise())
 

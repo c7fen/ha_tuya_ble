@@ -118,7 +118,6 @@ def _async_migrate_s1_motor_state_entity(
                 suggested_object_id=old_entry.entity_id.partition(".")[2],
                 disabled_by=old_entry.disabled_by,
                 hidden_by=old_entry.hidden_by,
-                get_initial_options=lambda: old_entry.options,
                 config_entry=entry,
                 config_subentry_id=old_entry.config_subentry_id,
                 device_id=old_entry.device_id,
@@ -133,7 +132,7 @@ def _async_migrate_s1_motor_state_entity(
             aliases = list(old_entry.aliases)
             area_id = old_entry.area_id
             categories = dict(old_entry.categories)
-            device_class = old_entry.device_class
+            device_class = None
             disabled_by = old_entry.disabled_by
             hidden_by = old_entry.hidden_by
             icon = old_entry.icon
@@ -146,7 +145,7 @@ def _async_migrate_s1_motor_state_entity(
             )
             area_id = new_entry.area_id or old_entry.area_id
             categories = {**old_entry.categories, **new_entry.categories}
-            device_class = new_entry.device_class or old_entry.device_class
+            device_class = new_entry.device_class
             disabled_by = new_entry.disabled_by or old_entry.disabled_by
             hidden_by = new_entry.hidden_by or old_entry.hidden_by
             icon = new_entry.icon or old_entry.icon

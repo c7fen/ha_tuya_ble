@@ -157,10 +157,13 @@ State registry entry is migrated from `switch` to `binary_sensor` before the
 new platform entity is registered. The integration unique ID remains
 unchanged, and Home Assistant reuses the object-ID portion when it is
 collision-free. User-assigned name, icon, area, disabled and hidden state,
-labels, aliases, and supported registry customization are retained. If both
-old and new entries exist after a partial migration, the binary-sensor entry
-is kept and missing customization is merged from the old entry before the old
-switch entry is removed.
+labels, aliases, and user categories are retained. Switch-domain options and
+switch device-class overrides are deliberately not copied because they are not
+valid binary-sensor customization. If both old and new entries exist after a
+partial migration, the binary-sensor entry is kept, its own target-domain
+options and device-class override remain authoritative, and other missing
+customization is merged from the old entry before the old switch entry is
+removed.
 
 The entity domain necessarily changes, for example from
 `switch.s1_motor_state` to `binary_sensor.s1_motor_state`. Automations,
