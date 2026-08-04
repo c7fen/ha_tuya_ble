@@ -38,6 +38,7 @@ class TuyaBLEButtonMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     is_available: TuyaBLEButtonIsAvailable = None
+    press_value: bool | None = None
 
 
 def is_fingerbot_in_push_mode(self: TuyaBLEButton, product: TuyaBLEProductInfo) -> bool:
@@ -209,6 +210,18 @@ mapping: dict[str, TuyaBLECategoryButtonMapping] = {
     ),
     "ms": TuyaBLECategoryButtonMapping(
         products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLEButtonMapping(
+                    dp_id=46,
+                    description=ButtonEntityDescription(
+                        key="manual_lock",
+                        translation_key="lock",
+                        icon="mdi:lock",
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    press_value=True,
+                ),
+            ],
             **dict.fromkeys(
                 [
                     "okkyfgfs",
@@ -276,17 +289,25 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button."""
+        initial_value = (
+            self._mapping.press_value
+            if self._mapping.press_value is not None
+            else False
+        )
         datapoint = self._device.datapoints.get_or_create(
             self._mapping.dp_id,
             TuyaBLEDataPointType.DT_BOOL,
-            False,
+            initial_value,
         )
         if datapoint:
-            if self._product.lock:
+            if self._mapping.press_value is not None:
+                value = self._mapping.press_value
+            elif self._product.lock:
                 # Lock needs true to activate lock/unlock commands
-                self._hass.create_task(datapoint.set_value(True))
+                value = True
             else:
-                self._hass.create_task(datapoint.set_value(not bool(datapoint.value)))
+                value = not bool(datapoint.value)
+            self._hass.create_task(datapoint.set_value(value))
 
     @property
     def available(self) -> bool:

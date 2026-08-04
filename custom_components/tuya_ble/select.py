@@ -364,7 +364,6 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
                     "uamrw6h3",
                     "okkyfgfs",
                     "sidhzylo",
-                    "7a4xvbtt",
                     "wgv4haro",
                 ],  # Smart Lock
                 [
@@ -383,6 +382,23 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
                     ),
                 ],
             ),
+            "yy2bmcoh": [  # Legacy Smart Lock; only DP31 was evidenced.
+                TuyaBLESelectMapping(
+                    dp_id=31,
+                    description=SelectEntityDescription(
+                        key="beep_volume",
+                        icon="mdi:volume-high",
+                        options=[
+                            "mute",
+                            "low",
+                            "normal",
+                            "high",
+                        ],
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+            ],
             **dict.fromkeys(
                 ["6fibxtph", "99gv5nmz", "kpn4zaf7"],
                 [
@@ -465,6 +481,21 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
     ),
     "jtmspro": TuyaBLECategorySelectMapping(
         products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLESelectMapping(
+                    dp_id=34,
+                    description=SelectEntityDescription(
+                        key="unlock_switch",
+                        icon="mdi:account-key",
+                        options=[
+                            "single_unlock",
+                            "finger_card",
+                        ],
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+            ],
             "hc7n0urm": [  # A1 Ultra-JM
                 TuyaBLESelectMapping(
                     dp_id=31,

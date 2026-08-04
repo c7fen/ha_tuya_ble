@@ -29,6 +29,11 @@
             }
         }
     },
+    "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Local unlock is not initialized for this device. A device-specific template must first be received."
+        }
+    },
     "entity": {
         "binary_sensor": {
             "fault": {
@@ -57,6 +62,9 @@
             "push": {
                 "name": "Push"
             },
+            "lock": {
+                "name": "Lock"
+            },
             "ble_unlock_check": {
                 "name": "Unlock"
             },
@@ -69,7 +77,15 @@
                 "name": "Event"
             }
         },
+        "lock": {
+            "lock": {
+                "name": "Lock"
+            }
+        },
         "number": {
+            "auto_lock_time": {
+                "name": "Auto-Lock Delay"
+            },
             "ble_unlock_check": {
                 "name": "Unlock"
             },
@@ -122,6 +138,13 @@
         "select": {
             "beep_volume": {
                 "name": "Lock Volume"
+            },
+            "unlock_switch": {
+                "name": "Authentication Mode",
+                "state": {
+                    "single_unlock": "Single authentication",
+                    "finger_card": "Fingerprint and card"
+                }
             },
             "language": {
                 "name": "Lock Language"
@@ -229,8 +252,59 @@
                 "state": {
                     "wrong_finger": "Wrong Fingerprint",
                     "wrong_password": "Wrong Password",
+                    "wrong_card": "Wrong Card",
                     "low_battery": "Low Battery",
                     "power_off": "Power off"
+                }
+            },
+            "last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "fingerprint": "Fingerprint",
+                    "password": "Password",
+                    "dynamic": "Dynamic password",
+                    "card": "Card",
+                    "ble": "Bluetooth",
+                    "temporary": "Temporary password",
+                    "phone_remote": "Phone remote"
+                }
+            },
+            "s1_alarm_lock": {
+                "name": "Alarm",
+                "state": {
+                    "wrong_finger": "Wrong fingerprint",
+                    "wrong_password": "Wrong password",
+                    "wrong_card": "Wrong card",
+                    "wrong_face": "Wrong face",
+                    "tongue_bad": "Latch fault",
+                    "too_hot": "Temperature too high",
+                    "unclosed_time": "Door left open",
+                    "tongue_not_out": "Latch not extended",
+                    "pry": "Tamper detected",
+                    "key_in": "Key inserted",
+                    "low_battery": "Low battery",
+                    "power_off": "Power loss",
+                    "shock": "Shock detected",
+                    "defense": "Armed alarm"
+                }
+            },
+            "s1_last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "fingerprint": "Fingerprint",
+                    "card": "Card",
+                    "key": "Mechanical key",
+                    "ble": "Bluetooth",
+                    "phone_remote": "Phone remote",
+                    "voice_remote": "Voice remote"
+                }
+            },
+            "closed_opened": {
+                "name": "Door State",
+                "state": {
+                    "unknown": "Unknown",
+                    "open": "Open",
+                    "closed": "Closed"
                 }
             },
             "power_off": {
@@ -311,7 +385,7 @@
                 "name": "Battery"
             },
             "signal_strength": {
-                "name": "Signal strength"
+                "name": "Signal Strength"
             },
             "temperature": {
                 "name": "Temperature"
@@ -382,7 +456,7 @@
         },
         "switch": {
             "automatic_lock": {
-                "name": "Automatic lock"
+                "name": "Auto-Lock"
             },
             "antifreeze": {
                 "name": "Antifreeze"

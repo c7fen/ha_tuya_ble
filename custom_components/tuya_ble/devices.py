@@ -391,12 +391,17 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
                     "sidhzylo",
                     "mqc2hevy",
                     "a6nttc41",
-                    "7a4xvbtt",
                 ],
                 TuyaBLEProductInfo(  # device product_id
                     name="Smart Lock",
                     lock=1,
                 ),
+            ),
+            "yy2bmcoh": TuyaBLEProductInfo(
+                name="Smart Lock",
+            ),
+            "7a4xvbtt": TuyaBLEProductInfo(
+                name="V1 Smart Lock",
             ),
             "okkyfgfs": TuyaBLEProductInfo(
                 name="TEKXDD Fingerprint Smart Lock",
@@ -446,6 +451,12 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
     ),
     "jtmspro": TuyaBLECategoryInfo(
         products={
+            "akwn32dw": TuyaBLEProductInfo(
+                name="Drawer Smart Lock",
+            ),
+            "xqeob8h6": TuyaBLEProductInfo(
+                name="S1-TY-BLE-PRO",
+            ),
             "y2yaegze": TuyaBLEProductInfo(name="Drawer Lock CTL20H", lock=1),
             "hc7n0urm": TuyaBLEProductInfo(  # device product_id
                 name="A1 Ultra-JM",
