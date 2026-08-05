@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 MANIFEST = ROOT / "custom_components" / "tuya_ble" / "manifest.json"
 README = ROOT / "README.md"
