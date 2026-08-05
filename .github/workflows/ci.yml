@@ -27,7 +27,7 @@ jobs:
 
       - name: "Setup outputs"
         id: setup-outsputs
-        run: echo "PY_PATH=${{env.pythonLocation}}" >> $GITHUB_OUTPUT
+        run: echo "PY_PATH=${{env.pythonLocation}}" >> "$GITHUB_OUTPUT"
 
       - name: "Cache dependencies"
         id: cache-dependencies
@@ -108,4 +108,3 @@ jobs:
       - name: "Pytest"
         run: |
           ${{needs.base.outputs.PY_PATH}}/bin/pytest --cov --disable-warnings -s
-

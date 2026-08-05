@@ -1,0 +1,52 @@
+name: Device support request
+description: Request support for a public Tuya category and Product ID
+title: "[Device]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public issue. Provide only public product metadata and a sanitized schema description.
+
+        **Do not post credentials, complete Bluetooth addresses, private Device IDs, UUIDs, Local Keys, SecKeys, raw Home Assistant logs, datapoint payloads, or HCI captures.** Never copy a lock command or try multiple commands to discover behavior.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy and safety check
+      options:
+        - label: I removed credentials, complete addresses, private Device IDs, UUIDs, Local Keys, SecKeys, raw logs, datapoint payloads, and HCI captures.
+          required: true
+        - label: I did not discover behavior by spraying commands or replaying captured data.
+          required: true
+  - type: input
+    id: model
+    attributes:
+      label: Manufacturer and model
+    validations:
+      required: true
+  - type: input
+    id: category
+    attributes:
+      label: Public Tuya category
+    validations:
+      required: true
+  - type: input
+    id: product-id
+    attributes:
+      label: Public Tuya Product ID
+      description: Do not enter the private per-device Device ID.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized schema provenance and requested behavior
+      description: Cite the authorized metadata source and summarize datapoint names, types, and ranges without values or payloads.
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: Exact-head validation
+      description: If hardware was tested, give the exact commit and sanitized result. Do not attach raw evidence.
