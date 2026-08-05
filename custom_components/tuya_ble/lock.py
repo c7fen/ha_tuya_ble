@@ -52,7 +52,7 @@ S1_UNLOCK_ERROR_TRANSLATION_KEY = "s1_unlock_templates_unavailable"
 
 def _harden_s1_store_permissions(path: str) -> None:
     """Restrict an existing regular S1 template Store file to its owner."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:

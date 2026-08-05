@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -198,6 +199,16 @@ def test_s1_store_permission_hardening_rejects_symlink(tmp_path: Path) -> None:
         _harden_s1_store_permissions(str(store_path))
 
     assert stat.S_IMODE(target_path.stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO required")
+def test_s1_store_permission_hardening_rejects_fifo(tmp_path: Path) -> None:
+    """A special Store path is rejected without blocking setup."""
+    store_path = tmp_path / S1_STORE_KEY
+    os.mkfifo(store_path)
+
+    with pytest.raises(HomeAssistantError, match="not a regular file"):
+        _harden_s1_store_permissions(str(store_path))
 
 
 async def test_s1_store_load_is_singleton_under_concurrent_setup(
