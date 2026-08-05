@@ -6,12 +6,14 @@ import asyncio
 import base64
 import hashlib
 import logging
+import stat
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
@@ -27,6 +29,7 @@ from custom_components.tuya_ble.lock import (
     TuyaBLES1Lock,
     TuyaBLES1TemplateStore,
     _async_get_s1_template_store,
+    _harden_s1_store_permissions,
 )
 from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDataPointType,
@@ -60,11 +63,14 @@ def _stored_pair() -> dict[str, str]:
 class _BackingStore:
     """Minimal storage double that retains delayed persistence snapshots."""
 
-    def __init__(self, loaded: object = None) -> None:
+    def __init__(self, loaded: object = None, path: str = "") -> None:
         self.loaded = loaded
+        self.path = path
+        self.load_calls = 0
         self.delayed_saves: list[tuple[object, float]] = []
 
     async def async_load(self) -> object:
+        self.load_calls += 1
         return self.loaded
 
     def async_delay_save(self, data_func, delay: float = 0) -> None:
@@ -114,21 +120,84 @@ def _make_entity(
     return entity, device, backing_store
 
 
-async def test_s1_store_uses_legacy_version_one_key(hass: HomeAssistant) -> None:
-    """The b2 storage key and version remain directly readable."""
-    backing_store = _BackingStore({SYNTHETIC_DEVICE_ID: _stored_pair()})
+async def test_s1_store_uses_private_atomic_legacy_version_one_key(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """The b2 key remains readable through private atomic storage."""
+    backing_store = _BackingStore(
+        {SYNTHETIC_DEVICE_ID: _stored_pair()}, str(tmp_path / "missing-store")
+    )
     with patch(
         "custom_components.tuya_ble.lock.storage.Store", return_value=backing_store
     ) as store_class:
         template_store = await TuyaBLES1TemplateStore.async_load(hass)
 
-    store_class.assert_called_once_with(hass, S1_STORE_VERSION, S1_STORE_KEY)
+    store_class.assert_called_once_with(
+        hass,
+        S1_STORE_VERSION,
+        S1_STORE_KEY,
+        private=True,
+        atomic_writes=True,
+    )
+    assert backing_store.load_calls == 1
     assert S1_STORE_VERSION == 1
     assert S1_STORE_KEY == "tuya_ble_jtmspro_lock_templates"
     assert template_store.templates_for(SYNTHETIC_DEVICE_ID) == (
         SYNTHETIC_DP70,
         SYNTHETIC_DP71,
     )
+
+
+async def test_s1_store_hardens_existing_legacy_file_before_load(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """An existing non-private b2 Store becomes owner-only before loading."""
+    store_path = tmp_path / S1_STORE_KEY
+    store_path.write_text("synthetic legacy store", encoding="utf-8")
+    store_path.chmod(0o644)
+    backing_store = _BackingStore({}, str(store_path))
+
+    with patch(
+        "custom_components.tuya_ble.lock.storage.Store", return_value=backing_store
+    ):
+        await TuyaBLES1TemplateStore.async_load(hass)
+
+    assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
+    assert backing_store.load_calls == 1
+
+
+async def test_s1_store_rejects_non_regular_legacy_path_before_load(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """Unexpected Store paths fail closed before template data is loaded."""
+    store_path = tmp_path / S1_STORE_KEY
+    store_path.mkdir()
+    backing_store = _BackingStore({}, str(store_path))
+
+    with (
+        patch(
+            "custom_components.tuya_ble.lock.storage.Store",
+            return_value=backing_store,
+        ),
+        pytest.raises(HomeAssistantError, match="not a regular file"),
+    ):
+        await TuyaBLES1TemplateStore.async_load(hass)
+
+    assert backing_store.load_calls == 0
+
+
+def test_s1_store_permission_hardening_rejects_symlink(tmp_path: Path) -> None:
+    """Permission migration never follows a replacement path symlink."""
+    target_path = tmp_path / "target"
+    target_path.write_text("synthetic target", encoding="utf-8")
+    target_path.chmod(0o644)
+    store_path = tmp_path / S1_STORE_KEY
+    store_path.symlink_to(target_path)
+
+    with pytest.raises(HomeAssistantError, match="permissions are invalid"):
+        _harden_s1_store_permissions(str(store_path))
+
+    assert stat.S_IMODE(target_path.stat().st_mode) == 0o644
 
 
 async def test_s1_store_load_is_singleton_under_concurrent_setup(
