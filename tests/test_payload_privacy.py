@@ -330,6 +330,35 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
     assert all(value not in log_text for value in protected_forms)
 
 
+@pytest.mark.parametrize("failing_operation", ("stop_notify", "disconnect"))
+@pytest.mark.asyncio
+async def test_disconnect_transport_errors_redact_synthetic_identifiers(
+    failing_operation: str,
+) -> None:
+    """Foreign disconnect errors cannot bypass redaction through a traceback."""
+    device = _make_device()
+    _set_synthetic_credentials(device)
+    protected_forms = _protected_identifier_forms(device)
+    exception_text = "synthetic disconnect failure " + " ".join(protected_forms)
+    client = Mock(is_connected=True)
+    client.stop_notify = AsyncMock()
+    client.disconnect = AsyncMock()
+    getattr(client, failing_operation).side_effect = BleakError(exception_text)
+    device._client = client
+
+    with pytest.raises(BleakError) as raised:
+        await device._execute_disconnect()
+
+    rendered_error = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
+    assert all(value not in rendered_error for value in protected_forms)
+
+
 def test_payload_values_and_encodings_never_enter_protocol_logs(caplog) -> None:
     """Protocol logs retain metadata without raw, encoded, or credential material."""
     device = _make_device()

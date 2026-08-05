@@ -807,8 +807,11 @@ class TuyaBLEDevice:
             self._expected_disconnect = True
             self._client = None
             if client and client.is_connected:
-                await client.stop_notify(self._characteristic_notify)
-                await client.disconnect()
+                try:
+                    await client.stop_notify(self._characteristic_notify)
+                    await client.disconnect()
+                except Exception as ex:  # noqa: BLE001
+                    raise self._sanitized_transport_error(ex) from None
         self._clean_input()
         async with self._seq_num_lock:
             self._current_seq_num = 1
