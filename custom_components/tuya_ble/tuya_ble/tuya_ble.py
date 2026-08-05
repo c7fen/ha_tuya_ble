@@ -1399,6 +1399,11 @@ class TuyaBLEDevice:
                     raise TuyaBLEDataLengthError()
                 result = data[0]
 
+            case TuyaBLECode.FUN_SENDER_DPS:
+                if len(data) != 1:
+                    raise TuyaBLEDataLengthError()
+                result = data[0]
+
             case TuyaBLECode.FUN_SENDER_DPS_V4:
                 if len(data) != 6:
                     raise TuyaBLEDataLengthError()

@@ -18,6 +18,7 @@ from custom_components.tuya_ble import (
     binary_sensor,
     button,
     devices,
+    lock,
     number,
     select,
     sensor,
@@ -173,15 +174,10 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
 
 def test_v1_contract_excludes_generic_and_speculative_entities() -> None:
     """V1 exposes only the evidenced action, settings, and diagnostics."""
-    buttons = _mapping_by_key(button.get_mapping_by_device(V1_DEVICE))
-    assert set(buttons) == {"manual_lock"}
-    manual_lock = buttons["manual_lock"]
-    assert manual_lock.dp_id == 46
-    assert manual_lock.dp_type is TuyaBLEDataPointType.DT_BOOL
-    assert manual_lock.press_value is True
-    assert manual_lock.description.translation_key == "lock"
-    assert manual_lock.description.icon == "mdi:lock"
-    assert manual_lock.description.entity_category is None
+    assert button.get_mapping_by_device(V1_DEVICE) == []
+    assert lock.V1_DP_LOCK == 46
+    assert lock.V1_DP_ACCESS == 6
+    assert lock.V1_DP_MOTOR_STATE == 47
 
     sensors = _mapping_by_key(sensor.get_mapping_by_device(V1_DEVICE))
     assert set(sensors) == {"alarm_lock", "battery", "last_unlock_method"}
@@ -218,7 +214,7 @@ def test_v1_contract_excludes_generic_and_speculative_entities() -> None:
         )
         for item in platform_mappings
     }
-    assert writable_dp_ids == {33, 36, 46}
+    assert writable_dp_ids == {33, 36}
 
 
 def test_shared_entity_presentation_and_platform_types_match() -> None:
@@ -298,26 +294,6 @@ def test_shared_entity_translation_catalog_preserves_visible_names() -> None:
         assert list(entities["sensor"]["last_unlock_method"]["state"]) == list(
             V1_LAST_UNLOCK_METHODS.values()
         )
-
-
-def test_v1_manual_lock_button_writes_true_exactly_once() -> None:
-    """The V1 action is momentary and never toggles DP46 to false."""
-    manual_lock = button.get_mapping_by_device(V1_DEVICE)[0]
-    datapoint = FakeDatapoint(False)
-    datapoints = FakeDatapoints({46: datapoint})
-    hass = FakeHass()
-    entity = SimpleNamespace(
-        _mapping=manual_lock,
-        _device=SimpleNamespace(datapoints=datapoints),
-        _product=devices.get_product_info_by_ids("ms", "7a4xvbtt"),
-        _hass=hass,
-    )
-
-    button.TuyaBLEButton.press(entity)
-    hass.drain()
-
-    assert datapoints.get_or_create_calls == [(46, TuyaBLEDataPointType.DT_BOOL, True)]
-    assert datapoint.writes == [True]
 
 
 @pytest.mark.parametrize(

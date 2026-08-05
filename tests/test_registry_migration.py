@@ -22,12 +22,13 @@ from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.entity import EntityCategory
 
 from custom_components import tuya_ble as integration
-from custom_components.tuya_ble import binary_sensor, button
+from custom_components.tuya_ble import binary_sensor, lock
 from custom_components.tuya_ble.const import DOMAIN
 from custom_components.tuya_ble.devices import TuyaBLEData, get_product_info_by_ids
 
 ADDRESS = "00:11:22:33:44:55"
 MOTOR_UNIQUE_ID = "synthetic-device-lock_motor_state"
+V1_UNIQUE_ID = "synthetic-v1-device-manual_lock"
 _CONTEXT_DEVICE = object()
 
 
@@ -138,6 +139,53 @@ def _create_old_motor_entry(
         icon="mdi:cog",
         labels={context.label.label_id},
         name="Garage motor",
+    )
+
+
+def _create_old_v1_button_entry(
+    context: SimpleNamespace,
+    *,
+    unique_id: str = V1_UNIQUE_ID,
+    config_entry: ConfigEntry | None = None,
+    device_id: str | None | object = _CONTEXT_DEVICE,
+    config_subentry_id: str | None = None,
+):
+    """Create the b2 V1 manual-lock button shape with customizations."""
+    create_kwargs = {}
+    if config_subentry_id is not None:
+        create_kwargs["config_subentry_id"] = config_subentry_id
+    old_entry = context.registry.async_get_or_create(
+        Platform.BUTTON,
+        DOMAIN,
+        unique_id,
+        suggested_object_id="custom_v1_lock",
+        get_initial_options=lambda: {"button": {"synthetic_option": True}},
+        config_entry=config_entry or context.entry,
+        device_id=(
+            context.device_entry.id if device_id is _CONTEXT_DEVICE else device_id
+        ),
+        **create_kwargs,
+    )
+    return context.registry.async_update_entity(
+        old_entry.entity_id,
+        aliases=["V1 lock alias"],
+        area_id=context.area.id,
+        categories={"old_scope": "lock", "shared_scope": "old"},
+        disabled_by=er.RegistryEntryDisabler.USER,
+        hidden_by=er.RegistryEntryHider.USER,
+        icon="mdi:lock-outline",
+        labels={context.label.label_id},
+        name="Garage V1 lock",
+    )
+
+
+def _v1_device() -> SimpleNamespace:
+    """Return the exact V1 identity used by the registry migration."""
+    return SimpleNamespace(
+        category="ms",
+        product_id="7a4xvbtt",
+        device_id="synthetic-v1-device",
+        address=ADDRESS,
     )
 
 
@@ -267,7 +315,7 @@ def test_s1_repeated_platform_setup_reuses_migrated_registry_entries(
 def test_v1_repeated_platform_setup_reuses_manual_lock_registry_entry(
     tmp_path,
 ) -> None:
-    """V1 setup keeps the b2 manual_lock identity without duplicate entries."""
+    """V1 setup reuses the migrated manual_lock identity without duplicates."""
 
     async def exercise() -> None:
         context = await _registry_context(tmp_path, "v1-platform-setup")
@@ -283,6 +331,15 @@ def test_v1_repeated_platform_setup_reuses_manual_lock_registry_entry(
             config_entry=context.entry,
             device_id=context.device_entry.id,
         )
+        v1_device = SimpleNamespace(
+            category="ms",
+            product_id="7a4xvbtt",
+            device_id="synthetic-v1-device",
+            address=ADDRESS,
+        )
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, v1_device
+        )
         context.hass.data.setdefault(DOMAIN, {})[context.entry.entry_id] = TuyaBLEData(
             title=context.entry.title,
             device=device,
@@ -294,12 +351,13 @@ def test_v1_repeated_platform_setup_reuses_manual_lock_registry_entry(
         setup_batches = []
         for _ in range(2):
             entities = []
-            await button.async_setup_entry(context.hass, context.entry, entities.extend)
+            await lock.async_setup_entry(context.hass, context.entry, entities.extend)
             setup_batches.append(entities)
 
+        assert context.registry.async_get(legacy_entry.entity_id) is None
         assert [len(entities) for entities in setup_batches] == [1, 1]
         assert all(
-            isinstance(entities[0], button.TuyaBLEButton) for entities in setup_batches
+            isinstance(entities[0], lock.TuyaBLEV1Lock) for entities in setup_batches
         )
         emitted_entities = [entities[0] for entities in setup_batches]
         assert [entity.unique_id for entity in emitted_entities] == [
@@ -315,18 +373,426 @@ def test_v1_repeated_platform_setup_reuses_manual_lock_registry_entry(
             _register_runtime_entity(context, entity) for entity in emitted_entities
         ]
         assert [entry.entity_id for entry in registered] == [
-            legacy_entry.entity_id,
-            legacy_entry.entity_id,
+            context.registry.async_get_entity_id(
+                Platform.LOCK, DOMAIN, expected_unique_id
+            ),
+            context.registry.async_get_entity_id(
+                Platform.LOCK, DOMAIN, expected_unique_id
+            ),
         ]
         assert [
             (entry.domain, entry.unique_id)
             for entry in er.async_entries_for_config_entry(
                 context.registry, context.entry.entry_id
             )
-        ] == [(Platform.BUTTON, expected_unique_id)]
+        ] == [(Platform.LOCK, expected_unique_id)]
 
         for entity in emitted_entities:
             _assert_entity_device_reuses_registry_identity(context, entity)
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_preserves_customization_collision_and_idempotency(
+    tmp_path,
+) -> None:
+    """V1 migration is collision-safe, drops button options, and is idempotent."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-primary")
+        collision = context.registry.async_get_or_create(
+            Platform.LOCK,
+            "other_integration",
+            "other-v1-unique-id",
+            suggested_object_id="custom_v1_lock",
+        )
+        old_entry = _create_old_v1_button_entry(context)
+
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+
+        assert context.registry.async_get(old_entry.entity_id) is None
+        assert context.registry.async_get(collision.entity_id) == collision
+        new_entity_id = context.registry.async_get_entity_id(
+            Platform.LOCK, DOMAIN, V1_UNIQUE_ID
+        )
+        assert new_entity_id == "lock.custom_v1_lock_2"
+        new_entry = context.registry.async_get(new_entity_id)
+        assert new_entry is not None
+        assert new_entry.config_entry_id == context.entry.entry_id
+        assert new_entry.device_id == context.device_entry.id
+        assert new_entry.name == "Garage V1 lock"
+        assert new_entry.icon == "mdi:lock-outline"
+        assert new_entry.area_id == context.area.id
+        assert new_entry.disabled_by is er.RegistryEntryDisabler.USER
+        assert new_entry.hidden_by is er.RegistryEntryHider.USER
+        assert new_entry.labels == {context.label.label_id}
+        expected_aliases = ["V1 lock alias"]
+        if hasattr(er, "COMPUTED_NAME"):
+            expected_aliases.insert(0, er.COMPUTED_NAME)
+        assert list(new_entry.aliases) == expected_aliases
+        assert new_entry.categories == {
+            "old_scope": "lock",
+            "shared_scope": "old",
+        }
+        assert new_entry.device_class is None
+        assert new_entry.original_device_class is None
+        assert new_entry.options == {}
+        assert new_entry.entity_category is None
+        assert new_entry.translation_key == "lock"
+        assert new_entry.original_icon == "mdi:lock"
+        assert new_entry.supported_features == 0
+
+        before = new_entry
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+        assert context.registry.async_get(new_entity_id) == before
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_merges_existing_lock_target(tmp_path) -> None:
+    """Existing lock customizations and lock-only options take precedence."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-existing-target")
+        old_entry = _create_old_v1_button_entry(context)
+        target_label = lr.async_get(context.hass).async_create("Existing V1 target")
+        target = context.registry.async_get_or_create(
+            Platform.LOCK,
+            DOMAIN,
+            V1_UNIQUE_ID,
+            suggested_object_id="existing_v1_lock",
+            get_initial_options=lambda: {"lock": {"synthetic_target_option": True}},
+            config_entry=context.entry,
+            device_id=context.device_entry.id,
+        )
+        target = context.registry.async_update_entity(
+            target.entity_id,
+            aliases=["Target alias"],
+            categories={"new_scope": "lock", "shared_scope": "target"},
+            icon="mdi:lock-check",
+            labels={target_label.label_id},
+            name="Existing V1 target name",
+        )
+
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+
+        assert context.registry.async_get(old_entry.entity_id) is None
+        merged = context.registry.async_get(target.entity_id)
+        assert merged is not None
+        assert merged.name == "Existing V1 target name"
+        assert merged.icon == "mdi:lock-check"
+        assert merged.area_id == context.area.id
+        assert merged.disabled_by is er.RegistryEntryDisabler.USER
+        assert merged.hidden_by is er.RegistryEntryHider.USER
+        assert merged.labels == {context.label.label_id, target_label.label_id}
+        assert list(merged.aliases) == ["Target alias", "V1 lock alias"]
+        assert merged.categories == {
+            "old_scope": "lock",
+            "new_scope": "lock",
+            "shared_scope": "target",
+        }
+        assert merged.device_class is None
+        assert merged.options == {"lock": {"synthetic_target_option": True}}
+        assert "button" not in merged.options
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("category", "product_id"),
+    (("jtmspro", "xqeob8h6"), ("ms", "other-product")),
+)
+def test_v1_migration_is_scoped_to_exact_product(
+    tmp_path, category: str, product_id: str
+) -> None:
+    """No other lock or product can enter the V1 registry migration."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, f"v1-{category}-{product_id}")
+        old_entry = _create_old_v1_button_entry(context)
+        other_device = SimpleNamespace(
+            category=category,
+            product_id=product_id,
+            device_id="synthetic-v1-device",
+            address=ADDRESS,
+        )
+
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, other_device
+        )
+
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert (
+            context.registry.async_get_entity_id(Platform.LOCK, DOMAIN, V1_UNIQUE_ID)
+            is None
+        )
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_rejects_ambiguous_and_foreign_buttons(tmp_path) -> None:
+    """Suffix collisions and globally foreign button ownership fail closed."""
+
+    async def exercise() -> None:
+        ambiguous = await _registry_context(tmp_path, "v1-ambiguous")
+        first = _create_old_v1_button_entry(ambiguous)
+        second = _create_old_v1_button_entry(
+            ambiguous, unique_id="other-v1-device-manual_lock"
+        )
+        with pytest.raises(ConfigEntryError, match="ambiguous"):
+            integration._async_migrate_v1_manual_lock_entity(
+                ambiguous.hass, ambiguous.entry, _v1_device()
+            )
+        assert ambiguous.registry.async_get(first.entity_id) == first
+        assert ambiguous.registry.async_get(second.entity_id) == second
+
+        foreign = await _registry_context(tmp_path, "v1-foreign")
+        other_entry = _new_config_entry("v1-foreign-owner")
+        foreign.hass.config_entries._entries[other_entry.entry_id] = other_entry
+        foreign_old = _create_old_v1_button_entry(
+            foreign,
+            config_entry=other_entry,
+            device_id=None,
+        )
+        with pytest.raises(ConfigEntryError, match="ambiguous"):
+            integration._async_migrate_v1_manual_lock_entity(
+                foreign.hass, foreign.entry, _v1_device()
+            )
+        assert foreign.registry.async_get(foreign_old.entity_id) == foreign_old
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_rejects_device_and_target_ownership_conflicts(
+    tmp_path,
+) -> None:
+    """The V1 lock target must share the current owner and device association."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-device-conflict")
+        old_entry = _create_old_v1_button_entry(context)
+        other_device = context.device_registry.async_get_or_create(
+            config_entry_id=context.entry.entry_id,
+            identifiers={(DOMAIN, "AA:BB:CC:DD:EE:FF")},
+        )
+        target = context.registry.async_get_or_create(
+            Platform.LOCK,
+            DOMAIN,
+            V1_UNIQUE_ID,
+            suggested_object_id="wrong_device_v1_lock",
+            config_entry=context.entry,
+            device_id=other_device.id,
+        )
+
+        with pytest.raises(ConfigEntryError, match="different device"):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert context.registry.async_get(target.entity_id) == target
+
+        foreign_target = await _registry_context(tmp_path, "v1-foreign-target")
+        foreign_old = _create_old_v1_button_entry(foreign_target)
+        other_entry = _new_config_entry("v1-target-owner")
+        foreign_target.hass.config_entries._entries[other_entry.entry_id] = other_entry
+        target = foreign_target.registry.async_get_or_create(
+            Platform.LOCK,
+            DOMAIN,
+            V1_UNIQUE_ID,
+            suggested_object_id="foreign_target_v1_lock",
+            config_entry=other_entry,
+        )
+
+        with pytest.raises(ConfigEntryError, match="not owned"):
+            integration._async_migrate_v1_manual_lock_entity(
+                foreign_target.hass, foreign_target.entry, _v1_device()
+            )
+        assert foreign_target.registry.async_get(foreign_old.entity_id) == foreign_old
+        assert foreign_target.registry.async_get(target.entity_id) == target
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("device_class", "options", "message"),
+    (
+        (
+            SwitchDeviceClass.SWITCH,
+            {"lock": {"synthetic_target_option": True}},
+            "invalid device class",
+        ),
+        (
+            None,
+            {"button": {"synthetic_target_option": True}},
+            "invalid entity options",
+        ),
+    ),
+)
+def test_v1_migration_rejects_non_lock_target_state(
+    tmp_path,
+    device_class: SwitchDeviceClass | None,
+    options: dict,
+    message: str,
+) -> None:
+    """A partial lock target cannot retain state from another platform."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, f"v1-{message.replace(' ', '-')}")
+        old_entry = _create_old_v1_button_entry(context)
+        target = context.registry.async_get_or_create(
+            Platform.LOCK,
+            DOMAIN,
+            V1_UNIQUE_ID,
+            suggested_object_id="invalid_target_v1_lock",
+            get_initial_options=lambda: options,
+            config_entry=context.entry,
+            device_id=context.device_entry.id,
+        )
+        if device_class is not None:
+            target = context.registry.async_update_entity(
+                target.entity_id, device_class=device_class
+            )
+
+        with pytest.raises(ConfigEntryError, match=message):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert context.registry.async_get(target.entity_id) == target
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_rejects_conflicting_valid_subentries(tmp_path) -> None:
+    """Different valid V1 config subentries cannot be reconciled implicitly."""
+    if "subentries_data" not in inspect.signature(ConfigEntry).parameters:
+        pytest.skip("This Home Assistant version has no config subentries")
+
+    async def exercise() -> None:
+        subentries = (
+            {
+                "data": {},
+                "subentry_id": "v1-subentry-old",
+                "subentry_type": "device",
+                "title": "Old V1 association",
+                "unique_id": "v1-old-association",
+            },
+            {
+                "data": {},
+                "subentry_id": "v1-subentry-target",
+                "subentry_type": "device",
+                "title": "Target V1 association",
+                "unique_id": "v1-target-association",
+            },
+        )
+        context = await _registry_context(
+            tmp_path,
+            "v1-subentry-conflict",
+            subentries_data=subentries,
+            device_subentry_id="v1-subentry-old",
+        )
+        old_entry = _create_old_v1_button_entry(
+            context,
+            device_id=None,
+            config_subentry_id="v1-subentry-old",
+        )
+        target = context.registry.async_get_or_create(
+            Platform.LOCK,
+            DOMAIN,
+            V1_UNIQUE_ID,
+            suggested_object_id="subentry_target_v1_lock",
+            config_entry=context.entry,
+            config_subentry_id="v1-subentry-target",
+        )
+
+        with pytest.raises(ConfigEntryError, match="different config subentries"):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert context.registry.async_get(target.entity_id) == target
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_rolls_back_new_target_when_update_fails(tmp_path) -> None:
+    """A newly created V1 lock target is removed after an incomplete update."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-rollback")
+        old_entry = _create_old_v1_button_entry(context)
+
+        with (
+            patch.object(
+                context.registry,
+                "async_update_entity",
+                side_effect=RuntimeError("synthetic V1 update failure"),
+            ),
+            pytest.raises(ConfigEntryError, match="Unable to safely migrate"),
+        ):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert (
+            context.registry.async_get_entity_id(Platform.LOCK, DOMAIN, V1_UNIQUE_ID)
+            is None
+        )
+
+    asyncio.run(exercise())
+
+
+def test_v1_setup_stops_before_coordinator_and_forwarding_on_registry_conflict(
+    tmp_path,
+) -> None:
+    """V1 registry ambiguity blocks setup before platform exposure."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-setup-order")
+        other_entry = _new_config_entry("v1-setup-foreign-owner")
+        context.hass.config_entries._entries[other_entry.entry_id] = other_entry
+        old_entry = _create_old_v1_button_entry(
+            context,
+            config_entry=other_entry,
+            device_id=None,
+        )
+        fake_device = SimpleNamespace(
+            initialize=AsyncMock(),
+            category="ms",
+            product_id="7a4xvbtt",
+            device_id="synthetic-v1-device",
+            address=ADDRESS,
+        )
+        forward = AsyncMock()
+
+        with (
+            patch.object(
+                integration.bluetooth,
+                "async_ble_device_from_address",
+                return_value=object(),
+            ),
+            patch.object(integration, "TuyaBLEDevice", return_value=fake_device),
+            patch.object(integration, "get_device_product_info", return_value=object()),
+            patch.object(integration, "TuyaBLECoordinator") as coordinator,
+            patch.object(
+                context.hass.config_entries,
+                "async_forward_entry_setups",
+                new=forward,
+            ),
+            pytest.raises(ConfigEntryError, match="ambiguous"),
+        ):
+            await integration.async_setup_entry(context.hass, context.entry)
+
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        coordinator.assert_not_called()
+        forward.assert_not_awaited()
 
     asyncio.run(exercise())
 

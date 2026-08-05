@@ -32,6 +32,9 @@
     "exceptions": {
         "s1_unlock_templates_unavailable": {
             "message": "Local unlock is not initialized for this device. A device-specific template must first be received."
+        },
+        "v1_command_unavailable": {
+            "message": "The V1 command datapoints are unavailable or invalid."
         }
     },
     "entity": {
