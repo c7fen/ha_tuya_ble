@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/c7fen/ha_tuya_ble/security/advisories/new
+    about: Report vulnerabilities privately. Never disclose credentials, identifiers, raw logs, datapoint payloads, or HCI captures in a public issue.
+  - name: Documentation and support
+    url: https://github.com/c7fen/ha_tuya_ble#development-and-support
+    about: Read the documentation and privacy guidance before opening a public issue.

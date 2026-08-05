@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible Tuya BLE integration defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. This is a public issue.
+
+        **Do not post credentials, complete Bluetooth addresses, Device IDs, UUIDs, Local Keys, SecKeys, raw Home Assistant logs, datapoint payloads, or HCI captures.** Do not paste process-local log labels. Follow the [logging and privacy guide](../../docs/logging-and-privacy.md).
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, complete addresses, Device IDs, UUIDs, Local Keys, SecKeys, raw logs, datapoint payloads, and HCI captures.
+          required: true
+        - label: This is not a vulnerability report; security reports use the private route in SECURITY.md.
+          required: true
+  - type: input
+    id: ha-version
+    attributes:
+      label: Home Assistant version
+      placeholder: 2026.7.4
+    validations:
+      required: true
+  - type: input
+    id: integration-version
+    attributes:
+      label: Tuya BLE integration version
+      placeholder: v0.9.0b3
+    validations:
+      required: true
+  - type: input
+    id: product
+    attributes:
+      label: Public category and Product ID
+      description: These public product metadata fields are not the private Device ID.
+      placeholder: category/product_id
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Sanitized problem description
+      description: Describe the operation, result, time window, module, and sanitized error class. Do not paste logs.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Do not include secrets, raw values, captures, or unsafe physical instructions.
+    validations:
+      required: true

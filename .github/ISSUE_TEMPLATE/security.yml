@@ -1,0 +1,23 @@
+name: Security report redirect
+description: Do not disclose security details in a public issue
+title: "[Security]: private report required"
+labels:
+  - security
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Stop: GitHub issues are public. Do not describe the vulnerability here.**
+
+        Use the repository's [private vulnerability-reporting route](https://github.com/c7fen/ha_tuya_ble/security/advisories/new).
+
+        Never post credentials, complete Bluetooth addresses, Device IDs, UUIDs, Local Keys, SecKeys, raw Home Assistant logs, datapoint payloads, HCI captures, packet data, or lock command material.
+  - type: checkboxes
+    id: redirect
+    attributes:
+      label: Private-report confirmation
+      options:
+        - label: I will use the private reporting route and will not place security details in this public form.
+          required: true
+        - label: I will not publish credentials, complete addresses, Device IDs, UUIDs, Local Keys, SecKeys, raw logs, datapoint payloads, or HCI captures.
+          required: true
