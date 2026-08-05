@@ -53,6 +53,13 @@ def door_status_getter(self: TuyaBLEBinarySensor) -> None:
             self._attr_is_on = None
 
 
+def motor_state_getter(self: TuyaBLEBinarySensor) -> None:
+    """Expose a reported motor state without inventing one when it is absent."""
+    datapoint = self._device.datapoints[47]
+    value = datapoint.value if datapoint is not None else None
+    self._attr_is_on = value if isinstance(value, bool) else None
+
+
 @dataclass
 class TuyaBLEBinarySensorMapping:
     """Models a BLE binary sensor"""
@@ -140,6 +147,18 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
     ),
     "ms": TuyaBLECategoryBinarySensorMapping(
         products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLEBinarySensorMapping(
+                    dp_id=47,
+                    description=BinarySensorEntityDescription(
+                        key="lock_motor_state",
+                        icon="mdi:engine",
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=motor_state_getter,
+                ),
+            ],
             # TODO: Review how many of these are better off as a switch only?
             **dict.fromkeys(
                 [
@@ -244,6 +263,18 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
     ),
     "jtmspro": TuyaBLECategoryBinarySensorMapping(
         products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLEBinarySensorMapping(
+                    dp_id=47,
+                    description=BinarySensorEntityDescription(
+                        key="lock_motor_state",
+                        icon="mdi:engine",
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=motor_state_getter,
+                ),
+            ],
             **dict.fromkeys(
                 [
                     "stugc8dl",

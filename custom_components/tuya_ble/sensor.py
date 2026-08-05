@@ -1,6 +1,8 @@
 """The Tuya BLE integration."""
 
 from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import logging
 from typing import Callable
@@ -37,8 +39,13 @@ from .const import (
     CO2_LEVEL_NORMAL,
     DOMAIN,
 )
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
-from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
+from .devices import (
+    TuyaBLECoordinator,
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+)
+from .tuya_ble import TuyaBLEDataPoint, TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
 SIGNAL_STRENGTH_DP_ID = -1
@@ -57,6 +64,21 @@ class TuyaBLESensorMapping:
     coefficient: float = 1.0
     icons: list[str] | None = None
     is_available: TuyaBLESensorIsAvailable = None
+
+
+@dataclass
+class TuyaBLELastUnlockSensorMapping:
+    """Describe the datapoints that can identify an unlock method."""
+
+    unlock_methods: Mapping[int, str]
+    description: SensorEntityDescription = field(
+        default_factory=lambda: SensorEntityDescription(
+            key="last_unlock_method",
+            icon="mdi:account-lock-open",
+            device_class=SensorDeviceClass.ENUM,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+    )
 
 
 @dataclass
@@ -112,12 +134,25 @@ def bstuokey_battery_getter(self: TuyaBLESensor) -> None:
         }.get(datapoint.value)
 
 
+def v1_battery_getter(self: TuyaBLESensor) -> None:
+    """Return V1 battery values only when they are valid percentages."""
+    datapoint = self._device.datapoints[8]
+    value = datapoint.value if datapoint is not None else None
+    self._attr_native_value = (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
+        else None
+    )
+
+
 @dataclass
 class TuyaBLECategorySensorMapping:
     """Models a dict of products and their mappings"""
 
-    products: dict[str, list[TuyaBLESensorMapping]] | None = None
-    mapping: list[TuyaBLESensorMapping] | None = None
+    products: (
+        dict[str, list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping]] | None
+    ) = None
+    mapping: list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping] | None = None
 
 
 @dataclass
@@ -222,7 +257,6 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                     "sidhzylo",
                     "bvclwu9b",
                     "k53ok3u9",
-                    "7a4xvbtt",
                     "6fibxtph",
                     "99gv5nmz",
                 ],  # Smart Lock
@@ -244,6 +278,74 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                     ),
                 ],
             ),
+            "yy2bmcoh": [  # Legacy Smart Lock; only observed entities are mapped.
+                TuyaBLESensorMapping(
+                    dp_id=21,
+                    description=SensorEntityDescription(
+                        key="alarm_lock",
+                        device_class=SensorDeviceClass.ENUM,
+                        options=[
+                            "wrong_finger",
+                            "wrong_password",
+                            "low_battery",
+                        ],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+                TuyaBLEBatteryMapping(
+                    dp_id=8,
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                ),
+            ],
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLESensorMapping(
+                    dp_id=21,
+                    description=SensorEntityDescription(
+                        key="alarm_lock",
+                        icon="mdi:alert",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "wrong_finger",
+                            "wrong_password",
+                            "wrong_card",
+                            "low_battery",
+                        ],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+                TuyaBLEBatteryMapping(
+                    dp_id=8,
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=v1_battery_getter,
+                ),
+                TuyaBLELastUnlockSensorMapping(
+                    unlock_methods={
+                        12: "fingerprint",
+                        13: "password",
+                        14: "dynamic",
+                        15: "card",
+                        19: "ble",
+                        55: "temporary",
+                        62: "phone_remote",
+                    },
+                    description=SensorEntityDescription(
+                        key="last_unlock_method",
+                        icon="mdi:account-lock-open",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "fingerprint",
+                            "password",
+                            "dynamic",
+                            "card",
+                            "ble",
+                            "temporary",
+                            "phone_remote",
+                        ],
+                    ),
+                ),
+            ],
             "wgv4haro": [
                 TuyaBLEAlarmLockStateMapping(dp_id=21),
                 TuyaBLEBatteryMapping(dp_id=8),
@@ -399,6 +501,80 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
     ),
     "jtmspro": TuyaBLECategorySensorMapping(
         products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLESensorMapping(
+                    dp_id=21,
+                    description=SensorEntityDescription(
+                        key="alarm_lock",
+                        translation_key="s1_alarm_lock",
+                        icon="mdi:alert",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "wrong_finger",
+                            "wrong_password",
+                            "wrong_card",
+                            "wrong_face",
+                            "tongue_bad",
+                            "too_hot",
+                            "unclosed_time",
+                            "tongue_not_out",
+                            "pry",
+                            "key_in",
+                            "low_battery",
+                            "power_off",
+                            "shock",
+                            "defense",
+                        ],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+                TuyaBLEBatteryMapping(
+                    dp_id=8,
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                ),
+                TuyaBLELastUnlockSensorMapping(
+                    unlock_methods={
+                        12: "fingerprint",
+                        15: "card",
+                        16: "key",
+                        19: "ble",
+                        62: "phone_remote",
+                        63: "voice_remote",
+                    },
+                    description=SensorEntityDescription(
+                        key="last_unlock_method",
+                        translation_key="s1_last_unlock_method",
+                        icon="mdi:account-lock-open",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=[
+                            "fingerprint",
+                            "card",
+                            "key",
+                            "ble",
+                            "phone_remote",
+                            "voice_remote",
+                        ],
+                    ),
+                ),
+                TuyaBLESensorMapping(
+                    dp_id=40,
+                    description=SensorEntityDescription(
+                        key="closed_opened",
+                        icon="mdi:door",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        entity_registry_enabled_default=False,
+                        options=[
+                            "unknown",
+                            "open",
+                            "closed",
+                        ],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+            ],
             "y2yaegze": [
                 TuyaBLEAlarmLockStateMapping(dp_id=21),
                 TuyaBLESensorMapping(
@@ -1823,7 +1999,9 @@ rssi_mapping = TuyaBLESensorMapping(
 )
 
 
-def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLESensorMapping]:
+def get_mapping_by_device(
+    device: TuyaBLEDevice,
+) -> list[TuyaBLESensorMapping | TuyaBLELastUnlockSensorMapping]:
     category = mapping.get(device.category)
     if category is not None and category.products is not None:
         product_mapping = category.products.get(device.product_id)
@@ -1891,6 +2069,75 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
         return result
 
 
+def _select_last_unlock_datapoint(
+    unlock_methods: Mapping[int, str],
+    update_batch: Sequence[TuyaBLEDataPoint],
+) -> TuyaBLEDataPoint | None:
+    """Select an unambiguous unlock event from the current callback batch."""
+    candidates = [
+        datapoint for datapoint in update_batch if datapoint.id in unlock_methods
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        changed_candidates = [
+            datapoint for datapoint in candidates if datapoint.changed_by_device
+        ]
+        if len(changed_candidates) == 1:
+            return changed_candidates[0]
+    return None
+
+
+class TuyaBLELastUnlockSensor(TuyaBLEEntity, SensorEntity):
+    """Represent the last unambiguous unlock method in one callback batch."""
+
+    platform = Platform.SENSOR
+    _attr_force_update = True
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+        mapping: TuyaBLELastUnlockSensorMapping,
+    ) -> None:
+        super().__init__(hass, coordinator, device, product, mapping.description)
+        self._unlock_methods = mapping.unlock_methods
+        self._attr_native_value = None
+        self._attr_extra_state_attributes = {}
+        self._last_connected = coordinator.connected
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle only datapoints in the coordinator's current callback batch."""
+        connected = self._coordinator.connected
+        availability_changed = connected != self._last_connected
+        self._last_connected = connected
+        update_batch = self._coordinator.last_updates
+        if not update_batch:
+            if availability_changed:
+                self.async_write_ha_state()
+            return
+
+        datapoint = _select_last_unlock_datapoint(
+            self._unlock_methods,
+            update_batch,
+        )
+        if datapoint is None:
+            if availability_changed:
+                self.async_write_ha_state()
+            return
+
+        method = self._unlock_methods[datapoint.id]
+        attributes: dict[str, str | int] = {"method": method}
+        if isinstance(datapoint.value, int) and not isinstance(datapoint.value, bool):
+            attributes["value"] = datapoint.value
+        self._attr_native_value = method
+        self._attr_extra_state_attributes = attributes
+        self.async_write_ha_state()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1899,7 +2146,7 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLESensor] = [
+    entities: list[TuyaBLESensor | TuyaBLELastUnlockSensor] = [
         TuyaBLESensor(
             hass,
             data.coordinator,
@@ -1909,7 +2156,17 @@ async def async_setup_entry(
         )
     ]
     for mapping in mappings:
-        if mapping.force_add or data.device.datapoints.has_id(
+        if isinstance(mapping, TuyaBLELastUnlockSensorMapping):
+            entities.append(
+                TuyaBLELastUnlockSensor(
+                    hass,
+                    data.coordinator,
+                    data.device,
+                    data.product,
+                    mapping,
+                )
+            )
+        elif mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
             entities.append(

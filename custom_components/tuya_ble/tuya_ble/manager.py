@@ -9,9 +9,9 @@ from typing import List
 class TuyaBLEDeviceCredentials:
     """Model of credentials"""
 
-    uuid: str
+    uuid: str = field(repr=False)
     local_key: str = field(repr=False)
-    device_id: str
+    device_id: str = field(repr=False)
     category: str
     product_id: str
     device_name: str | None
@@ -35,10 +35,10 @@ class TuyaBLEDeviceCredentials:
             "functions: %s"
             "status_range: %s"
         ) % (
-            self.uuid,
+            "**REDACTED**",
             "**REDACTED**",
             "**REDACTED**" if self.sec_key else None,
-            self.device_id,
+            "**REDACTED**",
             self.category,
             self.product_id,
             self.device_name,

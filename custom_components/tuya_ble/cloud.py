@@ -38,6 +38,7 @@ from .const import (
     CONF_PRODUCT_MODEL,
     CONF_UUID,
     CONF_LOCAL_KEY,
+    CONF_LEGACY_APP_TYPE,
     CONF_SEC_KEY,
     CONF_CATEGORY,
     CONF_PRODUCT_ID,
@@ -91,13 +92,34 @@ CONF_TUYA_DEVICE_KEYS = [
 _cache: dict[str, TuyaCloudCacheItem] = {}
 
 
+def normalize_app_type_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a non-persistent view compatible with both app-type key names."""
+    normalized = data.copy()
+    has_current = CONF_APP_TYPE in normalized
+    has_legacy = CONF_LEGACY_APP_TYPE in normalized
+
+    if (
+        has_current
+        and has_legacy
+        and normalized[CONF_APP_TYPE] != normalized[CONF_LEGACY_APP_TYPE]
+    ):
+        raise ValueError("Conflicting Tuya application type configuration")
+
+    if has_current:
+        normalized[CONF_LEGACY_APP_TYPE] = normalized[CONF_APP_TYPE]
+    elif has_legacy:
+        normalized[CONF_APP_TYPE] = normalized[CONF_LEGACY_APP_TYPE]
+
+    return normalized
+
+
 class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
     """Cloud connected manager of the Tuya BLE devices credentials."""
 
     def __init__(self, hass: HomeAssistant, data: dict[str, Any]) -> None:
         assert hass is not None
         self._hass = hass
-        self._data = data
+        self._data = normalize_app_type_data(data)
 
     @staticmethod
     def _is_login_success(response: dict[Any, Any]) -> bool:
@@ -105,11 +127,13 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
     @staticmethod
     def _get_cache_key(data: dict[str, Any]) -> str:
+        data = normalize_app_type_data(data)
         key_dict = {key: data.get(key) for key in CONF_TUYA_LOGIN_KEYS}
         return json.dumps(key_dict)
 
     @staticmethod
     def _has_login(data: dict[Any, Any]) -> bool:
+        data = normalize_app_type_data(data)
         for key in CONF_TUYA_LOGIN_KEYS:
             if data.get(key) is None:
                 return False
@@ -129,6 +153,8 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
         if len(data) == 0:
             return {}
 
+        data = normalize_app_type_data(data)
+
         api = TuyaOpenAPI(
             endpoint=data.get(CONF_ENDPOINT, ""),
             access_id=data.get(CONF_ACCESS_ID, ""),
@@ -146,7 +172,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
         )
 
         if self._is_login_success(response):
-            _LOGGER.debug("Successful login for %s", data[CONF_USERNAME])
+            _LOGGER.debug("Tuya cloud login succeeded")
             if add_to_cache:
                 auth_type = data[CONF_AUTH_TYPE]
                 if isinstance(auth_type, AuthType):
@@ -243,11 +269,9 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
     async def build_cache(self) -> None:
         global _cache
-        data = {}
         tuya_config_entries = self._hass.config_entries.async_entries(TUYA_DOMAIN)
         for config_entry in tuya_config_entries:
-            data.clear()
-            data.update(config_entry.data)
+            data = normalize_app_type_data(dict(config_entry.data))
             key = self._get_cache_key(data)
             item = _cache.get(key)
             if item is None or len(item.credentials) == 0:
@@ -258,8 +282,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
         ble_config_entries = self._hass.config_entries.async_entries(DOMAIN)
         for config_entry in ble_config_entries:
-            data.clear()
-            data.update(config_entry.options)
+            data = normalize_app_type_data(dict(config_entry.options))
             key = self._get_cache_key(data)
             item = _cache.get(key)
             if item is None or len(item.credentials) == 0:
@@ -324,7 +347,11 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                 credentials.get(CONF_STATUS_RANGE, []),
                 sec_key=sec_key,
             )
-            _LOGGER.debug("Retrieved: %s", result)
+            _LOGGER.debug(
+                "Retrieved Tuya BLE credentials for category=%s product=%s",
+                result.category,
+                result.product_id,
+            )
             if save_data:
                 if item:
                     self._data.update(item.login)

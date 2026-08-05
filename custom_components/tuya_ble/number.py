@@ -170,6 +170,25 @@ def set_fingerbot_program_position(
             self._hass.create_task(datapoint.set_value(new_value))
 
 
+def get_smart_lock_auto_lock_time(
+    self: TuyaBLENumber, product: TuyaBLEProductInfo
+) -> float | None:
+    """Return an Auto-Lock delay only inside its product-specific range."""
+    datapoint = self._device.datapoints[36]
+    value = datapoint.value if datapoint is not None else None
+    minimum = self._mapping.description.native_min_value
+    maximum = self._mapping.description.native_max_value
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum is not None
+        and maximum is not None
+        and minimum <= value <= maximum
+    ):
+        return float(value)
+    return None
+
+
 @dataclass
 class TuyaBLEDownPositionDescription(NumberEntityDescription):
     key: str = "down_position"
@@ -854,6 +873,23 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
     ),
     "ms": TuyaBLECategoryNumberMapping(
         products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=5,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_smart_lock_auto_lock_time,
+                    mode=NumberMode.BOX,
+                ),
+            ],
             **dict.fromkeys(
                 ["6fibxtph", "99gv5nmz"],
                 [
@@ -875,6 +911,23 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
     ),
     "jtmspro": TuyaBLECategoryNumberMapping(
         products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=1,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_smart_lock_auto_lock_time,
+                    mode=NumberMode.BOX,
+                ),
+            ],
             **dict.fromkeys(
                 [
                     "stugc8dl",

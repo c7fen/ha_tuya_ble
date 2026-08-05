@@ -191,9 +191,8 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         _LOGGER.debug(
-            "Updated data for %s: %s",
-            self._device.name,
-            self._device.datapoints.__dict__(),
+            "Cover coordinator update received with %d cached datapoints",
+            len(self._device.datapoints),
         )
         if self._mapping.cover_state_dp_id != 0:
             datapoint = self._device.datapoints[self._mapping.cover_state_dp_id]
@@ -317,8 +316,8 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
             or self._device.last_data_received < time_now
         ):
             _LOGGER.warning(
-                "No data received from device (cover) %s within %dms, manually requesting status update",
-                self._device.name,
+                "%s: No cover data received within %dms; requesting a status update",
+                self._device.log_identity,
                 sleep_ms,
             )
             await self._device.update()

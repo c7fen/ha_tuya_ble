@@ -38,6 +38,7 @@ class TuyaBLEButtonMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     is_available: TuyaBLEButtonIsAvailable = None
+    press_value: bool | None = None
 
 
 def is_fingerbot_in_push_mode(self: TuyaBLEButton, product: TuyaBLEProductInfo) -> bool:
@@ -199,34 +200,28 @@ mapping: dict[str, TuyaBLECategoryButtonMapping] = {
                     ),
                 ],
             ),
-            "hs21i377": [  # Raycube K7 Pro+
-                TuyaBLEButtonMapping(
-                    dp_id=71,
-                    description=ButtonEntityDescription(
-                        key="bluetooth_unlock",
-                        icon="mdi:lock-open-check-outline",
-                    ),
-                    dp_type=TuyaBLEDataPointType.DT_RAW,
-                ),
-            ],
             "kholoaew": [  # Smart Lock
                 TuyaBLEButtonMapping(
                     dp_id=46,
                     description=ButtonEntityDescription(key="manual_lock"),
-                ),
-                TuyaBLEButtonMapping(
-                    dp_id=71,
-                    description=ButtonEntityDescription(
-                        key="bluetooth_unlock",
-                        icon="mdi:lock-open-check-outline",
-                    ),
-                    dp_type=TuyaBLEDataPointType.DT_RAW,
                 ),
             ],
         },
     ),
     "ms": TuyaBLECategoryButtonMapping(
         products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLEButtonMapping(
+                    dp_id=46,
+                    description=ButtonEntityDescription(
+                        key="manual_lock",
+                        translation_key="lock",
+                        icon="mdi:lock",
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    press_value=True,
+                ),
+            ],
             **dict.fromkeys(
                 [
                     "okkyfgfs",
@@ -292,59 +287,27 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
 
-    async def _run_hs21i377_unlock(self) -> None:
-        """Run the validated dp71 unlock flow for hs21i377."""
-        # hs21i377 uses a device-specific dp71 unlock payload.
-        # Practical testing confirmed multiple payload variants can unlock,
-        # so this is not treated as a fixed "known lock code". We keep an
-        # empirically validated value here until the payload semantics are
-        # understood better.
-        dp71_value = bytes.fromhex("0001ffff36383538313536320169ab34cd0000")
-
-        dp71 = self._device.datapoints.get_or_create(
-            71,
-            TuyaBLEDataPointType.DT_RAW,
-            b"",
-        )
-        if dp71:
-            await dp71.set_value(dp71_value)
-
-    async def _run_kholoaew_unlock(self) -> None:
-        """Run the validated dp71 unlock flow for kholoaew."""
-        # It seems like kholoaew requires the same type of unlock as hs21i377
-        # but I haven't been able to make it work.
-        dp71_value = bytes.fromhex("0001ffff3038383532353836016a1f49270000")
-
-        dp71 = self._device.datapoints.get_or_create(
-            71,
-            TuyaBLEDataPointType.DT_RAW,
-            b"",
-        )
-        if dp71:
-            await dp71.set_value(dp71_value)
-
     def press(self) -> None:
         """Press the button."""
-        if self._device.product_id == "kholoaew":
-            if self._mapping.description.key == "bluetooth_unlock":
-                self._hass.create_task(self._run_kholoaew_unlock())
-                return
-        if self._device.product_id == "hs21i377":
-            if self._mapping.description.key == "bluetooth_unlock":
-                self._hass.create_task(self._run_hs21i377_unlock())
-                return
-
+        initial_value = (
+            self._mapping.press_value
+            if self._mapping.press_value is not None
+            else False
+        )
         datapoint = self._device.datapoints.get_or_create(
             self._mapping.dp_id,
             TuyaBLEDataPointType.DT_BOOL,
-            False,
+            initial_value,
         )
         if datapoint:
-            if self._product.lock:
+            if self._mapping.press_value is not None:
+                value = self._mapping.press_value
+            elif self._product.lock:
                 # Lock needs true to activate lock/unlock commands
-                self._hass.create_task(datapoint.set_value(True))
+                value = True
             else:
-                self._hass.create_task(datapoint.set_value(not bool(datapoint.value)))
+                value = not bool(datapoint.value)
+            self._hass.create_task(datapoint.set_value(value))
 
     @property
     def available(self) -> bool:

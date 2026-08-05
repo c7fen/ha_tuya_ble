@@ -151,6 +151,15 @@ def set_16wgjvck_water_valve(
         self._hass.create_task(self._device.set_multiple_values({1: False}))
 
 
+def smart_lock_automatic_lock_getter(
+    self: TuyaBLESwitch, product: TuyaBLEProductInfo
+) -> bool | None:
+    """Return Auto-Lock only when DP 33 contains a reported boolean."""
+    datapoint = self._device.datapoints[33]
+    value = datapoint.value if datapoint is not None else None
+    return value if isinstance(value, bool) else None
+
+
 @dataclass
 class TuyaBLEFingerbotSwitchMapping(TuyaBLESwitchMapping):
     description: SwitchEntityDescription = field(
@@ -413,10 +422,21 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     "isk2p555",
                     "gumrixyt",
                     "sidhzylo",
-                    "7a4xvbtt",
                 ],  # Smart Lock
                 [TuyaLockMotorStateMapping(dp_id=47)],
             ),
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLESwitchMapping(
+                    dp_id=33,
+                    description=SwitchEntityDescription(
+                        key="automatic_lock",
+                        icon="mdi:lock-clock",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=smart_lock_automatic_lock_getter,
+                ),
+            ],
             **dict.fromkeys(
                 ["uamrw6h3", "mqc2hevy"],
                 [
@@ -522,6 +542,18 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
     ),
     "jtmspro": TuyaBLECategorySwitchMapping(
         products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLESwitchMapping(
+                    dp_id=33,
+                    description=SwitchEntityDescription(
+                        key="automatic_lock",
+                        icon="mdi:lock-clock",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=smart_lock_automatic_lock_getter,
+                ),
+            ],
             "y2yaegze": [
                 TuyaBLESwitchMapping(
                     dp_id=33,

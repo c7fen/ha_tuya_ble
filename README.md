@@ -2,10 +2,9 @@
 
 ## Overview
 
-This integration is an amalgamation of a number of community maintained forks. It should be considered **unstable** quality at this time.
+This integration is an amalgamation of a number of community-maintained forks. It should be considered **unstable** quality at this time. This repository is the maintained downstream fork at [c7fen/ha_tuya_ble](https://github.com/c7fen/ha_tuya_ble), based on the operational upstream [ha-tuya-ble/ha_tuya_ble](https://github.com/ha-tuya-ble/ha_tuya_ble).
 
-See full list of forks:
-https://github.com/ha-tuya-ble/ha_tuya_ble/issues/1
+See the [upstream fork history](https://github.com/ha-tuya-ble/ha_tuya_ble/issues/1). Report downstream issues at [c7fen/ha_tuya_ble/issues](https://github.com/c7fen/ha_tuya_ble/issues).
 
 
 _Inspired by code of [@redphx](https://github.com/redphx/poc-tuya-ble-fingerbot) & forked from https://github.com/PlusPlus-ua/ha_tuya_ble_ 
@@ -19,7 +18,15 @@ _This forks base is from https://github.com/markusg1234/ha_tuya_ble_
 
 Place the `custom_components` folder in your configuration directory (or add its contents to an existing `custom_components` folder). Alternatively install via [HACS](https://hacs.xyz/).
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ha-tuya-ble&repository=ha_tuya_ble&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=c7fen&repository=ha_tuya_ble&category=integration)
+
+To clone the maintained downstream repository manually:
+
+```shell
+git clone https://github.com/c7fen/ha_tuya_ble.git
+```
+
+Published downstream versions, when available, are listed on the [releases page](https://github.com/c7fen/ha_tuya_ble/releases).
 
 ## Usage
 
@@ -29,6 +36,29 @@ The integration works locally, but connection to Tuya BLE device requires device
 
 Newer protocol-v2 devices may also require a 16-character `secKey`. Enter it in
 the optional **Tuya BLE SecKey** field when configuring such a device.
+
+### Smart-lock safety and upgrade behavior
+
+S1-TY-BLE-PRO local Unlock never uses an embedded or cross-device payload. It is available only after valid DP70 and DP71 templates have been received from the same authenticated device, or when a compatible per-device template record from version `v0.1.11b2` already exists. Until then, Unlock fails without a Bluetooth write. Receiving a template on physical hardware remains unverified; no particular vendor-app action is guaranteed to initialize it. Lock remains a separate, evidenced DP46 action.
+
+Lock P1 / V1 intentionally exposes a one-way **Lock** button. A press writes DP46 `true` once. It has no local Unlock or Open action, and DP33 remains Auto-Lock configuration rather than a lock command.
+
+| Entity | S1-TY-BLE-PRO | Lock P1 / V1 | Presentation |
+| --- | --- | --- | --- |
+| Lock | LockEntity with fail-closed Unlock | One-way ButtonEntity | `mdi:lock` |
+| Auto-Lock | DP33 switch | DP33 switch | Configuration, `mdi:lock-clock` |
+| Auto-Lock Delay | DP36, 1–1800 seconds | DP36, 5–1800 seconds | Configuration, `mdi:timer-lock` |
+| Battery | DP8 | DP8 | Diagnostic percentage |
+| Alarm | Product-specific DP21 enum | Product-specific DP21 enum | Diagnostic, `mdi:alert` |
+| Last Unlock Method | Product-specific current-batch DPs | Product-specific current-batch DPs | Diagnostic, `mdi:account-lock-open` |
+| Motor State | Read-only DP47 binary sensor | Read-only DP47 binary sensor | Diagnostic, `mdi:engine` |
+| Signal Strength | Available | Available | Diagnostic, disabled by default |
+| Authentication Mode | DP34 select | Not supported | Configuration, `mdi:account-key` |
+| Door State | Read-only DP40 enum | Not supported | Diagnostic, disabled by default |
+
+Existing `v0.1.11b2` config entries retain the legacy `app_type` option while the current `tuya_app_type` alias is used additively. Conflicting alias values fail closed instead of selecting credentials silently. The integration domain and directory remain `tuya_ble`, so the repository rename does not create a second integration identity.
+
+The S1 Motor State entity changes from the obsolete switch domain to a read-only binary-sensor domain. Registry customizations are migrated when ownership is unambiguous, but automations that directly reference the old switch entity ID may need to be updated to the resulting `binary_sensor` entity ID.
 
 ## Supported devices list
 
@@ -127,11 +157,31 @@ See a device marked Experimental you have? We could use real world testing feedb
       <td>—</td>
     </tr>
     <tr>
-      <td rowspan="23"><strong>Smart Locks</strong></td>
-      <td rowspan="23"><code>ms</code>, <code>jtmspro</code></td>
+      <td rowspan="27"><strong>Smart Locks</strong></td>
+      <td rowspan="27"><code>ms</code>, <code>jtmspro</code></td>
       <td>Smart Lock</td>
-      <td><code>ludzroix</code>, <code>isk2p555</code>, <code>gumrixyt</code>, <code>uamrw6h3</code>, <code>sidhzylo</code>, <code>mqc2hevy</code>, <code>7a4xvbtt</code></td>
+      <td><code>ludzroix</code>, <code>isk2p555</code>, <code>gumrixyt</code>, <code>uamrw6h3</code>, <code>sidhzylo</code>, <code>mqc2hevy</code></td>
       <td>—</td>
+    </tr>
+    <tr>
+      <td>Lock P1 / V1</td>
+      <td><code>7a4xvbtt</code></td>
+      <td>Test-backed one-way Lock button and configuration/status entities. No local Unlock or Open action.</td>
+    </tr>
+    <tr>
+      <td>Smart Lock</td>
+      <td><code>yy2bmcoh</code></td>
+      <td>Limited, experimental support: recognition, battery, alarm, and volume only. Hardware validation is not claimed.</td>
+    </tr>
+    <tr>
+      <td>S1-TY-BLE-PRO</td>
+      <td><code>xqeob8h6</code></td>
+      <td>Test-backed entity and transport behavior. Local Unlock requires valid templates captured from this same device; live hardware validation is not claimed.</td>
+    </tr>
+    <tr>
+      <td>Drawer Smart Lock</td>
+      <td><code>akwn32dw</code></td>
+      <td>Experimental recognition only; no control or status mappings are inferred.</td>
     </tr>
     <tr>
       <td>Primebras Athenas Lock</td>
@@ -211,12 +261,12 @@ See a device marked Experimental you have? We could use real world testing feedb
     <tr>
       <td>Smart Cylinder Lock (LVD11_BK)</td>
       <td><code>hs21i377</code></td>
-      <td>—</td>
+      <td>Partial. Bluetooth unlock is intentionally unavailable because the inherited device-derived payload was removed.</td>
     </tr>
     <tr>
       <td>Smart Lock</td>
       <td><code>kholoaew</code></td>
-      <td>Partial.</td>
+      <td>Partial. Manual lock remains available; Bluetooth unlock is intentionally unavailable because the inherited device-derived payload was removed.</td>
     </tr>
     <tr>
       <td>CentralAcesso</td>
