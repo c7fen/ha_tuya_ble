@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.0b3](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b3) (2026-08-05)
+## [0.9.0b3](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b3) (2026-08-06)
 
 This beta supersedes `v0.9.0b1` and `v0.9.0b2` for installation. Those
 releases used a deterministic, address-derived, twelve-hex log pseudonym.
