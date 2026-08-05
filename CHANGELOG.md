@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.9.0b2](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b2) (2026-08-05)
+
+This beta adds product-specific bidirectional coupling control for V1 / Lock P1
+on top of `v0.9.0b1`. It retains all S1 and unaffected upstream behavior.
+
+### Fixed
+
+- Presents the V1 `manual_lock` control as a Home Assistant Lock entity instead
+  of a one-way button while preserving its registry identity, device ownership,
+  customizations, and restart persistence.
+- Uses the physically confirmed protocol-v3 command contract: Lock sends the
+  product-specific DP46 Boolean `true` secure/uncouple action, while Unlock
+  builds the observed two-field DP6 access/couple action semantically.
+- Requires an exactly correlated sender-DPS response with a one-byte zero status
+  and prevents automatic command replay after ambiguous transport failures.
+- Keeps DP33 exclusively as Auto-Lock configuration and DP47 exclusively as the
+  read-only physical state source. Open remains unsupported.
+
+### Security and compatibility
+
+- Stores no captured V1 command, complete payload, or additional device secret.
+  Fresh protocol framing is used for each command; receiver-side rejection of
+  externally replayed ciphertext is not claimed.
+- Keeps the S1 and generic lock paths on their existing response and retry
+  behavior, and retains every unrelated product mapping.
+- Exact runtime head `5bfbd7c0b9a67cd1416ee3a21b6acdc5ea4a968c`
+  passed non-actuating Home Assistant `2026.7.4` validation, complete physical
+  V1 Lock/Unlock cycles, exactly one motor action per command, distinct expected
+  motor directions and sounds, restart persistence, and a representative S1
+  Lock/Unlock smoke test.
+
+Release preparation changes only manifest, changelog, and test metadata. The
+integration's Python runtime remains byte-identical to the hardware-tested head.
+
 ## [0.9.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b1) (2026-08-05)
 
 This downstream beta is based on `ha-tuya-ble/ha_tuya_ble` 0.8.1 and retains
