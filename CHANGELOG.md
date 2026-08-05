@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## [0.9.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b1) (2026-08-05)
+
+This downstream beta is based on `ha-tuya-ble/ha_tuya_ble` 0.8.1 and retains
+every upstream product registration and unaffected device mapping. The two
+embedded, device-specific raw-DP71 Unlock actions for `jtmspro/hs21i377` and
+`jtmspro/kholoaew` are intentionally withdrawn; their product registrations and
+other evidenced behavior remain.
+
+### Added
+
+- S1-TY-BLE-PRO support with unified S1/V1 entity presentation.
+- Same-device DP70/DP71 template capture, validation, persistence, and
+  serialized S1 Unlock handling.
+- Private, atomic S1 Store handling that protects regular files with mode
+  `0600` before loading and rejects symlinks, FIFOs, directories, and other
+  special paths fail-closed.
+- A read-only Motor State binary sensor and ownership-safe, collision-safe,
+  idempotent migration from the obsolete switch representation.
+
+### Security
+
+- Removed embedded complete unlock payloads and cross-device or product-wide
+  fallback material.
+- Preserved device-scoped b2 Store compatibility while requiring complete,
+  canonical, same-device templates before any S1 Unlock write.
+
+### Compatibility and hardware scope
+
+- Existing `v0.1.11b2` config entries, credentials, Store records, devices,
+  entities, and customizations remain upgrade-compatible.
+- Exact runtime head `31738211ffd6f205e1291918a342a33c1a416fc6`
+  passed non-actuating validation and physical Lock/Unlock testing on exactly
+  one of four S1 devices. The other three were not physically retested at that
+  head; no four-device physical-success claim is made.
+- V1 / Lock P1 remains intentionally one-way: DP46 `true` secure/uncouple only.
+  Coupling/Unlock and Open are not implemented; DP33 remains Auto-Lock
+  configuration and DP47 remains read-only.
+
+Release preparation changes only manifest and documentation/test metadata; the
+integration's Python runtime is byte-identical to the physically tested head.
+
 ## [0.8.1](https://github.com/ha-tuya-ble/ha_tuya_ble/compare/0.8.0...0.8.1) (2026-08-03)
 
 
