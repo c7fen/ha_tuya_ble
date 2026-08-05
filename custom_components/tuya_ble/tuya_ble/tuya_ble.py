@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable, Hashable
@@ -58,6 +59,11 @@ from .security import TuyaBLESecurityMaterial
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_LOG_IDENTITY_ALPHABET = "ghjkmnpqrstuvwxyz"
+_LOG_IDENTITY_LENGTH = 16
+_TRANSPORT_ERROR_FALLBACK = "Tuya BLE transport error"
 
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
@@ -335,6 +341,9 @@ class TuyaBLEDevice:
         self._device_info: TuyaBLEDeviceCredentials | None = None
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
+        self._log_identity = "tuya-ble-session-" + "".join(
+            secrets.choice(_LOG_IDENTITY_ALPHABET) for _ in range(_LOG_IDENTITY_LENGTH)
+        )
         self._operation_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
@@ -512,11 +521,42 @@ class TuyaBLEDevice:
 
     @property
     def log_identity(self) -> str:
-        """Return a deterministic pseudonym that is safe to include in logs."""
-        digest = hashlib.sha256(
-            f"tuya-ble-log-v1:{self.address.upper()}".encode()
-        ).hexdigest()
-        return f"tuya-ble-{digest[:12]}"
+        """Return this device object's process-local opaque log label."""
+        return self._log_identity
+
+    def _sanitized_transport_error(self, error: BaseException) -> BleakError:
+        """Return a transport error without device identifiers or foreign context."""
+        message = str(error) or _TRANSPORT_ERROR_FALLBACK
+        address = self.address
+        protected_values = {
+            address,
+            address.replace(":", ""),
+            address.replace(":", "-"),
+            address.replace(":", "_"),
+            address.replace(":", "."),
+        }
+        if self._device_info is not None:
+            protected_values.update(
+                {
+                    self._device_info.device_id,
+                    self._device_info.uuid,
+                    self._device_info.local_key,
+                    self._device_info.sec_key,
+                    self._device_info.device_name,
+                }
+            )
+        for value in sorted(
+            (value for value in protected_values if value), key=len, reverse=True
+        ):
+            message = re.sub(
+                re.escape(value), "[redacted]", message, flags=re.IGNORECASE
+            )
+        message = re.sub(
+            r"(?i)(?<![0-9a-f])[0-9a-f]{12,}(?![0-9a-f])",
+            "[redacted]",
+            message,
+        )
+        return BleakError(message)
 
     @property
     def name(self) -> str:
@@ -830,16 +870,16 @@ class TuyaBLEDevice:
                             "%s: Bluetooth is already shutdown, terminating connection attempts",
                             self.log_identity,
                         )
-                        raise
+                        raise self._sanitized_transport_error(ex) from None
                     _LOGGER.debug("%s: communication failed", self.log_identity)
                     continue
-                except Exception as ex:
+                except Exception as ex:  # noqa: BLE001
                     if "Bluetooth is already shutdown" in str(ex):
                         _LOGGER.debug(
                             "%s: Bluetooth is already shutdown, terminating connection attempts",
                             self.log_identity,
                         )
-                        raise
+                        raise self._sanitized_transport_error(ex) from None
                     _LOGGER.debug("%s: unexpected error", self.log_identity)
                     continue
 
@@ -867,13 +907,13 @@ class TuyaBLEDevice:
                             self._notification_handler,
                             **notify_kwargs,
                         )
-                    except Exception as ex:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
+                    except Exception as ex:  # noqa: BLE001
                         if "Bluetooth is already shutdown" in str(ex):
                             _LOGGER.debug(
                                 "%s: Bluetooth is already shutdown, terminating connection attempts",
                                 self.log_identity,
                             )
-                            raise
+                            raise self._sanitized_transport_error(ex) from None
                         self._client = None
                         _LOGGER.error(
                             "%s: starting notifications failed",
@@ -902,13 +942,13 @@ class TuyaBLEDevice:
                                 self.log_identity,
                             )
                             continue
-                    except Exception as ex:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
+                    except Exception as ex:  # noqa: BLE001
                         if "Bluetooth is already shutdown" in str(ex):
                             _LOGGER.debug(
                                 "%s: Bluetooth is already shutdown, terminating connection attempts",
                                 self.log_identity,
                             )
-                            raise
+                            raise self._sanitized_transport_error(ex) from None
                         self._client = None
                         _LOGGER.error(
                             "%s: Sending device info request failed",
@@ -933,13 +973,13 @@ class TuyaBLEDevice:
                                 self.log_identity,
                             )
                             continue
-                    except Exception as ex:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
+                    except Exception as ex:  # noqa: BLE001
                         if "Bluetooth is already shutdown" in str(ex):
                             _LOGGER.debug(
                                 "%s: Bluetooth is already shutdown, terminating connection attempts",
                                 self.log_identity,
                             )
-                            raise
+                            raise self._sanitized_transport_error(ex) from None
                         self._client = None
                         _LOGGER.error(
                             "%s: Sending pairing request failed",
@@ -1253,7 +1293,7 @@ class TuyaBLEDevice:
                     "%s: Bluetooth is already shutdown, not resending packets or reconnecting",
                     self.log_identity,
                 )
-                raise BleakError("Bluetooth is already shutdown") from ex
+                raise self._sanitized_transport_error(ex) from None
             # Disconnect so we can reset state and try again
             await asyncio.sleep(BLEAK_BACKOFF_TIME)
             _LOGGER.debug(
@@ -1266,14 +1306,14 @@ class TuyaBLEDevice:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
-            raise BleakError from ex
+            raise self._sanitized_transport_error(ex) from None
         except BleakError as ex:
             if "Bluetooth is already shutdown" in str(ex):
                 _LOGGER.debug(
                     "%s: Bluetooth is already shutdown, not resending packets or reconnecting",
                     self.log_identity,
                 )
-                raise
+                raise self._sanitized_transport_error(ex) from None
             # Disconnect so we can reset state and try again
             _LOGGER.debug(
                 "%s: RSSI: %s; Disconnecting after transport error",
@@ -1284,7 +1324,7 @@ class TuyaBLEDevice:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
-            raise
+            raise self._sanitized_transport_error(ex) from None
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
         """Execute command and read response."""
@@ -1296,20 +1336,20 @@ class TuyaBLEDevice:
                         packet,
                         False,
                     )
-                except Exception as ex:
+                except Exception as ex:  # noqa: BLE001
                     if "Bluetooth is already shutdown" in str(ex):
                         _LOGGER.debug(
                             "%s: Bluetooth is already shutdown during sending packet",
                             self.log_identity,
                         )
-                        raise BleakError("Bluetooth is already shutdown") from ex
+                        raise self._sanitized_transport_error(ex) from None
                     _LOGGER.error(
                         "%s: Error during sending packet",
                         self.log_identity,
                     )
                     if self._client and self._client.is_connected:
                         self._disconnected(self._client)
-                    raise BleakError()
+                    raise self._sanitized_transport_error(ex) from None
             else:
                 _LOGGER.error(
                     "%s: Client disconnected during sending packet",
