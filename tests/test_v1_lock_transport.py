@@ -446,6 +446,81 @@ async def test_v1_requires_correlated_zero_status_response(status: int) -> None:
     assert device._input_expected_responses == {}
 
 
+async def test_v1_wrong_status_response_family_cannot_confirm_command() -> None:
+    """A correlated zero device-status response is not a sender-DPS response."""
+    device = _make_device()
+    device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    device._ensure_connected = AsyncMock()
+    device._build_packets = Mock(return_value=[b"synthetic-fragment"])
+
+    async def emit_wrong_response(_: list[bytes]) -> None:
+        response_to, future = next(iter(device._input_expected_responses.items()))
+        assert (
+            device._input_expected_response_codes[response_to]
+            is TuyaBLECode.FUN_SENDER_DPS
+        )
+        device._handle_command_or_response(
+            2,
+            response_to,
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            bytes([0]),
+        )
+        assert not future.done()
+
+    device._int_send_packets_locked = AsyncMock(side_effect=emit_wrong_response)
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0):
+        with pytest.raises(TuyaBLECommandUnconfirmedError):
+            await TuyaBLEDevice._send_datapoints_once(device, [V1_DP_LOCK])
+
+    assert device._input_expected_responses == {}
+    assert device._input_expected_response_codes == {}
+
+
+async def test_v1_correlated_inbound_report_cannot_confirm_command() -> None:
+    """A valid inbound DP report is processed but cannot confirm a V1 write."""
+    device = _make_device()
+    device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    device._ensure_connected = AsyncMock()
+    device._build_packets = Mock(return_value=[b"synthetic-fragment"])
+    device._send_response = AsyncMock()
+
+    async def emit_inbound_report(_: list[bytes]) -> None:
+        response_to, future = next(iter(device._input_expected_responses.items()))
+        assert (
+            device._input_expected_response_codes[response_to]
+            is TuyaBLECode.FUN_SENDER_DPS
+        )
+        device._handle_command_or_response(
+            2,
+            response_to,
+            TuyaBLECode.FUN_RECEIVE_DP,
+            bytes(
+                [
+                    V1_DP_MOTOR_STATE,
+                    TuyaBLEDataPointType.DT_BOOL.value,
+                    1,
+                    1,
+                ]
+            ),
+        )
+        assert not future.done()
+
+    device._int_send_packets_locked = AsyncMock(side_effect=emit_inbound_report)
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0):
+        with pytest.raises(TuyaBLECommandUnconfirmedError):
+            await TuyaBLEDevice._send_datapoints_once(device, [V1_DP_LOCK])
+    await asyncio.sleep(0)
+
+    assert device.datapoints[V1_DP_MOTOR_STATE].value is True
+    device._send_response.assert_awaited_once_with(
+        TuyaBLECode.FUN_RECEIVE_DP, bytes(0), 2
+    )
+    assert device._input_expected_responses == {}
+    assert device._input_expected_response_codes == {}
+
+
 async def test_v1_expected_disconnect_fails_before_transport() -> None:
     """An expected disconnect is not silently accepted as command success."""
     device = _make_device()

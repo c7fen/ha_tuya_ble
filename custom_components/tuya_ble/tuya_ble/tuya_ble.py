@@ -369,6 +369,7 @@ class TuyaBLEDevice:
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
         self._input_expected_responses: dict[int, asyncio.Future[int] | None] = {}
+        self._input_expected_response_codes: dict[int, TuyaBLECode] = {}
         # self._input_future: asyncio.Future[int] | None = None
 
         self._datapoints = TuyaBLEDataPoints(self)
@@ -1129,6 +1130,7 @@ class TuyaBLEDevice:
             0,
             True,
             resend_on_error=False,
+            expected_response_code=code,
         )
         if not confirmed:
             raise TuyaBLECommandUnconfirmedError()
@@ -1150,6 +1152,7 @@ class TuyaBLEDevice:
         response_to: int,
         wait_for_response: bool,
         resend_on_error: bool = True,
+        expected_response_code: TuyaBLECode | None = None,
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
@@ -1159,6 +1162,8 @@ class TuyaBLEDevice:
         if wait_for_response:
             future = asyncio.Future()
             self._input_expected_responses[seq_num] = future
+            if expected_response_code is not None:
+                self._input_expected_response_codes[seq_num] = expected_response_code
 
         if response_to > 0:
             _LOGGER.debug(
@@ -1193,6 +1198,7 @@ class TuyaBLEDevice:
         finally:
             if future:
                 self._input_expected_responses.pop(seq_num, None)
+                self._input_expected_response_codes.pop(seq_num, None)
 
         return result
 
@@ -1553,18 +1559,28 @@ class TuyaBLEDevice:
                     )
 
         if response_to != 0:
-            future = self._input_expected_responses.pop(response_to, None)
-            if future:
+            expected_code = self._input_expected_response_codes.get(response_to)
+            if expected_code is not None and code is not expected_code:
                 _LOGGER.debug(
-                    "%s: Received expected response to #%s, result: %s",
+                    "%s: Ignoring unexpected %s response to #%s",
                     self.log_identity,
+                    code.name,
                     response_to,
-                    result,
                 )
-                if result == 0:
-                    future.set_result(result)
-                else:
-                    future.set_exception(TuyaBLEDeviceError(result))
+            else:
+                future = self._input_expected_responses.pop(response_to, None)
+                self._input_expected_response_codes.pop(response_to, None)
+                if future:
+                    _LOGGER.debug(
+                        "%s: Received expected response to #%s, result: %s",
+                        self.log_identity,
+                        response_to,
+                        result,
+                    )
+                    if result == 0:
+                        future.set_result(result)
+                    else:
+                        future.set_exception(TuyaBLEDeviceError(result))
 
     def _clean_input(self) -> None:
         self._input_buffer = None

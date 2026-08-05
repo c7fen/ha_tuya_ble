@@ -52,9 +52,10 @@ remote-open key, or device-specific payload field participated in Access.
 - **Lock / secure:** issue exactly one protocol-v3 DP46 Boolean `true` update.
 - **Unlock / access:** issue exactly one protocol-v3 DP6 Raw update built from
   the observed two enabled fields.
-- **Confirmation:** require the correlated one-byte zero-status response. A
-  timeout, malformed response, nonzero status, expected disconnect, or protocol
-  version other than v3 fails the service call.
+- **Confirmation:** require the correlated protocol-v3 sender-DPS response with
+  exactly one zero-status byte. A different response family, timeout, malformed
+  response, nonzero status, expected disconnect, or protocol version other than
+  v3 fails the service call.
 - **At-most-once transport:** never automatically replay a V1 command after an
   ambiguous BLE transport error. Home Assistant reports the error and the
   operator must inspect the reported physical state before choosing to retry.
