@@ -45,12 +45,13 @@ from ..const import (
 )
 
 from .exceptions import (
-    TuyaBLEError,
+    TuyaBLECommandUnconfirmedError,
     TuyaBLEDataCRCError,
     TuyaBLEDataFormatError,
     TuyaBLEDataLengthError,
     TuyaBLEDeviceError,
     TuyaBLEEnumValueError,
+    TuyaBLEError,
 )
 from .manager import AbstaractTuyaBLEDeviceManager, TuyaBLEDeviceCredentials
 from .security import TuyaBLESecurityMaterial
@@ -170,7 +171,8 @@ class TuyaBLEDataPoint:
     def __str__(self) -> str:
         return repr(self)
 
-    async def set_value(self, value: bytes | bool | int | str) -> None:
+    def _set_local_value(self, value: bytes | bool | int | str) -> None:
+        """Normalize a value and mark it as locally originated."""
         match self._type:
             case TuyaBLEDataPointType.DT_RAW | TuyaBLEDataPointType.DT_BITMAP:
                 self._value = bytes(value)
@@ -190,7 +192,24 @@ class TuyaBLEDataPoint:
 
         self._changed_by_device = False
         self._received_from_device = False
+
+    async def set_value(self, value: bytes | bool | int | str) -> None:
+        self._set_local_value(value)
         await self._owner._update_from_user(self._id)
+
+    async def set_value_once(self, value: bytes | bool | int | str) -> None:
+        """Send one confirmed command without automatic packet replay."""
+        previous_value = self._value
+        previous_changed_by_device = self._changed_by_device
+        previous_received_from_device = self._received_from_device
+        self._set_local_value(value)
+        try:
+            await self._owner._update_from_user_once(self._id)
+        except (Exception, asyncio.CancelledError):
+            self._value = previous_value
+            self._changed_by_device = previous_changed_by_device
+            self._received_from_device = previous_received_from_device
+            raise
 
 
 class TuyaBLEDataPoints:
@@ -277,6 +296,10 @@ class TuyaBLEDataPoints:
         else:
             await self._owner._send_datapoints([dp_id])
 
+    async def _update_from_user_once(self, dp_id: int) -> None:
+        """Send one datapoint through the confirmed at-most-once path."""
+        await self._owner._send_datapoints_once([dp_id])
+
 
 global_connect_lock = asyncio.Lock()
 
@@ -346,6 +369,7 @@ class TuyaBLEDevice:
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
         self._input_expected_responses: dict[int, asyncio.Future[int] | None] = {}
+        self._input_expected_response_codes: dict[int, TuyaBLECode] = {}
         # self._input_future: asyncio.Future[int] | None = None
 
         self._datapoints = TuyaBLEDataPoints(self)
@@ -584,6 +608,11 @@ class TuyaBLEDevice:
     @property
     def protocol_version(self) -> str:
         return self._protocol_version_str
+
+    @property
+    def protocol_major_version(self) -> int:
+        """Return the negotiated Tuya BLE protocol major version."""
+        return self._protocol_version
 
     @property
     def datapoints(self) -> TuyaBLEDataPoints:
@@ -1084,6 +1113,28 @@ class TuyaBLEDevice:
             return
         await self._send_packet_while_connected(code, data, 0, wait_for_response)
 
+    async def _send_packet_once_confirmed(
+        self,
+        code: TuyaBLECode,
+        data: bytes,
+    ) -> None:
+        """Send once without replay and require an explicit success response."""
+        if self._expected_disconnect or self._protocol_version != 3:
+            raise TuyaBLECommandUnconfirmedError()
+        await self._ensure_connected()
+        if self._expected_disconnect or self._protocol_version != 3:
+            raise TuyaBLECommandUnconfirmedError()
+        confirmed = await self._send_packet_while_connected(
+            code,
+            data,
+            0,
+            True,
+            resend_on_error=False,
+            expected_response_code=code,
+        )
+        if not confirmed:
+            raise TuyaBLECommandUnconfirmedError()
+
     async def _send_response(
         self,
         code: TuyaBLECode,
@@ -1100,6 +1151,8 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
         wait_for_response: bool,
+        resend_on_error: bool = True,
+        expected_response_code: TuyaBLECode | None = None,
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
@@ -1109,6 +1162,8 @@ class TuyaBLEDevice:
         if wait_for_response:
             future = asyncio.Future()
             self._input_expected_responses[seq_num] = future
+            if expected_response_code is not None:
+                self._input_expected_response_codes[seq_num] = expected_response_code
 
         if response_to > 0:
             _LOGGER.debug(
@@ -1125,25 +1180,32 @@ class TuyaBLEDevice:
                 seq_num,
                 code.name,
             )
-        packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-        await self._int_send_packet_while_connected(packets)
-        if future:
-            try:
-                await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
-            except asyncio.TimeoutError:
-                _LOGGER.error(
-                    "%s: timeout receiving response, RSSI: %s",
-                    self.log_identity,
-                    self.rssi,
-                )
-                result = False
-            self._input_expected_responses.pop(seq_num, None)
+        try:
+            packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
+            await self._int_send_packet_while_connected(
+                packets, resend_on_error=resend_on_error
+            )
+            if future:
+                try:
+                    await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    _LOGGER.error(
+                        "%s: timeout receiving response, RSSI: %s",
+                        self.log_identity,
+                        self.rssi,
+                    )
+                    result = False
+        finally:
+            if future:
+                self._input_expected_responses.pop(seq_num, None)
+                self._input_expected_response_codes.pop(seq_num, None)
 
         return result
 
     async def _int_send_packet_while_connected(
         self,
         packets: list[bytes],
+        resend_on_error: bool = True,
     ) -> None:
         if self._operation_lock.locked():
             _LOGGER.debug(
@@ -1154,7 +1216,9 @@ class TuyaBLEDevice:
             )
         async with self._operation_lock:
             try:
-                await self._send_packets_locked(packets)
+                await self._send_packets_locked(
+                    packets, resend_on_error=resend_on_error
+                )
             except BleakNotFoundError:
                 _LOGGER.error(
                     "%s: device not found, no longer in range, or poor RSSI: %s",
@@ -1177,7 +1241,9 @@ class TuyaBLEDevice:
             return
         await self._int_send_packet_while_connected(packets)
 
-    async def _send_packets_locked(self, packets: list[bytes]) -> None:
+    async def _send_packets_locked(
+        self, packets: list[bytes], resend_on_error: bool = True
+    ) -> None:
         """Send command to device and read response."""
         try:
             await self._int_send_packets_locked(packets)
@@ -1196,7 +1262,7 @@ class TuyaBLEDevice:
                 self.rssi,
                 BLEAK_BACKOFF_TIME,
             )
-            if self._is_paired:
+            if self._is_paired and resend_on_error:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
@@ -1214,7 +1280,7 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-            if self._is_paired:
+            if self._is_paired and resend_on_error:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
@@ -1399,6 +1465,11 @@ class TuyaBLEDevice:
                     raise TuyaBLEDataLengthError()
                 result = data[0]
 
+            case TuyaBLECode.FUN_SENDER_DPS:
+                if len(data) != 1:
+                    raise TuyaBLEDataLengthError()
+                result = data[0]
+
             case TuyaBLECode.FUN_SENDER_DPS_V4:
                 if len(data) != 6:
                     raise TuyaBLEDataLengthError()
@@ -1488,18 +1559,28 @@ class TuyaBLEDevice:
                     )
 
         if response_to != 0:
-            future = self._input_expected_responses.pop(response_to, None)
-            if future:
+            expected_code = self._input_expected_response_codes.get(response_to)
+            if expected_code is not None and code is not expected_code:
                 _LOGGER.debug(
-                    "%s: Received expected response to #%s, result: %s",
+                    "%s: Ignoring unexpected %s response to #%s",
                     self.log_identity,
+                    code.name,
                     response_to,
-                    result,
                 )
-                if result == 0:
-                    future.set_result(result)
-                else:
-                    future.set_exception(TuyaBLEDeviceError(result))
+            else:
+                future = self._input_expected_responses.pop(response_to, None)
+                self._input_expected_response_codes.pop(response_to, None)
+                if future:
+                    _LOGGER.debug(
+                        "%s: Received expected response to #%s, result: %s",
+                        self.log_identity,
+                        response_to,
+                        result,
+                    )
+                    if result == 0:
+                        future.set_result(result)
+                    else:
+                        future.set_exception(TuyaBLEDeviceError(result))
 
     def _clean_input(self) -> None:
         self._input_buffer = None
@@ -1666,6 +1747,13 @@ class TuyaBLEDevice:
         """Send new values using the protocol-v3 DP command."""
         data = self._encode_datapoints(datapoint_ids, 1)
         await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
+
+    async def _send_datapoints_once(self, datapoint_ids: list[int]) -> None:
+        """Send one protocol-v3 DP command without replay and require success."""
+        if self._protocol_version != 3:
+            raise TuyaBLECommandUnconfirmedError()
+        data = self._encode_datapoints(datapoint_ids, 1)
+        await self._send_packet_once_confirmed(TuyaBLECode.FUN_SENDER_DPS, data)
 
     async def _send_datapoints_v4(self, datapoint_ids: list[int]) -> None:
         """Send new values using the protocol-v4 DP command."""

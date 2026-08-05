@@ -28,6 +28,11 @@
             }
         }
     },
+    "exceptions": {
+        "v1_command_unavailable": {
+            "message": "Les points de données de commande V1 sont indisponibles ou non valides."
+        }
+    },
     "entity": {
         "binary_sensor": {
             "fault": {

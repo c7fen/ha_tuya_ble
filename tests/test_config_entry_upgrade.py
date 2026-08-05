@@ -143,8 +143,11 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
             managers.append(manager)
             return manager
 
-        def migration(*_args) -> None:
-            setup_order.append("migration")
+        def s1_migration(*_args) -> None:
+            setup_order.append("s1_migration")
+
+        def v1_migration(*_args) -> None:
+            setup_order.append("v1_migration")
 
         async def forward(*_args) -> None:
             setup_order.append("forward")
@@ -164,7 +167,12 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
             patch.object(
                 integration,
                 "_async_migrate_s1_motor_state_entity",
-                side_effect=migration,
+                side_effect=s1_migration,
+            ),
+            patch.object(
+                integration,
+                "_async_migrate_v1_manual_lock_entity",
+                side_effect=v1_migration,
             ),
             patch.object(integration, "TuyaBLECoordinator", return_value=object()),
             patch.object(
@@ -175,7 +183,7 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
         ):
             assert await integration.async_setup_entry(hass, entry) is True
 
-        assert setup_order == ["migration", "forward"]
+        assert setup_order == ["s1_migration", "v1_migration", "forward"]
         assert dict(entry.options) == original_options
         assert dict(entry.data) == {CONF_ADDRESS: ADDRESS}
         assert entry.unique_id == ADDRESS

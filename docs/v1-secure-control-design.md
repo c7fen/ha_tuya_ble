@@ -1,5 +1,133 @@
 # V1 secure coupling control: protocol decision record
 
+## 2026-08-05 additive decision: observed direct-BLE access command
+
+This section records new evidence obtained after the historical blocked decision
+below. It selects a product-specific implementation path for `ms/7a4xvbtt` on
+top of exact `next` commit
+`04017422e1ad71e20cb0b785d013bafba711c73b`. The older research and rejected
+DP60/DP61 design remain in this document as the previous evidence boundary.
+
+### Selected path and evidence provenance
+
+The selected design is **Path B: product-specific Tuya-app command evidence**.
+The device owner authorized a private Android Bluetooth HCI snoop after passive
+Home Assistant, MQTT, and cloud observation exposed only inbound reports. The
+owner performed every physical action with the door open. The integration and
+investigator did not invoke a lock service or write a device datapoint.
+
+Two complete app cycles produced the same semantics:
+
+| Action | Direct-BLE message | Product datapoint | Type | Value length | Physical result |
+| --- | --- | ---: | --- | ---: | --- |
+| Secure | protocol-v3 sender-DPS | 46 | Boolean | 1 byte | uncouple |
+| Access | protocol-v3 sender-DPS | 6 | Raw | 2 bytes | couple |
+
+Each of the four commands was caused by exactly one app tap and produced exactly
+one motor action. Both Access values had the same non-reversible fingerprint and
+the same two-field semantic shape. Both Secure values had the same Boolean
+meaning already implemented by the DP46 button. The session sequence number and
+AES-CBC IV changed normally between commands. The implementation must construct
+fresh framing and never reuse captured ciphertext. Receiver-side replay
+rejection remains unproven.
+
+Every captured message was reassembled from the write characteristic, decrypted
+privately through the integration's existing per-device Tuya BLE login/session
+derivation, and accepted only after CRC validation. The device returned a
+successful response to each exact sender-DPS request before emitting its
+corresponding reports. The two Access operations were followed by the observed
+DP19 Bluetooth-unlock event and DP47 coupled state. The two Secure operations
+were followed by DP46 manual-lock and DP47 uncoupled state reports.
+
+A fresh read-only query of the exact device specification did not list DP6 in
+either functions or status. Tuya's current Bluetooth Lock DP Reference explains
+that direct app Bluetooth unlock moved from the original DP6 generation to DP71,
+but it does not publish the original two-field DP6 layout. The repeated,
+product-specific capture is therefore the layout authority for this V1 firmware.
+No DP60/DP61 material, DP70/DP71 instruction, member ID, timestamp, ticket,
+remote-open key, or device-specific payload field participated in Access.
+
+### Selected runtime contract
+
+- **Lock / secure:** issue exactly one protocol-v3 DP46 Boolean `true` update.
+- **Unlock / access:** issue exactly one protocol-v3 DP6 Raw update built from
+  the observed two enabled fields.
+- **Confirmation:** require the correlated protocol-v3 sender-DPS response with
+  exactly one zero-status byte. A different response family, timeout, malformed
+  response, nonzero status, expected disconnect, or protocol version other than
+  v3 fails the service call.
+- **At-most-once transport:** never automatically replay a V1 command after an
+  ambiguous BLE transport error. Home Assistant reports the error and the
+  operator must inspect the reported physical state before choosing to retry.
+- **State:** read DP47 only. `false` means physically secure/uncoupled and
+  `true` means physically access-enabled/coupled. Missing, non-Boolean, or
+  wrongly typed values remain unknown.
+- **Open:** unsupported.
+- **Auto-Lock:** DP33 remains configuration only.
+- **Auto-Lock Delay:** DP36 remains configuration only.
+- **Motor State:** DP47 remains a read-only diagnostic entity.
+
+The DP6 value is constructed semantically for each request and passed through
+the ordinary Tuya BLE packet builder. It is not stored as captured ciphertext.
+The builder supplies a fresh sequence number and IV under the current
+device-scoped session key. No new Store, product-wide secret, embedded device
+material, or cloud request is required. Fresh local framing prevents captured
+ciphertext reuse by this integration; it is not evidence that the receiver
+rejects a replay performed elsewhere.
+
+The two individual DP6 field names remain undocumented. This uncertainty does
+not create an alternative wire length or value: both complete cycles used the
+same exact two-field action and the same success/report sequence. The
+implementation does not send alternatives or retry a different format.
+
+### Entity migration and automation impact
+
+The existing V1 `button` entity uses the stable unique-ID suffix `manual_lock`.
+It migrates to a `lock` entity with the same integration unique ID, exact config
+entry ownership, and device association. The migration preserves valid user
+name, icon, area, aliases, labels, hidden/disabled state, categories, and valid
+lock-target options. It rejects ambiguous, foreign, conflicting-device, or
+conflicting-subentry state; verifies the target before removing the old button;
+rolls back a newly created target after failure; and is idempotent.
+
+Automations that call the old button service must be updated to call
+`lock.lock` or `lock.unlock` on the migrated entity. `lock.open` is not exposed.
+The entity ID's domain necessarily changes from `button` to `lock`; a preserved
+custom name does not prevent that domain change.
+
+### Privacy handling
+
+The Android bug report and derived BTSnoop are held only in a private local
+directory with owner-only permissions. No raw report, Bluetooth address,
+device/account identifier, key, complete encrypted frame, or complete decrypted
+value is committed, posted, or included in this record. Keys were read into one
+private analysis process and never persisted by the decoder. Raw capture
+deletion is deferred until protocol, security, and compatibility review are
+complete.
+
+### Rejected alternatives after observation
+
+- DP33 remains rejected because changing Auto-Lock changed configuration and
+  caused a configuration side effect; it is not a directional motor command.
+- DP46 `false` remains rejected because neither app Access cycle used it.
+- Writable DP47 remains rejected because every observation used it as device
+  state only.
+- DP60/DP61 remain rejected because neither valid cycle used them and their
+  cloud ownership/lifecycle concerns remain unresolved.
+- DP70/DP71, `ble_unlock_check`, `getRemoteOpenKey`, cloud actuation, captured
+  ciphertext replay, and command spraying remain rejected because none was
+  required by the exact V1 app command.
+
+### Hardware validation plan
+
+The implementation remains hardware-unverified until one exact reviewed feature
+head is deployed after a full Home Assistant backup. With the door open, the
+owner must verify two complete Lock/Unlock cycles, one motor action per command,
+the distinct physical directions and sounds, DP33 configuration-only behavior,
+DP47 read-only behavior, restart persistence, registry uniqueness, and one S1
+smoke cycle because shared response-status parsing is tightened. The agent must
+not operate the lock.
+
 ## Status and decision
 
 This record is bound to migration head

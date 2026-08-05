@@ -38,3 +38,10 @@ class TuyaBLEDeviceError(TuyaBLEError):
 
     def __init__(self, code: int) -> None:
         super().__init__(("BLE deice returned error code %s") % (code))
+
+
+class TuyaBLECommandUnconfirmedError(TuyaBLEError):
+    """Raised when an at-most-once command has no valid success response."""
+
+    def __init__(self) -> None:
+        super().__init__("BLE command was not confirmed by the device")

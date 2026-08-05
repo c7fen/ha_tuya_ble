@@ -44,6 +44,14 @@ S1_DP71_MIN_LENGTH = 19
 S1_DP71_TIMESTAMP = slice(13, 17)
 S1_UNLOCK_DELAY = 0.8
 
+V1_CATEGORY = "ms"
+V1_PRODUCT_ID = "7a4xvbtt"
+V1_DP_ACCESS = 6
+V1_DP_LOCK = 46
+V1_DP_MOTOR_STATE = 47
+V1_ACCESS_FIELD_COUNT = 2
+V1_COMMAND_ERROR_TRANSLATION_KEY = "v1_command_unavailable"
+
 S1_STORE_VERSION = 1
 S1_STORE_KEY = f"{DOMAIN}_jtmspro_lock_templates"
 S1_RUNTIME_STORE_KEY = "__s1_lock_template_store_v1"
@@ -100,6 +108,20 @@ def _raise_s1_unlock_validation_error() -> NoReturn:
         translation_domain=DOMAIN,
         translation_key=S1_UNLOCK_ERROR_TRANSLATION_KEY,
     )
+
+
+def _raise_v1_command_validation_error() -> NoReturn:
+    """Raise the translated, payload-free V1 command validation error."""
+    raise ServiceValidationError(
+        "The V1 command datapoints are unavailable or invalid.",
+        translation_domain=DOMAIN,
+        translation_key=V1_COMMAND_ERROR_TRANSLATION_KEY,
+    )
+
+
+def _build_v1_access_value() -> bytes:
+    """Build the observed two-field V1 access action without replaying a frame."""
+    return bytes([int(True)] * V1_ACCESS_FIELD_COUNT)
 
 
 class TuyaBLES1TemplateStore:
@@ -253,7 +275,20 @@ async def async_setup_entry(
     """Set up the Tuya BLE locks."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     product = get_device_product_info(data.device)
-    if data.device.category == S1_CATEGORY and data.device.product_id == S1_PRODUCT_ID:
+    if data.device.category == V1_CATEGORY and data.device.product_id == V1_PRODUCT_ID:
+        async_add_entities(
+            [
+                TuyaBLEV1Lock(
+                    hass,
+                    data.coordinator,
+                    data.device,
+                    product or data.product,
+                )
+            ]
+        )
+    elif (
+        data.device.category == S1_CATEGORY and data.device.product_id == S1_PRODUCT_ID
+    ):
         template_store = await _async_get_s1_template_store(hass)
         async_add_entities(
             [
@@ -268,6 +303,95 @@ async def async_setup_entry(
         )
     elif product and product.lock:
         async_add_entities([TuyaBLELock(hass, data.coordinator, data.device, product)])
+
+
+class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
+    """Product-specific bidirectional V1 coupling control."""
+
+    platform = Platform.LOCK
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            LockEntityDescription(
+                key="manual_lock",
+                translation_key="lock",
+                icon="mdi:lock",
+            ),
+        )
+        self._attr_supported_features = LockEntityFeature(0)
+        self._attr_is_locking = False
+        self._attr_is_unlocking = False
+        self._operation_lock = asyncio.Lock()
+
+    @property
+    def is_locked(self) -> bool | None:
+        """Return the physical secure state reported by read-only DP47."""
+        motor_state = self._device.datapoints[V1_DP_MOTOR_STATE]
+        if (
+            motor_state is None
+            or motor_state.type is not TuyaBLEDataPointType.DT_BOOL
+            or not isinstance(motor_state.value, bool)
+        ):
+            return None
+        return not motor_state.value
+
+    async def async_lock(self, **kwargs: Any) -> None:
+        """Secure by issuing exactly one DP46 true command."""
+        async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
+            datapoint = self._device.datapoints[V1_DP_LOCK]
+            if datapoint is not None and (
+                datapoint.type is not TuyaBLEDataPointType.DT_BOOL
+                or not isinstance(datapoint.value, bool)
+            ):
+                _raise_v1_command_validation_error()
+            manual_lock = self._device.datapoints.get_or_create(
+                V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+            )
+
+            self._attr_is_locking = True
+            self.async_write_ha_state()
+            try:
+                await manual_lock.set_value_once(True)
+            finally:
+                self._attr_is_locking = False
+                self.async_write_ha_state()
+
+    async def async_unlock(self, **kwargs: Any) -> None:
+        """Enable access using one observed product-specific DP6 action."""
+        async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
+            datapoint = self._device.datapoints[V1_DP_ACCESS]
+            if datapoint is not None and (
+                datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                or not isinstance(datapoint.value, bytes | bytearray)
+            ):
+                _raise_v1_command_validation_error()
+            access_value = _build_v1_access_value()
+            access = self._device.datapoints.get_or_create(
+                V1_DP_ACCESS, TuyaBLEDataPointType.DT_RAW, access_value
+            )
+
+            self._attr_is_unlocking = True
+            self.async_write_ha_state()
+            try:
+                await access.set_value_once(access_value)
+            finally:
+                self._attr_is_unlocking = False
+                self.async_write_ha_state()
 
 
 class TuyaBLELock(TuyaBLEEntity, LockEntity):

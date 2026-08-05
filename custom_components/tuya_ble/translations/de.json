@@ -28,6 +28,11 @@
             }
         }
     },
+    "exceptions": {
+        "v1_command_unavailable": {
+            "message": "Die V1-Befehlsdatenpunkte sind nicht verfügbar oder ungültig."
+        }
+    },
     "entity": {
         "binary_sensor": {
             "fault": {
