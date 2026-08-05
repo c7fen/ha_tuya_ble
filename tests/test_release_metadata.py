@@ -15,7 +15,7 @@ def test_release_manifest_is_exact() -> None:
     """Require the reviewed beta version, owner order, and downstream URLs."""
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.9.0b1"
+    assert manifest["version"] == "0.9.0b2"
     assert manifest["codeowners"] == [
         "@c7fen",
         "@PlusPlus-ua",
@@ -44,6 +44,6 @@ def test_release_links_are_downstream_and_versioned() -> None:
 
     assert "c7fen/ha_tuya_ble-s1" not in readme
     assert (
-        "## [0.9.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b1)"
+        "## [0.9.0b2](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b2)"
         in changelog
     )
