@@ -349,6 +349,8 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     async def async_lock(self, **kwargs: Any) -> None:
         """Secure by issuing exactly one DP46 true command."""
         async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
             datapoint = self._device.datapoints[V1_DP_LOCK]
             if datapoint is not None and (
                 datapoint.type is not TuyaBLEDataPointType.DT_BOOL
@@ -362,7 +364,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_locking = True
             self.async_write_ha_state()
             try:
-                await manual_lock.set_value(True)
+                await manual_lock.set_value_once(True)
             finally:
                 self._attr_is_locking = False
                 self.async_write_ha_state()
@@ -370,6 +372,8 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     async def async_unlock(self, **kwargs: Any) -> None:
         """Enable access using one observed product-specific DP6 action."""
         async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
             datapoint = self._device.datapoints[V1_DP_ACCESS]
             if datapoint is not None and (
                 datapoint.type is not TuyaBLEDataPointType.DT_RAW
@@ -384,7 +388,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_unlocking = True
             self.async_write_ha_state()
             try:
-                await access.set_value(access_value)
+                await access.set_value_once(access_value)
             finally:
                 self._attr_is_unlocking = False
                 self.async_write_ha_state()

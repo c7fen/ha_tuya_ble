@@ -27,8 +27,9 @@ Each of the four commands was caused by exactly one app tap and produced exactly
 one motor action. Both Access values had the same non-reversible fingerprint and
 the same two-field semantic shape. Both Secure values had the same Boolean
 meaning already implemented by the DP46 button. The session sequence number and
-AES-CBC IV changed normally between commands, so captured ciphertext is neither
-reused nor replayable.
+AES-CBC IV changed normally between commands. The implementation must construct
+fresh framing and never reuse captured ciphertext. Receiver-side replay
+rejection remains unproven.
 
 Every captured message was reassembled from the write characteristic, decrypted
 privately through the integration's existing per-device Tuya BLE login/session
@@ -51,6 +52,12 @@ remote-open key, or device-specific payload field participated in Access.
 - **Lock / secure:** issue exactly one protocol-v3 DP46 Boolean `true` update.
 - **Unlock / access:** issue exactly one protocol-v3 DP6 Raw update built from
   the observed two enabled fields.
+- **Confirmation:** require the correlated one-byte zero-status response. A
+  timeout, malformed response, nonzero status, expected disconnect, or protocol
+  version other than v3 fails the service call.
+- **At-most-once transport:** never automatically replay a V1 command after an
+  ambiguous BLE transport error. Home Assistant reports the error and the
+  operator must inspect the reported physical state before choosing to retry.
 - **State:** read DP47 only. `false` means physically secure/uncoupled and
   `true` means physically access-enabled/coupled. Missing, non-Boolean, or
   wrongly typed values remain unknown.
@@ -63,7 +70,9 @@ The DP6 value is constructed semantically for each request and passed through
 the ordinary Tuya BLE packet builder. It is not stored as captured ciphertext.
 The builder supplies a fresh sequence number and IV under the current
 device-scoped session key. No new Store, product-wide secret, embedded device
-material, or cloud request is required.
+material, or cloud request is required. Fresh local framing prevents captured
+ciphertext reuse by this integration; it is not evidence that the receiver
+rejects a replay performed elsewhere.
 
 The two individual DP6 field names remain undocumented. This uncertainty does
 not create an alternative wire length or value: both complete cycles used the
