@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import Callable
+import os
+import stat
 import time
+from collections.abc import Callable
 from typing import Any, NoReturn
 
 from homeassistant.components.lock import (
@@ -17,7 +19,7 @@ from homeassistant.components.lock import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import storage
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -46,6 +48,34 @@ S1_STORE_VERSION = 1
 S1_STORE_KEY = f"{DOMAIN}_jtmspro_lock_templates"
 S1_RUNTIME_STORE_KEY = "__s1_lock_template_store_v1"
 S1_UNLOCK_ERROR_TRANSLATION_KEY = "s1_unlock_templates_unavailable"
+
+
+def _harden_s1_store_permissions(path: str) -> None:
+    """Restrict an existing regular S1 template Store file to its owner."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        raise HomeAssistantError(
+            "Secure S1 template storage permissions are invalid."
+        ) from err
+
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise HomeAssistantError(
+                "Secure S1 template storage path is not a regular file."
+            )
+        if stat.S_IMODE(file_stat.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+    except OSError as err:
+        raise HomeAssistantError(
+            "Secure S1 template storage permissions could not be applied."
+        ) from err
+    finally:
+        os.close(descriptor)
 
 
 def _strict_decode_template(value: object, minimum_length: int) -> bytes | None:
@@ -88,7 +118,16 @@ class TuyaBLES1TemplateStore:
     @classmethod
     async def async_load(cls, hass: HomeAssistant) -> TuyaBLES1TemplateStore:
         """Load the legacy-compatible device-scoped template store."""
-        backing_store = storage.Store(hass, S1_STORE_VERSION, S1_STORE_KEY)
+        backing_store = storage.Store(
+            hass,
+            S1_STORE_VERSION,
+            S1_STORE_KEY,
+            private=True,
+            atomic_writes=True,
+        )
+        await hass.async_add_executor_job(
+            _harden_s1_store_permissions, backing_store.path
+        )
         return cls(hass, backing_store, await backing_store.async_load())
 
     def templates_for(self, device_id: str) -> tuple[bytes, bytes] | None:
