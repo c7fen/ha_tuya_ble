@@ -6,13 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0b3](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b3) (2026-08-06)
+
+This beta supersedes `v0.9.0b1` and `v0.9.0b2` for installation. Those
+releases used a deterministic, address-derived, twelve-hex log pseudonym.
+Although it was not the literal BLE address, it was stable, linkable, and
+address-shaped, and therefore violated the downstream privacy policy.
 
 ### Security
 
-- Replaces the deterministic, address-derived, twelve-hex log identity used by
-  `v0.9.0b1` and `v0.9.0b2` with a process-local opaque device label that is not
-  persistent or linkable across Home Assistant process restarts.
+- Replaces the persistent address-derived log pseudonym with a process-local
+  opaque device label. The label is not derived from a persistent identifier,
+  is not stored, and changes with a new Home Assistant process, preventing
+  correlation through that label across restarts.
 - Sanitizes transport exception paths so device identifiers and credentials do
   not re-enter Tuya BLE logs through exception text.
 
@@ -23,6 +29,13 @@ and this project adheres to
   templates.
 - Reconciles release policy around canonical `v`-prefixed, manually gated tags
   and disables stale Release Please automation before the stable cutover.
+
+### Compatibility
+
+- Does not change V1, S1, generic-device, BLE-command, entity, Home Assistant
+  Store, or registry behavior.
+- Includes the current smart-lock, upgrade, security, release, and
+  logging/privacy guidance.
 
 ## [0.9.0b2](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b2) (2026-08-05)
 
