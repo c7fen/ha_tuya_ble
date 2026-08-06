@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0) (2026-08-06)
+
+This is the first stable release of the maintained downstream 0.9 line. It
+supersedes `v0.9.0b1`, `v0.9.0b2`, and `v0.9.0b3` for installation while
+retaining the complete unaffected upstream Tuya BLE product set.
+
+### Added
+
+- Adds product-specific S1-TY-BLE-PRO support with local Lock and Unlock,
+  same-device DP70/DP71 template capture, fail-closed validation, and a private,
+  atomic, mode-`0600` Home Assistant Store without a product-wide fallback.
+- Adds product-specific V1 / Lock P1 bidirectional coupling control: Lock sends
+  exactly one DP46 Boolean `true` secure/uncouple action and Unlock builds the
+  observed two-field DP6 access/couple action for each request. Open remains
+  unsupported.
+- Adds current smart-lock, upgrade, contribution, security, release, and
+  logging/privacy documentation for Home Assistant 2026.5 and later.
+
+### Changed
+
+- Presents V1 control as a Lock entity instead of the obsolete one-way button,
+  preserving its registry identity and valid user customization.
+- Represents S1 Motor State as a read-only binary sensor instead of a writable
+  switch, with an ownership-safe, collision-safe, idempotent registry migration.
+- Keeps DP33 exclusively as Auto-Lock configuration and DP47 exclusively as a
+  read-only physical-state source for the supported V1 and S1 products.
+- Uses the maintained `c7fen/ha_tuya_ble` repository, HACS, documentation,
+  issue-tracker, badge, and clone targets while retaining upstream attribution
+  and maintainers.
+
+### Security
+
+- Removes embedded complete unlock payloads and cross-device S1 template
+  fallback material. S1 Unlock requires complete canonical templates captured
+  from the same device.
+- Replaces the beta releases' deterministic, address-derived, twelve-hex log
+  pseudonym with a non-persisted process-local opaque label that changes with a
+  new Home Assistant process.
+- Sanitizes transport exception paths and keeps device identifiers,
+  credentials, datapoint values, templates, packet bytes, and lock payloads out
+  of Tuya BLE logs.
+
+### Compatibility and validation
+
+- Preserves `v0.1.11b2` config entries, credentials, device ownership, S1 Store
+  records, entity associations, and user customizations through the documented
+  migrations.
+- The exact `v0.9.0b3` Python runtime passed the complete Home Assistant
+  validation matrix, supported HACS installation, two restart-window privacy
+  gates, owner-operated V1 Lock/Unlock hardware testing, and one representative
+  S1 Lock/Unlock hardware smoke cycle. Each tested command produced exactly one
+  expected physical action.
+- Stable release preparation changes only manifest, changelog, and release-test
+  metadata. Every integration Python runtime file is byte-identical to
+  `v0.9.0b3`; no further hardware test is required for this metadata-only
+  promotion.
+
 ## [0.9.0b3](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b3) (2026-08-06)
 
 This beta supersedes `v0.9.0b1` and `v0.9.0b2` for installation. Those
