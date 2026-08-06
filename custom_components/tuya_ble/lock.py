@@ -1,303 +1,270 @@
-"""The Tuya BLE integration."""
+"""Tuya BLE lock entities."""
+
 from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
+import binascii
+import os
+import stat
 import time
-from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Callable
+from typing import Any, NoReturn
 
-from homeassistant.components.lock import LockEntity, LockEntityDescription
+from homeassistant.components.lock import (
+    LockEntity,
+    LockEntityDescription,
+    LockEntityFeature,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import storage
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, DPCode
 from .devices import (
+    TuyaBLECoordinator,
     TuyaBLEData,
     TuyaBLEEntity,
-    TuyaBLEPassiveCoordinator,
     TuyaBLEProductInfo,
+    get_device_product_info,
 )
-from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
+from .tuya_ble import TuyaBLEDataPoint, TuyaBLEDataPointType, TuyaBLEDevice
 
-FALLBACK_DP70_B64 = "AAH//wAAAAAAAAAAAP//AA=="
-FALLBACK_DP71_B64 = "AAH//zgzNjcxNDYyAWnRJAkAAA=="
+S1_CATEGORY = "jtmspro"
+S1_PRODUCT_ID = "xqeob8h6"
+S1_DP_LOCK = 46
+S1_DP_MOTOR_STATE = 47
+S1_DP_UNLOCK_REQUEST = 70
+S1_DP_UNLOCK_CONFIRM = 71
+S1_DP70_MIN_LENGTH = 1
+S1_DP71_MIN_LENGTH = 19
+S1_DP71_TIMESTAMP = slice(13, 17)
+S1_UNLOCK_DELAY = 0.8
 
-DP71_TIME_OFFSET_SECONDS = 0
+V1_CATEGORY = "ms"
+V1_PRODUCT_ID = "7a4xvbtt"
+V1_DP_ACCESS = 6
+V1_DP_LOCK = 46
+V1_DP_MOTOR_STATE = 47
+V1_ACCESS_FIELD_COUNT = 2
+V1_COMMAND_ERROR_TRANSLATION_KEY = "v1_command_unavailable"
 
-CACHE_KEY = "jtmspro_lock_templates"
-STORE_KEY = "jtmspro_lock_templates_store"
-STORE_VERSION = 1
-STORE_FILENAME = f"{DOMAIN}_jtmspro_lock_templates"
-
-TuyaBLELockIsAvailable = Callable[["TuyaBLELock", TuyaBLEProductInfo], bool] | None
-
-
-@dataclass
-class TuyaBLELockMapping:
-    description: LockEntityDescription
-    force_add: bool = True
-    is_available: TuyaBLELockIsAvailable = None
-
-
-@dataclass
-class TuyaBLECategoryLockMapping:
-    products: dict[str, list[TuyaBLELockMapping]] | None = None
-    mapping: list[TuyaBLELockMapping] | None = None
-
-
-mapping: dict[str, TuyaBLECategoryLockMapping] = {
-    "jtmspro": TuyaBLECategoryLockMapping(
-        products={
-            "xqeob8h6": [
-                TuyaBLELockMapping(
-                    description=LockEntityDescription(
-                        key="ble_unlock_lock",
-                        name="S1-TY-BLE-PRO Lock",
-                        icon="mdi:lock-smart",
-                    ),
-                    force_add=True,
-                ),
-            ],
-        },
-    ),
-}
+S1_STORE_VERSION = 1
+S1_STORE_KEY = f"{DOMAIN}_jtmspro_lock_templates"
+S1_RUNTIME_STORE_KEY = "__s1_lock_template_store_v1"
+S1_UNLOCK_ERROR_TRANSLATION_KEY = "s1_unlock_templates_unavailable"
 
 
-def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLELockMapping]:
-    category = mapping.get(device.category)
-    if category is not None and category.products is not None:
-        product_mapping = category.products.get(device.product_id)
-        if product_mapping is not None:
-            return product_mapping
-        if category.mapping is not None:
-            return category.mapping
-    return []
+def _harden_s1_store_permissions(path: str) -> None:
+    """Restrict an existing regular S1 template Store file to its owner."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        raise HomeAssistantError(
+            "Secure S1 template storage permissions are invalid."
+        ) from err
+
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise HomeAssistantError(
+                "Secure S1 template storage path is not a regular file."
+            )
+        if stat.S_IMODE(file_stat.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+    except OSError as err:
+        raise HomeAssistantError(
+            "Secure S1 template storage permissions could not be applied."
+        ) from err
+    finally:
+        os.close(descriptor)
 
 
-class TuyaBLELock(TuyaBLEEntity, LockEntity):
-    """Representation of a Tuya BLE Lock."""
+def _strict_decode_template(value: object, minimum_length: int) -> bytes | None:
+    """Decode one canonical, strictly validated base64 template."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) < minimum_length:
+        return None
+    if base64.b64encode(decoded).decode("ascii") != value:
+        return None
+    return decoded
 
-    _attr_should_poll = False
+
+def _raise_s1_unlock_validation_error() -> NoReturn:
+    """Raise the translated, payload-free S1 unlock validation error."""
+    raise ServiceValidationError(
+        "Secure unlock templates are unavailable or invalid.",
+        translation_domain=DOMAIN,
+        translation_key=S1_UNLOCK_ERROR_TRANSLATION_KEY,
+    )
+
+
+def _raise_v1_command_validation_error() -> NoReturn:
+    """Raise the translated, payload-free V1 command validation error."""
+    raise ServiceValidationError(
+        "The V1 command datapoints are unavailable or invalid.",
+        translation_domain=DOMAIN,
+        translation_key=V1_COMMAND_ERROR_TRANSLATION_KEY,
+    )
+
+
+def _build_v1_access_value() -> bytes:
+    """Build the observed two-field V1 access action without replaying a frame."""
+    return bytes([int(True)] * V1_ACCESS_FIELD_COUNT)
+
+
+class TuyaBLES1TemplateStore:
+    """Device-scoped version 1 store for S1 live unlock templates."""
 
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: TuyaBLEPassiveCoordinator,
-        device: TuyaBLEDevice,
-        product: TuyaBLEProductInfo,
-        mapping: TuyaBLELockMapping,
+        backing_store: storage.Store,
+        data: object,
     ) -> None:
-        super().__init__(hass, coordinator, device, product, mapping.description)
-        self._mapping = mapping
-        self._attr_is_unlocking = False
-        self._attr_is_locking = False
+        self._hass = hass
+        self._backing_store = backing_store
+        self._data: dict[str, object] = data if isinstance(data, dict) else {}
 
-        domain_data = hass.data.setdefault(DOMAIN, {})
-        self._cache: dict = domain_data.setdefault(CACHE_KEY, {})
-        self._store: storage.Store = domain_data[STORE_KEY]
-        self._device_cache: dict = self._cache.setdefault(self._device.device_id, {})
-
-        self._save_task: asyncio.Task | None = None
-
-        self._capture_live_templates()
-        self._unsub_callback = self._device.register_callback(self._handle_device_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        if hasattr(self, "_unsub_callback") and self._unsub_callback:
-            self._unsub_callback()
-        if self._save_task and not self._save_task.done():
-            self._save_task.cancel()
-
-    def _schedule_persist_cache(self) -> None:
-        if self._save_task and not self._save_task.done():
-            self._save_task.cancel()
-        self._save_task = self.hass.async_create_task(self._async_persist_cache())
-
-    async def _async_persist_cache(self) -> None:
-        await asyncio.sleep(0)
-        await self._store.async_save(self._cache)
-
-    def _cache_set_b64(self, key: str, raw_value: bytes) -> bool:
-        new_b64 = base64.b64encode(raw_value).decode()
-        old_b64 = self._device_cache.get(key)
-        if old_b64 != new_b64:
-            self._device_cache[key] = new_b64
-            return True
-        return False
-
-    def _cache_get_bytes(self, key: str) -> bytes | None:
-        value = self._device_cache.get(key)
-        if isinstance(value, str) and value:
-            try:
-                return base64.b64decode(value)
-            except Exception:
-                return None
-        return None
-
-    def _handle_device_update(self, datapoints) -> None:
-        self._capture_live_templates()
-
-    def _capture_live_templates(self) -> None:
-        changed = False
-
-        dp70 = self._device.datapoints[70]
-        if dp70 is not None and isinstance(dp70.value, (bytes, bytearray)):
-            raw70 = bytes(dp70.value)
-            if self._cache_set_b64("dp70_b64", raw70):
-                changed = True
-
-        dp71 = self._device.datapoints[71]
-        if dp71 is not None and isinstance(dp71.value, (bytes, bytearray)):
-            raw71 = bytes(dp71.value)
-            if self._cache_set_b64("dp71_b64", raw71):
-                changed = True
-
-        if changed:
-            self._schedule_persist_cache()
-
-    def _fallback_dp70_bytes(self) -> bytes:
-        return base64.b64decode(FALLBACK_DP70_B64)
-
-    def _fallback_dp71_bytes(self) -> bytes:
-        return base64.b64decode(FALLBACK_DP71_B64)
-
-    def _get_dp70_bytes(self) -> bytes:
-        cached = self._cache_get_bytes("dp70_b64")
-        if cached is not None:
-            return cached
-
-        live = self._device.datapoints[70]
-        if live is not None and isinstance(live.value, (bytes, bytearray)):
-            raw = bytes(live.value)
-            self._cache_set_b64("dp70_b64", raw)
-            self._schedule_persist_cache()
-            return raw
-
-        return self._fallback_dp70_bytes()
-
-    def _get_dp71_template_bytes(self) -> bytes:
-        cached = self._cache_get_bytes("dp71_b64")
-        if cached is not None:
-            return cached
-
-        live = self._device.datapoints[71]
-        if live is not None and isinstance(live.value, (bytes, bytearray)):
-            raw = bytes(live.value)
-            self._cache_set_b64("dp71_b64", raw)
-            self._schedule_persist_cache()
-            return raw
-
-        return self._fallback_dp71_bytes()
-
-    def _build_dp71_payload(self) -> bytes:
-        template = self._get_dp71_template_bytes()
-
-        if len(template) >= 19:
-            prefix = template[0:4]
-            identifier = template[4:12]
-            marker = template[12:13]
-            suffix = template[17:]
-
-            timestamp = int(time.time()) + DP71_TIME_OFFSET_SECONDS
-            timestamp_bytes = timestamp.to_bytes(4, "big", signed=False)
-
-            return prefix + identifier + marker + timestamp_bytes + suffix
-
-        fallback = self._fallback_dp71_bytes()
-        prefix = fallback[0:4]
-        identifier = fallback[4:12]
-        marker = fallback[12:13]
-        suffix = fallback[17:]
-
-        timestamp = int(time.time()) + DP71_TIME_OFFSET_SECONDS
-        timestamp_bytes = timestamp.to_bytes(4, "big", signed=False)
-
-        return prefix + identifier + marker + timestamp_bytes + suffix
-
-    async def _send_raw_dp_bytes(self, dp_id: int, raw_value: bytes) -> None:
-        datapoint = self._device.datapoints.get_or_create(
-            dp_id,
-            TuyaBLEDataPointType.DT_RAW,
-            raw_value,
+    @classmethod
+    async def async_load(cls, hass: HomeAssistant) -> TuyaBLES1TemplateStore:
+        """Load the legacy-compatible device-scoped template store."""
+        backing_store = storage.Store(
+            hass,
+            S1_STORE_VERSION,
+            S1_STORE_KEY,
+            private=True,
+            atomic_writes=True,
         )
-
-        if not datapoint:
-            return
-
-        result = datapoint.set_value(raw_value)
-        if inspect.isawaitable(result):
-            await result
-
-    async def _send_bool_dp(self, dp_id: int, value: bool) -> None:
-        datapoint = self._device.datapoints.get_or_create(
-            dp_id,
-            TuyaBLEDataPointType.DT_BOOL,
-            value,
+        await hass.async_add_executor_job(
+            _harden_s1_store_permissions, backing_store.path
         )
+        return cls(hass, backing_store, await backing_store.async_load())
 
-        if not datapoint:
-            return
+    def templates_for(self, device_id: str) -> tuple[bytes, bytes] | None:
+        """Return one device's complete valid template pair, if available."""
+        if not device_id:
+            return None
+        device_data = self._data.get(device_id)
+        if not isinstance(device_data, dict):
+            return None
+        expected_metadata = {
+            "category": S1_CATEGORY,
+            "product_id": S1_PRODUCT_ID,
+            "format_version": S1_STORE_VERSION,
+        }
+        if any(
+            key in device_data and device_data[key] != expected
+            for key, expected in expected_metadata.items()
+        ):
+            return None
 
-        result = datapoint.set_value(value)
-        if inspect.isawaitable(result):
-            await result
+        dp70 = _strict_decode_template(device_data.get("dp70_b64"), S1_DP70_MIN_LENGTH)
+        dp71 = _strict_decode_template(device_data.get("dp71_b64"), S1_DP71_MIN_LENGTH)
+        if dp70 is None or dp71 is None:
+            return None
+        return dp70, dp71
 
-    async def _unlock_sequence(self) -> None:
-        self._attr_is_unlocking = True
-        self.async_write_ha_state()
-        try:
-            dp70_payload = self._get_dp70_bytes()
-            await self._send_raw_dp_bytes(70, dp70_payload)
-
-            await asyncio.sleep(0.8)
-
-            dp71_payload = self._build_dp71_payload()
-            await self._send_raw_dp_bytes(71, dp71_payload)
-        finally:
-            self._attr_is_unlocking = False
-            self.async_write_ha_state()
-
-    async def _lock_sequence(self) -> None:
-        self._attr_is_locking = True
-        self.async_write_ha_state()
-        try:
-            await self._send_bool_dp(46, True)
-        finally:
-            self._attr_is_locking = False
-            self.async_write_ha_state()
-
-    async def async_unlock(self, **kwargs) -> None:
-        await self._unlock_sequence()
-
-    async def async_lock(self, **kwargs) -> None:
-        await self._lock_sequence()
-
-    @property
-    def is_locked(self) -> bool | None:
-        datapoint = self._device.datapoints[47]
-        if datapoint is not None and isinstance(datapoint.value, bool):
-            return not bool(datapoint.value)
-        return None
-
-    @property
-    def is_locking(self) -> bool | None:
-        return self._attr_is_locking
-
-    @property
-    def is_unlocking(self) -> bool | None:
-        return self._attr_is_unlocking
-
-    @property
-    def available(self) -> bool:
-        if self._device is None:
+    def capture_inbound(
+        self, device_id: str, datapoints: list[TuyaBLEDataPoint]
+    ) -> bool:
+        """Capture valid raw templates proven to come from this device."""
+        if not device_id:
             return False
-        if self._mapping.is_available is not None:
-            return self._mapping.is_available(self, self._product)
+
+        captured: dict[str, str] = {}
+        for datapoint in datapoints:
+            if (
+                not datapoint.received_from_device
+                or datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                or not isinstance(datapoint.value, (bytes, bytearray))
+            ):
+                continue
+            raw_value = bytes(datapoint.value)
+            if (
+                datapoint.id == S1_DP_UNLOCK_REQUEST
+                and len(raw_value) >= S1_DP70_MIN_LENGTH
+            ):
+                captured["dp70_b64"] = base64.b64encode(raw_value).decode("ascii")
+            elif (
+                datapoint.id == S1_DP_UNLOCK_CONFIRM
+                and len(raw_value) >= S1_DP71_MIN_LENGTH
+            ):
+                captured["dp71_b64"] = base64.b64encode(raw_value).decode("ascii")
+
+        if not captured:
+            return False
+
+        previous = self._data.get(device_id)
+        device_data = dict(previous) if isinstance(previous, dict) else {}
+        expected_metadata = {
+            "category": S1_CATEGORY,
+            "product_id": S1_PRODUCT_ID,
+            "format_version": S1_STORE_VERSION,
+        }
+        if any(
+            key in device_data and device_data[key] != expected
+            for key, expected in expected_metadata.items()
+        ):
+            return False
+        changed = False
+        for key, expected in expected_metadata.items():
+            if device_data.get(key) != expected:
+                device_data[key] = expected
+                changed = True
+        for key, encoded in captured.items():
+            if device_data.get(key) != encoded:
+                device_data[key] = encoded
+                changed = True
+        if not changed:
+            return False
+
+        self._data[device_id] = device_data
+        self._backing_store.async_delay_save(self._snapshot, 0)
         return True
+
+    def _snapshot(self) -> dict[str, object]:
+        """Return a shallow-isolated JSON-compatible storage snapshot."""
+        return {
+            device_id: (
+                dict(device_data) if isinstance(device_data, dict) else device_data
+            )
+            for device_id, device_data in self._data.items()
+        }
+
+
+async def _async_get_s1_template_store(
+    hass: HomeAssistant,
+) -> TuyaBLES1TemplateStore:
+    """Return the singleton S1 template store for this Home Assistant instance."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    template_store = domain_data.get(S1_RUNTIME_STORE_KEY)
+    if isinstance(template_store, TuyaBLES1TemplateStore):
+        return template_store
+    if isinstance(template_store, asyncio.Future):
+        return await template_store
+
+    load_task = hass.async_create_task(TuyaBLES1TemplateStore.async_load(hass))
+    domain_data[S1_RUNTIME_STORE_KEY] = load_task
+    try:
+        template_store = await load_task
+    except Exception:
+        if domain_data.get(S1_RUNTIME_STORE_KEY) is load_task:
+            domain_data.pop(S1_RUNTIME_STORE_KEY)
+        raise
+    domain_data[S1_RUNTIME_STORE_KEY] = template_store
+    return template_store
 
 
 async def async_setup_entry(
@@ -305,29 +272,330 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Tuya BLE lock entities."""
-    domain_data = hass.data.setdefault(DOMAIN, {})
-
-    if STORE_KEY not in domain_data:
-        store = storage.Store(hass, STORE_VERSION, STORE_FILENAME)
-        saved = await store.async_load()
-        domain_data[STORE_KEY] = store
-        domain_data[CACHE_KEY] = saved if isinstance(saved, dict) else {}
-
+    """Set up the Tuya BLE locks."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
-    mappings = get_mapping_by_device(data.device)
-
-    entities: list[TuyaBLELock] = []
-    for mapping_item in mappings:
-        if mapping_item.force_add:
-            entities.append(
-                TuyaBLELock(
+    product = get_device_product_info(data.device)
+    if data.device.category == V1_CATEGORY and data.device.product_id == V1_PRODUCT_ID:
+        async_add_entities(
+            [
+                TuyaBLEV1Lock(
                     hass,
                     data.coordinator,
                     data.device,
-                    data.product,
-                    mapping_item,
+                    product or data.product,
                 )
+            ]
+        )
+    elif (
+        data.device.category == S1_CATEGORY and data.device.product_id == S1_PRODUCT_ID
+    ):
+        template_store = await _async_get_s1_template_store(hass)
+        async_add_entities(
+            [
+                TuyaBLES1Lock(
+                    hass,
+                    data.coordinator,
+                    data.device,
+                    product or data.product,
+                    template_store,
+                )
+            ]
+        )
+    elif product and product.lock:
+        async_add_entities([TuyaBLELock(hass, data.coordinator, data.device, product)])
+
+
+class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
+    """Product-specific bidirectional V1 coupling control."""
+
+    platform = Platform.LOCK
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            LockEntityDescription(
+                key="manual_lock",
+                translation_key="lock",
+                icon="mdi:lock",
+            ),
+        )
+        self._attr_supported_features = LockEntityFeature(0)
+        self._attr_is_locking = False
+        self._attr_is_unlocking = False
+        self._operation_lock = asyncio.Lock()
+
+    @property
+    def is_locked(self) -> bool | None:
+        """Return the physical secure state reported by read-only DP47."""
+        motor_state = self._device.datapoints[V1_DP_MOTOR_STATE]
+        if (
+            motor_state is None
+            or motor_state.type is not TuyaBLEDataPointType.DT_BOOL
+            or not isinstance(motor_state.value, bool)
+        ):
+            return None
+        return not motor_state.value
+
+    async def async_lock(self, **kwargs: Any) -> None:
+        """Secure by issuing exactly one DP46 true command."""
+        async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
+            datapoint = self._device.datapoints[V1_DP_LOCK]
+            if datapoint is not None and (
+                datapoint.type is not TuyaBLEDataPointType.DT_BOOL
+                or not isinstance(datapoint.value, bool)
+            ):
+                _raise_v1_command_validation_error()
+            manual_lock = self._device.datapoints.get_or_create(
+                V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
             )
 
-    async_add_entities(entities)
+            self._attr_is_locking = True
+            self.async_write_ha_state()
+            try:
+                await manual_lock.set_value_once(True)
+            finally:
+                self._attr_is_locking = False
+                self.async_write_ha_state()
+
+    async def async_unlock(self, **kwargs: Any) -> None:
+        """Enable access using one observed product-specific DP6 action."""
+        async with self._operation_lock:
+            if self._device.protocol_major_version != 3:
+                _raise_v1_command_validation_error()
+            datapoint = self._device.datapoints[V1_DP_ACCESS]
+            if datapoint is not None and (
+                datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                or not isinstance(datapoint.value, bytes | bytearray)
+            ):
+                _raise_v1_command_validation_error()
+            access_value = _build_v1_access_value()
+            access = self._device.datapoints.get_or_create(
+                V1_DP_ACCESS, TuyaBLEDataPointType.DT_RAW, access_value
+            )
+
+            self._attr_is_unlocking = True
+            self.async_write_ha_state()
+            try:
+                await access.set_value_once(access_value)
+            finally:
+                self._attr_is_unlocking = False
+                self.async_write_ha_state()
+
+
+class TuyaBLELock(TuyaBLEEntity, LockEntity):
+    """Generic upstream Tuya BLE lock."""
+
+    platform = Platform.LOCK
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            LockEntityDescription(key="lock", name=product.name),
+        )
+        self._attr_supported_features = LockEntityFeature.OPEN
+
+    @property
+    def is_locked(self) -> bool | None:
+        """Return true if lock is locked."""
+        dpid = self.find_dpid(DPCode.LOCK_MOTOR_STATE)
+        if dpid is None:
+            dpid = DPCode.LOCK_MOTOR_STATE
+        if motor_state := self._device.datapoints.get_or_create(
+            dpid, TuyaBLEDataPointType.DT_BOOL, False
+        ):
+            return not motor_state.value
+        return None
+
+    async def async_lock(self, **kwargs: Any) -> None:
+        """Lock the lock."""
+        manual_lock_id = self.find_dpid(DPCode.MANUAL_LOCK)
+        if manual_lock_id is not None:
+            if manual_lock := self._device.datapoints.get_or_create(
+                manual_lock_id, TuyaBLEDataPointType.DT_BOOL, True
+            ):
+                await manual_lock.set_value(True)
+        elif self.find_dpid(DPCode.LOCK_MOTOR_STATE) is not None:
+            if motor_state := self._device.datapoints.get_or_create(
+                self.find_dpid(DPCode.LOCK_MOTOR_STATE),
+                TuyaBLEDataPointType.DT_BOOL,
+                False,
+            ):
+                await motor_state.set_value(False)
+        elif self._device.product_id == "wgv4haro":
+            # Guard Dog Security Smart Lock locks automatically, locking command is no-op
+            # NOTE: Other momentary locks in category ms/jtmspro (like okkyfgfs, k53ok3u9,
+            # sidhzylo, a6nttc41, stugc8dl, xicdxood, rlyxv7pe, oyqux5vv, hs21i377, kholoaew)
+            # may also need updating in the future.
+            return
+        else:
+            if manual_lock := self._device.datapoints.get_or_create(
+                DPCode.MANUAL_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+            ):
+                await manual_lock.set_value(True)
+
+    async def async_unlock(self, **kwargs: Any) -> None:
+        """Unlock the lock."""
+        manual_lock_id = self.find_dpid(DPCode.MANUAL_LOCK)
+        if manual_lock_id is not None:
+            if manual_lock := self._device.datapoints.get_or_create(
+                manual_lock_id, TuyaBLEDataPointType.DT_BOOL, False
+            ):
+                await manual_lock.set_value(False)
+        elif self.find_dpid(DPCode.LOCK_MOTOR_STATE) is not None:
+            if motor_state := self._device.datapoints.get_or_create(
+                self.find_dpid(DPCode.LOCK_MOTOR_STATE),
+                TuyaBLEDataPointType.DT_BOOL,
+                True,
+            ):
+                await motor_state.set_value(True)
+        elif self._device.product_id == "wgv4haro":
+            # Guard Dog Security Smart Lock uses DP 6 for bluetooth unlock
+            # NOTE: Other momentary locks (e.g. okkyfgfs, k53ok3u9, sidhzylo, a6nttc41 on DP 6;
+            # or stugc8dl, xicdxood, rlyxv7pe, oyqux5vv, hs21i377, kholoaew on DP 71)
+            # may also need updating in the future.
+            if bluetooth_unlock := self._device.datapoints.get_or_create(
+                6, TuyaBLEDataPointType.DT_BOOL, False
+            ):
+                await bluetooth_unlock.set_value(True)
+        else:
+            if manual_lock := self._device.datapoints.get_or_create(
+                DPCode.MANUAL_LOCK, TuyaBLEDataPointType.DT_BOOL, False
+            ):
+                await manual_lock.set_value(False)
+
+    async def async_open(self, **kwargs: Any) -> None:
+        """Open the lock."""
+        await self.async_unlock(**kwargs)
+
+
+class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
+    """S1 lock using device-specific, live-captured unlock templates."""
+
+    platform = Platform.LOCK
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+        template_store: TuyaBLES1TemplateStore,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            LockEntityDescription(
+                key="ble_unlock_lock",
+                translation_key="lock",
+                icon="mdi:lock",
+            ),
+        )
+        self._attr_supported_features = LockEntityFeature(0)
+        self._attr_is_locking = False
+        self._attr_is_unlocking = False
+        self._template_store = template_store
+        self._unlock_lock = asyncio.Lock()
+        current_templates = [
+            datapoint
+            for dp_id in (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM)
+            if (datapoint := device.datapoints[dp_id]) is not None
+        ]
+        self._capture_inbound_templates(current_templates)
+        self._unsub_template_callback: Callable[[], None] | None = (
+            device.register_callback(self._capture_inbound_templates)
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop capturing templates when the entity is removed."""
+        if self._unsub_template_callback is not None:
+            self._unsub_template_callback()
+            self._unsub_template_callback = None
+        await super().async_will_remove_from_hass()
+
+    def _capture_inbound_templates(self, datapoints: list[TuyaBLEDataPoint]) -> None:
+        self._template_store.capture_inbound(self._device.device_id, datapoints)
+
+    @property
+    def is_locked(self) -> bool | None:
+        """Return true if the S1 motor is in its locked state."""
+        motor_state = self._device.datapoints[S1_DP_MOTOR_STATE]
+        if motor_state is not None and isinstance(motor_state.value, bool):
+            return not motor_state.value
+        return None
+
+    async def async_lock(self, **kwargs: Any) -> None:
+        """Lock by issuing the S1's one-way manual-lock command."""
+        self._attr_is_locking = True
+        self.async_write_ha_state()
+        try:
+            manual_lock = self._device.datapoints.get_or_create(
+                S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+            )
+            await manual_lock.set_value(True)
+        finally:
+            self._attr_is_locking = False
+            self.async_write_ha_state()
+
+    async def async_unlock(self, **kwargs: Any) -> None:
+        """Unlock using one validated, serialized S1 DP70/DP71 sequence."""
+        async with self._unlock_lock:
+            templates = self._template_store.templates_for(self._device.device_id)
+            if templates is None:
+                _raise_s1_unlock_validation_error()
+            for dp_id in (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM):
+                datapoint = self._device.datapoints[dp_id]
+                if (
+                    datapoint is not None
+                    and datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                ):
+                    _raise_s1_unlock_validation_error()
+            dp70_payload, dp71_template = templates
+            dp71_payload = bytearray(dp71_template)
+            timestamp = int(time.time()).to_bytes(4, "big", signed=False)
+            dp71_payload[S1_DP71_TIMESTAMP] = timestamp
+
+            self._attr_is_unlocking = True
+            self.async_write_ha_state()
+            try:
+                dp70 = self._device.datapoints.get_or_create(
+                    S1_DP_UNLOCK_REQUEST,
+                    TuyaBLEDataPointType.DT_RAW,
+                    dp70_payload,
+                )
+                await dp70.set_value(dp70_payload)
+
+                await asyncio.sleep(S1_UNLOCK_DELAY)
+
+                dp71 = self._device.datapoints.get_or_create(
+                    S1_DP_UNLOCK_CONFIRM,
+                    TuyaBLEDataPointType.DT_RAW,
+                    bytes(dp71_payload),
+                )
+                await dp71.set_value(bytes(dp71_payload))
+            finally:
+                self._attr_is_unlocking = False
+                self.async_write_ha_state()

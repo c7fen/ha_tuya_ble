@@ -20,40 +20,104 @@
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "Tuya BLE SecKey (optional)",
                     "country_code": "Country",
                     "password": "Password",
                     "username": "Account"
                 },
-                "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+                "description": "Tuya BLE requires obtaining encryption key from Tuya cloud. Almost all devices only need to access the cloud once during setup.\n\nRefer to documentation of Tuya integration to retrieve the cloud credentials {url}\n\nEnter your Tuya credentials."
             }
+        }
+    },
+    "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Local unlock is not initialized for this device. A device-specific template must first be received."
+        },
+        "v1_command_unavailable": {
+            "message": "The V1 command datapoints are unavailable or invalid."
         }
     },
     "entity": {
         "binary_sensor": {
+            "fault": {
+                "name": "Fault"
+            },
+            "lack_water": {
+                "name": "Lack of water"
+            },
             "low_battery": {
                 "name": "Battery"
+            },
+            "lock_motor_state": {
+                "name": "Motor State"
+            },
+            "low_temp": {
+                "name": "Low temperature"
+            },
+            "motor_fault": {
+                "name": "Motor fault"
+            },
+            "sensor_fault": {
+                "name": "Sensor fault"
             }
         },
         "button": {
             "push": {
                 "name": "Push"
+            },
+            "lock": {
+                "name": "Lock"
+            },
+            "ble_unlock_check": {
+                "name": "Unlock"
+            },
+            "bluetooth_unlock": {
+                "name": "Unlock"
+            }
+        },
+        "event": {
+            "event": {
+                "name": "Event"
+            }
+        },
+        "lock": {
+            "lock": {
+                "name": "Lock"
             }
         },
         "number": {
+            "auto_lock_time": {
+                "name": "Auto-Lock Delay"
+            },
+            "ble_unlock_check": {
+                "name": "Unlock"
+            },
             "brightness": {
                 "name": "Brightness"
             },
             "carbon_dioxide_alarm_level": {
                 "name": "Alarm level"
             },
+            "countdown": {
+                "name": "Countdown"
+            },
             "countdown_duration": {
                 "name": "Irrigation duration"
+            },
+            "countdown_duration_z1": {
+                "name": "Irrigation duration - Zone 1"
+            },
+            "countdown_duration_z2": {
+                "name": "Irrigation duration - Zone 2"
             },
             "down_position": {
                 "name": "Down position"
             },
             "hold_time": {
                 "name": "Hold time"
+            },
+            "humidity_calibration": {
+                "name": "Humidity calibration"
             },
             "program_idle_position": {
                 "name": "Idle position"
@@ -67,6 +131,9 @@
             "reporting_period": {
                 "name": "Reporting period"
             },
+            "temperature_calibration": {
+                "name": "Temperature calibration"
+            },
             "up_position": {
                 "name": "Up position"
             }
@@ -75,6 +142,16 @@
             "beep_volume": {
                 "name": "Lock Volume"
             },
+            "unlock_switch": {
+                "name": "Authentication Mode",
+                "state": {
+                    "single_unlock": "Single authentication",
+                    "finger_card": "Fingerprint and card"
+                }
+            },
+            "language": {
+                "name": "Lock Language"
+            },
             "fingerbot_mode": {
                 "name": "Mode",
                 "state": {
@@ -82,6 +159,35 @@
                     "push": "Push",
                     "switch": "Switch"
                 }
+            },
+            "weather_delay": {
+                "name": "Weather delay",
+                "state": {
+                    "cancel": "Cancel",
+                    "1day": "1 day",
+                    "2day": "2 days",
+                    "3day": "3 days",
+                    "4day": "4 days",
+                    "5day": "5 days",
+                    "6day": "6 days",
+                    "7day": "7 days"
+                }
+            },
+            "weather": {
+                "name": "Weather",
+                "state": {
+                    "sunny": "Sunny",
+                    "rainy": "Rainy"
+                }
+            },
+            "weather_delay_z1": {
+                "name": "Weather delay - Zone 1"
+            },
+            "weather_delay_z2": {
+                "name": "Weather delay - Zone 2"
+            },
+            "smart_weather": {
+                "name": "Smart weather"
             },
             "reminder_mode": {
                 "name": "Reminder mode",
@@ -92,11 +198,120 @@
             },
             "temperature_unit": {
                 "name": "Temperature unit"
+            },
+            "mode": {
+                "name": "Cleaning mode",
+                "state": {
+                    "smart": "Smart",
+                    "z_mode": "Z-Mode",
+                    "n_mode": "N-Mode",
+                    "edge": "Edge",
+                    "spot": "Spot"
+                }
+            },
+            "direction_control": {
+                "name": "Direction",
+                "state": {
+                    "forward": "Forward",
+                    "backward": "Backward",
+                    "turn_left": "Turn left",
+                    "turn_right": "Turn right",
+                    "stop": "Stop"
+                }
+            },
+            "timer": {
+                "name": "Timer",
+                "state": {
+                    "cancel": "Cancel",
+                    "1h": "1 hour",
+                    "3h": "3 hours",
+                    "6h": "6 hours"
+                }
+            },
+            "scene": {
+                "name": "Scene",
+                "state": {
+                    "night": "Night",
+                    "read": "Reading",
+                    "work": "Working",
+                    "rest": "Relax",
+                    "grassland": "Grassland",
+                    "colorful": "Party",
+                    "gorgeous": "Gorgeous",
+                    "dazzle": "Dazzle"
+                }
+            },
+            "spray_mode": {
+                "name": "Spray mode",
+                "state": {
+                    "small": "Low",
+                    "large": "High"
+                }
             }
         },
         "sensor": {
             "alarm_lock": {
-                "name": "Alarm"
+                "name": "Alarm",
+                "state": {
+                    "wrong_finger": "Wrong Fingerprint",
+                    "wrong_password": "Wrong Password",
+                    "wrong_card": "Wrong Card",
+                    "low_battery": "Low Battery",
+                    "power_off": "Power off"
+                }
+            },
+            "last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "fingerprint": "Fingerprint",
+                    "password": "Password",
+                    "dynamic": "Dynamic password",
+                    "card": "Card",
+                    "ble": "Bluetooth",
+                    "temporary": "Temporary password",
+                    "phone_remote": "Phone remote"
+                }
+            },
+            "s1_alarm_lock": {
+                "name": "Alarm",
+                "state": {
+                    "wrong_finger": "Wrong fingerprint",
+                    "wrong_password": "Wrong password",
+                    "wrong_card": "Wrong card",
+                    "wrong_face": "Wrong face",
+                    "tongue_bad": "Latch fault",
+                    "too_hot": "Temperature too high",
+                    "unclosed_time": "Door left open",
+                    "tongue_not_out": "Latch not extended",
+                    "pry": "Tamper detected",
+                    "key_in": "Key inserted",
+                    "low_battery": "Low battery",
+                    "power_off": "Power loss",
+                    "shock": "Shock detected",
+                    "defense": "Armed alarm"
+                }
+            },
+            "s1_last_unlock_method": {
+                "name": "Last Unlock Method",
+                "state": {
+                    "fingerprint": "Fingerprint",
+                    "card": "Card",
+                    "key": "Mechanical key",
+                    "ble": "Bluetooth",
+                    "phone_remote": "Phone remote",
+                    "voice_remote": "Voice remote"
+                }
+            },
+            "closed_opened": {
+                "name": "Door State",
+                "state": {
+                    "unknown": "Unknown",
+                    "open": "Open",
+                    "closed": "Closed"
+                }
+            },
+            "power_off": {
+                "name": "Power off"
             },
             "battery": {
                 "name": "Battery"
@@ -114,6 +329,7 @@
                 "state": {
                     "high": "High",
                     "low": "Low",
+                    "middle": "Medium",
                     "normal": "Normal"
                 }
             },
@@ -127,6 +343,23 @@
                     "normal": "Normal"
                 }
             },
+            "day_usage_after_reset": {
+                "name": "Daily usage after reset"
+            },
+            "day_water_usage": {
+                "name": "Daily water usage"
+            },
+            "flow_velocity": {
+                "name": "Flow rate"
+            },
+            "lock_door_status": {
+                "name": "Door status",
+                "state": {
+                    "door_status_unknown": "Unknown",
+                    "door_status_open": "Open",
+                    "door_status_closed": "Closed"
+                }
+            },
             "humidity": {
                 "name": "Humidity"
             },
@@ -136,11 +369,34 @@
             "moisture": {
                 "name": "Moisture"
             },
+            "work_state": {
+                "name": "Work state"
+            },
+            "work_state_z1": {
+                "name": "Work state - Zone 1",
+                "state": {
+                    "auto": "Auto",
+                    "manual": "Manual",
+                    "idle": "Idle",
+                    "working": "Working",
+                    "rain_delay": "Rain Delay"
+                }
+            },
+            "work_state_z2": {
+                "name": "Work state - Zone 2",
+                "state": {
+                    "auto": "Auto",
+                    "manual": "Manual",
+                    "idle": "Idle",
+                    "working": "Working",
+                    "rain_delay": "Rain Delay"
+                }
+            },
             "residual_electricity": {
                 "name": "Battery"
             },
             "signal_strength": {
-                "name": "Signal strength"
+                "name": "Signal Strength"
             },
             "temperature": {
                 "name": "Temperature"
@@ -148,17 +404,77 @@
             "time_left": {
                 "name": "Remaining irrigation time"
             },
+            "time_left_z1": {
+                "name": "Remaining irrigation time - Zone 1"
+            },
+            "time_left_z2": {
+                "name": "Remaining irrigation time - Zone 2"
+            },
+            "total_usage_after_reset": {
+                "name": "Total usage after reset"
+            },
+            "use_time_z1": {
+                "name": "Last irrigation time - Zone 1"
+            },
+            "use_time_z2": {
+                "name": "Last irrigation time - Zone 2"
+            },
+            "use_time": {
+                "name": "Accumulated use time"
+            },
+            "use_time_one": {
+                "name": "Last irrigation time"
+            },
             "water_intake": {
                 "name": "Water intake"
+            },
+            "water_once": {
+                "name": "Last session water usage"
+            },
+            "water_use_data": {
+                "name": "Total water usage"
             },
             "wrong_finger": {
                 "name": "Wrong Fingerprint"
             },
             "wrong_password": {
                 "name": "Wrong Password"
+            },
+            "unlock_fingerprint": {
+                "name": "Last used Fingerprint"
+            },
+            "unlock_card": {
+                "name": "Last used Card"
+            },
+            "unlock_password": {
+                "name": "Last used Password"
+            },
+            "unlock_key": {
+                "name": "Last used Key"
+            },
+            "unlock_dynamic": {
+                "name": "Last used Dynamic Password"
+            },
+            "unlock_ble": {
+                "name": "Last used Bluetooth"
+            },
+            "unlock_app": {
+                "name": "Last used App"
+            },
+            "unlock_voice": {
+                "name": "Last used Voice"
+            },
+            "unlock_temp_pwd": {
+                "name": "Last used Temporary Password"
+            },
+            "time_remaining": {
+                "name": "Time remaining"
             }
         },
         "switch": {
+            "automatic_lock": {
+                "name": "Auto-Lock"
+            },
             "antifreeze": {
                 "name": "Antifreeze"
             },
@@ -204,13 +520,39 @@
             "water_valve": {
                 "name": "Irrigation valve"
             },
+            "water_valve_z1": {
+                "name": "Irrigation valve - Zone 1"
+            },
+            "water_valve_z2": {
+                "name": "Irrigation valve - Zone 2"
+            },
+            "weather_switch": {
+                "name": "Weather switch"
+            },
             "window_check": {
                 "name": "Window Check"
+            },
+            "window_cleaner_switch": {
+                "name": "Cleaning"
+            },
+            "water_auto": {
+                "name": "Auto water spray"
+            },
+            "switch_spray": {
+                "name": "Spraying"
             }
         },
         "text": {
             "program": {
                 "name": "Program: position[/time];..."
+            }
+        },
+        "vacuum": {
+            "vacuum": {
+                "name": "Window Cleaner"
+            },
+            "clean_time": {
+                "name": "Clean time"
             }
         }
     },
@@ -229,7 +571,7 @@
                     "password": "Password",
                     "username": "Account"
                 },
-                "description": "Refer to documentation of Tuya integration to retrive the cloud credentials https://www.home-assistant.io/integrations/tuya/\n\nEnter your Tuya credentials."
+                "description": "Refer to documentation of Tuya integration to retrieve the cloud credentials {url}\n\nEnter your Tuya credentials."
             }
         }
     }

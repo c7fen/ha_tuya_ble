@@ -1,7 +1,10 @@
 """The Tuya BLE integration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+import logging
 from struct import pack, unpack
 from typing import Callable
 
@@ -10,23 +13,36 @@ from homeassistant.components.text import (
     TextEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo, TuyaBLEPassiveCoordinator
+from .const import (
+    DOMAIN,
+)
+from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
+_LOGGER = logging.getLogger(__name__)
+
+SIGNAL_STRENGTH_DP_ID = -1
+
 TuyaBLETextGetter = Callable[["TuyaBLEText", TuyaBLEProductInfo], str | None] | None
+
+
 TuyaBLETextIsAvailable = Callable[["TuyaBLEText", TuyaBLEProductInfo], bool] | None
+
+
 TuyaBLETextSetter = Callable[["TuyaBLEText", TuyaBLEProductInfo, str], None] | None
 
 
 def is_fingerbot_in_program_mode(
-    self: "TuyaBLEText",
+    self: TuyaBLEText,
     product: TuyaBLEProductInfo,
 ) -> bool:
+    """Determines if in program mode"""
     result: bool = True
     if product.fingerbot:
         datapoint = self._device.datapoints[product.fingerbot.mode]
@@ -36,10 +52,10 @@ def is_fingerbot_in_program_mode(
 
 
 def get_fingerbot_program(
-    self: "TuyaBLEText",
+    self: TuyaBLEText,
     product: TuyaBLEProductInfo,
 ) -> str | None:
-    result: str | None = None
+    result: float | None = None
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.program]
         if datapoint and isinstance(datapoint.value, bytes):
@@ -47,10 +63,9 @@ def get_fingerbot_program(
             step_count: int = datapoint.value[3]
             for step in range(step_count):
                 step_pos = 4 + step * 3
-                step_data = datapoint.value[step_pos:step_pos + 3]
+                step_data = datapoint.value[step_pos : step_pos + 3]
                 position, delay = unpack(">BH", step_data)
-                if delay > 9999:
-                    delay = 9999
+                delay = min(delay, 9999)
                 result += (
                     (";" if step > 0 else "")
                     + str(position)
@@ -60,7 +75,7 @@ def get_fingerbot_program(
 
 
 def set_fingerbot_program(
-    self: "TuyaBLEText",
+    self: TuyaBLEText,
     product: TuyaBLEProductInfo,
     value: str,
 ) -> None:
@@ -80,17 +95,22 @@ def set_fingerbot_program(
 
 @dataclass
 class TuyaBLETextMapping:
+    """Model a DP, description and default values"""
+
     dp_id: int
     description: TextEntityDescription
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
+    default_value: str | None = None
     is_available: TuyaBLETextIsAvailable = None
-    getter: TuyaBLETextGetter = None
-    setter: TuyaBLETextSetter = None
+    getter: Callable[[TuyaBLEText], None] | None = None
+    setter: Callable[[TuyaBLEText], None] | None = None
 
 
 @dataclass
 class TuyaBLECategoryTextMapping:
+    """Models a dict of products and their mappings"""
+
     products: dict[str, list[TuyaBLETextMapping]] | None = None
     mapping: list[TuyaBLETextMapping] | None = None
 
@@ -99,10 +119,58 @@ mapping: dict[str, TuyaBLECategoryTextMapping] = {
     "szjqr": TuyaBLECategoryTextMapping(
         products={
             **dict.fromkeys(
-                ["blliqpsj", "ndvkgsrm", "yiihr7zh", "neq16kgd"],
+                [
+                    "blliqpsj",
+                    "ndvkgsrm",
+                    "yiihr7zh",
+                    "neq16kgd",
+                    "6jcvqwh0",
+                    "riecov42",
+                    "h8kdwywx",
+                ],  # Fingerbot Plus
                 [
                     TuyaBLETextMapping(
                         dp_id=121,
+                        description=TextEntityDescription(
+                            key="program",
+                            icon="mdi:repeat",
+                            pattern=r"^((\d{1,2}|100)(\/\d{1,2})?)(;((\d{1,2}|100)(\/\d{1,2})?))+$",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                        is_available=is_fingerbot_in_program_mode,
+                        getter=get_fingerbot_program,
+                        setter=set_fingerbot_program,
+                    ),
+                ],
+            ),
+        },
+    ),
+    "dcb": TuyaBLECategoryTextMapping(
+        products={
+            **dict.fromkeys(
+                ["ajrhf1aj", "z5ztlw3k"],  # PARKSIDE Smart battery
+                [
+                    TuyaBLETextMapping(
+                        dp_id=106,
+                        description=TextEntityDescription(
+                            key="battery_pin",
+                            icon="mdi:key-variant",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                        dp_type=TuyaBLEDataPointType.DT_STRING,
+                        default_value="0000",  # Default PIN
+                    ),
+                ],
+            ),
+        },
+    ),
+    "kg": TuyaBLECategoryTextMapping(
+        products={
+            **dict.fromkeys(
+                ["mknd4lci", "riecov42", "bs3ubslo", "gnpbj0bq"],  # Fingerbot Plus
+                [
+                    TuyaBLETextMapping(
+                        dp_id=109,
                         description=TextEntityDescription(
                             key="program",
                             icon="mdi:repeat",
@@ -121,6 +189,7 @@ mapping: dict[str, TuyaBLECategoryTextMapping] = {
 
 
 def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLETextMapping]:
+    """Lookup mapping for a given device"""
     category = mapping.get(device.category)
     if category is not None and category.products is not None:
         product_mapping = category.products.get(device.product_id)
@@ -128,27 +197,37 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLETextMapping]:
             return product_mapping
         if category.mapping is not None:
             return category.mapping
-        return []
+
     return []
 
 
 class TuyaBLEText(TuyaBLEEntity, TextEntity):
     """Representation of a Tuya BLE text entity."""
 
+    platform = Platform.TEXT
+
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: TuyaBLEPassiveCoordinator,
+        coordinator: DataUpdateCoordinator,
         device: TuyaBLEDevice,
         product: TuyaBLEProductInfo,
         mapping: TuyaBLETextMapping,
     ) -> None:
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
-        self._attr_mode = "text"
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        result = super().available
+        if result and self._mapping.is_available:
+            result = self._mapping.is_available(self, self._product)
+        return result
 
     @property
     def native_value(self) -> str | None:
+        """Return the value reported by the text."""
         if self._mapping.getter:
             return self._mapping.getter(self, self._product)
 
@@ -156,13 +235,13 @@ class TuyaBLEText(TuyaBLEEntity, TextEntity):
         if datapoint:
             return str(datapoint.value)
 
-        return None
+        return self._mapping.default_value
 
     def set_value(self, value: str) -> None:
+        """Change the value."""
         if self._mapping.setter:
             self._mapping.setter(self, self._product, value)
             return
-
         datapoint = self._device.datapoints.get_or_create(
             self._mapping.dp_id,
             TuyaBLEDataPointType.DT_STRING,
@@ -177,13 +256,13 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-
     entities: list[TuyaBLEText] = []
-    for mapping_item in mappings:
-        if mapping_item.force_add or data.device.datapoints.has_id(
-            mapping_item.dp_id, mapping_item.dp_type
+    for mapping in mappings:
+        if mapping.force_add or data.device.datapoints.has_id(
+            mapping.dp_id, mapping.dp_type
         ):
             entities.append(
                 TuyaBLEText(
@@ -191,8 +270,7 @@ async def async_setup_entry(
                     data.coordinator,
                     data.device,
                     data.product,
-                    mapping_item,
+                    mapping,
                 )
             )
-
     async_add_entities(entities)

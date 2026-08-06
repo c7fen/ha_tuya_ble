@@ -26,22 +26,28 @@ from homeassistant.const import (
 )
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowHandler, FlowResult
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
-from .tuya_ble import SERVICE_UUID, TuyaBLEDeviceCredentials
+from .tuya_ble import SERVICE_UUIDS, TuyaBLEDeviceCredentials
 
 from .const import (
-    DOMAIN,
-    CONF_ACCESS_ID,
-    CONF_ACCESS_SECRET,
-    CONF_AUTH_TYPE,
-    CONF_APP_TYPE,
-    CONF_ENDPOINT,
-    SMARTLIFE_APP,
-    TUYA_SMART_APP,
     TUYA_COUNTRIES,
+    TUYA_SMART_APP,
+    SMARTLIFE_APP,
+    TUYA_RESPONSE_SUCCESS,
     TUYA_RESPONSE_CODE,
     TUYA_RESPONSE_MSG,
-    TUYA_RESPONSE_SUCCESS,
+    CONF_ACCESS_ID,
+    CONF_ACCESS_SECRET,
+    CONF_APP_TYPE,
+    CONF_AUTH_TYPE,
+    CONF_ENDPOINT,
+    CONF_SEC_KEY,
+    DOMAIN,
 )
 from .devices import TuyaBLEData, get_device_readable_name
 from .cloud import HASSTuyaBLEDeviceManager
@@ -73,6 +79,8 @@ async def _try_login(
         CONF_PASSWORD: user_input[CONF_PASSWORD],
         CONF_COUNTRY_CODE: country.country_code,
     }
+    if sec_key := user_input.get(CONF_SEC_KEY):
+        data[CONF_SEC_KEY] = sec_key
 
     for app_type in (TUYA_SMART_APP, SMARTLIFE_APP, ""):
         data[CONF_APP_TYPE] = app_type
@@ -119,6 +127,8 @@ def _show_login_form(
     except:
         pass
 
+    placeholders["url"] = "https://www.home-assistant.io/integrations/tuya/"
+
     return flow.async_show_form(
         step_id="login",
         data_schema=vol.Schema(
@@ -137,6 +147,10 @@ def _show_login_form(
                     CONF_ACCESS_SECRET,
                     default=user_input.get(CONF_ACCESS_SECRET, ""),
                 ): str,
+                vol.Optional(
+                    CONF_SEC_KEY,
+                    default=user_input.get(CONF_SEC_KEY, ""),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
                 vol.Required(
                     CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")
                 ): str,
@@ -185,6 +199,8 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                     placeholders,
                 )
                 if login_data:
+                    entry.manager.data.pop(CONF_SEC_KEY, None)
+                    entry.manager.data.update(login_data)
                     credentials = await entry.manager.get_device_credentials(
                         address, True, True
                     )
@@ -193,8 +209,8 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                             title=self.config_entry.title,
                             data=entry.manager.data,
                         )
-                    else:
-                        errors["base"] = "device_not_registered"
+
+                    errors["base"] = "device_not_registered"
 
         if user_input is None:
             user_input = {}
@@ -315,7 +331,7 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
                     discovery.address in current_addresses
                     or discovery.address in self._discovered_devices
                     or discovery.service_data is None
-                    or not SERVICE_UUID in discovery.service_data.keys()
+                    or not any(uuid in discovery.service_data for uuid in SERVICE_UUIDS)
                 ):
                     continue
                 self._discovered_devices[discovery.address] = discovery

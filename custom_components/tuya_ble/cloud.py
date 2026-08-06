@@ -1,4 +1,5 @@
 """The Tuya BLE integration."""
+
 from __future__ import annotations
 
 import logging
@@ -9,50 +10,47 @@ from typing import Any, Iterable
 
 from homeassistant.const import (
     CONF_ADDRESS,
-    CONF_COUNTRY_CODE,
     CONF_DEVICE_ID,
+    CONF_COUNTRY_CODE,
     CONF_PASSWORD,
     CONF_USERNAME,
 )
+
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo, EntityDescription
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-)
 
 from tuya_iot import (
     TuyaOpenAPI,
     AuthType,
-    TuyaOpenMQ,
-    TuyaDeviceManager,
 )
 
 from .tuya_ble import (
     AbstaractTuyaBLEDeviceManager,
-    TuyaBLEDevice,
     TuyaBLEDeviceCredentials,
 )
 
 from .const import (
+    TUYA_DOMAIN,
+    CONF_ACCESS_ID,
+    CONF_ACCESS_SECRET,
+    CONF_APP_TYPE,
+    CONF_AUTH_TYPE,
+    CONF_ENDPOINT,
     CONF_PRODUCT_MODEL,
     CONF_UUID,
     CONF_LOCAL_KEY,
+    CONF_LEGACY_APP_TYPE,
+    CONF_SEC_KEY,
     CONF_CATEGORY,
     CONF_PRODUCT_ID,
     CONF_DEVICE_NAME,
     CONF_PRODUCT_NAME,
+    CONF_FUNCTIONS,
+    CONF_STATUS_RANGE,
     DOMAIN,
-    TUYA_DOMAIN,
     TUYA_API_DEVICES_URL,
     TUYA_API_FACTORY_INFO_URL,
+    TUYA_API_DEVICE_SPECIFICATION,
     TUYA_FACTORY_INFO_MAC,
-    CONF_ACCESS_ID,
-    CONF_ACCESS_SECRET,
-    CONF_AUTH_TYPE,
-    CONF_APP_TYPE,
-    CONF_ENDPOINT,
-    SMARTLIFE_APP,
     TUYA_RESPONSE_RESULT,
     TUYA_RESPONSE_SUCCESS,
 )
@@ -62,6 +60,8 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class TuyaCloudCacheItem:
+    """A cache model for API keys/credentials"""
+
     api: TuyaOpenAPI | None
     login: dict[str, Any]
     credentials: dict[str, dict[str, Any]]
@@ -92,13 +92,34 @@ CONF_TUYA_DEVICE_KEYS = [
 _cache: dict[str, TuyaCloudCacheItem] = {}
 
 
+def normalize_app_type_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a non-persistent view compatible with both app-type key names."""
+    normalized = data.copy()
+    has_current = CONF_APP_TYPE in normalized
+    has_legacy = CONF_LEGACY_APP_TYPE in normalized
+
+    if (
+        has_current
+        and has_legacy
+        and normalized[CONF_APP_TYPE] != normalized[CONF_LEGACY_APP_TYPE]
+    ):
+        raise ValueError("Conflicting Tuya application type configuration")
+
+    if has_current:
+        normalized[CONF_LEGACY_APP_TYPE] = normalized[CONF_APP_TYPE]
+    elif has_legacy:
+        normalized[CONF_APP_TYPE] = normalized[CONF_LEGACY_APP_TYPE]
+
+    return normalized
+
+
 class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
     """Cloud connected manager of the Tuya BLE devices credentials."""
 
     def __init__(self, hass: HomeAssistant, data: dict[str, Any]) -> None:
         assert hass is not None
         self._hass = hass
-        self._data = data
+        self._data = normalize_app_type_data(data)
 
     @staticmethod
     def _is_login_success(response: dict[Any, Any]) -> bool:
@@ -106,11 +127,13 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
     @staticmethod
     def _get_cache_key(data: dict[str, Any]) -> str:
+        data = normalize_app_type_data(data)
         key_dict = {key: data.get(key) for key in CONF_TUYA_LOGIN_KEYS}
         return json.dumps(key_dict)
 
     @staticmethod
     def _has_login(data: dict[Any, Any]) -> bool:
+        data = normalize_app_type_data(data)
         for key in CONF_TUYA_LOGIN_KEYS:
             if data.get(key) is None:
                 return False
@@ -130,6 +153,8 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
         if len(data) == 0:
             return {}
 
+        data = normalize_app_type_data(data)
+
         api = TuyaOpenAPI(
             endpoint=data.get(CONF_ENDPOINT, ""),
             access_id=data.get(CONF_ACCESS_ID, ""),
@@ -147,10 +172,10 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
         )
 
         if self._is_login_success(response):
-            _LOGGER.debug("Successful login for %s", data[CONF_USERNAME])
+            _LOGGER.debug("Tuya cloud login succeeded")
             if add_to_cache:
                 auth_type = data[CONF_AUTH_TYPE]
-                if type(auth_type) is AuthType:
+                if isinstance(auth_type, AuthType):
                     data[CONF_AUTH_TYPE] = auth_type.value
                 cache_key = self._get_cache_key(data)
                 cache_item = _cache.get(cache_key)
@@ -164,7 +189,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
     def _check_login(self) -> bool:
         cache_key = self._get_cache_key(self._data)
-        return _cache.get(cache_key) != None
+        return _cache.get(cache_key) is not None
 
     async def login(self, add_to_cache: bool = False) -> dict[Any, Any]:
         return await self._login(self._data, add_to_cache)
@@ -174,7 +199,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
             item.api.get,
             TUYA_API_DEVICES_URL % (item.api.token_info.uid),
         )
-        if devices_response.get(TUYA_RESPONSE_SUCCESS):
+        if devices_response.get(TUYA_RESPONSE_RESULT):
             devices = devices_response.get(TUYA_RESPONSE_RESULT)
             if isinstance(devices, Iterable):
                 for device in devices:
@@ -182,14 +207,19 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                         item.api.get,
                         TUYA_API_FACTORY_INFO_URL % (device.get("id")),
                     )
+
                     fi_response_result = fi_response.get(TUYA_RESPONSE_RESULT)
                     if fi_response_result and len(fi_response_result) > 0:
                         factory_info = fi_response_result[0]
                         if factory_info and (TUYA_FACTORY_INFO_MAC in factory_info):
-                            mac = ":".join(
-                                factory_info[TUYA_FACTORY_INFO_MAC][i : i + 2]
-                                for i in range(0, 12, 2)
-                            ).upper()
+                            raw_mac = factory_info[TUYA_FACTORY_INFO_MAC]
+                            if ":" in raw_mac:
+                                # API already returned a colon-separated MAC
+                                mac = raw_mac.upper()
+                            else:
+                                mac = ":".join(
+                                    raw_mac[i : i + 2] for i in range(0, 12, 2)
+                                ).upper()
                             item.credentials[mac] = {
                                 CONF_ADDRESS: mac,
                                 CONF_UUID: device.get("uuid"),
@@ -201,14 +231,47 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                                 CONF_PRODUCT_MODEL: device.get("model"),
                                 CONF_PRODUCT_NAME: device.get("product_name"),
                             }
+                            sec_key = device.get("sec_key") or device.get("secKey")
+                            if sec_key:
+                                item.credentials[mac][CONF_SEC_KEY] = sec_key
+
+                            spec_response = await self._hass.async_add_executor_job(
+                                item.api.get,
+                                TUYA_API_DEVICE_SPECIFICATION % device.get("id"),
+                            )
+
+                            spec_response_result = spec_response.get(
+                                TUYA_RESPONSE_RESULT
+                            )
+                            if spec_response_result:
+                                functions = spec_response_result.get("functions")
+                                if functions:
+                                    item.credentials[mac][CONF_FUNCTIONS] = functions
+                                status = spec_response_result.get("status")
+                                if status:
+                                    item.credentials[mac][CONF_STATUS_RANGE] = status
+
+                            spec_response = await self._hass.async_add_executor_job(
+                                item.api.get,
+                                TUYA_API_DEVICE_SPECIFICATION % device.get("id"),
+                            )
+
+                            spec_response_result = spec_response.get(
+                                TUYA_RESPONSE_RESULT
+                            )
+                            if spec_response_result:
+                                functions = spec_response_result.get("functions")
+                                if functions:
+                                    item.credentials[mac][CONF_FUNCTIONS] = functions
+                                status = spec_response_result.get("status")
+                                if status:
+                                    item.credentials[mac][CONF_STATUS_RANGE] = status
 
     async def build_cache(self) -> None:
         global _cache
-        data = {}
         tuya_config_entries = self._hass.config_entries.async_entries(TUYA_DOMAIN)
         for config_entry in tuya_config_entries:
-            data.clear()
-            data.update(config_entry.data)
+            data = normalize_app_type_data(dict(config_entry.data))
             key = self._get_cache_key(data)
             item = _cache.get(key)
             if item is None or len(item.credentials) == 0:
@@ -219,8 +282,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
         ble_config_entries = self._hass.config_entries.async_entries(DOMAIN)
         for config_entry in ble_config_entries:
-            data.clear()
-            data.update(config_entry.options)
+            data = normalize_app_type_data(dict(config_entry.options))
             key = self._get_cache_key(data)
             item = _cache.get(key)
             if item is None or len(item.credentials) == 0:
@@ -260,6 +322,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                         break
             if cache_key:
                 item = _cache.get(cache_key)
+
             if item is None or force_update:
                 if self._is_login_success(await self.login(True)):
                     item = _cache.get(cache_key)
@@ -270,6 +333,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                 credentials = item.credentials.get(address)
 
         if credentials:
+            sec_key = credentials.get(CONF_SEC_KEY) or self._data.get(CONF_SEC_KEY)
             result = TuyaBLEDeviceCredentials(
                 credentials.get(CONF_UUID, ""),
                 credentials.get(CONF_LOCAL_KEY, ""),
@@ -279,12 +343,21 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                 credentials.get(CONF_DEVICE_NAME, ""),
                 credentials.get(CONF_PRODUCT_MODEL, ""),
                 credentials.get(CONF_PRODUCT_NAME, ""),
+                credentials.get(CONF_FUNCTIONS, []),
+                credentials.get(CONF_STATUS_RANGE, []),
+                sec_key=sec_key,
             )
-            _LOGGER.debug("Retrieved: %s", result)
+            _LOGGER.debug(
+                "Retrieved Tuya BLE credentials for category=%s product=%s",
+                result.category,
+                result.product_id,
+            )
             if save_data:
                 if item:
                     self._data.update(item.login)
                 self._data.update(credentials)
+                if sec_key:
+                    self._data[CONF_SEC_KEY] = sec_key
 
         return result
 

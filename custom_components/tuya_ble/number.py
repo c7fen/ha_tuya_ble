@@ -1,33 +1,36 @@
 """The Tuya BLE integration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 import logging
-from typing import Any, Callable
+from typing import Callable
 
 from homeassistant.components.number import (
     NumberEntityDescription,
-    NumberMode,
+    NumberEntity,
 )
-from homeassistant.components.number import NumberEntity as BaseNumberEntity
+from homeassistant.components.number.const import NumberDeviceClass, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
+    UnitOfTemperature,
     UnitOfTime,
     UnitOfVolume,
-    UnitOfTemperature,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    Platform,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.components.bluetooth.passive_update_coordinator import PassiveBluetoothDataUpdateCoordinator
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo, TuyaBLEPassiveCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
 from .const import DOMAIN
+from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
-from homeassistant.components.number.const import NumberDeviceClass
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,9 +39,7 @@ TuyaBLENumberGetter = (
 )
 
 
-TuyaBLENumberIsAvailable = (
-    Callable[["TuyaBLENumber", TuyaBLEProductInfo], bool] | None
-)
+TuyaBLENumberIsAvailable = Callable[["TuyaBLENumber", TuyaBLEProductInfo], bool] | None
 
 
 TuyaBLENumberSetter = (
@@ -48,6 +49,8 @@ TuyaBLENumberSetter = (
 
 @dataclass
 class TuyaBLENumberMapping:
+    """Model a DP, description and default values"""
+
     dp_id: int
     description: NumberEntityDescription
     force_add: bool = True
@@ -63,6 +66,7 @@ def is_fingerbot_in_program_mode(
     self: TuyaBLENumber,
     product: TuyaBLEProductInfo,
 ) -> bool:
+    """Returns if in program mode or not"""
     result: bool = True
     if product.fingerbot:
         datapoint = self._device.datapoints[product.fingerbot.mode]
@@ -99,6 +103,7 @@ def is_fingerbot_repeat_count_available(
     self: TuyaBLENumber,
     product: TuyaBLEProductInfo,
 ) -> bool:
+    """Determine if a repeat count is available"""
     result: bool = True
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.mode]
@@ -106,7 +111,7 @@ def is_fingerbot_repeat_count_available(
             result = datapoint.value == 2
         if result:
             datapoint = self._device.datapoints[product.fingerbot.program]
-            if datapoint and type(datapoint.value) is bytes:
+            if datapoint and isinstance(datapoint.value, bytes):
                 repeat_count = int.from_bytes(datapoint.value[0:2], "big")
                 result = repeat_count != 0xFFFF
 
@@ -120,7 +125,7 @@ def get_fingerbot_program_repeat_count(
     result: float | None = None
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.program]
-        if datapoint and type(datapoint.value) is bytes:
+        if datapoint and isinstance(datapoint.value, bytes):
             repeat_count = int.from_bytes(datapoint.value[0:2], "big")
             result = repeat_count * 1.0
 
@@ -134,11 +139,8 @@ def set_fingerbot_program_repeat_count(
 ) -> None:
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.program]
-        if datapoint and type(datapoint.value) is bytes:
-            new_value = (
-                int.to_bytes(int(value), 2, "big") +
-                datapoint.value[2:]
-            )
+        if datapoint and isinstance(datapoint.value, bytes):
+            new_value = int.to_bytes(int(value), 2, "big") + datapoint.value[2:]
             self._hass.create_task(datapoint.set_value(new_value))
 
 
@@ -149,7 +151,7 @@ def get_fingerbot_program_position(
     result: float | None = None
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.program]
-        if datapoint and type(datapoint.value) is bytes:
+        if datapoint and isinstance(datapoint.value, bytes):
             result = datapoint.value[2] * 1.0
 
     return result
@@ -162,10 +164,29 @@ def set_fingerbot_program_position(
 ) -> None:
     if product.fingerbot and product.fingerbot.program:
         datapoint = self._device.datapoints[product.fingerbot.program]
-        if datapoint and type(datapoint.value) is bytes:
+        if datapoint and isinstance(datapoint.value, bytes):
             new_value = bytearray(datapoint.value)
             new_value[2] = int(value)
             self._hass.create_task(datapoint.set_value(new_value))
+
+
+def get_smart_lock_auto_lock_time(
+    self: TuyaBLENumber, product: TuyaBLEProductInfo
+) -> float | None:
+    """Return an Auto-Lock delay only inside its product-specific range."""
+    datapoint = self._device.datapoints[36]
+    value = datapoint.value if datapoint is not None else None
+    minimum = self._mapping.description.native_min_value
+    maximum = self._mapping.description.native_max_value
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum is not None
+        and maximum is not None
+        and minimum <= value <= maximum
+    ):
+        return float(value)
+    return None
 
 
 @dataclass
@@ -211,6 +232,8 @@ class TuyaBLEHoldTimeMapping(TuyaBLENumberMapping):
 
 @dataclass
 class TuyaBLECategoryNumberMapping:
+    """Models a dict of products and their mappings"""
+
     products: dict[str, list[TuyaBLENumberMapping]] | None = None
     mapping: list[TuyaBLENumberMapping] | None = None
 
@@ -247,6 +270,101 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
             ],
         },
     ),
+    "dcb": TuyaBLECategoryNumberMapping(
+        products={
+            **dict.fromkeys(
+                ["ajrhf1aj", "z5ztlw3k"],  # PARKSIDE Smart battery
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=116,
+                        description=NumberEntityDescription(
+                            key="low_discharge_voltage",
+                            device_class=NumberDeviceClass.VOLTAGE,
+                            native_unit_of_measurement=UnitOfElectricPotential.MILLIVOLT,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=117,
+                        description=NumberEntityDescription(
+                            key="discharge_current_limit",
+                            device_class=NumberDeviceClass.CURRENT,
+                            native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=118,
+                        description=NumberEntityDescription(
+                            key="power_indicator_time",
+                            device_class=NumberDeviceClass.DURATION,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=164,
+                        description=NumberEntityDescription(
+                            key="lamp_brightness_percentage",
+                            native_unit_of_measurement=PERCENTAGE,
+                            icon="mdi:brightness-percent",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=165,
+                        description=NumberEntityDescription(
+                            key="lamp_delay_time",
+                            device_class=NumberDeviceClass.DURATION,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            icon="mdi:camera-timer",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=173,
+                        description=NumberEntityDescription(
+                            key="kick_back_adjust",
+                            icon="mdi:car-esp",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=178,
+                        description=NumberEntityDescription(
+                            key="speed_percentage",
+                            native_unit_of_measurement=PERCENTAGE,
+                            icon="mdi:speedometer",
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                ],
+            ),
+        },
+    ),
+    "wkf": TuyaBLECategoryNumberMapping(
+        products={
+            **dict.fromkeys(
+                [
+                    "llflaywg",
+                ],  # Thermostatic Radiator Valve
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=27,
+                        description=NumberEntityDescription(
+                            key="temperature_calibration",
+                            icon="mdi:thermometer-lines",
+                            native_max_value=6,
+                            native_min_value=-6,
+                            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                            native_step=1,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                ],
+            ),
+        },
+    ),
     "szjqr": TuyaBLECategoryNumberMapping(
         products={
             **dict.fromkeys(
@@ -272,7 +390,10 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     "blliqpsj",
                     "ndvkgsrm",
                     "yiihr7zh",
-                    "neq16kgd"
+                    "neq16kgd",
+                    "6jcvqwh0",
+                    "riecov42",
+                    "h8kdwywx",
                 ],  # Fingerbot Plus
                 [
                     TuyaBLENumberMapping(
@@ -348,15 +469,49 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     ),
                 ],
             ),
+            "yn4x5fa7": [
+                TuyaBLEHoldTimeMapping(
+                    dp_id=3,
+                    description=TuyaBLEHoldTimeDescription(
+                        native_min_value=0.3,
+                        native_max_value=10.0,
+                        native_step=0.1,
+                    ),
+                    coefficient=10.0,
+                ),
+                TuyaBLENumberMapping(
+                    dp_id=4,
+                    description=NumberEntityDescription(
+                        key="up_position",
+                        icon="mdi:arrow-up-bold",
+                        native_max_value=30,
+                        native_min_value=0,
+                        native_unit_of_measurement=PERCENTAGE,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    is_available=is_fingerbot_not_in_program_mode,
+                ),
+                TuyaBLENumberMapping(
+                    dp_id=5,
+                    description=NumberEntityDescription(
+                        key="down_position",
+                        icon="mdi:arrow-down-bold",
+                        native_max_value=30,
+                        native_min_value=0,
+                        native_unit_of_measurement=PERCENTAGE,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    is_available=is_fingerbot_not_in_program_mode,
+                ),
+            ],
         },
     ),
     "kg": TuyaBLECategoryNumberMapping(
         products={
             **dict.fromkeys(
-                [
-                    "mknd4lci",
-                    "riecov42"
-                ],  # Fingerbot Plus
+                ["mknd4lci", "riecov42", "bs3ubslo", "gnpbj0bq"],  # Fingerbot Plus
                 [
                     TuyaBLENumberMapping(
                         dp_id=102,
@@ -443,12 +598,41 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     ),
                 ),
             ],
+            **dict.fromkeys(
+                ["vyfoip9h", "1jvidcsf"],
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=23,
+                        description=NumberEntityDescription(
+                            key="temperature_calibration",
+                            icon="mdi:thermometer-lines",
+                            native_max_value=2.0,
+                            native_min_value=-2.0,
+                            native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                            native_step=0.1,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                        coefficient=10.0,
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=24,
+                        description=NumberEntityDescription(
+                            key="humidity_calibration",
+                            icon="mdi:water-check",
+                            native_max_value=10,
+                            native_min_value=-10,
+                            native_unit_of_measurement=PERCENTAGE,
+                            native_step=1,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                ],
+            ),
         },
     ),
     "znhsb": TuyaBLECategoryNumberMapping(
         products={
-            "cdlandip":  # Smart water bottle
-            [
+            "cdlandip": [  # Smart water bottle
                 TuyaBLENumberMapping(
                     dp_id=103,
                     description=NumberEntityDescription(
@@ -479,11 +663,11 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     ),
                 ),
             ],
-            "hfgdqhho": [  # Irrigation computer SGW08
+            "hfgdqhho": [  # Irrigation computer - SGW02, SGW08
                 TuyaBLENumberMapping(
                     dp_id=106,
                     description=NumberEntityDescription(
-                        key="countdown_duration_1",
+                        key="countdown_duration_z1",
                         name="CH1 Countdown",
                         icon="mdi:timer",
                         native_max_value=1440,
@@ -495,7 +679,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                 TuyaBLENumberMapping(
                     dp_id=103,
                     description=NumberEntityDescription(
-                        key="countdown_duration_2",
+                        key="countdown_duration_z2",
                         name="CH2 Countdown",
                         icon="mdi:timer",
                         native_max_value=1440,
@@ -505,37 +689,354 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     ),
                 ),
             ],
+            **dict.fromkeys(
+                [
+                    "hfgdqhho",
+                    "qycalacn",
+                    "fnlw6npo",
+                    "jjqi2syk",
+                    "jntxv3q4",
+                ],  # Irrigation computer - dual outlet
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=106,
+                        description=NumberEntityDescription(
+                            key="countdown_duration_z1",
+                            icon="mdi:timer",
+                            native_max_value=1440,
+                            native_min_value=1,
+                            native_unit_of_measurement=UnitOfTime.MINUTES,
+                            native_step=1,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=103,
+                        description=NumberEntityDescription(
+                            key="countdown_duration_z2",
+                            icon="mdi:timer",
+                            native_max_value=1440,
+                            native_min_value=1,
+                            native_unit_of_measurement=UnitOfTime.MINUTES,
+                            native_step=1,
+                        ),
+                    ),
+                ],
+            ),
+        },
+    ),
+    "sfkzq": TuyaBLECategoryNumberMapping(
+        products={
+            "ojrvmfkk": [
+                # Valve 1 countdown - DP 11 (0 to 86400)
+                TuyaBLENumberMapping(
+                    dp_id=11,
+                    description=NumberEntityDescription(
+                        key="countdown_duration_z1",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+                # Valve 2 countdown - DP 122 (0 to 86400)
+                TuyaBLENumberMapping(
+                    dp_id=122,
+                    description=NumberEntityDescription(
+                        key="countdown_duration_z2",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
+            "16wgjvck": [
+                TuyaBLENumberMapping(
+                    dp_id=2,
+                    description=NumberEntityDescription(
+                        key="valve_opening_percentage",
+                        icon="mdi:valve",
+                        native_max_value=100,
+                        native_min_value=0,
+                        native_unit_of_measurement=PERCENTAGE,
+                        native_step=1,
+                    ),
+                ),
+                TuyaBLENumberMapping(
+                    dp_id=11,
+                    description=NumberEntityDescription(
+                        key="countdown",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+                TuyaBLENumberMapping(
+                    dp_id=15,
+                    description=NumberEntityDescription(
+                        key="use_time",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
+            "tqzkwarw": [  # HCT-611 Water Timer
+                TuyaBLENumberMapping(
+                    dp_id=11,
+                    description=NumberEntityDescription(
+                        key="countdown",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
+            **dict.fromkeys(
+                ["46zia2nz", "1fcnd8xk", "0axr5s0b", "d4vpmigg"],
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=11,
+                        description=NumberEntityDescription(
+                            key="countdown_duration",
+                            icon="mdi:timer",
+                            native_max_value=86400,
+                            native_min_value=1,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            native_step=1,
+                        ),
+                    ),
+                ],
+            ),
+            **dict.fromkeys(
+                ["ldcdnigc", "e1poaiwa"],  # ZX-7378 / Rainpoint TTV102B
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=11,
+                        description=NumberEntityDescription(
+                            key="countdown",
+                            icon="mdi:timer",
+                            native_max_value=86400,
+                            native_min_value=0,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            native_step=1,
+                        ),
+                    ),
+                ],
+            ),
+            "svhikeyq": [
+                TuyaBLENumberMapping(
+                    dp_id=11,
+                    description=NumberEntityDescription(
+                        key="countdown",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=1,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+                TuyaBLENumberMapping(
+                    dp_id=9,
+                    description=NumberEntityDescription(
+                        key="countdown_duration",
+                        icon="mdi:timer",
+                        native_max_value=2592000,
+                        native_min_value=1,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
+            "nxquc5lb": [  # Smart water timer - SOP10
+                TuyaBLENumberMapping(
+                    dp_id=11,
+                    description=NumberEntityDescription(
+                        key="countdown",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=60,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
+        },
+    ),
+    "ms": TuyaBLECategoryNumberMapping(
+        products={
+            "7a4xvbtt": [  # V1 Smart Lock / Lock P1
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=5,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_smart_lock_auto_lock_time,
+                    mode=NumberMode.BOX,
+                ),
+            ],
+            **dict.fromkeys(
+                ["6fibxtph", "99gv5nmz"],
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=36,
+                        description=NumberEntityDescription(
+                            key="auto_lock_time",
+                            icon="mdi:lock-clock",
+                            native_max_value=1800,
+                            native_min_value=0,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            native_step=1,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                ],
+            ),
+        },
+    ),
+    "jtmspro": TuyaBLECategoryNumberMapping(
+        products={
+            "xqeob8h6": [  # S1-TY-BLE-PRO
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:timer-lock",
+                        native_max_value=1800,
+                        native_min_value=1,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    getter=get_smart_lock_auto_lock_time,
+                    mode=NumberMode.BOX,
+                ),
+            ],
+            **dict.fromkeys(
+                [
+                    "stugc8dl",
+                    "xicdxood",
+                ],
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=27,
+                        description=NumberEntityDescription(
+                            key="doorbell_volume",
+                            icon="mdi:volume-high",
+                            native_max_value=100,
+                            native_min_value=0,
+                            native_unit_of_measurement=PERCENTAGE,
+                            native_step=1,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                    TuyaBLENumberMapping(
+                        dp_id=36,
+                        description=NumberEntityDescription(
+                            key="auto_lock_time",
+                            icon="mdi:lock-clock",
+                            native_max_value=180,
+                            native_min_value=10,
+                            native_unit_of_measurement=UnitOfTime.SECONDS,
+                            native_step=10,
+                            entity_category=EntityCategory.CONFIG,
+                        ),
+                    ),
+                ],
+            ),
+            "yfqp0shy": [
+                TuyaBLENumberMapping(
+                    dp_id=36,
+                    description=NumberEntityDescription(
+                        key="auto_lock_time",
+                        icon="mdi:lock-clock",
+                        native_max_value=1800,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                ),
+            ],
+        },
+    ),
+    "cl": TuyaBLECategoryNumberMapping(
+        products={
+            **dict.fromkeys(
+                ["4pbr8eig", "qqdxfdht", "kcy0x4pi", "vlwf3ud6"],
+                [
+                    TuyaBLENumberMapping(
+                        dp_id=105,
+                        description=NumberEntityDescription(
+                            key="cover_speed",
+                            icon="mdi:speedometer",
+                            native_max_value=40,
+                            native_min_value=1,
+                            native_step=1,
+                            mode=NumberMode.BOX,
+                        ),
+                    )
+                ],
+            )
+        },
+    ),
+    "dj": TuyaBLECategoryNumberMapping(
+        products={
+            "bpqbwf8y": [  # LED BULB B509Z2
+                TuyaBLENumberMapping(
+                    dp_id=0,
+                    description=NumberEntityDescription(
+                        key="countdown",
+                        icon="mdi:timer",
+                        native_max_value=86400,
+                        native_min_value=0,
+                        native_unit_of_measurement=UnitOfTime.SECONDS,
+                        native_step=1,
+                    ),
+                ),
+            ],
         },
     ),
 }
 
 
-def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLENumberMapping]:
+def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategoryNumberMapping]:
     category = mapping.get(device.category)
-    result: list[TuyaBLENumberMapping] = []
     if category is not None and category.products is not None:
         product_mapping = category.products.get(device.product_id)
         if product_mapping is not None:
-            result.extend(product_mapping)
-    if category is not None and category.mapping is not None:
-        result.extend(category.mapping)
-    return result
+            return product_mapping
+        if category.mapping is not None:
+            return category.mapping
+
+    return []
 
 
-class TuyaBLENumber(TuyaBLEEntity):
+class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     """Representation of a Tuya BLE Number."""
 
-    _attr_entity_category = None
-    _attr_native_min_value = None
-    _attr_native_max_value = None
-    _attr_native_step = None
-    _attr_native_unit_of_measurement = None
-    _attr_mode = None
+    platform = Platform.NUMBER
 
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: TuyaBLEPassiveCoordinator,
+        coordinator: DataUpdateCoordinator,
         device: TuyaBLEDevice,
         product: TuyaBLEProductInfo,
         mapping: TuyaBLENumberMapping,
@@ -543,23 +1044,22 @@ class TuyaBLENumber(TuyaBLEEntity):
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
         self._attr_mode = mapping.mode
-        self._attr_native_min_value = mapping.description.native_min_value
-        self._attr_native_max_value = mapping.description.native_max_value
-        self._attr_native_step = mapping.description.native_step
-        self._attr_native_unit_of_measurement = mapping.description.native_unit_of_measurement
-        self._attr_entity_category = mapping.description.entity_category
 
     @property
     def native_value(self) -> float | None:
-        if self._mapping.getter is not None:
+        """Return the entity value to represent the entity state."""
+        if self._mapping.getter:
             return self._mapping.getter(self, self._product)
+
         datapoint = self._device.datapoints[self._mapping.dp_id]
-        if datapoint and isinstance(datapoint.value, (int, float)):
+        if datapoint:
             return datapoint.value / self._mapping.coefficient
+
         return self._mapping.description.native_min_value
 
-    async def async_set_native_value(self, value: float) -> None:
-        if self._mapping.setter is not None:
+    def set_native_value(self, value: float) -> None:
+        """Set new value."""
+        if self._mapping.setter:
             self._mapping.setter(self, self._product, value)
             return
         int_value = int(value * self._mapping.coefficient)
@@ -569,10 +1069,15 @@ class TuyaBLENumber(TuyaBLEEntity):
             int(int_value),
         )
         if datapoint:
-            await datapoint.set_value(int_value)
+            self._hass.create_task(datapoint.set_value(int_value))
 
-    # Свойство available не определяется, используется только базовое
-    # ...existing code...
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        result = super().available
+        if result and self._mapping.is_available:
+            result = self._mapping.is_available(self, self._product)
+        return result
 
 
 async def async_setup_entry(
@@ -580,7 +1085,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Tuya BLE numbers."""
+    """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
     entities: list[TuyaBLENumber] = []
