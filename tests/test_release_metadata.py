@@ -29,10 +29,10 @@ RELEASE_POLICY = ROOT / "docs" / "releasing.md"
 
 
 def test_release_manifest_is_exact() -> None:
-    """Require the reviewed beta version, owner order, and downstream URLs."""
+    """Require the reviewed stable version, owner order, and downstream URLs."""
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.9.0b3"
+    assert manifest["version"] == "0.9.0"
     assert manifest["codeowners"] == [
         "@c7fen",
         "@PlusPlus-ua",
@@ -60,6 +60,13 @@ def test_release_links_are_downstream_and_versioned() -> None:
         assert expected in readme
 
     assert "c7fen/ha_tuya_ble-s1" not in readme
+    assert (
+        "## [0.9.0](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0)"
+        in changelog
+    )
+    assert "supersedes `v0.9.0b1`, `v0.9.0b2`, and `v0.9.0b3`" in changelog
+    assert "byte-identical to\n  `v0.9.0b3`" in changelog
+    assert "one representative\n  S1 Lock/Unlock hardware smoke cycle" in changelog
     assert (
         "## [0.9.0b3](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0b3)"
         in changelog
