@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity import EntityCategory
@@ -39,6 +40,10 @@ from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEControlSuspendedError,
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
+from custom_components.tuya_ble.vacuum import (
+    TuyaBLEVacuumEntity,
+    TuyaBLEVacuumMapping,
+)
 
 
 SYNTHETIC_ADDRESS = "00:00:00:00:00:21"
@@ -420,6 +425,29 @@ async def test_suspended_lock_commands_perform_zero_writes(
 
     assert device._send_datapoints.await_count == 0
     assert device._send_datapoints_once.await_count == 0
+
+
+async def test_suspended_vacuum_command_performs_zero_writes(
+    hass: HomeAssistant,
+) -> None:
+    device = _make_device(enabled=False)
+    device._send_datapoints = AsyncMock()
+    coordinator = TuyaBLECoordinator(hass, device)
+    entity = TuyaBLEVacuumEntity(
+        hass,
+        coordinator,
+        device,
+        TuyaBLEProductInfo("Synthetic vacuum"),
+        TuyaBLEVacuumMapping(
+            dp_start_bool=1,
+            status_map={"idle": VacuumActivity.IDLE},
+        ),
+    )
+
+    with pytest.raises(TuyaBLEControlSuspendedError):
+        await entity.async_start()
+
+    assert device._send_datapoints.await_count == 0
 
 
 async def test_options_flow_connection_settings_preserve_credentials(

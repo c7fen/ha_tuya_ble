@@ -56,7 +56,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.const import Platform
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -262,12 +267,14 @@ class TuyaBLEVacuumEntity(TuyaBLEEntity, StateVacuumEntity):
         return dp.value if dp else None
 
     def _send_bool(self, dp_id: int, value: bool) -> None:
+        ensure_control_available(self._device)
         dp = self._device.datapoints.get_or_create(
             dp_id, TuyaBLEDataPointType.DT_BOOL, value
         )
         self._hass.create_task(dp.set_value(value))
 
     def _send_enum(self, dp_id: int, value: int) -> None:
+        ensure_control_available(self._device)
         dp = self._device.datapoints.get_or_create(
             dp_id, TuyaBLEDataPointType.DT_ENUM, value
         )
