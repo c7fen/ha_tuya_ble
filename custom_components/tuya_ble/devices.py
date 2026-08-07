@@ -125,25 +125,18 @@ class TuyaBLEEntity(CoordinatorEntity):
         """Return if entity is available."""
         if self._is_connection_policy_entity:
             return True
-        if (
-            not self._device.ble_control_enabled
-            or self._device.effective_policy
-            in {
-                EffectiveConnectionPolicy.STOPPED,
-                EffectiveConnectionPolicy.SUSPENDED,
-            }
-        ):
+        if not self._device.ble_control_enabled or self._device.effective_policy in {
+            EffectiveConnectionPolicy.STOPPED,
+            EffectiveConnectionPolicy.SUSPENDED,
+        }:
             return False
         if self._is_command_entity:
             return self._coordinator.connected or (
                 self._device.connection_mode is ConnectionMode.ON_DEMAND
             )
-        return (
-            self._coordinator.connected
-            and (
-                self._device.state_data_fresh
-                or not getattr(self._device, "_has_disconnected", False)
-            )
+        return self._coordinator.connected and (
+            self._device.state_data_fresh
+            or not getattr(self._device, "_has_disconnected", False)
         )
 
     @property

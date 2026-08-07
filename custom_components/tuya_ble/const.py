@@ -48,6 +48,7 @@ class EffectiveConnectionPolicy(StrEnum):
     ALWAYS_CONNECTED = "always_connected"
     ON_DEMAND = "on_demand"
 
+
 DEVICE_METADATA_UUIDS: Final = "uuids"
 
 DEVICE_DEF_MANUFACTURER: Final = "Tuya"

@@ -530,9 +530,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from err
 
     address: str = entry.data[CONF_ADDRESS]
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, address.upper(), True
-    )
+    ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
     raw_mode = entry.options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
     try:
         connection_mode = ConnectionMode(raw_mode)
@@ -543,7 +541,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     if not isinstance(ble_control_enabled, bool):
         ble_control_enabled = DEFAULT_BLE_CONTROL_ENABLED
-    if ble_device is None and ble_control_enabled and connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+    if (
+        ble_device is None
+        and ble_control_enabled
+        and connection_mode is ConnectionMode.ALWAYS_CONNECTED
+    ):
         try:
             ble_device = await get_device(address)
         except BLEAK_EXCEPTIONS:
@@ -594,9 +596,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from ex
     """
 
-    if getattr(device, "ble_control_enabled", True) and getattr(
-        device, "connection_mode", ConnectionMode.ALWAYS_CONNECTED
-    ) is ConnectionMode.ALWAYS_CONNECTED:
+    if (
+        getattr(device, "ble_control_enabled", True)
+        and getattr(device, "connection_mode", ConnectionMode.ALWAYS_CONNECTED)
+        is ConnectionMode.ALWAYS_CONNECTED
+    ):
         if hasattr(hass, "async_create_task"):
             device._startup_task = hass.async_create_task(device.startup_update())
         else:

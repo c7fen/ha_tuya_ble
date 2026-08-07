@@ -385,8 +385,9 @@ class TuyaBLEDevice:
         address: str | None = None,
         connection_mode: str = DEFAULT_CONNECTION_MODE,
         ble_control_enabled: bool = DEFAULT_BLE_CONTROL_ENABLED,
-        persist_options: Callable[[dict[str, Any]], Awaitable[None] | None]
-        | None = None,
+        persist_options: (
+            Callable[[dict[str, Any]], Awaitable[None] | None] | None
+        ) = None,
     ) -> None:
         """Init the TuyaBLE."""
         self._device_manager = device_manager
@@ -621,9 +622,7 @@ class TuyaBLEDevice:
             )
         except (TypeError, ValueError):
             new_mode = ConnectionMode.ALWAYS_CONNECTED
-        raw_enabled = options.get(
-            CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
-        )
+        raw_enabled = options.get(CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED)
         new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
         self._connection_mode = new_mode
         self._ble_control_enabled = new_enabled
@@ -1574,9 +1573,8 @@ class TuyaBLEDevice:
     ) -> None:
         """Send once without replay and require an explicit success response."""
         if (
-            (self._expected_disconnect and self._active_lease_count == 0)
-            or self._protocol_version != 3
-        ):
+            self._expected_disconnect and self._active_lease_count == 0
+        ) or self._protocol_version != 3:
             raise TuyaBLECommandUnconfirmedError()
         async with self.connection_lease("confirmed datapoint"):
             if self._protocol_version != 3:

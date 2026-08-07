@@ -4,6 +4,7 @@ from homeassistant.exceptions import ServiceValidationError
 
 from ..const import DOMAIN
 
+
 class TuyaBLEError(Exception):
     """Base class for Tuya BLE errors."""
 

@@ -1071,13 +1071,10 @@ async def async_setup_entry(
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
     entities: list[TuyaBLEEntity] = []
-    if (
-        (data.device.category, data.device.product_id)
-        in {
-            ("jtmspro", "xqeob8h6"),
-            ("ms", "7a4xvbtt"),
-        }
-    ):
+    if (data.device.category, data.device.product_id) in {
+        ("jtmspro", "xqeob8h6"),
+        ("ms", "7a4xvbtt"),
+    }:
         entities.append(
             TuyaBLEControlSwitch(
                 hass,
