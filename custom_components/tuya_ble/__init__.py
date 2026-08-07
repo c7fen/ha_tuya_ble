@@ -567,20 +567,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             result = hass.config_entries.async_update_entry(
                 entry, options=merged_options
             )
-        except Exception as err:
+        except Exception:
             raise ConfigEntryError(
                 "Unable to persist the Tuya BLE connection policy"
-            ) from err
+            ) from None
         if result is False:
             raise ConfigEntryError("Unable to persist the Tuya BLE connection policy")
 
     device._persist_options = _async_persist_policy_options
     try:
         await device.initialize()
-    except ValueError as err:
+    except ValueError:
         raise ConfigEntryNotReady(
             "Could not load the stored Tuya BLE device credentials"
-        ) from err
+        ) from None
     product_info = get_device_product_info(device)
 
     _async_migrate_s1_motor_state_entity(hass, entry, device)

@@ -593,9 +593,9 @@ class TuyaBLEDevice:
             result = self._persist_options(updates)
             if inspect.isawaitable(result):
                 await result
-        except Exception as err:
+        except Exception:
             _LOGGER.error("%s: Connection policy persistence failed", self.log_identity)
-            raise TuyaBLEPolicyTransitionError() from err
+            raise TuyaBLEPolicyTransitionError() from None
 
     async def async_update_connection_policy(
         self,
@@ -610,8 +610,8 @@ class TuyaBLEDevice:
             else:
                 try:
                     new_mode = ConnectionMode(connection_mode)
-                except (TypeError, ValueError) as err:
-                    raise TuyaBLEPolicyTransitionError() from err
+                except (TypeError, ValueError):
+                    raise TuyaBLEPolicyTransitionError() from None
 
             if ble_control_enabled is None:
                 new_enabled = self._ble_control_enabled
@@ -704,8 +704,8 @@ class TuyaBLEDevice:
                 self._lease_zero_event.wait(),
                 CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError as err:
-            raise TuyaBLEPolicyTransitionError() from err
+        except asyncio.TimeoutError:
+            raise TuyaBLEPolicyTransitionError() from None
 
         async with self._policy_lock:
             if self._terminal_stopped:
@@ -740,9 +740,9 @@ class TuyaBLEDevice:
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             await self._release_connection_lease()
             raise
-        except Exception as err:
+        except Exception:
             await self._release_connection_lease()
-            raise TuyaBLEConnectionUnavailableError() from err
+            raise TuyaBLEConnectionUnavailableError() from None
 
         async with self._policy_lock:
             if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:

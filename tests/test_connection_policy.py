@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -289,11 +290,17 @@ async def test_persistence_failure_does_not_disconnect() -> None:
     device = _make_device(persist_options=persist)
     device._execute_disconnect = AsyncMock()
 
-    with pytest.raises(ServiceValidationError):
+    with pytest.raises(ServiceValidationError) as raised:
         await device.async_update_connection_policy(ble_control_enabled=False)
 
     assert device.ble_control_enabled is True
     device._execute_disconnect.assert_not_awaited()
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert "synthetic persistence failure" not in rendered
 
 
 async def test_repeated_suspension_application_is_idempotent() -> None:
