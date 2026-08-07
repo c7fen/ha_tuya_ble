@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from contextlib import AbstractAsyncContextManager
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -13,7 +14,7 @@ import time
 from collections.abc import Callable, Hashable
 from struct import pack, unpack
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 import json
 
@@ -80,6 +81,9 @@ _LOGGER = logging.getLogger(__name__)
 _LOG_IDENTITY_ALPHABET = "ghjkmnpqrstuvwxyz"
 _LOG_IDENTITY_LENGTH = 16
 _TRANSPORT_ERROR_FALLBACK = "Tuya BLE transport error"
+_CONNECTION_LEASE_CONTEXT: ContextVar[int] = ContextVar(
+    "tuya_ble_connection_lease", default=0
+)
 
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
@@ -339,18 +343,29 @@ class TuyaBLEConnectionLease(AbstractAsyncContextManager):
         self._reason = reason
         self._defer_connection = defer_connection
         self._acquired = False
+        self._context_token: Token[int] | None = None
 
-    async def __aenter__(self) -> TuyaBLEConnectionLease:
+    async def __aenter__(self) -> Self:
         await self._device._acquire_connection_lease(
             self._reason, self._defer_connection
         )
         self._acquired = True
+        self._context_token = _CONNECTION_LEASE_CONTEXT.set(
+            _CONNECTION_LEASE_CONTEXT.get() + 1
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         if self._acquired:
             self._acquired = False
-            await self._device._release_connection_lease()
+            context_token = self._context_token
+            self._context_token = None
+            if context_token is not None:
+                _CONNECTION_LEASE_CONTEXT.reset(context_token)
+            try:
+                await self._device._release_connection_lease()
+            finally:
+                self._context_token = None
 
 
 global_connect_lock = asyncio.Lock()
@@ -404,6 +419,7 @@ class TuyaBLEDevice:
         self._operation_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._policy_lock = asyncio.Lock()
+        self._policy_transition_lock = asyncio.Lock()
         self._lease_zero_event = asyncio.Event()
         self._lease_zero_event.set()
         self._active_lease_count = 0
@@ -543,9 +559,12 @@ class TuyaBLEDevice:
 
     def ensure_control_available(self) -> None:
         """Reject work that cannot safely use the current policy."""
-        if self._terminal_stopped:
+        lease_active = _CONNECTION_LEASE_CONTEXT.get() > 0
+        if self._terminal_stopped and not lease_active:
             raise TuyaBLEConnectionUnavailableError()
-        if not self._ble_control_enabled or self._suspension_requested:
+        if (
+            not self._ble_control_enabled or self._suspension_requested
+        ) and not lease_active:
             raise TuyaBLEControlSuspendedError()
 
     def register_connection_state_callback(
@@ -574,7 +593,7 @@ class TuyaBLEDevice:
             result = self._persist_options(updates)
             if inspect.isawaitable(result):
                 await result
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             _LOGGER.error("%s: Connection policy persistence failed", self.log_identity)
             raise TuyaBLEPolicyTransitionError() from err
 
@@ -585,49 +604,53 @@ class TuyaBLEDevice:
         ble_control_enabled: bool | None = None,
     ) -> None:
         """Persist and apply one or both connection policy settings."""
-        if connection_mode is None:
-            new_mode = self._connection_mode
-        else:
-            try:
-                new_mode = ConnectionMode(connection_mode)
-            except (TypeError, ValueError) as err:
-                raise TuyaBLEPolicyTransitionError() from err
+        async with self._policy_transition_lock:
+            if connection_mode is None:
+                new_mode = self._connection_mode
+            else:
+                try:
+                    new_mode = ConnectionMode(connection_mode)
+                except (TypeError, ValueError) as err:
+                    raise TuyaBLEPolicyTransitionError() from err
 
-        if ble_control_enabled is None:
-            new_enabled = self._ble_control_enabled
-        elif isinstance(ble_control_enabled, bool):
-            new_enabled = ble_control_enabled
-        else:
-            raise TuyaBLEPolicyTransitionError()
+            if ble_control_enabled is None:
+                new_enabled = self._ble_control_enabled
+            elif isinstance(ble_control_enabled, bool):
+                new_enabled = ble_control_enabled
+            else:
+                raise TuyaBLEPolicyTransitionError()
 
-        updates: dict[str, Any] = {}
-        if new_mode is not self._connection_mode:
-            updates[CONF_CONNECTION_MODE] = new_mode.value
-        if new_enabled != self._ble_control_enabled:
-            updates[CONF_BLE_CONTROL_ENABLED] = new_enabled
-        if updates:
-            await self._persist_policy_options(updates)
+            updates: dict[str, Any] = {}
+            if new_mode is not self._connection_mode:
+                updates[CONF_CONNECTION_MODE] = new_mode.value
+            if new_enabled != self._ble_control_enabled:
+                updates[CONF_BLE_CONTROL_ENABLED] = new_enabled
+            if updates:
+                await self._persist_policy_options(updates)
 
-        self._connection_mode = new_mode
-        self._ble_control_enabled = new_enabled
-        if not new_enabled:
-            self._suspension_requested = True
-        await self._apply_connection_policy()
+            self._connection_mode = new_mode
+            self._ble_control_enabled = new_enabled
+            if not new_enabled:
+                self._suspension_requested = True
+            await self._apply_connection_policy()
 
     async def async_apply_persisted_options(self, options: dict[str, Any]) -> None:
         """Apply stored policy options without writing them again."""
-        try:
-            new_mode = ConnectionMode(
-                options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+        async with self._policy_transition_lock:
+            try:
+                new_mode = ConnectionMode(
+                    options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+                )
+            except (TypeError, ValueError):
+                new_mode = ConnectionMode.ALWAYS_CONNECTED
+            raw_enabled = options.get(
+                CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
             )
-        except (TypeError, ValueError):
-            new_mode = ConnectionMode.ALWAYS_CONNECTED
-        raw_enabled = options.get(CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED)
-        new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
-        self._connection_mode = new_mode
-        self._ble_control_enabled = new_enabled
-        self._suspension_requested = not new_enabled
-        await self._apply_connection_policy()
+            new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
+            self._connection_mode = new_mode
+            self._ble_control_enabled = new_enabled
+            self._suspension_requested = not new_enabled
+            await self._apply_connection_policy()
 
     async def _apply_connection_policy(self) -> None:
         if self._terminal_stopped:
@@ -664,6 +687,11 @@ class TuyaBLEDevice:
     async def _suspend_runtime(self) -> None:
         async with self._policy_lock:
             if self._terminal_stopped:
+                return
+            if (
+                self._policy_state is ConnectionPolicyState.SUSPENDED
+                and not self.is_gatt_connected
+            ):
                 return
             self._suspension_requested = True
             self._cancel_reconnect_locked()
@@ -706,10 +734,13 @@ class TuyaBLEDevice:
             return
         try:
             await self._ensure_connected()
+        except asyncio.CancelledError:
+            await self._release_connection_lease()
+            raise
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             await self._release_connection_lease()
             raise
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             await self._release_connection_lease()
             raise TuyaBLEConnectionUnavailableError() from err
 
@@ -772,6 +803,11 @@ class TuyaBLEDevice:
                     self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
         except asyncio.CancelledError:
             return
+        except Exception:
+            _LOGGER.error(
+                "%s: On-demand idle disconnect failed",
+                self.log_identity,
+            )
         finally:
             if self._idle_disconnect_task is current_task:
                 self._idle_disconnect_task = None
@@ -830,7 +866,7 @@ class TuyaBLEDevice:
         """Run the initial status path without failing config-entry setup."""
         try:
             await self.update()
-        except Exception:  # noqa: BLE001
+        except Exception:
             if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 self._schedule_reconnect()
         finally:
@@ -1410,7 +1446,8 @@ class TuyaBLEDevice:
         try:
             if self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 return
-            await self._ensure_connected()
+            async with self.connection_lease("policy reconnect", defer_connection=True):
+                await self._ensure_connected()
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
         except BLEAK_EXCEPTIONS as ex:  # BleakNotFoundError:
             if "Bluetooth is already shutdown" in str(ex):
@@ -1597,8 +1634,18 @@ class TuyaBLEDevice:
         response_to: int,
     ) -> None:
         """Send response to received packet."""
-        if self._client and self._client.is_connected:
-            await self._send_packet_while_connected(code, data, response_to, False)
+        if not self._client or not self._client.is_connected:
+            return
+        try:
+            async with self.connection_lease(
+                "protocol response", defer_connection=True
+            ):
+                if self._client and self._client.is_connected:
+                    await self._send_packet_while_connected(
+                        code, data, response_to, False
+                    )
+        except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
+            return
 
     async def _send_packet_while_connected(
         self,
@@ -1693,10 +1740,17 @@ class TuyaBLEDevice:
             return
         if self._expected_disconnect or self._suspension_requested:
             return
-        await self._ensure_connected()
-        if self._expected_disconnect:
+        try:
+            async with self.connection_lease("transport resend", defer_connection=True):
+                await self._ensure_connected()
+                await self._int_send_packet_while_connected(packets)
+        except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
-        await self._int_send_packet_while_connected(packets)
+        except BLEAK_EXCEPTIONS:
+            _LOGGER.debug(
+                "%s: Transport resend failed",
+                self.log_identity,
+            )
 
     async def _send_packets_locked(
         self, packets: list[bytes], resend_on_error: bool = True

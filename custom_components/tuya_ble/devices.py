@@ -32,7 +32,6 @@ from .tuya_ble import (
 from .cloud import HASSTuyaBLEDeviceManager
 from .const import (
     ConnectionMode,
-    ConnectionPolicyState,
     DEVICE_DEF_MANUFACTURER,
     DOMAIN,
     EffectiveConnectionPolicy,

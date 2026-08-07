@@ -927,14 +927,12 @@ class TuyaBLEConnectionModeSelect(TuyaBLEEntity, SelectEntity):
         self._hass.create_task(self._async_select_connection_mode(value))
 
     async def _async_select_connection_mode(self, value: str) -> None:
-        try:
-            await self._device.async_update_connection_policy(connection_mode=value)
-        except Exception:  # noqa: BLE001
-            _LOGGER.error(
-                "%s: Connection mode change failed",
-                self._device.log_identity,
-            )
+        await self._device.async_update_connection_policy(connection_mode=value)
         self.async_write_ha_state()
+
+    async def async_select_option(self, value: str) -> None:
+        """Persist a mode selected through a Home Assistant service call."""
+        await self._async_select_connection_mode(value)
 
 
 async def async_setup_entry(

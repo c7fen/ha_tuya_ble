@@ -22,7 +22,6 @@ from custom_components.tuya_ble.const import (
     CONF_CONNECTION_MODE,
     ConnectionMode,
     ConnectionPolicyState,
-    DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
     DOMAIN,
     EffectiveConnectionPolicy,
 )
@@ -34,7 +33,7 @@ from custom_components.tuya_ble.devices import (
 from custom_components.tuya_ble.lock import TuyaBLES1Lock, TuyaBLEV1Lock
 from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
-from custom_components.tuya_ble.tuya_ble import TuyaBLEDevice
+from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEControlSuspendedError,
 )
@@ -98,9 +97,7 @@ def test_defaults_and_effective_policy() -> None:
     assert device.connection_mode is ConnectionMode.ALWAYS_CONNECTED
     assert device.ble_control_enabled is True
     assert device.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
-    assert (
-        device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
-    )
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
     assert device.is_connection_active is False
 
 
@@ -239,6 +236,79 @@ async def test_suspension_waits_for_existing_lease() -> None:
     assert device.active_lease_count == 0
 
 
+async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
+    persisted = asyncio.Event()
+
+    async def persist(_: dict[str, object]) -> None:
+        persisted.set()
+
+    device = _make_device(persist_options=persist)
+    device._send_datapoints = AsyncMock()
+    device._execute_disconnect = AsyncMock()
+    datapoint = device.datapoints.get_or_create(46, TuyaBLEDataPointType.DT_BOOL, False)
+
+    async with device.connection_lease("active operation", defer_connection=True):
+        suspension = asyncio.create_task(
+            device.async_update_connection_policy(ble_control_enabled=False)
+        )
+        await persisted.wait()
+        await datapoint.set_value(True)
+        await asyncio.sleep(0)
+        assert device._send_datapoints.await_count == 1
+    await suspension
+
+    assert device.active_lease_count == 0
+    device._execute_disconnect.assert_awaited_once()
+
+
+async def test_cancelled_lease_acquisition_releases_count() -> None:
+    connection_started = asyncio.Event()
+    release_connection = asyncio.Event()
+
+    device = _make_device()
+
+    async def wait_for_connection() -> None:
+        connection_started.set()
+        await release_connection.wait()
+
+    device._ensure_connected = wait_for_connection
+    lease_task = asyncio.create_task(device.connection_lease("cancelled").__aenter__())
+    await connection_started.wait()
+    lease_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lease_task
+
+    assert device.active_lease_count == 0
+    release_connection.set()
+
+
+async def test_persistence_failure_does_not_disconnect() -> None:
+    async def persist(_: dict[str, object]) -> None:
+        raise RuntimeError("synthetic persistence failure")
+
+    device = _make_device(persist_options=persist)
+    device._execute_disconnect = AsyncMock()
+
+    with pytest.raises(ServiceValidationError):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    assert device.ble_control_enabled is True
+    device._execute_disconnect.assert_not_awaited()
+
+
+async def test_repeated_suspension_application_is_idempotent() -> None:
+    device = _make_device()
+    device._execute_disconnect = AsyncMock()
+
+    await asyncio.gather(
+        device.async_update_connection_policy(ble_control_enabled=False),
+        device.async_apply_persisted_options({CONF_BLE_CONTROL_ENABLED: False}),
+    )
+
+    device._execute_disconnect.assert_awaited_once()
+    assert device.policy_state is ConnectionPolicyState.SUSPENDED
+
+
 async def test_mode_change_while_suspended_does_not_connect() -> None:
     device = _make_device(enabled=False)
     device._ensure_connected = AsyncMock()
@@ -259,13 +329,9 @@ async def test_policy_entities_are_available_while_disconnected(
 ) -> None:
     device = _make_device(enabled=False)
     data = _make_data(hass, device)
-    mode = TuyaBLEConnectionModeSelect(
-        hass, data.coordinator, device, data.product
-    )
+    mode = TuyaBLEConnectionModeSelect(hass, data.coordinator, device, data.product)
     control = TuyaBLEControlSwitch(hass, data.coordinator, device, data.product)
-    connection = TuyaBLEConnectionSensor(
-        hass, data.coordinator, device, data.product
-    )
+    connection = TuyaBLEConnectionSensor(hass, data.coordinator, device, data.product)
 
     assert mode.available is True
     assert control.available is True

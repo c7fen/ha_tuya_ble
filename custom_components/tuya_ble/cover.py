@@ -322,7 +322,10 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
     ) -> None:
         time_now = time_now or datetime.now(timezone.utc)
         await asyncio.sleep(sleep_ms / 1000.0)
-        if self._device.connection_mode is ConnectionMode.ON_DEMAND:
+        if (
+            self._device.connection_mode is ConnectionMode.ON_DEMAND
+            or not self._device.ble_control_enabled
+        ):
             return
         if self._device._is_paired and (
             not self._device.last_data_received

@@ -1050,16 +1050,16 @@ class TuyaBLEControlSwitch(TuyaBLEEntity, SwitchEntity):
         self._hass.create_task(self._async_set_control(False))
 
     async def _async_set_control(self, enabled: bool) -> None:
-        try:
-            await self._device.async_update_connection_policy(
-                ble_control_enabled=enabled
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.error(
-                "%s: Home Assistant BLE control change failed",
-                self._device.log_identity,
-            )
+        await self._device.async_update_connection_policy(ble_control_enabled=enabled)
         self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Persist enabled BLE control through a Home Assistant service call."""
+        await self._async_set_control(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Persist suspended BLE control through a Home Assistant service call."""
+        await self._async_set_control(False)
 
 
 async def async_setup_entry(

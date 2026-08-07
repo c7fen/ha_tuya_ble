@@ -567,7 +567,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             result = hass.config_entries.async_update_entry(
                 entry, options=merged_options
             )
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             raise ConfigEntryError(
                 "Unable to persist the Tuya BLE connection policy"
             ) from err

@@ -175,6 +175,15 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
         super().__init__(config_entry)
+        self._flow_config_entry = config_entry
+
+    @property
+    def _entry(self) -> ConfigEntry:
+        """Return the linked entry across Home Assistant Options Flow APIs."""
+        try:
+            return self.config_entry
+        except (AttributeError, ValueError):
+            return self._flow_config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -197,13 +206,13 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
             )
             try:
                 mode = ConnectionMode(raw_mode)
+                if not isinstance(raw_enabled, bool):
+                    raise ValueError
             except (TypeError, ValueError):
                 errors["base"] = "ble_policy_transition_failed"
             else:
                 domain_data = self.hass.data.get(DOMAIN, {})
-                entry_data: TuyaBLEData | None = domain_data.get(
-                    self.config_entry.entry_id
-                )
+                entry_data: TuyaBLEData | None = domain_data.get(self._entry.entry_id)
                 try:
                     if entry_data:
                         await entry_data.device.async_update_connection_policy(
@@ -213,7 +222,7 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                 except Exception:  # noqa: BLE001
                     errors["base"] = "ble_policy_transition_failed"
                 else:
-                    options = dict(self.config_entry.options)
+                    options = dict(self._entry.options)
                     options.update(
                         {
                             CONF_CONNECTION_MODE: mode.value,
@@ -221,11 +230,11 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                         }
                     )
                     return self.async_create_entry(
-                        title=self.config_entry.title,
+                        title=self._entry.title,
                         data=options,
                     )
 
-        options = self.config_entry.options
+        options = self._entry.options
         try:
             default_mode = ConnectionMode(
                 options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
@@ -261,13 +270,13 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
         errors: dict[str, str] = {}
         placeholders: dict[str, Any] = {}
         credentials: TuyaBLEDeviceCredentials | None = None
-        address: str | None = self.config_entry.data.get(CONF_ADDRESS)
+        address: str | None = self._entry.data.get(CONF_ADDRESS)
 
         if user_input is not None:
             entry: TuyaBLEData | None = None
             domain_data = self.hass.data.get(DOMAIN)
             if domain_data:
-                entry = domain_data.get(self.config_entry.entry_id)
+                entry = domain_data.get(self._entry.entry_id)
             if entry:
                 login_data = await _try_login(
                     entry.manager,
@@ -282,10 +291,10 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                         address, True, True
                     )
                     if credentials:
-                        options = dict(self.config_entry.options)
+                        options = dict(self._entry.options)
                         options.update(entry.manager.data)
                         return self.async_create_entry(
-                            title=self.config_entry.title,
+                            title=self._entry.title,
                             data=options,
                         )
 
@@ -293,7 +302,7 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
 
         if user_input is None:
             user_input = {}
-            user_input.update(self.config_entry.options)
+            user_input.update(self._entry.options)
 
         return _show_login_form(self, user_input, errors, placeholders)
 
