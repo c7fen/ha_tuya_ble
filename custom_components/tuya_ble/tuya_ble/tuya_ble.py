@@ -873,15 +873,29 @@ class TuyaBLEDevice:
     def _schedule_response(
         self, code: TuyaBLECode, data: bytes, response_to: int
     ) -> None:
-        task = asyncio.create_task(self._response_task_runner(code, data, response_to))
+        operation_lease_active = _CONNECTION_LEASE_CONTEXT.get() > 0
+        task = self._create_policy_task(
+            self._response_task_runner(code, data, response_to, operation_lease_active)
+        )
         self._response_tasks.add(task)
         task.add_done_callback(self._response_tasks.discard)
 
     async def _response_task_runner(
-        self, code: TuyaBLECode, data: bytes, response_to: int
+        self,
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
+        operation_lease_active: bool,
     ) -> None:
         try:
-            await self._send_response(code, data, response_to)
+            if operation_lease_active:
+                lease_context_token = _CONNECTION_LEASE_CONTEXT.set(1)
+                try:
+                    await self._send_response(code, data, response_to)
+                finally:
+                    _CONNECTION_LEASE_CONTEXT.reset(lease_context_token)
+            else:
+                await self._send_response(code, data, response_to)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1699,13 +1713,19 @@ class TuyaBLEDevice:
         if not self._client or not self._client.is_connected:
             return
         try:
-            async with self.connection_lease(
-                "protocol response", defer_connection=True
-            ):
+            if _CONNECTION_LEASE_CONTEXT.get() > 0:
                 if self._client and self._client.is_connected:
                     await self._send_packet_while_connected(
                         code, data, response_to, False
                     )
+            else:
+                async with self.connection_lease(
+                    "protocol response", defer_connection=True
+                ):
+                    if self._client and self._client.is_connected:
+                        await self._send_packet_while_connected(
+                            code, data, response_to, False
+                        )
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
 

@@ -37,6 +37,7 @@ from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
+from custom_components.tuya_ble.tuya_ble.tuya_ble import _CONNECTION_LEASE_CONTEXT
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEControlSuspendedError,
 )
@@ -359,6 +360,28 @@ async def test_stop_cancels_pending_protocol_response_task() -> None:
 
     assert not device._response_tasks
     release_response.set()
+
+
+async def test_response_task_does_not_inherit_lease_context() -> None:
+    device = _make_device()
+    observed: list[int] = []
+    response_started = asyncio.Event()
+
+    async def record_response(_: TuyaBLECode, __: bytes, ___: int) -> None:
+        observed.append(_CONNECTION_LEASE_CONTEXT.get())
+        response_started.set()
+
+    device._send_response = record_response
+    async with device.connection_lease("operation", defer_connection=True):
+        device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
+        await response_started.wait()
+
+    assert observed == [1]
+    observed.clear()
+    response_started.clear()
+    device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
+    await response_started.wait()
+    assert observed == [0]
 
 
 async def test_mode_change_while_suspended_does_not_connect() -> None:
