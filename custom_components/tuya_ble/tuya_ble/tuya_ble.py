@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from contextlib import AbstractAsyncContextManager
-from contextvars import ContextVar, Token
+from contextvars import ContextVar, Token, copy_context
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -425,6 +425,8 @@ class TuyaBLEDevice:
         self._active_lease_count = 0
         self._idle_disconnect_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        self._resend_task: asyncio.Task | None = None
+        self._response_tasks: set[asyncio.Task] = set()
         self._startup_task: asyncio.Task | None = None
         self._persist_options = persist_options
         try:
@@ -663,6 +665,7 @@ class TuyaBLEDevice:
         if self._connection_mode is ConnectionMode.ON_DEMAND:
             async with self._policy_lock:
                 self._cancel_reconnect_locked()
+                self._cancel_resend_locked()
                 if self._active_lease_count:
                     self._policy_state = (
                         ConnectionPolicyState.ON_DEMAND_ACTIVE
@@ -677,6 +680,7 @@ class TuyaBLEDevice:
             return
 
         async with self._policy_lock:
+            self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
                 self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
@@ -695,6 +699,7 @@ class TuyaBLEDevice:
                 return
             self._suspension_requested = True
             self._cancel_reconnect_locked()
+            self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
@@ -777,10 +782,22 @@ class TuyaBLEDevice:
             self._reconnect_task.cancel()
             self._reconnect_task = None
 
+    def _cancel_resend_locked(self) -> None:
+        if self._resend_task is not None:
+            self._resend_task.cancel()
+            self._resend_task = None
+
+    @staticmethod
+    def _create_policy_task(coroutine: Any) -> asyncio.Task:
+        """Create background policy work without inheriting an operation lease."""
+        context = copy_context()
+        context.run(_CONNECTION_LEASE_CONTEXT.set, 0)
+        return context.run(asyncio.create_task, coroutine)
+
     def _schedule_idle_disconnect_locked(self) -> None:
         if self._idle_disconnect_task is not None:
             return
-        self._idle_disconnect_task = asyncio.create_task(
+        self._idle_disconnect_task = self._create_policy_task(
             self._idle_disconnect_after_delay()
         )
 
@@ -815,7 +832,9 @@ class TuyaBLEDevice:
     def _schedule_reconnect_locked(self, delay: float) -> None:
         if self._reconnect_task is not None:
             return
-        self._reconnect_task = asyncio.create_task(self._reconnect_after_delay(delay))
+        self._reconnect_task = self._create_policy_task(
+            self._reconnect_after_delay(delay)
+        )
 
     async def _reconnect_after_delay(self, delay: float) -> None:
         current_task = asyncio.current_task()
@@ -828,6 +847,45 @@ class TuyaBLEDevice:
         finally:
             if self._reconnect_task is current_task:
                 self._reconnect_task = None
+
+    def _schedule_resend(self, packets: list[bytes]) -> None:
+        if (
+            self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED
+            or self._terminal_stopped
+            or self._suspension_requested
+            or self._resend_task is not None
+        ):
+            return
+        self._resend_task = self._create_policy_task(self._resend_task_runner(packets))
+
+    async def _resend_task_runner(self, packets: list[bytes]) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await self._resend_packets(packets)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.debug("%s: Background resend failed", self.log_identity)
+        finally:
+            if self._resend_task is current_task:
+                self._resend_task = None
+
+    def _schedule_response(
+        self, code: TuyaBLECode, data: bytes, response_to: int
+    ) -> None:
+        task = asyncio.create_task(self._response_task_runner(code, data, response_to))
+        self._response_tasks.add(task)
+        task.add_done_callback(self._response_tasks.discard)
+
+    async def _response_task_runner(
+        self, code: TuyaBLECode, data: bytes, response_to: int
+    ) -> None:
+        try:
+            await self._send_response(code, data, response_to)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.debug("%s: Protocol response failed", self.log_identity)
 
     async def initialize(self) -> None:
         _LOGGER.debug("%s: Initializing", self.log_identity)
@@ -1214,7 +1272,11 @@ class TuyaBLEDevice:
             self._suspension_requested = True
             self._policy_state = ConnectionPolicyState.STOPPED
             self._cancel_reconnect_locked()
+            self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
+            for task in self._response_tasks:
+                task.cancel()
+            self._response_tasks.clear()
             if self._startup_task is not None:
                 self._startup_task.cancel()
                 self._startup_task = None
@@ -1480,7 +1542,7 @@ class TuyaBLEDevice:
         if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
             return
         if self._reconnect_task is None:
-            self._reconnect_task = asyncio.create_task(
+            self._reconnect_task = self._create_policy_task(
                 self._reconnect_after_delay(delay)
             )
 
@@ -1776,7 +1838,7 @@ class TuyaBLEDevice:
             )
             if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
                 if self._is_paired and resend_on_error:
-                    asyncio.create_task(self._resend_packets(packets))
+                    self._schedule_resend(packets)
                 else:
                     self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
@@ -1795,7 +1857,7 @@ class TuyaBLEDevice:
             )
             if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
                 if self._is_paired and resend_on_error:
-                    asyncio.create_task(self._resend_packets(packets))
+                    self._schedule_resend(packets)
                 else:
                     self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
@@ -1996,7 +2058,7 @@ class TuyaBLEDevice:
                 timestamp = int(time.time_ns() / 1000000)
                 timezone = -int(time.timezone / 36)
                 data = str(timestamp).encode() + pack(">h", timezone)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME2_REQ:
                 if len(data) != 0:
@@ -2015,25 +2077,25 @@ class TuyaBLEDevice:
                     time_str.tm_wday,
                     timezone,
                 )
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP:
                 self._parse_datapoints_v3(time.time(), 0, data, 0)
-                asyncio.create_task(self._send_response(code, bytes(0), seq_num))
+                self._schedule_response(code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_DP:
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
                 self._parse_datapoints_v3(time.time(), flags, data, 2)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME_DP:
                 timestamp: float
                 pos: int
                 timestamp, pos = self._parse_timestamp(data, 0)
                 self._parse_datapoints_v3(timestamp, 0, data, pos)
-                asyncio.create_task(self._send_response(code, bytes(0), seq_num))
+                self._schedule_response(code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_TIME_DP:
                 timestamp: float
@@ -2043,7 +2105,7 @@ class TuyaBLEDevice:
                 timestamp, pos = self._parse_timestamp(data, 3)
                 self._parse_datapoints_v3(time.time(), flags, data, pos)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP_V4:
                 if len(data) < 7:
@@ -2054,9 +2116,7 @@ class TuyaBLEDevice:
                 mode = data[6]
                 self._parse_datapoints_v4(time.time(), mode, data, 7)
                 if (send_flags & 0x80) == 0:
-                    asyncio.create_task(
-                        self._send_response(code, data[:7] + b"\x00", seq_num)
-                    )
+                    self._schedule_response(code, data[:7] + b"\x00", seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME_DP_V4:
                 if len(data) < 8:
@@ -2068,9 +2128,7 @@ class TuyaBLEDevice:
                 timestamp, pos = self._parse_timestamp(data, 7)
                 self._parse_datapoints_v4(timestamp, mode, data, pos)
                 if (send_flags & 0x80) == 0:
-                    asyncio.create_task(
-                        self._send_response(code, data[:7] + b"\x00", seq_num)
-                    )
+                    self._schedule_response(code, data[:7] + b"\x00", seq_num)
 
         if response_to != 0:
             expected_code = self._input_expected_response_codes.get(response_to)

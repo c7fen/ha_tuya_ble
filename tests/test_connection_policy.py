@@ -36,6 +36,7 @@ from custom_components.tuya_ble.lock import TuyaBLES1Lock, TuyaBLEV1Lock
 from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
+from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEControlSuspendedError,
 )
@@ -319,6 +320,45 @@ async def test_repeated_suspension_application_is_idempotent() -> None:
 
     device._execute_disconnect.assert_awaited_once()
     assert device.policy_state is ConnectionPolicyState.SUSPENDED
+
+
+async def test_generic_resend_is_single_flight_and_cancelled_by_mode_change() -> None:
+    device = _make_device()
+    device._resend_packets = AsyncMock(side_effect=asyncio.sleep(60))
+
+    device._schedule_resend([b"synthetic-fragment-1"])
+    first_task = device._resend_task
+    device._schedule_resend([b"synthetic-fragment-2"])
+    assert device._resend_task is first_task
+
+    await asyncio.sleep(0)
+    await device.async_update_connection_policy(
+        connection_mode=ConnectionMode.ON_DEMAND.value
+    )
+    await asyncio.sleep(0)
+
+    assert first_task is not None
+    assert first_task.done()
+    device._resend_packets.assert_awaited_once_with([b"synthetic-fragment-1"])
+
+
+async def test_stop_cancels_pending_protocol_response_task() -> None:
+    device = _make_device()
+    response_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def wait_for_response(*_: object) -> None:
+        response_started.set()
+        await release_response.wait()
+
+    device._send_response = wait_for_response
+    device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
+    await response_started.wait()
+    await device.stop()
+    await asyncio.sleep(0)
+
+    assert not device._response_tasks
+    release_response.set()
 
 
 async def test_mode_change_while_suspended_does_not_connect() -> None:
