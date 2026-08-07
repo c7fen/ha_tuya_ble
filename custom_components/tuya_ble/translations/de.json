@@ -466,6 +466,7 @@
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "Tuya BLE SecKey (optional)",
                     "country_code": "Land",
                     "password": "Passwort",
                     "username": "Konto"

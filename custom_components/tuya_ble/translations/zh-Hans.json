@@ -466,6 +466,7 @@
                 "data": {
                     "access_id": "涂鸦 IoT Access ID",
                     "access_secret": "涂鸦 IoT Access Secret",
+                    "sec_key": "涂鸦 BLE SecKey（可选）",
                     "country_code": "国家/地区",
                     "password": "密码",
                     "username": "账号"
