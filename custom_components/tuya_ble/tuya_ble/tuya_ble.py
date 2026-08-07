@@ -361,7 +361,10 @@ class TuyaBLEConnectionLease(AbstractAsyncContextManager):
             context_token = self._context_token
             self._context_token = None
             if context_token is not None:
-                _CONNECTION_LEASE_CONTEXT.reset(context_token)
+                try:
+                    _CONNECTION_LEASE_CONTEXT.reset(context_token)
+                except ValueError:
+                    pass
             try:
                 await self._device._release_connection_lease()
             finally:
@@ -716,8 +719,10 @@ class TuyaBLEDevice:
             if self._terminal_stopped:
                 return
             self._policy_state = ConnectionPolicyState.DISCONNECTING
-            await self._execute_disconnect()
-            self._policy_state = ConnectionPolicyState.SUSPENDED
+        await self._execute_disconnect()
+        async with self._policy_lock:
+            if not self._terminal_stopped:
+                self._policy_state = ConnectionPolicyState.SUSPENDED
 
     async def _acquire_connection_lease(
         self, reason: str, defer_connection: bool
@@ -815,7 +820,8 @@ class TuyaBLEDevice:
                 ):
                     return
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
-                await self._execute_disconnect()
+            await self._execute_disconnect()
+            async with self._policy_lock:
                 if not self._terminal_stopped and self._ble_control_enabled:
                     self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
         except asyncio.CancelledError:

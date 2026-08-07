@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+from unittest.mock import MagicMock
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from custom_components.tuya_ble.binary_sensor import (
     TuyaBLEConnectionSensor,
     async_setup_entry as async_setup_binary_sensors,
 )
+from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.config_flow import TuyaBLEOptionsFlow
 from custom_components.tuya_ble.const import (
     CONF_BLE_CONTROL_ENABLED,
@@ -137,6 +139,64 @@ async def test_deferred_initialize_loads_without_advertisement() -> None:
     assert device.category == "jtmspro"
     assert device.product_id == "xqeob8h6"
     manager.get_device_credentials.assert_awaited_once_with(SYNTHETIC_ADDRESS, False)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {CONF_BLE_CONTROL_ENABLED: False},
+        {CONF_CONNECTION_MODE: ConnectionMode.ON_DEMAND.value},
+    ],
+    ids=("suspended", "on-demand"),
+)
+async def test_config_entry_setup_without_advertisement_stays_loaded(
+    hass: HomeAssistant,
+    options: dict[str, object],
+) -> None:
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    credentials = TuyaBLEDeviceCredentials(
+        uuid="synthetic-setup-uuid",
+        local_key="synthetic-setup-key",
+        device_id="synthetic-setup-device",
+        category="jtmspro",
+        product_id="xqeob8h6",
+        device_name="Synthetic setup device",
+        product_model="SYNTHETIC",
+        product_name="Synthetic setup device",
+        functions=[],
+        status_range=[],
+    )
+    manager = MagicMock()
+    manager.get_device_credentials = AsyncMock(return_value=credentials)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Synthetic setup device",
+        data={"address": SYNTHETIC_ADDRESS},
+        options=options,
+    )
+    entry.add_to_hass(hass)
+    forwarded = AsyncMock()
+    hass.config_entries.async_forward_entry_setups = forwarded
+
+    with (
+        patch.object(integration, "HASSTuyaBLEDeviceManager", return_value=manager),
+        patch.object(
+            integration.bluetooth, "async_ble_device_from_address", return_value=None
+        ),
+        patch.object(integration, "get_device", new=AsyncMock()) as cloud_lookup,
+        patch.object(
+            integration.bluetooth, "async_register_callback", return_value=Mock()
+        ),
+    ):
+        assert await integration.async_setup_entry(hass, entry) is True
+
+    cloud_lookup.assert_not_awaited()
+    forwarded.assert_awaited_once()
+    assert entry.entry_id in hass.data[DOMAIN]
+    assert hass.data[DOMAIN][entry.entry_id].device.ble_control_enabled is (
+        options.get(CONF_BLE_CONTROL_ENABLED, True)
+    )
 
 
 async def test_overlapping_leases_do_not_disconnect_early() -> None:
@@ -341,6 +401,106 @@ async def test_generic_resend_is_single_flight_and_cancelled_by_mode_change() ->
     assert first_task is not None
     assert first_task.done()
     device._resend_packets.assert_awaited_once_with([b"synthetic-fragment-1"])
+
+
+async def test_reconnect_is_single_flight_and_stop_cancels_task() -> None:
+    device = _make_device()
+    reconnect_started = asyncio.Event()
+    release_reconnect = asyncio.Event()
+
+    async def wait_for_reconnect() -> None:
+        reconnect_started.set()
+        await release_reconnect.wait()
+
+    device._reconnect = wait_for_reconnect
+    device._schedule_reconnect()
+    first_task = device._reconnect_task
+    await reconnect_started.wait()
+    device._schedule_reconnect()
+
+    assert first_task is device._reconnect_task
+    await device.stop()
+    await asyncio.sleep(0)
+    release_reconnect.set()
+    assert first_task is not None
+    assert first_task.done()
+    assert device._reconnect_task is None
+
+
+async def test_stop_cancels_startup_status_task() -> None:
+    device = _make_device()
+    startup_started = asyncio.Event()
+    release_startup = asyncio.Event()
+
+    async def wait_for_startup() -> None:
+        startup_started.set()
+        await release_startup.wait()
+
+    device.update = wait_for_startup
+    startup_task = asyncio.create_task(device.startup_update())
+    device._startup_task = startup_task
+    await startup_started.wait()
+    await device.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await startup_task
+    release_startup.set()
+    assert device._startup_task is None
+
+
+async def test_late_advertisement_completes_deferred_connection() -> None:
+    device = _make_device()
+    device._ble_device = None
+    device._ble_target_event.clear()
+    device._local_key = b"synthetic-local-key"
+    device._is_paired = True
+    device._send_packet_while_connected = AsyncMock(return_value=True)
+    client = Mock(is_connected=True)
+    client.services.get_characteristic.return_value = None
+    client.start_notify = AsyncMock()
+    target = BLEDevice(
+        name="Synthetic late target",
+        address="00:00:00:00:00:22",
+        details={},
+    )
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+        new=AsyncMock(return_value=client),
+    ) as establish_connection:
+        connection_task = asyncio.create_task(
+            device.connection_lease("late advertisement").__aenter__()
+        )
+        await asyncio.sleep(0)
+        device.set_ble_device_and_advertisement_data(target, Mock())
+        lease = await asyncio.wait_for(connection_task, 1)
+        await lease.__aexit__(None, None, None)
+
+    establish_connection.assert_awaited_once()
+    assert device.address == target.address
+
+
+async def test_policy_lock_is_available_during_disconnect_wait() -> None:
+    device = _make_device()
+    disconnect_started = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    async def wait_for_disconnect() -> None:
+        disconnect_started.set()
+        await release_disconnect.wait()
+
+    device._execute_disconnect = wait_for_disconnect
+    suspension = asyncio.create_task(
+        device.async_update_connection_policy(ble_control_enabled=False)
+    )
+    await disconnect_started.wait()
+
+    async def acquire_policy_lock() -> None:
+        async with device._policy_lock:
+            return
+
+    await asyncio.wait_for(acquire_policy_lock(), 1)
+    release_disconnect.set()
+    await suspension
 
 
 async def test_stop_cancels_pending_protocol_response_task() -> None:
