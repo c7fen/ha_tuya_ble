@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "ID d'accès Tuya IoT",
                     "access_secret": "Clé secrète d'accès Tuya IoT",
+                    "sec_key": "SecKey Tuya BLE (facultative)",
                     "country_code": "Pays",
                     "password": "Mot de passe",
                     "username": "Compte"
@@ -29,6 +30,9 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Le déverrouillage local n'est pas initialisé pour cet appareil. Un modèle propre à l'appareil doit d'abord être reçu."
+        },
         "v1_command_unavailable": {
             "message": "Les points de données de commande V1 sont indisponibles ou non valides."
         },

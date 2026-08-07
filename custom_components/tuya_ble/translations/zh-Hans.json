@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "涂鸦 IoT Access ID",
                     "access_secret": "涂鸦 IoT Access Secret",
+                    "sec_key": "涂鸦 BLE SecKey（可选）",
                     "country_code": "国家/地区",
                     "password": "密码",
                     "username": "账号"
@@ -29,6 +30,9 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "此设备的本地解锁尚未初始化。必须先接收设备专用模板。"
+        },
         "v1_command_unavailable": {
             "message": "V1 命令数据点不可用或无效。"
         },

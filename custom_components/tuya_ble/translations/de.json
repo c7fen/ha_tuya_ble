@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "Tuya BLE SecKey (optional)",
                     "country_code": "Land",
                     "password": "Passwort",
                     "username": "Konto"
@@ -29,6 +30,9 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Die lokale Entriegelung ist für dieses Gerät nicht initialisiert. Zuerst muss eine gerätespezifische Vorlage empfangen werden."
+        },
         "v1_command_unavailable": {
             "message": "Die V1-Befehlsdatenpunkte sind nicht verfügbar oder ungültig."
         },

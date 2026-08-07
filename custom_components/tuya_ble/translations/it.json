@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "SecKey Tuya BLE (facoltativa)",
                     "country_code": "Paese",
                     "password": "Password",
                     "username": "Account"
@@ -29,6 +30,9 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Lo sblocco locale non è inizializzato per questo dispositivo. È necessario ricevere prima un modello specifico del dispositivo."
+        },
         "v1_command_unavailable": {
             "message": "I punti dati dei comandi V1 non sono disponibili o non sono validi."
         },
