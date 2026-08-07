@@ -51,6 +51,7 @@ from ..const import (
     CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     ConnectionMode,
     ConnectionPolicyState,
+    EffectiveConnectionPolicy,
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
     DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
@@ -407,6 +408,7 @@ class TuyaBLEDevice:
         self._active_lease_count = 0
         self._idle_disconnect_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
         self._persist_options = persist_options
         try:
             self._connection_mode = ConnectionMode(connection_mode)
@@ -429,6 +431,7 @@ class TuyaBLEDevice:
             )
         )
         self._state_data_fresh = False
+        self._has_disconnected = False
         self._physical_connection_active = False
         self._connection_state_callbacks: list[Callable[[bool], None]] = []
         self._client: BleakClientWithServiceCache | None = None
@@ -491,15 +494,15 @@ class TuyaBLEDevice:
         return self._ble_control_enabled
 
     @property
-    def effective_policy(self) -> ConnectionPolicyState:
+    def effective_policy(self) -> EffectiveConnectionPolicy:
         """Return the effective policy after applying suspension and stop."""
         if self._terminal_stopped:
-            return ConnectionPolicyState.STOPPED
+            return EffectiveConnectionPolicy.STOPPED
         if not self._ble_control_enabled or self._suspension_requested:
-            return ConnectionPolicyState.SUSPENDED
+            return EffectiveConnectionPolicy.SUSPENDED
         if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
-            return ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
-        return ConnectionPolicyState.ON_DEMAND_IDLE
+            return EffectiveConnectionPolicy.ALWAYS_CONNECTED
+        return EffectiveConnectionPolicy.ON_DEMAND
 
     @property
     def policy_state(self) -> ConnectionPolicyState:
@@ -752,6 +755,7 @@ class TuyaBLEDevice:
         )
 
     async def _idle_disconnect_after_delay(self) -> None:
+        current_task = asyncio.current_task()
         try:
             await asyncio.sleep(DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS)
             async with self._policy_lock:
@@ -770,7 +774,7 @@ class TuyaBLEDevice:
         except asyncio.CancelledError:
             return
         finally:
-            if self._idle_disconnect_task is asyncio.current_task():
+            if self._idle_disconnect_task is current_task:
                 self._idle_disconnect_task = None
 
     def _schedule_reconnect_locked(self, delay: float) -> None:
@@ -779,6 +783,7 @@ class TuyaBLEDevice:
         self._reconnect_task = asyncio.create_task(self._reconnect_after_delay(delay))
 
     async def _reconnect_after_delay(self, delay: float) -> None:
+        current_task = asyncio.current_task()
         try:
             if delay:
                 await asyncio.sleep(delay)
@@ -786,7 +791,7 @@ class TuyaBLEDevice:
         except asyncio.CancelledError:
             return
         finally:
-            if self._reconnect_task is asyncio.current_task():
+            if self._reconnect_task is current_task:
                 self._reconnect_task = None
 
     async def initialize(self) -> None:
@@ -821,6 +826,17 @@ class TuyaBLEDevice:
     async def update(self) -> None:
         _LOGGER.debug("%s: Updating", self.log_identity)
         await self._send_packet(TuyaBLECode.FUN_SENDER_DEVICE_STATUS, bytes())
+
+    async def startup_update(self) -> None:
+        """Run the initial status path without failing config-entry setup."""
+        try:
+            await self.update()
+        except Exception:  # noqa: BLE001
+            if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
+                self._schedule_reconnect()
+        finally:
+            if self._startup_task is asyncio.current_task():
+                self._startup_task = None
 
     async def _update_device_info(self) -> bool:
         if self._device_info is None:
@@ -1164,6 +1180,9 @@ class TuyaBLEDevice:
             self._policy_state = ConnectionPolicyState.STOPPED
             self._cancel_reconnect_locked()
             self._cancel_idle_disconnect_locked()
+            if self._startup_task is not None:
+                self._startup_task.cancel()
+                self._startup_task = None
         try:
             await asyncio.wait_for(
                 self._lease_zero_event.wait(),
@@ -1182,6 +1201,8 @@ class TuyaBLEDevice:
         self._physical_connection_active = False
         self._is_paired = False
         self._state_data_fresh = False
+        if was_connected:
+            self._has_disconnected = True
         self._clean_input()
         if was_connected:
             self._fire_disconnected_callbacks()
@@ -1246,7 +1267,7 @@ class TuyaBLEDevice:
         self._session_key = None
         self._auth_key = None
         if error is not None:
-            raise error
+            raise error from None
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
@@ -1388,7 +1409,7 @@ class TuyaBLEDevice:
         async with self._seq_num_lock:
             self._current_seq_num = 1
         try:
-            if self.effective_policy is not ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE:
+            if self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 return
             await self._ensure_connected()
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
@@ -1406,7 +1427,15 @@ class TuyaBLEDevice:
             async with self._policy_lock:
                 if self._reconnect_task is asyncio.current_task():
                     self._reconnect_task = None
-                if self.effective_policy is ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE:
+                if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
+                    self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
+        except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
+            return
+        except Exception:  # noqa: BLE001
+            async with self._policy_lock:
+                if self._reconnect_task is asyncio.current_task():
+                    self._reconnect_task = None
+                if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                     self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
 
     def _schedule_reconnect(self, delay: float = 0) -> None:

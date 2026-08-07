@@ -23,7 +23,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import storage
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, DPCode
+from .const import ConnectionMode, DOMAIN, DPCode
 from .devices import (
     TuyaBLECoordinator,
     TuyaBLEData,
@@ -309,6 +309,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     """Product-specific bidirectional V1 coupling control."""
 
     platform = Platform.LOCK
+    _is_command_entity = True
     _attr_should_poll = False
 
     def __init__(
@@ -337,6 +338,11 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return the physical secure state reported by read-only DP47."""
+        if not self._device.state_data_fresh and (
+            self._device.connection_mode is ConnectionMode.ON_DEMAND
+            or getattr(self._device, "_has_disconnected", False)
+        ):
+            return None
         motor_state = self._device.datapoints[V1_DP_MOTOR_STATE]
         if (
             motor_state is None
@@ -348,6 +354,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Secure by issuing exactly one DP46 true command."""
+        self._device.ensure_control_available()
         async with self._operation_lock:
             if self._device.protocol_major_version != 3:
                 _raise_v1_command_validation_error()
@@ -374,6 +381,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Enable access using one observed product-specific DP6 action."""
+        self._device.ensure_control_available()
         async with self._operation_lock:
             if self._device.protocol_major_version != 3:
                 _raise_v1_command_validation_error()
@@ -404,6 +412,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
     """Generic upstream Tuya BLE lock."""
 
     platform = Platform.LOCK
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -424,6 +433,11 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return true if lock is locked."""
+        if not self._device.state_data_fresh and (
+            self._device.connection_mode is ConnectionMode.ON_DEMAND
+            or getattr(self._device, "_has_disconnected", False)
+        ):
+            return None
         dpid = self.find_dpid(DPCode.LOCK_MOTOR_STATE)
         if dpid is None:
             dpid = DPCode.LOCK_MOTOR_STATE
@@ -435,6 +449,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the lock."""
+        self._device.ensure_control_available()
         manual_lock_id = self.find_dpid(DPCode.MANUAL_LOCK)
         if manual_lock_id is not None:
             if manual_lock := self._device.datapoints.get_or_create(
@@ -462,6 +477,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the lock."""
+        self._device.ensure_control_available()
         manual_lock_id = self.find_dpid(DPCode.MANUAL_LOCK)
         if manual_lock_id is not None:
             if manual_lock := self._device.datapoints.get_or_create(
@@ -492,6 +508,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
 
     async def async_open(self, **kwargs: Any) -> None:
         """Open the lock."""
+        self._device.ensure_control_available()
         await self.async_unlock(**kwargs)
 
 
@@ -499,6 +516,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
     """S1 lock using device-specific, live-captured unlock templates."""
 
     platform = Platform.LOCK
+    _is_command_entity = True
     _attr_should_poll = False
 
     def __init__(
@@ -548,6 +566,11 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return true if the S1 motor is in its locked state."""
+        if not self._device.state_data_fresh and (
+            self._device.connection_mode is ConnectionMode.ON_DEMAND
+            or getattr(self._device, "_has_disconnected", False)
+        ):
+            return None
         motor_state = self._device.datapoints[S1_DP_MOTOR_STATE]
         if motor_state is not None and isinstance(motor_state.value, bool):
             return not motor_state.value
@@ -555,6 +578,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock by issuing the S1's one-way manual-lock command."""
+        self._device.ensure_control_available()
         self._attr_is_locking = True
         self.async_write_ha_state()
         try:
@@ -571,6 +595,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock using one validated, serialized S1 DP70/DP71 sequence."""
+        self._device.ensure_control_available()
         async with self._unlock_lock:
             templates = self._template_store.templates_for(self._device.device_id)
             if templates is None:

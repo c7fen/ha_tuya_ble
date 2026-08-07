@@ -29,7 +29,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -1032,6 +1037,7 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     """Representation of a Tuya BLE Number."""
 
     platform = Platform.NUMBER
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -1059,6 +1065,7 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
 
     def set_native_value(self, value: float) -> None:
         """Set new value."""
+        ensure_control_available(self._device)
         if self._mapping.setter:
             self._mapping.setter(self, self._product, value)
             return

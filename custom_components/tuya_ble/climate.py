@@ -24,7 +24,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPoint, TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -179,6 +184,7 @@ class TuyaBLEClimate(TuyaBLEEntity, ClimateEntity):
     """Representation of a Tuya BLE Climate."""
 
     platform = Platform.CLIMATE
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -287,6 +293,7 @@ class TuyaBLEClimate(TuyaBLEEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set new target temperature."""
+        ensure_control_available(self._device)
         if self._mapping.target_temperature_dp_id != 0:
             int_value = int(kwargs["temperature"] * 2)
             datapoint = self._device.datapoints.get_or_create(
@@ -299,6 +306,7 @@ class TuyaBLEClimate(TuyaBLEEntity, ClimateEntity):
 
     async def async_set_humidity(self, humidity: int) -> None:
         """Set new target humidity."""
+        ensure_control_available(self._device)
         if self._mapping.target_humidity_dp_id != 0:
             int_value = int(humidity * self._mapping.target_humidity_coefficient)
             datapoint = self._device.datapoints.get_or_create(
@@ -311,6 +319,7 @@ class TuyaBLEClimate(TuyaBLEEntity, ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
+        ensure_control_available(self._device)
         if (
             self._mapping.hvac_mode_dp_id != 0
             and self._mapping.hvac_modes
@@ -336,6 +345,7 @@ class TuyaBLEClimate(TuyaBLEEntity, ClimateEntity):
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
+        ensure_control_available(self._device)
         if self._mapping.preset_mode_dp_ids:
             datapoint: TuyaBLEDataPoint | None = None
             bool_value = False

@@ -22,7 +22,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .const import (
     DOMAIN,
 )
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -205,6 +210,7 @@ class TuyaBLEText(TuyaBLEEntity, TextEntity):
     """Representation of a Tuya BLE text entity."""
 
     platform = Platform.TEXT
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -239,6 +245,7 @@ class TuyaBLEText(TuyaBLEEntity, TextEntity):
 
     def set_value(self, value: str) -> None:
         """Change the value."""
+        ensure_control_available(self._device)
         if self._mapping.setter:
             self._mapping.setter(self, self._product, value)
             return

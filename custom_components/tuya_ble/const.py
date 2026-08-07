@@ -39,6 +39,15 @@ class ConnectionPolicyState(StrEnum):
     ON_DEMAND_ACTIVE = "on_demand_active"
     DISCONNECTING = "disconnecting"
 
+
+class EffectiveConnectionPolicy(StrEnum):
+    """Effective policy after applying permission and terminal lifecycle."""
+
+    STOPPED = "stopped"
+    SUSPENDED = "suspended"
+    ALWAYS_CONNECTED = "always_connected"
+    ON_DEMAND = "on_demand"
+
 DEVICE_METADATA_UUIDS: Final = "uuids"
 
 DEVICE_DEF_MANUFACTURER: Final = "Tuya"

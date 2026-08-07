@@ -73,6 +73,30 @@ the app from connecting. Close the inactive client and wait for its connection
 to end; repeatedly reloading or issuing commands does not resolve GATT
 ownership safely.
 
+## Connection policy controls
+
+S1 `jtmspro/xqeob8h6` and V1 `ms/7a4xvbtt` expose three local controls:
+
+| Entity | Meaning |
+| --- | --- |
+| Connection Mode | Always connected retains paired GATT; On demand starts disconnected and leases one session for an explicit command. |
+| Home Assistant BLE Control | Enabled permits HA control; disabled persists suspension, releases GATT after active work finishes, blocks commands, and suppresses reconnects. |
+| Bluetooth Connection | On only for an authenticated and paired GATT session; it remains available as a diagnostic while off or suspended. |
+
+On demand uses a fixed 15-second idle disconnect. It does not reconnect for an
+advertisement alone, and local access events can be missed while disconnected.
+Use Always connected for access-event monitoring and any future Passage Mode
+Guard. Repeated connection and pairing work has an energy cost, but this
+integration makes no unsupported battery-percentage claim.
+
+To let the Tuya app take the peripheral, turn **Home Assistant BLE Control**
+off. Wait for **Bluetooth Connection** to turn off, use the app, close or
+disconnect the app, and turn HA control on again. In Always connected mode HA
+will make a bounded reconnection attempt; in On demand mode it remains idle
+until the next explicit command. The **Connection settings** path in the
+integration Options Flow works without advertisements, BLE access, cloud login,
+or re-entering credentials.
+
 ## Reporting a problem
 
 Follow [Logging and privacy](logging-and-privacy.md). Report only the time,

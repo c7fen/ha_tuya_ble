@@ -35,10 +35,22 @@
         },
         "v1_command_unavailable": {
             "message": "The V1 command datapoints are unavailable or invalid."
+        },
+        "ble_control_suspended": {
+            "message": "Home Assistant BLE control is suspended."
+        },
+        "ble_connection_unavailable": {
+            "message": "The Bluetooth connection is unavailable."
+        },
+        "ble_policy_transition_failed": {
+            "message": "The Bluetooth connection policy could not be changed safely."
         }
     },
     "entity": {
         "binary_sensor": {
+            "bluetooth_connection": {
+                "name": "Bluetooth Connection"
+            },
             "fault": {
                 "name": "Fault"
             },
@@ -139,6 +151,13 @@
             }
         },
         "select": {
+            "connection_mode": {
+                "name": "Connection Mode",
+                "state": {
+                    "always_connected": "Always connected",
+                    "on_demand": "On demand"
+                }
+            },
             "beep_volume": {
                 "name": "Lock Volume"
             },
@@ -472,6 +491,9 @@
             }
         },
         "switch": {
+            "ble_control_enabled": {
+                "name": "Home Assistant BLE Control"
+            },
             "automatic_lock": {
                 "name": "Auto-Lock"
             },
@@ -558,11 +580,26 @@
     },
     "options": {
         "error": {
+            "ble_policy_transition_failed": "The Bluetooth connection policy could not be changed safely.",
             "device_not_registered": "Device is not registered in Tuya cloud",
             "invalid_auth": "Invalid authentication",
             "login_error": "Login error ({code}): {msg}"
         },
         "step": {
+            "init": {
+                "title": "Configure Tuya BLE",
+                "menu_options": {
+                    "connection_settings": "Connection settings",
+                    "login": "Tuya credentials"
+                }
+            },
+            "connection_settings": {
+                "data": {
+                    "connection_mode": "Connection Mode",
+                    "ble_control_enabled": "Home Assistant BLE Control"
+                },
+                "description": "Choose how Home Assistant uses the Bluetooth connection."
+            },
             "login": {
                 "data": {
                     "access_id": "Tuya IoT Access ID",

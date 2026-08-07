@@ -35,6 +35,11 @@ from homeassistant.helpers.selector import (
 from .tuya_ble import SERVICE_UUIDS, TuyaBLEDeviceCredentials
 
 from .const import (
+    CONF_BLE_CONTROL_ENABLED,
+    CONF_CONNECTION_MODE,
+    ConnectionMode,
+    DEFAULT_BLE_CONTROL_ENABLED,
+    DEFAULT_CONNECTION_MODE,
     TUYA_COUNTRIES,
     TUYA_SMART_APP,
     SMARTLIFE_APP,
@@ -175,7 +180,79 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
-        return await self.async_step_login(user_input)
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["connection_settings", "login"],
+        )
+
+    async def async_step_connection_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manage connection mode and Home Assistant BLE control."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            raw_mode = user_input.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            raw_enabled = user_input.get(
+                CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+            )
+            try:
+                mode = ConnectionMode(raw_mode)
+            except (TypeError, ValueError):
+                errors["base"] = "ble_policy_transition_failed"
+            else:
+                domain_data = self.hass.data.get(DOMAIN, {})
+                entry_data: TuyaBLEData | None = domain_data.get(
+                    self.config_entry.entry_id
+                )
+                try:
+                    if entry_data:
+                        await entry_data.device.async_update_connection_policy(
+                            connection_mode=mode.value,
+                            ble_control_enabled=raw_enabled,
+                        )
+                except Exception:  # noqa: BLE001
+                    errors["base"] = "ble_policy_transition_failed"
+                else:
+                    options = dict(self.config_entry.options)
+                    options.update(
+                        {
+                            CONF_CONNECTION_MODE: mode.value,
+                            CONF_BLE_CONTROL_ENABLED: raw_enabled,
+                        }
+                    )
+                    return self.async_create_entry(
+                        title=self.config_entry.title,
+                        data=options,
+                    )
+
+        options = self.config_entry.options
+        try:
+            default_mode = ConnectionMode(
+                options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            ).value
+        except (TypeError, ValueError):
+            default_mode = DEFAULT_CONNECTION_MODE
+        default_enabled = options.get(
+            CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+        )
+        if not isinstance(default_enabled, bool):
+            default_enabled = DEFAULT_BLE_CONTROL_ENABLED
+        return self.async_show_form(
+            step_id="connection_settings",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_CONNECTION_MODE,
+                        default=default_mode,
+                    ): vol.In([mode.value for mode in ConnectionMode]),
+                    vol.Required(
+                        CONF_BLE_CONTROL_ENABLED,
+                        default=default_enabled,
+                    ): bool,
+                }
+            ),
+            errors=errors,
+        )
 
     async def async_step_login(
         self, user_input: dict[str, Any] | None = None
@@ -205,9 +282,11 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                         address, True, True
                     )
                     if credentials:
+                        options = dict(self.config_entry.options)
+                        options.update(entry.manager.data)
                         return self.async_create_entry(
                             title=self.config_entry.title,
-                            data=entry.manager.data,
+                            data=options,
                         )
 
                     errors["base"] = "device_not_registered"

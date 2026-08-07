@@ -19,8 +19,13 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .const import CONF_BLE_CONTROL_ENABLED, DOMAIN
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -900,6 +905,7 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
     """Representation of a Tuya BLE Switch."""
 
     platform = Platform.SWITCH
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -937,6 +943,7 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
 
     def turn_on(self, **kwargs: Any) -> None:
         """Turn the switch on."""
+        ensure_control_available(self._device)
         if self._mapping.setter:
             return self._mapping.setter(self, self._product, True)
 
@@ -964,6 +971,7 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
 
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the switch off."""
+        ensure_control_available(self._device)
         if self._mapping.setter:
             return self._mapping.setter(self, self._product, False)
 
@@ -998,6 +1006,62 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
         return result
 
 
+class TuyaBLEControlSwitch(TuyaBLEEntity, SwitchEntity):
+    """Persistently permit or suspend Home Assistant BLE control."""
+
+    platform = Platform.SWITCH
+    _is_connection_policy_entity = True
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: DataUpdateCoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            SwitchEntityDescription(
+                key=CONF_BLE_CONTROL_ENABLED,
+                icon="mdi:bluetooth-connect",
+                entity_category=EntityCategory.CONFIG,
+            ),
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether the local policy control is available."""
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        """Return the persisted Home Assistant BLE-control permission."""
+        return self._device.ble_control_enabled
+
+    def turn_on(self, **kwargs: Any) -> None:
+        """Persist and apply enabled BLE control."""
+        self._hass.create_task(self._async_set_control(True))
+
+    def turn_off(self, **kwargs: Any) -> None:
+        """Persist and apply suspended BLE control."""
+        self._hass.create_task(self._async_set_control(False))
+
+    async def _async_set_control(self, enabled: bool) -> None:
+        try:
+            await self._device.async_update_connection_policy(
+                ble_control_enabled=enabled
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.error(
+                "%s: Home Assistant BLE control change failed",
+                self._device.log_identity,
+            )
+        self.async_write_ha_state()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1006,7 +1070,22 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLESwitch] = []
+    entities: list[TuyaBLEEntity] = []
+    if (
+        (data.device.category, data.device.product_id)
+        in {
+            ("jtmspro", "xqeob8h6"),
+            ("ms", "7a4xvbtt"),
+        }
+    ):
+        entities.append(
+            TuyaBLEControlSwitch(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+            )
+        )
     for mapping in mappings:
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type

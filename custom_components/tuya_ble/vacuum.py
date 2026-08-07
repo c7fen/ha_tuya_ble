@@ -223,6 +223,7 @@ class TuyaBLEVacuumEntity(TuyaBLEEntity, StateVacuumEntity):
     """Tuya BLE vacuum / window cleaner robot entity."""
 
     platform = Platform.VACUUM
+    _is_command_entity = True
 
     def __init__(
         self,

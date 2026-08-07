@@ -31,8 +31,11 @@ from .tuya_ble import (
 
 from .cloud import HASSTuyaBLEDeviceManager
 from .const import (
+    ConnectionMode,
+    ConnectionPolicyState,
     DEVICE_DEF_MANUFACTURER,
     DOMAIN,
+    EffectiveConnectionPolicy,
     FINGERBOT_BUTTON_EVENT,
     SET_DISCONNECTED_DELAY,
     DPCode,
@@ -42,6 +45,13 @@ from .const import (
 from .base import IntegerTypeData, EnumTypeData
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def ensure_control_available(device: Any) -> None:
+    """Apply the runtime policy guard when a full device object is present."""
+    guard = getattr(device, "ensure_control_available", None)
+    if guard is not None:
+        guard()
 
 
 @dataclass
@@ -84,6 +94,8 @@ class TuyaBLEEntity(CoordinatorEntity):
     """Tuya BLE base entity."""
 
     platform: Platform = Platform.SENSOR
+    _is_command_entity = False
+    _is_connection_policy_entity = False
 
     def __init__(
         self,
@@ -111,7 +123,28 @@ class TuyaBLEEntity(CoordinatorEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self._coordinator.connected
+        if self._is_connection_policy_entity:
+            return True
+        if (
+            not self._device.ble_control_enabled
+            or self._device.effective_policy
+            in {
+                EffectiveConnectionPolicy.STOPPED,
+                EffectiveConnectionPolicy.SUSPENDED,
+            }
+        ):
+            return False
+        if self._is_command_entity:
+            return self._coordinator.connected or (
+                self._device.connection_mode is ConnectionMode.ON_DEMAND
+            )
+        return (
+            self._coordinator.connected
+            and (
+                self._device.state_data_fresh
+                or not getattr(self._device, "_has_disconnected", False)
+            )
+        )
 
     @property
     def device(self) -> TuyaBLEDevice:
@@ -129,6 +162,7 @@ class TuyaBLEEntity(CoordinatorEntity):
         dp_type: TuyaBLEDataPointType,
         value: bytes | bool | int | str | None = None,
     ) -> None:
+        ensure_control_available(self._device)
         dpid = self.find_dpid(key)
         if dpid is not None:
             datapoint = self._device.datapoints.get_or_create(
@@ -140,6 +174,7 @@ class TuyaBLEEntity(CoordinatorEntity):
 
     def _send_command(self, commands: list[dict[str, Any]]) -> None:
         """Send the commands to the device"""
+        ensure_control_available(self._device)
         for command in commands:
             code = command.get("code")
             value = command.get("value")

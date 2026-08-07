@@ -19,12 +19,19 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    CONF_CONNECTION_MODE,
+    ConnectionMode,
     DOMAIN,
     FINGERBOT_MODE_PROGRAM,
     FINGERBOT_MODE_PUSH,
     FINGERBOT_MODE_SWITCH,
 )
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -827,6 +834,7 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
     """Representation of a Tuya BLE select."""
 
     platform = Platform.SELECT
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -854,6 +862,7 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
 
     def select_option(self, value: str) -> None:
         """Change the selected option."""
+        ensure_control_available(self._device)
         if value in self._attr_options:
             if self._mapping.dp_type == TuyaBLEDataPointType.DT_STRING:
                 datapoint = self._device.datapoints.get_or_create(
@@ -874,6 +883,62 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
                     self._hass.create_task(datapoint.set_value(int_value))
 
 
+class TuyaBLEConnectionModeSelect(TuyaBLEEntity, SelectEntity):
+    """Select the per-device BLE connection mode."""
+
+    platform = Platform.SELECT
+    _is_connection_policy_entity = True
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: DataUpdateCoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            SelectEntityDescription(
+                key=CONF_CONNECTION_MODE,
+                options=[mode.value for mode in ConnectionMode],
+                icon="mdi:connection",
+                entity_category=EntityCategory.CONFIG,
+            ),
+        )
+        self._attr_options = [mode.value for mode in ConnectionMode]
+
+    @property
+    def available(self) -> bool:
+        """Return whether the local policy control is available."""
+        return True
+
+    @property
+    def current_option(self) -> str:
+        """Return the persisted connection mode."""
+        return self._device.connection_mode.value
+
+    def select_option(self, value: str) -> None:
+        """Persist and apply a new connection mode."""
+        if value not in self._attr_options:
+            raise ValueError("Unsupported Tuya BLE connection mode")
+        self._hass.create_task(
+            self._async_select_connection_mode(value)
+        )
+
+    async def _async_select_connection_mode(self, value: str) -> None:
+        try:
+            await self._device.async_update_connection_policy(connection_mode=value)
+        except Exception:  # noqa: BLE001
+            _LOGGER.error(
+                "%s: Connection mode change failed",
+                self._device.log_identity,
+            )
+        self.async_write_ha_state()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -882,7 +947,22 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLESelect] = []
+    entities: list[TuyaBLEEntity] = []
+    if (
+        (data.device.category, data.device.product_id)
+        in {
+            ("jtmspro", "xqeob8h6"),
+            ("ms", "7a4xvbtt"),
+        }
+    ):
+        entities.append(
+            TuyaBLEConnectionModeSelect(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+            )
+        )
     for mapping in mappings:
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type

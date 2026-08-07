@@ -490,6 +490,55 @@ class TuyaBLEBinarySensor(TuyaBLEEntity, BinarySensorEntity):
         return result
 
 
+class TuyaBLEConnectionSensor(TuyaBLEEntity, BinarySensorEntity):
+    """Report the actual authenticated and paired GATT session state."""
+
+    platform = Platform.BINARY_SENSOR
+    _is_connection_policy_entity = True
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: DataUpdateCoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            BinarySensorEntityDescription(
+                key="bluetooth_connection",
+                device_class=BinarySensorDeviceClass.CONNECTIVITY,
+                entity_category=EntityCategory.DIAGNOSTIC,
+            ),
+        )
+        self._unsub_connection_state = device.register_connection_state_callback(
+            self._async_handle_connection_state
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether the loaded config entry can report connectivity."""
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether an authenticated paired GATT session is active."""
+        return self._device.is_connection_active
+
+    @callback
+    def _async_handle_connection_state(self, _: bool) -> None:
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unregister the immediate transport-state callback."""
+        self._unsub_connection_state()
+        await super().async_will_remove_from_hass()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -498,7 +547,23 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLEBinarySensor] = []
+    entities: list[TuyaBLEEntity] = []
+    if (
+        (data.device.category, data.device.product_id)
+        in {
+            ("jtmspro", "xqeob8h6"),
+            ("ms", "7a4xvbtt"),
+        }
+        and hasattr(data.device, "register_connection_state_callback")
+    ):
+        entities.append(
+            TuyaBLEConnectionSensor(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+            )
+        )
     for mapping in mappings:
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
