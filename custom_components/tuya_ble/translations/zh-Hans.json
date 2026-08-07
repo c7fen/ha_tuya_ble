@@ -31,10 +31,22 @@
     "exceptions": {
         "v1_command_unavailable": {
             "message": "V1 命令数据点不可用或无效。"
+        },
+        "ble_control_suspended": {
+            "message": "Home Assistant 蓝牙控制已暂停。"
+        },
+        "ble_connection_unavailable": {
+            "message": "蓝牙连接不可用。"
+        },
+        "ble_policy_transition_failed": {
+            "message": "无法安全更改蓝牙连接策略。"
         }
     },
     "entity": {
         "binary_sensor": {
+            "bluetooth_connection": {
+                "name": "蓝牙连接"
+            },
             "fault": {
                 "name": "故障"
             },
@@ -124,6 +136,13 @@
             }
         },
         "select": {
+            "connection_mode": {
+                "name": "连接模式",
+                "state": {
+                    "always_connected": "始终连接",
+                    "on_demand": "按需连接"
+                }
+            },
             "beep_volume": {
                 "name": "锁音量"
             },
@@ -342,6 +361,9 @@
             }
         },
         "switch": {
+            "ble_control_enabled": {
+                "name": "Home Assistant 蓝牙控制"
+            },
             "antifreeze": {
                 "name": "防冻"
             },
@@ -416,11 +438,26 @@
     },
     "options": {
         "error": {
+            "ble_policy_transition_failed": "无法安全更改蓝牙连接策略。",
             "device_not_registered": "设备未在涂鸦云端注册",
             "invalid_auth": "身份验证无效",
             "login_error": "登录错误 ({code}): {msg}"
         },
         "step": {
+            "init": {
+                "title": "配置涂鸦 BLE",
+                "menu_options": {
+                    "connection_settings": "连接设置",
+                    "login": "涂鸦凭据"
+                }
+            },
+            "connection_settings": {
+                "data": {
+                    "connection_mode": "连接模式",
+                    "ble_control_enabled": "Home Assistant 蓝牙控制"
+                },
+                "description": "选择 Home Assistant 使用蓝牙连接的方式。"
+            },
             "login": {
                 "data": {
                     "access_id": "涂鸦 IoT Access ID",
