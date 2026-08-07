@@ -20,7 +20,14 @@ from homeassistant.helpers.entity import EntityCategory
 from .tuya_ble import TuyaBLEDevice
 
 from .cloud import HASSTuyaBLEDeviceManager, normalize_app_type_data
-from .const import DOMAIN
+from .const import (
+    CONF_BLE_CONTROL_ENABLED,
+    CONF_CONNECTION_MODE,
+    DEFAULT_BLE_CONTROL_ENABLED,
+    DEFAULT_CONNECTION_MODE,
+    DOMAIN,
+    ConnectionMode,
+)
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
 
 PLATFORMS: list[Platform] = [
@@ -525,12 +532,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     address: str = entry.data[CONF_ADDRESS]
     ble_device = bluetooth.async_ble_device_from_address(
         hass, address.upper(), True
-    ) or await get_device(address)
-    if not ble_device:
-        raise ConfigEntryNotReady("Could not find the configured Tuya BLE device")
+    )
+    raw_mode = entry.options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+    try:
+        connection_mode = ConnectionMode(raw_mode)
+    except (TypeError, ValueError):
+        connection_mode = ConnectionMode.ALWAYS_CONNECTED
+    ble_control_enabled = entry.options.get(
+        CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+    )
+    if not isinstance(ble_control_enabled, bool):
+        ble_control_enabled = DEFAULT_BLE_CONTROL_ENABLED
+    if ble_device is None and ble_control_enabled and connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+        try:
+            ble_device = await get_device(address)
+        except BLEAK_EXCEPTIONS:
+            ble_device = None
 
     manager = HASSTuyaBLEDeviceManager(hass, manager_data)
-    device = TuyaBLEDevice(manager, ble_device)
+    device = TuyaBLEDevice(
+        manager,
+        ble_device,
+        address=address,
+        connection_mode=connection_mode.value,
+        ble_control_enabled=ble_control_enabled,
+    )
+
+    async def _async_persist_policy_options(updates: dict[str, Any]) -> None:
+        merged_options = dict(entry.options)
+        merged_options.update(updates)
+        try:
+            result = hass.config_entries.async_update_entry(
+                entry, options=merged_options
+            )
+        except Exception as err:  # noqa: BLE001
+            raise ConfigEntryError(
+                "Unable to persist the Tuya BLE connection policy"
+            ) from err
+        if result is False:
+            raise ConfigEntryError("Unable to persist the Tuya BLE connection policy")
+
+    device._persist_options = _async_persist_policy_options
     await device.initialize()
     product_info = get_device_product_info(device)
 
@@ -547,7 +589,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from ex
     """
 
-    hass.add_job(device.update())
+    if device.ble_control_enabled and device.connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+        hass.add_job(device.update())
 
     @callback
     def _async_update_ble(
@@ -592,6 +635,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    await data.device.async_apply_persisted_options(dict(entry.options))
     if entry.title != data.title:
         await hass.config_entries.async_reload(entry.entry_id)
 

@@ -364,7 +364,10 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_locking = True
             self.async_write_ha_state()
             try:
-                await manual_lock.set_value_once(True)
+                async with self._device.connection_lease(
+                    "v1 lock", defer_connection=True
+                ):
+                    await manual_lock.set_value_once(True)
             finally:
                 self._attr_is_locking = False
                 self.async_write_ha_state()
@@ -388,7 +391,10 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_unlocking = True
             self.async_write_ha_state()
             try:
-                await access.set_value_once(access_value)
+                async with self._device.connection_lease(
+                    "v1 unlock", defer_connection=True
+                ):
+                    await access.set_value_once(access_value)
             finally:
                 self._attr_is_unlocking = False
                 self.async_write_ha_state()
@@ -552,10 +558,13 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
         self._attr_is_locking = True
         self.async_write_ha_state()
         try:
-            manual_lock = self._device.datapoints.get_or_create(
-                S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
-            )
-            await manual_lock.set_value(True)
+            async with self._device.connection_lease(
+                "s1 lock", defer_connection=True
+            ):
+                manual_lock = self._device.datapoints.get_or_create(
+                    S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+                )
+                await manual_lock.set_value(True)
         finally:
             self._attr_is_locking = False
             self.async_write_ha_state()
@@ -581,21 +590,24 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_unlocking = True
             self.async_write_ha_state()
             try:
-                dp70 = self._device.datapoints.get_or_create(
-                    S1_DP_UNLOCK_REQUEST,
-                    TuyaBLEDataPointType.DT_RAW,
-                    dp70_payload,
-                )
-                await dp70.set_value(dp70_payload)
+                async with self._device.connection_lease(
+                    "s1 unlock", defer_connection=True
+                ):
+                    dp70 = self._device.datapoints.get_or_create(
+                        S1_DP_UNLOCK_REQUEST,
+                        TuyaBLEDataPointType.DT_RAW,
+                        dp70_payload,
+                    )
+                    await dp70.set_value(dp70_payload)
 
-                await asyncio.sleep(S1_UNLOCK_DELAY)
+                    await asyncio.sleep(S1_UNLOCK_DELAY)
 
-                dp71 = self._device.datapoints.get_or_create(
-                    S1_DP_UNLOCK_CONFIRM,
-                    TuyaBLEDataPointType.DT_RAW,
-                    bytes(dp71_payload),
-                )
-                await dp71.set_value(bytes(dp71_payload))
+                    dp71 = self._device.datapoints.get_or_create(
+                        S1_DP_UNLOCK_CONFIRM,
+                        TuyaBLEDataPointType.DT_RAW,
+                        bytes(dp71_payload),
+                    )
+                    await dp71.set_value(bytes(dp71_payload))
             finally:
                 self._attr_is_unlocking = False
                 self.async_write_ha_state()

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from homeassistant.exceptions import ServiceValidationError
+
+from ..const import DOMAIN
 
 class TuyaBLEError(Exception):
     """Base class for Tuya BLE errors."""
@@ -45,3 +48,36 @@ class TuyaBLECommandUnconfirmedError(TuyaBLEError):
 
     def __init__(self) -> None:
         super().__init__("BLE command was not confirmed by the device")
+
+
+class TuyaBLEControlSuspendedError(ServiceValidationError):
+    """Raised when Home Assistant BLE control is persistently suspended."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Home Assistant BLE control is suspended.",
+            translation_domain=DOMAIN,
+            translation_key="ble_control_suspended",
+        )
+
+
+class TuyaBLEConnectionUnavailableError(ServiceValidationError):
+    """Raised when a policy-approved connection cannot be established."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The Bluetooth connection is unavailable.",
+            translation_domain=DOMAIN,
+            translation_key="ble_connection_unavailable",
+        )
+
+
+class TuyaBLEPolicyTransitionError(ServiceValidationError):
+    """Raised when a connection-policy transition cannot complete safely."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The Bluetooth connection policy could not be changed safely.",
+            translation_domain=DOMAIN,
+            translation_key="ble_policy_transition_failed",
+        )

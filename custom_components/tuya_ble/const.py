@@ -10,6 +10,35 @@ from typing_extensions import Final
 
 DOMAIN: Final = "tuya_ble"
 
+CONF_CONNECTION_MODE: Final = "connection_mode"
+CONF_BLE_CONTROL_ENABLED: Final = "ble_control_enabled"
+
+DEFAULT_CONNECTION_MODE: Final = "always_connected"
+DEFAULT_BLE_CONTROL_ENABLED: Final = True
+DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS: Final = 15.0
+CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS: Final = 30.0
+BLE_TARGET_WAIT_TIMEOUT_SECONDS: Final = 10.0
+
+
+class ConnectionMode(StrEnum):
+    """Supported per-device connection modes."""
+
+    ALWAYS_CONNECTED = "always_connected"
+    ON_DEMAND = "on_demand"
+
+
+class ConnectionPolicyState(StrEnum):
+    """Runtime states of the per-device connection policy."""
+
+    STOPPED = "stopped"
+    SUSPENDED = "suspended"
+    ALWAYS_CONNECTED_CONNECTING = "always_connected_connecting"
+    ALWAYS_CONNECTED_ACTIVE = "always_connected_active"
+    ON_DEMAND_IDLE = "on_demand_idle"
+    ON_DEMAND_CONNECTING = "on_demand_connecting"
+    ON_DEMAND_ACTIVE = "on_demand_active"
+    DISCONNECTING = "disconnecting"
+
 DEVICE_METADATA_UUIDS: Final = "uuids"
 
 DEVICE_DEF_MANUFACTURER: Final = "Tuya"

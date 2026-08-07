@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import logging
 import re
 import secrets
@@ -42,6 +45,15 @@ from .const import (
 )
 
 from ..const import (
+    BLE_TARGET_WAIT_TIMEOUT_SECONDS,
+    CONF_BLE_CONTROL_ENABLED,
+    CONF_CONNECTION_MODE,
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
+    ConnectionMode,
+    ConnectionPolicyState,
+    DEFAULT_BLE_CONTROL_ENABLED,
+    DEFAULT_CONNECTION_MODE,
+    DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
     DPType,
 )
 
@@ -52,6 +64,9 @@ from .exceptions import (
     TuyaBLEDataLengthError,
     TuyaBLEDeviceError,
     TuyaBLEEnumValueError,
+    TuyaBLEConnectionUnavailableError,
+    TuyaBLEControlSuspendedError,
+    TuyaBLEPolicyTransitionError,
     TuyaBLEError,
 )
 from .manager import AbstaractTuyaBLEDeviceManager, TuyaBLEDeviceCredentials
@@ -200,11 +215,13 @@ class TuyaBLEDataPoint:
         self._received_from_device = False
 
     async def set_value(self, value: bytes | bool | int | str) -> None:
+        self._owner._owner.ensure_control_available()
         self._set_local_value(value)
         await self._owner._update_from_user(self._id)
 
     async def set_value_once(self, value: bytes | bool | int | str) -> None:
         """Send one confirmed command without automatic packet replay."""
+        self._owner._owner.ensure_control_available()
         previous_value = self._value
         previous_changed_by_device = self._changed_by_device
         previous_received_from_device = self._received_from_device
@@ -280,6 +297,7 @@ class TuyaBLEDataPoints:
         value: bytes | bool | int | str,
     ) -> None:
         self._last_data_received = datetime.now(timezone.utc)
+        self._owner._mark_state_data_fresh()
         dp = self._datapoints.get(dp_id)
         if dp:
             dp._update_from_device(timestamp, flags, type, value)
@@ -305,6 +323,33 @@ class TuyaBLEDataPoints:
     async def _update_from_user_once(self, dp_id: int) -> None:
         """Send one datapoint through the confirmed at-most-once path."""
         await self._owner._send_datapoints_once([dp_id])
+
+
+class TuyaBLEConnectionLease(AbstractAsyncContextManager):
+    """Reference-counted permission to use one device connection."""
+
+    def __init__(
+        self,
+        device: TuyaBLEDevice,
+        reason: str,
+        defer_connection: bool = False,
+    ) -> None:
+        self._device = device
+        self._reason = reason
+        self._defer_connection = defer_connection
+        self._acquired = False
+
+    async def __aenter__(self) -> TuyaBLEConnectionLease:
+        await self._device._acquire_connection_lease(
+            self._reason, self._defer_connection
+        )
+        self._acquired = True
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        if self._acquired:
+            self._acquired = False
+            await self._device._release_connection_lease()
 
 
 global_connect_lock = asyncio.Lock()
@@ -333,19 +378,59 @@ class TuyaBLEDevice:
     def __init__(
         self,
         device_manager: AbstaractTuyaBLEDeviceManager,
-        ble_device: BLEDevice,
+        ble_device: BLEDevice | None,
         advertisement_data: AdvertisementData | None = None,
+        *,
+        address: str | None = None,
+        connection_mode: str = DEFAULT_CONNECTION_MODE,
+        ble_control_enabled: bool = DEFAULT_BLE_CONTROL_ENABLED,
+        persist_options: Callable[[dict[str, Any]], Awaitable[None] | None]
+        | None = None,
     ) -> None:
         """Init the TuyaBLE."""
         self._device_manager = device_manager
         self._device_info: TuyaBLEDeviceCredentials | None = None
+        self._address = address or (ble_device.address if ble_device else "")
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
+        self._ble_target_event = asyncio.Event()
+        if ble_device is not None:
+            self._ble_target_event.set()
         self._log_identity = "tuya-ble-session-" + "".join(
             secrets.choice(_LOG_IDENTITY_ALPHABET) for _ in range(_LOG_IDENTITY_LENGTH)
         )
         self._operation_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
+        self._policy_lock = asyncio.Lock()
+        self._lease_zero_event = asyncio.Event()
+        self._lease_zero_event.set()
+        self._active_lease_count = 0
+        self._idle_disconnect_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
+        self._persist_options = persist_options
+        try:
+            self._connection_mode = ConnectionMode(connection_mode)
+        except (TypeError, ValueError):
+            self._connection_mode = ConnectionMode.ALWAYS_CONNECTED
+        self._ble_control_enabled = (
+            ble_control_enabled
+            if isinstance(ble_control_enabled, bool)
+            else DEFAULT_BLE_CONTROL_ENABLED
+        )
+        self._suspension_requested = not self._ble_control_enabled
+        self._terminal_stopped = False
+        self._policy_state = (
+            ConnectionPolicyState.SUSPENDED
+            if not self._ble_control_enabled
+            else (
+                ConnectionPolicyState.ON_DEMAND_IDLE
+                if self._connection_mode is ConnectionMode.ON_DEMAND
+                else ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+            )
+        )
+        self._state_data_fresh = False
+        self._physical_connection_active = False
+        self._connection_state_callbacks: list[Callable[[bool], None]] = []
         self._client: BleakClientWithServiceCache | None = None
         self._characteristic_notify = CHARACTERISTIC_NOTIFY
         self._characteristic_write = CHARACTERISTIC_WRITE
@@ -392,6 +477,317 @@ class TuyaBLEDevice:
         """Set the ble device."""
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
+        self._address = ble_device.address
+        self._ble_target_event.set()
+
+    @property
+    def connection_mode(self) -> ConnectionMode:
+        """Return the desired connection mode."""
+        return self._connection_mode
+
+    @property
+    def ble_control_enabled(self) -> bool:
+        """Return whether Home Assistant may control this device."""
+        return self._ble_control_enabled
+
+    @property
+    def effective_policy(self) -> ConnectionPolicyState:
+        """Return the effective policy after applying suspension and stop."""
+        if self._terminal_stopped:
+            return ConnectionPolicyState.STOPPED
+        if not self._ble_control_enabled or self._suspension_requested:
+            return ConnectionPolicyState.SUSPENDED
+        if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+            return ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+        return ConnectionPolicyState.ON_DEMAND_IDLE
+
+    @property
+    def policy_state(self) -> ConnectionPolicyState:
+        """Return the current runtime state."""
+        return self._policy_state
+
+    @property
+    def is_gatt_connected(self) -> bool:
+        """Return whether a physical GATT client is connected."""
+        return bool(self._client and self._client.is_connected)
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Return whether the current session completed pairing."""
+        return self._is_paired
+
+    @property
+    def is_connection_active(self) -> bool:
+        """Return whether an authenticated paired GATT session is active."""
+        return self.is_gatt_connected and self._is_paired
+
+    @property
+    def active_lease_count(self) -> int:
+        """Return the number of active connection leases."""
+        return self._active_lease_count
+
+    @property
+    def state_data_fresh(self) -> bool:
+        """Return whether current-session device data has been received."""
+        return self._state_data_fresh
+
+    def connection_lease(
+        self, reason: str, *, defer_connection: bool = False
+    ) -> TuyaBLEConnectionLease:
+        """Return a lease protecting a complete BLE operation."""
+        return TuyaBLEConnectionLease(self, reason, defer_connection)
+
+    def ensure_control_available(self) -> None:
+        """Reject work that cannot safely use the current policy."""
+        if self._terminal_stopped:
+            raise TuyaBLEConnectionUnavailableError()
+        if not self._ble_control_enabled or self._suspension_requested:
+            raise TuyaBLEControlSuspendedError()
+
+    def register_connection_state_callback(
+        self, callback: Callable[[bool], None]
+    ) -> Callable[[], None]:
+        """Register a callback for immediate paired-session state changes."""
+        self._connection_state_callbacks.append(callback)
+
+        def unregister_callback() -> None:
+            if callback in self._connection_state_callbacks:
+                self._connection_state_callbacks.remove(callback)
+
+        return unregister_callback
+
+    def _fire_connection_state_callbacks(self, connected: bool) -> None:
+        for callback in tuple(self._connection_state_callbacks):
+            callback(connected)
+
+    def _mark_state_data_fresh(self) -> None:
+        self._state_data_fresh = True
+
+    async def _persist_policy_options(self, updates: dict[str, Any]) -> None:
+        if self._persist_options is None:
+            return
+        try:
+            result = self._persist_options(updates)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("%s: Connection policy persistence failed", self.log_identity)
+            raise TuyaBLEPolicyTransitionError() from err
+
+    async def async_update_connection_policy(
+        self,
+        *,
+        connection_mode: str | None = None,
+        ble_control_enabled: bool | None = None,
+    ) -> None:
+        """Persist and apply one or both connection policy settings."""
+        if connection_mode is None:
+            new_mode = self._connection_mode
+        else:
+            try:
+                new_mode = ConnectionMode(connection_mode)
+            except (TypeError, ValueError) as err:
+                raise TuyaBLEPolicyTransitionError() from err
+
+        if ble_control_enabled is None:
+            new_enabled = self._ble_control_enabled
+        elif isinstance(ble_control_enabled, bool):
+            new_enabled = ble_control_enabled
+        else:
+            raise TuyaBLEPolicyTransitionError()
+
+        updates: dict[str, Any] = {}
+        if new_mode is not self._connection_mode:
+            updates[CONF_CONNECTION_MODE] = new_mode.value
+        if new_enabled != self._ble_control_enabled:
+            updates[CONF_BLE_CONTROL_ENABLED] = new_enabled
+        if updates:
+            await self._persist_policy_options(updates)
+
+        self._connection_mode = new_mode
+        self._ble_control_enabled = new_enabled
+        if not new_enabled:
+            self._suspension_requested = True
+        await self._apply_connection_policy()
+
+    async def async_apply_persisted_options(self, options: dict[str, Any]) -> None:
+        """Apply stored policy options without writing them again."""
+        try:
+            new_mode = ConnectionMode(
+                options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            )
+        except (TypeError, ValueError):
+            new_mode = ConnectionMode.ALWAYS_CONNECTED
+        raw_enabled = options.get(
+            CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+        )
+        new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
+        self._connection_mode = new_mode
+        self._ble_control_enabled = new_enabled
+        self._suspension_requested = not new_enabled
+        await self._apply_connection_policy()
+
+    async def _apply_connection_policy(self) -> None:
+        if self._terminal_stopped:
+            return
+        if not self._ble_control_enabled:
+            await self._suspend_runtime()
+            return
+
+        self._suspension_requested = False
+        if self._connection_mode is ConnectionMode.ON_DEMAND:
+            async with self._policy_lock:
+                self._cancel_reconnect_locked()
+                if self._active_lease_count:
+                    self._policy_state = (
+                        ConnectionPolicyState.ON_DEMAND_ACTIVE
+                        if self.is_connection_active
+                        else ConnectionPolicyState.ON_DEMAND_CONNECTING
+                    )
+                elif self.is_connection_active:
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+                    self._schedule_idle_disconnect_locked()
+                else:
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+            return
+
+        async with self._policy_lock:
+            self._cancel_idle_disconnect_locked()
+            if self.is_connection_active:
+                self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+            else:
+                self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+                self._schedule_reconnect_locked(0)
+
+    async def _suspend_runtime(self) -> None:
+        async with self._policy_lock:
+            if self._terminal_stopped:
+                return
+            self._suspension_requested = True
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+            if self.is_connection_active:
+                self._policy_state = ConnectionPolicyState.DISCONNECTING
+
+        try:
+            await asyncio.wait_for(
+                self._lease_zero_event.wait(),
+                CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as err:
+            raise TuyaBLEPolicyTransitionError() from err
+
+        async with self._policy_lock:
+            if self._terminal_stopped:
+                return
+            self._policy_state = ConnectionPolicyState.DISCONNECTING
+            await self._execute_disconnect()
+            self._policy_state = ConnectionPolicyState.SUSPENDED
+
+    async def _acquire_connection_lease(
+        self, reason: str, defer_connection: bool
+    ) -> None:
+        del reason
+        self.ensure_control_available()
+        async with self._policy_lock:
+            self.ensure_control_available()
+            self._cancel_idle_disconnect_locked()
+            self._active_lease_count += 1
+            self._lease_zero_event.clear()
+            self._expected_disconnect = False
+            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+                self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+            else:
+                self._policy_state = ConnectionPolicyState.ON_DEMAND_CONNECTING
+
+        if defer_connection:
+            return
+        try:
+            await self._ensure_connected()
+        except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
+            await self._release_connection_lease()
+            raise
+        except Exception as err:  # noqa: BLE001
+            await self._release_connection_lease()
+            raise TuyaBLEConnectionUnavailableError() from err
+
+        async with self._policy_lock:
+            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+                self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+            else:
+                self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+
+    async def _release_connection_lease(self) -> None:
+        async with self._policy_lock:
+            if self._active_lease_count == 0:
+                return
+            self._active_lease_count -= 1
+            if self._active_lease_count != 0:
+                return
+            self._lease_zero_event.set()
+            if (
+                self._connection_mode is ConnectionMode.ON_DEMAND
+                and self._ble_control_enabled
+                and not self._suspension_requested
+                and not self._terminal_stopped
+            ):
+                self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+                self._schedule_idle_disconnect_locked()
+
+    def _cancel_idle_disconnect_locked(self) -> None:
+        if self._idle_disconnect_task is not None:
+            self._idle_disconnect_task.cancel()
+            self._idle_disconnect_task = None
+
+    def _cancel_reconnect_locked(self) -> None:
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
+    def _schedule_idle_disconnect_locked(self) -> None:
+        if self._idle_disconnect_task is not None:
+            return
+        self._idle_disconnect_task = asyncio.create_task(
+            self._idle_disconnect_after_delay()
+        )
+
+    async def _idle_disconnect_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS)
+            async with self._policy_lock:
+                if (
+                    self._active_lease_count
+                    or self._connection_mode is not ConnectionMode.ON_DEMAND
+                    or not self._ble_control_enabled
+                    or self._suspension_requested
+                    or self._terminal_stopped
+                ):
+                    return
+                self._policy_state = ConnectionPolicyState.DISCONNECTING
+                await self._execute_disconnect()
+                if not self._terminal_stopped and self._ble_control_enabled:
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._idle_disconnect_task is asyncio.current_task():
+                self._idle_disconnect_task = None
+
+    def _schedule_reconnect_locked(self, delay: float) -> None:
+        if self._reconnect_task is not None:
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_after_delay(delay))
+
+    async def _reconnect_after_delay(self, delay: float) -> None:
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            await self._reconnect()
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
 
     async def initialize(self) -> None:
         _LOGGER.debug("%s: Initializing", self.log_identity)
@@ -430,7 +826,7 @@ class TuyaBLEDevice:
         if self._device_info is None:
             if self._device_manager:
                 self._device_info = await self._device_manager.get_device_credentials(
-                    self._ble_device.address, False
+                    self._address, False
                 )
             if self._device_info:
                 self._security_material = TuyaBLESecurityMaterial(
@@ -517,7 +913,7 @@ class TuyaBLEDevice:
     @property
     def address(self) -> str:
         """Return the address."""
-        return self._ble_device.address
+        return self._address
 
     @property
     def log_identity(self) -> str:
@@ -564,7 +960,9 @@ class TuyaBLEDevice:
         if self._device_info:
             return self._device_info.device_name
 
-        return self._ble_device.name or self._ble_device.address
+        if self._ble_device:
+            return self._ble_device.name or "Tuya BLE device"
+        return "Tuya BLE device"
 
     @property
     def rssi(self) -> int | None:
@@ -751,30 +1149,56 @@ class TuyaBLEDevice:
         self._disconnected_callbacks.append(callback)
         return unregister_callback
 
-    async def start(self):
+    async def start(self) -> None:
         """Start the TuyaBLE."""
         _LOGGER.debug("%s: Starting...", self.log_identity)
-        # await self._send_packet()
 
     async def stop(self) -> None:
         """Stop the TuyaBLE."""
         _LOGGER.debug("%s: Stop", self.log_identity)
-        await self._execute_disconnect()
+        async with self._policy_lock:
+            if self._terminal_stopped:
+                return
+            self._terminal_stopped = True
+            self._suspension_requested = True
+            self._policy_state = ConnectionPolicyState.STOPPED
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+        try:
+            await asyncio.wait_for(
+                self._lease_zero_event.wait(),
+                CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.error(
+                "%s: Stop deferred while a BLE operation remained active",
+                self.log_identity,
+            )
+            return
+        await self._execute_disconnect(terminal=True)
+
+    def _mark_connection_lost(self) -> None:
+        was_connected = self._physical_connection_active or self._is_paired
+        self._physical_connection_active = False
+        self._is_paired = False
+        self._state_data_fresh = False
+        self._clean_input()
+        if was_connected:
+            self._fire_disconnected_callbacks()
+            self._fire_connection_state_callbacks(False)
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
         was_paired = self._is_paired
-        self._is_paired = False
-        self._clean_input()
+        self._client = None
+        self._mark_connection_lost()
         if self._expected_disconnect:
             _LOGGER.debug(
                 "%s: Disconnected from device; RSSI: %s",
                 self.log_identity,
                 self.rssi,
             )
-            self._fire_disconnected_callbacks()
             return
-        self._client = None
         _LOGGER.warning(
             "%s: Device unexpectedly disconnected; RSSI: %s",
             self.log_identity,
@@ -786,7 +1210,7 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-            asyncio.create_task(self._reconnect())
+            self._schedule_reconnect()
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -800,27 +1224,36 @@ class TuyaBLEDevice:
         )
         await self._execute_disconnect()
 
-    async def _execute_disconnect(self) -> None:
+    async def _execute_disconnect(self, *, terminal: bool = False) -> None:
         """Execute disconnection."""
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
+            if terminal:
+                self._terminal_stopped = True
             self._client = None
+            error: BleakError | None = None
             if client and client.is_connected:
                 try:
                     await client.stop_notify(self._characteristic_notify)
                     await client.disconnect()
                 except Exception as ex:  # noqa: BLE001
-                    raise self._sanitized_transport_error(ex) from None
+                    error = self._sanitized_transport_error(ex)
+            self._mark_connection_lost()
         self._clean_input()
         async with self._seq_num_lock:
             self._current_seq_num = 1
+        self._session_key = None
+        self._auth_key = None
+        if error is not None:
+            raise error
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
-        if self._expected_disconnect:
-            return
+        self.ensure_control_available()
+        if self._expected_disconnect and self._active_lease_count == 0:
+            raise TuyaBLEConnectionUnavailableError()
         if self._connect_lock.locked():
             _LOGGER.debug(
                 "%s: Connection already in progress,"
@@ -830,175 +1263,118 @@ class TuyaBLEDevice:
             )
         if self._client and self._client.is_connected and self._is_paired:
             return
+        if self._ble_device is None:
+            try:
+                await asyncio.wait_for(
+                    self._ble_target_event.wait(),
+                    BLE_TARGET_WAIT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as err:
+                raise BleakNotFoundError() from err
+        if self._ble_device is None:
+            raise BleakNotFoundError()
         async with self._connect_lock:
             # Check again while holding the lock
             await asyncio.sleep(0.01)
             if self._client and self._client.is_connected and self._is_paired:
                 return
-            attempts_count = 100
-            while attempts_count > 0:
-                attempts_count -= 1
-                if attempts_count == 0:
-                    _LOGGER.error(
-                        "%s: Connecting, all attempts failed; RSSI: %s",
-                        self.log_identity,
-                        self.rssi,
-                    )
-                    raise BleakNotFoundError()
-                try:
-                    async with global_connect_lock:
-                        _LOGGER.debug(
-                            "%s: Connecting; RSSI: %s",
-                            self.log_identity,
-                            self.rssi,
-                        )
-                        client = await establish_connection(
-                            BleakClientWithServiceCache,
-                            self._ble_device,
-                            self.address,
-                            self._disconnected,
-                            use_services_cache=True,
-                            ble_device_callback=lambda: self._ble_device,
-                        )
-                except BleakNotFoundError:
-                    _LOGGER.error(
-                        "%s: device not found, not in range, or poor RSSI: %s",
-                        self.log_identity,
-                        self.rssi,
-                    )
-                    continue
-                except BLEAK_EXCEPTIONS as ex:
-                    if "Bluetooth is already shutdown" in str(ex):
-                        _LOGGER.debug(
-                            "%s: Bluetooth is already shutdown, terminating connection attempts",
-                            self.log_identity,
-                        )
-                        raise self._sanitized_transport_error(ex) from None
-                    _LOGGER.debug("%s: communication failed", self.log_identity)
-                    continue
-                except Exception as ex:  # noqa: BLE001
-                    if "Bluetooth is already shutdown" in str(ex):
-                        _LOGGER.debug(
-                            "%s: Bluetooth is already shutdown, terminating connection attempts",
-                            self.log_identity,
-                        )
-                        raise self._sanitized_transport_error(ex) from None
-                    _LOGGER.debug("%s: unexpected error", self.log_identity)
-                    continue
-
-                if client and client.is_connected:
+            try:
+                async with global_connect_lock:
                     _LOGGER.debug(
-                        "%s: Connected; RSSI: %s", self.log_identity, self.rssi
+                        "%s: Connecting; RSSI: %s",
+                        self.log_identity,
+                        self.rssi,
                     )
-                    self._client = client
-                    self._characteristic_notify = CHARACTERISTIC_NOTIFY
-                    self._characteristic_write = CHARACTERISTIC_WRITE
-                    # Support for additional GATT characteristics from @Shirkamdev
-                    for notify_uuid, write_uuid in SERVICE_CHARACTERISTICS.values():
-                        if client.services.get_characteristic(notify_uuid):
-                            self._characteristic_notify = notify_uuid
-                            self._characteristic_write = write_uuid
-                            break
-                    try:
-                        notify_kwargs = (
-                            {"bluez": {"use_start_notify": True}}
-                            if self._requires_fd50_device_info_handshake()
-                            else {}
-                        )
-                        await self._client.start_notify(
-                            self._characteristic_notify,
-                            self._notification_handler,
-                            **notify_kwargs,
-                        )
-                    except Exception as ex:  # noqa: BLE001
-                        if "Bluetooth is already shutdown" in str(ex):
-                            _LOGGER.debug(
-                                "%s: Bluetooth is already shutdown, terminating connection attempts",
-                                self.log_identity,
-                            )
-                            raise self._sanitized_transport_error(ex) from None
-                        self._client = None
-                        _LOGGER.error(
-                            "%s: starting notifications failed",
-                            self.log_identity,
-                        )
-                        continue
-                else:
-                    continue
+                    client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        self._ble_device,
+                        self.address,
+                        self._disconnected,
+                        use_services_cache=True,
+                        ble_device_callback=lambda: self._ble_device,
+                    )
+            except BleakNotFoundError:
+                _LOGGER.error(
+                    "%s: device not found, not in range, or poor RSSI",
+                    self.log_identity,
+                )
+                raise
+            except BLEAK_EXCEPTIONS as ex:
+                if "Bluetooth is already shutdown" in str(ex):
+                    _LOGGER.debug(
+                        "%s: Bluetooth is already shutdown, terminating connection attempt",
+                        self.log_identity,
+                    )
+                    raise self._sanitized_transport_error(ex) from None
+                raise self._sanitized_transport_error(ex) from None
+            except Exception as ex:  # noqa: BLE001
+                if "Bluetooth is already shutdown" in str(ex):
+                    _LOGGER.debug(
+                        "%s: Bluetooth is already shutdown, terminating connection attempt",
+                        self.log_identity,
+                    )
+                    raise self._sanitized_transport_error(ex) from None
+                raise self._sanitized_transport_error(ex) from None
 
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending device info request", self.log_identity)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                            (
-                                b"\x00\xf3"
-                                if self._requires_fd50_device_info_handshake()
-                                else bytes(0)
-                            ),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending device info request failed",
-                                self.log_identity,
-                            )
-                            continue
-                    except Exception as ex:  # noqa: BLE001
-                        if "Bluetooth is already shutdown" in str(ex):
-                            _LOGGER.debug(
-                                "%s: Bluetooth is already shutdown, terminating connection attempts",
-                                self.log_identity,
-                            )
-                            raise self._sanitized_transport_error(ex) from None
-                        self._client = None
-                        _LOGGER.error(
-                            "%s: Sending device info request failed",
-                            self.log_identity,
-                        )
-                        continue
-                else:
-                    continue
-
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending pairing request", self.log_identity)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_PAIR,
-                            self._build_pairing_request(),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending pairing request failed",
-                                self.log_identity,
-                            )
-                            continue
-                    except Exception as ex:  # noqa: BLE001
-                        if "Bluetooth is already shutdown" in str(ex):
-                            _LOGGER.debug(
-                                "%s: Bluetooth is already shutdown, terminating connection attempts",
-                                self.log_identity,
-                            )
-                            raise self._sanitized_transport_error(ex) from None
-                        self._client = None
-                        _LOGGER.error(
-                            "%s: Sending pairing request failed",
-                            self.log_identity,
-                        )
-                        continue
-                else:
-                    continue
-
-                break
+            if not client or not client.is_connected:
+                raise BleakNotFoundError()
+            _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
+            self._client = client
+            self._physical_connection_active = True
+            self._characteristic_notify = CHARACTERISTIC_NOTIFY
+            self._characteristic_write = CHARACTERISTIC_WRITE
+            for notify_uuid, write_uuid in SERVICE_CHARACTERISTICS.values():
+                if client.services.get_characteristic(notify_uuid):
+                    self._characteristic_notify = notify_uuid
+                    self._characteristic_write = write_uuid
+                    break
+            try:
+                notify_kwargs = (
+                    {"bluez": {"use_start_notify": True}}
+                    if self._requires_fd50_device_info_handshake()
+                    else {}
+                )
+                await self._client.start_notify(
+                    self._characteristic_notify,
+                    self._notification_handler,
+                    **notify_kwargs,
+                )
+                if not await self._send_packet_while_connected(
+                    TuyaBLECode.FUN_SENDER_DEVICE_INFO,
+                    (
+                        b"\x00\xf3"
+                        if self._requires_fd50_device_info_handshake()
+                        else bytes(0)
+                    ),
+                    0,
+                    True,
+                ):
+                    raise BleakError()
+                if not await self._send_packet_while_connected(
+                    TuyaBLECode.FUN_SENDER_PAIR,
+                    self._build_pairing_request(),
+                    0,
+                    True,
+                ):
+                    raise BleakError()
+            except Exception as ex:  # noqa: BLE001
+                self._client = None
+                self._mark_connection_lost()
+                if "Bluetooth is already shutdown" in str(ex):
+                    raise self._sanitized_transport_error(ex) from None
+                raise self._sanitized_transport_error(ex) from None
 
         if self._client:
             if self._client.is_connected:
                 if self._is_paired:
                     _LOGGER.debug("%s: Successfully connected", self.log_identity)
+                    self._policy_state = (
+                        ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+                        if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
+                        else ConnectionPolicyState.ON_DEMAND_ACTIVE
+                    )
                     self._fire_connected_callbacks()
+                    self._fire_connection_state_callbacks(True)
                 else:
                     _LOGGER.error("%s: Connected but not paired", self.log_identity)
             else:
@@ -1012,11 +1388,9 @@ class TuyaBLEDevice:
         async with self._seq_num_lock:
             self._current_seq_num = 1
         try:
-            if self._expected_disconnect:
+            if self.effective_policy is not ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE:
                 return
             await self._ensure_connected()
-            if self._expected_disconnect:
-                return
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
         except BLEAK_EXCEPTIONS as ex:  # BleakNotFoundError:
             if "Bluetooth is already shutdown" in str(ex):
@@ -1029,9 +1403,21 @@ class TuyaBLEDevice:
                 "%s: Reconnect, failed to ensure connection - backing off",
                 self.log_identity,
             )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.log_identity)
-            asyncio.create_task(self._reconnect())
+            async with self._policy_lock:
+                if self._reconnect_task is asyncio.current_task():
+                    self._reconnect_task = None
+                if self.effective_policy is ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE:
+                    self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
+
+    def _schedule_reconnect(self, delay: float = 0) -> None:
+        if self._terminal_stopped or self._suspension_requested:
+            return
+        if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
+            return
+        if self._reconnect_task is None:
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_after_delay(delay)
+            )
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -1149,12 +1535,8 @@ class TuyaBLEDevice:
         # retry: int | None = None,
     ) -> None:
         """Send packet to device and optional read response."""
-        if self._expected_disconnect:
-            return
-        await self._ensure_connected()
-        if self._expected_disconnect:
-            return
-        await self._send_packet_while_connected(code, data, 0, wait_for_response)
+        async with self.connection_lease("datapoint"):
+            await self._send_packet_while_connected(code, data, 0, wait_for_response)
 
     async def _send_packet_once_confirmed(
         self,
@@ -1162,21 +1544,24 @@ class TuyaBLEDevice:
         data: bytes,
     ) -> None:
         """Send once without replay and require an explicit success response."""
-        if self._expected_disconnect or self._protocol_version != 3:
+        if (
+            (self._expected_disconnect and self._active_lease_count == 0)
+            or self._protocol_version != 3
+        ):
             raise TuyaBLECommandUnconfirmedError()
-        await self._ensure_connected()
-        if self._expected_disconnect or self._protocol_version != 3:
-            raise TuyaBLECommandUnconfirmedError()
-        confirmed = await self._send_packet_while_connected(
-            code,
-            data,
-            0,
-            True,
-            resend_on_error=False,
-            expected_response_code=code,
-        )
-        if not confirmed:
-            raise TuyaBLECommandUnconfirmedError()
+        async with self.connection_lease("confirmed datapoint"):
+            if self._protocol_version != 3:
+                raise TuyaBLECommandUnconfirmedError()
+            confirmed = await self._send_packet_while_connected(
+                code,
+                data,
+                0,
+                True,
+                resend_on_error=False,
+                expected_response_code=code,
+            )
+            if not confirmed:
+                raise TuyaBLECommandUnconfirmedError()
 
     async def _send_response(
         self,
@@ -1277,7 +1662,9 @@ class TuyaBLEDevice:
                 raise
 
     async def _resend_packets(self, packets: list[bytes]) -> None:
-        if self._expected_disconnect:
+        if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
+            return
+        if self._expected_disconnect or self._suspension_requested:
             return
         await self._ensure_connected()
         if self._expected_disconnect:
@@ -1288,6 +1675,7 @@ class TuyaBLEDevice:
         self, packets: list[bytes], resend_on_error: bool = True
     ) -> None:
         """Send command to device and read response."""
+        self.ensure_control_available()
         try:
             await self._int_send_packets_locked(packets)
         except BleakDBusError as ex:
@@ -1305,10 +1693,11 @@ class TuyaBLEDevice:
                 self.rssi,
                 BLEAK_BACKOFF_TIME,
             )
-            if self._is_paired and resend_on_error:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
+            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+                if self._is_paired and resend_on_error:
+                    asyncio.create_task(self._resend_packets(packets))
+                else:
+                    self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
         except BleakError as ex:
             if "Bluetooth is already shutdown" in str(ex):
@@ -1323,10 +1712,11 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-            if self._is_paired and resend_on_error:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
+            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+                if self._is_paired and resend_on_error:
+                    asyncio.create_task(self._resend_packets(packets))
+                else:
+                    self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
@@ -1816,6 +2206,7 @@ class TuyaBLEDevice:
 
     async def set_multiple_values(self, dp_updates: dict[int, Any]) -> None:
         """Set multiple datapoint values in a single atomic BLE payload."""
+        self.ensure_control_available()
         updated_dps = []
         for dp_id, value in dp_updates.items():
             dp = self._datapoints[dp_id]
