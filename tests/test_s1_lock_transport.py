@@ -21,9 +21,13 @@ from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
     TuyaBLEProductInfo,
 )
-from custom_components.tuya_ble.const import ConnectionPolicyState
+from custom_components.tuya_ble.const import (
+    UNEXPECTED_RECONNECT_MIN_SECONDS,
+    ConnectionPolicyState,
+)
 from custom_components.tuya_ble.lock import (
     S1_DP_LOCK,
+    S1_DP_MOTOR_STATE,
     S1_DP_UNLOCK_CONFIRM,
     S1_DP_UNLOCK_REQUEST,
     S1_DP71_MIN_LENGTH,
@@ -42,6 +46,7 @@ from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDevice,
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
+from custom_components.tuya_ble.tuya_ble.tuya_ble import ConnectionSessionToken
 
 SYNTHETIC_DEVICE_ID = "synthetic-s1-device"
 SYNTHETIC_OTHER_DEVICE_ID = "synthetic-other-device"
@@ -122,6 +127,19 @@ def _make_device(device_id: str = SYNTHETIC_DEVICE_ID) -> TuyaBLEDevice:
     return device
 
 
+def _install_synthetic_session(
+    device: TuyaBLEDevice, client: _ConnectedTransportClient | Mock | None = None
+) -> ConnectionSessionToken:
+    """Install one exact synthetic S1 session for focused transport tests."""
+    if client is None:
+        client = Mock(is_connected=True)
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    device._connected_notified_token = token
+    return token
+
+
 def _make_entity(
     hass: HomeAssistant,
     stored_data: object,
@@ -152,10 +170,7 @@ def _make_transport_entity(
     del device._send_datapoints_no_replay
     client = _ConnectedTransportClient(write_side_effect)
     device._protocol_version = 3
-    device._client = client
-    device._is_paired = True
-    device._physical_connection_active = True
-    device._notifications_active = True
+    _install_synthetic_session(device, client)
     device._state_data_fresh = True
     device._build_packets = Mock(return_value=[b"synthetic-s1-gatt-fragment"])
     device._schedule_reconnect_locked = Mock()
@@ -284,11 +299,12 @@ async def test_s1_entity_captures_existing_inbound_snapshot(
 ) -> None:
     """A snapshot received just before platform setup remains captureable."""
     device = _make_device()
+    token = _install_synthetic_session(device)
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, token
     )
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, token
     )
     backing_store = _BackingStore({})
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
@@ -306,6 +322,49 @@ async def test_s1_entity_captures_existing_inbound_snapshot(
         SYNTHETIC_DP71,
     )
     assert len(backing_store.delayed_saves) == 1
+
+
+async def test_s1_lock_motor_state_requires_its_replacement_session_dp47(
+    hass: HomeAssistant,
+) -> None:
+    """Replacement DP8 cannot make the lock reuse an old DP47 motor value."""
+    entity, device, _ = _make_entity(hass, None)
+    old_client = Mock(is_connected=True)
+    old_token = _install_synthetic_session(device, old_client)
+    device.datapoints._update_from_device(
+        S1_DP_MOTOR_STATE,
+        1.0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        True,
+        old_token,
+    )
+    assert entity.is_locked is False
+
+    old_client.is_connected = False
+    replacement_token = _install_synthetic_session(device, Mock(is_connected=True))
+    device.datapoints._update_from_device(
+        8,
+        2.0,
+        0,
+        TuyaBLEDataPointType.DT_VALUE,
+        74,
+        replacement_token,
+    )
+    assert entity.is_locked is None
+
+    device.datapoints._update_from_device(
+        S1_DP_MOTOR_STATE,
+        3.0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        False,
+        replacement_token,
+    )
+    assert entity.is_locked is True
+
+    await entity.async_will_remove_from_hass()
+    entity._coordinator.shutdown()
 
 
 async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> None:
@@ -486,8 +545,9 @@ async def test_s1_unlock_rejects_non_raw_transport_slot_before_writing(
 ) -> None:
     """A conflicting live datapoint type cannot reinterpret template bytes."""
     entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    token = _install_synthetic_session(device)
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_STRING, "synthetic"
+        71, 1.0, 0, TuyaBLEDataPointType.DT_STRING, "synthetic", token
     )
 
     with pytest.raises(ServiceValidationError):
@@ -579,6 +639,11 @@ async def test_s1_ambiguous_write_never_defers_or_replays_a_command(
     expected_attempts: int,
 ) -> None:
     """S1 controls have one semantic attempt, even after a replacement session."""
+    real_asyncio_sleep = asyncio.sleep
+
+    async def yield_without_delay(_: float) -> None:
+        await real_asyncio_sleep(0)
+
     write_side_effect: object
     if operation == "unlock_dp71":
         write_side_effect = [None, BleakError("synthetic ambiguous S1 failure")]
@@ -606,7 +671,8 @@ async def test_s1_ambiguous_write_never_defers_or_replays_a_command(
     else:
         command = entity.async_unlock
         sleep_patch = patch(
-            "custom_components.tuya_ble.lock.asyncio.sleep", new=AsyncMock()
+            "custom_components.tuya_ble.lock.asyncio.sleep",
+            new=AsyncMock(side_effect=yield_without_delay),
         )
     timeout_patch = patch(
         "custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0
@@ -635,10 +701,8 @@ async def test_s1_ambiguous_write_never_defers_or_replays_a_command(
     assert entity.is_unlocking is False
 
     replacement = _ConnectedTransportClient(None)
-    device._client = replacement
-    device._is_paired = True
-    device._physical_connection_active = True
-    device._notifications_active = True
+    replacement_token = _install_synthetic_session(device, replacement)
+    device._status_attempted_token = replacement_token
 
     await device._reconnect()
 
@@ -655,6 +719,11 @@ async def test_s1_verified_loss_recovers_future_session_without_replay(
     expected_attempts: int,
 ) -> None:
     """S1 no-replay commands still recover the next Always-connected session."""
+    real_asyncio_sleep = asyncio.sleep
+
+    async def yield_without_delay(_: float) -> None:
+        await real_asyncio_sleep(0)
+
     entity, device, client = _make_transport_entity(hass, None)
 
     write_attempts = 0
@@ -674,7 +743,8 @@ async def test_s1_verified_loss_recovers_future_session_without_replay(
     else:
         command = entity.async_unlock
         sleep_patch = patch(
-            "custom_components.tuya_ble.lock.asyncio.sleep", new=AsyncMock()
+            "custom_components.tuya_ble.lock.asyncio.sleep",
+            new=AsyncMock(side_effect=yield_without_delay),
         )
     timeout_patch = patch(
         "custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0
@@ -704,14 +774,20 @@ async def test_s1_verified_loss_recovers_future_session_without_replay(
     assert entity.is_locking is False
     assert entity.is_unlocking is False
     assert state_changes == [False]
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
     assert not hasattr(device, "_deferred_resend_packets")
     assert not hasattr(device, "_resend_task")
 
-    device._disconnected(client)
+    token = device._connected_notified_token
+    assert token is not None
+    device._disconnected(client, token)
 
     assert state_changes == [False]
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
 
 
 async def test_s1_unlock_does_not_log_templates(

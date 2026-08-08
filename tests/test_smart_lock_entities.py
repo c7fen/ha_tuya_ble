@@ -151,12 +151,14 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert alarm.description.options == S1_ALARM_OPTIONS
     assert alarm.description.icon == "mdi:alert"
     assert alarm.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert alarm.requires_current_session is False
 
     battery = mappings["battery"]
     assert battery.dp_id == 8
     assert battery.description.device_class is SensorDeviceClass.BATTERY
     assert battery.description.native_unit_of_measurement == PERCENTAGE
     assert battery.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert battery.requires_current_session is True
 
     last_unlock = mappings["last_unlock_method"]
     assert last_unlock.unlock_methods == S1_LAST_UNLOCK_METHODS
@@ -170,6 +172,32 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert door.description.options == ["unknown", "open", "closed"]
     assert door.description.entity_registry_enabled_default is False
     assert door.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert door.requires_current_session is True
+
+
+def test_s1_current_configuration_has_exact_per_datapoint_provenance_scope() -> None:
+    """Only S1 current-state/configuration mappings require the active epoch."""
+    authentication = _mapping_by_key(select.get_mapping_by_device(S1_DEVICE))[
+        "unlock_switch"
+    ]
+    auto_lock = _mapping_by_key(switch.get_mapping_by_device(S1_DEVICE))[
+        "automatic_lock"
+    ]
+    auto_lock_delay = _mapping_by_key(number.get_mapping_by_device(S1_DEVICE))[
+        "auto_lock_time"
+    ]
+    motor = _mapping_by_key(binary_sensor.get_mapping_by_device(S1_DEVICE))[
+        "lock_motor_state"
+    ]
+
+    assert authentication.dp_id == 34
+    assert authentication.requires_current_session is True
+    assert auto_lock.dp_id == 33
+    assert auto_lock.requires_current_session is True
+    assert auto_lock_delay.dp_id == 36
+    assert auto_lock_delay.requires_current_session is True
+    assert motor.dp_id == 47
+    assert motor.requires_current_session is True
 
 
 def test_v1_contract_excludes_generic_and_speculative_entities() -> None:

@@ -47,6 +47,7 @@ async def test_select(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Select Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -91,7 +92,9 @@ async def test_select(hass: HomeAssistant) -> None:
     assert entity.current_option is None
 
     # Update coordinator state: 1 -> "low"
-    device.datapoints._update_from_device(31, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1)
+    device.datapoints._update_from_device(
+        31, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1, session_token
+    )
     entity._handle_coordinator_update()
     assert entity.current_option == "low"
 

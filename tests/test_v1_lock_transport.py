@@ -31,7 +31,10 @@ from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDataPointType,
     TuyaBLEDevice,
 )
-from custom_components.tuya_ble.const import ConnectionPolicyState
+from custom_components.tuya_ble.const import (
+    UNEXPECTED_RECONNECT_MIN_SECONDS,
+    ConnectionPolicyState,
+)
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLECommandUnconfirmedError,
@@ -41,6 +44,7 @@ from custom_components.tuya_ble.tuya_ble.exceptions import (
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
 from custom_components.tuya_ble.tuya_ble.security import TuyaBLESecurityMaterial
+from custom_components.tuya_ble.tuya_ble.tuya_ble import ConnectionSessionToken
 
 SYNTHETIC_DEVICE_ID = "synthetic-v1-device"
 SYNTHETIC_ADDRESS = "00:00:00:00:00:02"
@@ -71,6 +75,19 @@ def _make_device() -> TuyaBLEDevice:
     device._send_datapoints = AsyncMock()
     device._send_datapoints_once = AsyncMock()
     return device
+
+
+def _install_synthetic_session(
+    device: TuyaBLEDevice, client: Mock | None = None
+) -> ConnectionSessionToken:
+    """Install one exact synthetic V1 session for transport-focused tests."""
+    if client is None:
+        client = Mock(is_connected=True)
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    device._connected_notified_token = token
+    return token
 
 
 def _make_entity(hass: HomeAssistant) -> tuple[TuyaBLEV1Lock, TuyaBLEDevice]:
@@ -235,11 +252,55 @@ async def test_v1_state_uses_only_boolean_device_motor_state(
 ) -> None:
     """Only read-only DP47 Boolean state determines the physical lock state."""
     entity, device = _make_entity(hass)
-    device.datapoints._update_from_device(V1_DP_MOTOR_STATE, 1.0, 0, dp_type, value)
+    token = _install_synthetic_session(device)
+    device.datapoints._update_from_device(
+        V1_DP_MOTOR_STATE, 1.0, 0, dp_type, value, token
+    )
 
     assert entity.is_locked is expected
     device._send_datapoints.assert_not_awaited()
     device._send_datapoints_once.assert_not_awaited()
+
+
+async def test_v1_motor_state_requires_its_replacement_session_dp47(
+    hass: HomeAssistant,
+) -> None:
+    """An unrelated replacement datapoint cannot refresh cached V1 DP47."""
+    entity, device = _make_entity(hass)
+    old_client = Mock(is_connected=True)
+    old_token = _install_synthetic_session(device, old_client)
+    device.datapoints._update_from_device(
+        V1_DP_MOTOR_STATE,
+        1.0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        True,
+        old_token,
+    )
+    assert entity.is_locked is False
+
+    old_client.is_connected = False
+    replacement_token = _install_synthetic_session(device, Mock(is_connected=True))
+    device.datapoints._update_from_device(
+        8,
+        2.0,
+        0,
+        TuyaBLEDataPointType.DT_VALUE,
+        74,
+        replacement_token,
+    )
+    assert entity.is_locked is None
+
+    device.datapoints._update_from_device(
+        V1_DP_MOTOR_STATE,
+        3.0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        False,
+        replacement_token,
+    )
+    assert entity.is_locked is True
+    entity._coordinator.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -260,8 +321,9 @@ async def test_v1_conflicting_command_type_fails_before_any_write(
 ) -> None:
     """A malformed live slot cannot reinterpret V1 command data."""
     entity, device = _make_entity(hass)
+    token = _install_synthetic_session(device)
     device.datapoints._update_from_device(
-        dp_id, 1.0, 0, conflicting_type, conflicting_value
+        dp_id, 1.0, 0, conflicting_type, conflicting_value, token
     )
 
     with pytest.raises(ServiceValidationError) as raised:
@@ -395,7 +457,7 @@ async def test_v1_ambiguous_transport_error_never_replays_command(
     """Both physical directions fail closed without a background packet replay."""
     device = _make_device()
     device.datapoints.get_or_create(dp_id, dp_type, value)
-    device._is_paired = True
+    _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
     transport_error = (
@@ -434,17 +496,14 @@ async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
         client.is_connected = False
 
     client.disconnect = AsyncMock(side_effect=disconnect)
-    device._client = client
-    device._is_paired = True
-    device._physical_connection_active = True
-    device._notifications_active = True
+    token = _install_synthetic_session(device, client)
     device._disconnected_callbacks.clear()
     device._connection_state_callbacks.clear()
     device._schedule_reconnect = Mock()
     device._schedule_reconnect_locked = Mock()
 
     async def send_once(_: list[int]) -> None:
-        await device._send_packets_locked([b"synthetic-v1-command"])
+        await device._send_packets_locked(token, [b"synthetic-v1-command"])
 
     device._send_datapoints_once = send_once
 
@@ -475,10 +534,7 @@ async def test_v1_verified_loss_recovers_future_session_without_replay(
 
     client.write_gatt_char = AsyncMock(side_effect=lose_connection)
     client.disconnect = AsyncMock()
-    device._client = client
-    device._is_paired = True
-    device._physical_connection_active = True
-    device._notifications_active = True
+    token = _install_synthetic_session(device, client)
     device._build_packets = Mock(return_value=[b"synthetic-v1-command"])
     device._disconnected_callbacks.clear()
     device._schedule_reconnect_locked = Mock()
@@ -496,28 +552,32 @@ async def test_v1_verified_loss_recovers_future_session_without_replay(
     assert entity.is_locking is False
     assert entity.is_unlocking is False
     assert state_changes == [False]
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
     assert not hasattr(device, "_deferred_resend_packets")
     assert not hasattr(device, "_resend_task")
 
-    device._disconnected(client)
+    device._disconnected(client, token)
 
     assert state_changes == [False]
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
 
 
 async def test_unverified_generic_transport_error_does_not_schedule_recovery() -> None:
     """Recovery remains reserved for a verified physical transport loss."""
     device = _make_device()
     packets = [b"synthetic-fragment"]
-    device._is_paired = True
+    token = _install_synthetic_session(device)
     device._int_send_packets_locked = AsyncMock(
         side_effect=BleakError("synthetic generic transport error")
     )
     device._schedule_reconnect = Mock()
 
     with pytest.raises(BleakError, match="synthetic generic transport error"):
-        await device._send_packets_locked(packets)
+        await device._send_packets_locked(token, packets)
 
     device._schedule_reconnect.assert_not_called()
     assert not hasattr(device, "_deferred_resend_packets")
@@ -528,6 +588,7 @@ async def test_v1_response_timeout_is_an_unconfirmed_failure() -> None:
     """An absent acknowledgement cannot be reported as command success."""
     device = _make_device()
     device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
     device._int_send_packets_locked = AsyncMock()
@@ -543,14 +604,22 @@ async def test_v1_malformed_response_is_an_unconfirmed_failure() -> None:
     """A correlated malformed acknowledgement remains a failed service call."""
     device = _make_device()
     device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    token = _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
 
-    async def emit_malformed_response(_: list[bytes]) -> None:
-        response_to = next(iter(device._input_expected_responses))
+    async def emit_malformed_response(
+        session_token: ConnectionSessionToken, _: list[bytes]
+    ) -> None:
+        assert session_token is token
+        response_to = next(iter(device._input_expected_responses))[1]
         with pytest.raises(TuyaBLEDataLengthError):
             device._handle_command_or_response(
-                2, response_to, TuyaBLECode.FUN_SENDER_DPS, b""
+                2,
+                response_to,
+                TuyaBLECode.FUN_SENDER_DPS,
+                b"",
+                session_token=token,
             )
 
     device._int_send_packets_locked = AsyncMock(side_effect=emit_malformed_response)
@@ -567,13 +636,21 @@ async def test_v1_requires_correlated_zero_status_response(status: int) -> None:
     """Only the observed correlated zero status confirms a strict V1 command."""
     device = _make_device()
     device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    token = _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
 
-    async def emit_response(_: list[bytes]) -> None:
-        response_to = next(iter(device._input_expected_responses))
+    async def emit_response(
+        session_token: ConnectionSessionToken, _: list[bytes]
+    ) -> None:
+        assert session_token is token
+        response_to = next(iter(device._input_expected_responses))[1]
         device._handle_command_or_response(
-            2, response_to, TuyaBLECode.FUN_SENDER_DPS, bytes([status])
+            2,
+            response_to,
+            TuyaBLECode.FUN_SENDER_DPS,
+            bytes([status]),
+            session_token=token,
         )
 
     device._int_send_packets_locked = AsyncMock(side_effect=emit_response)
@@ -591,13 +668,18 @@ async def test_v1_wrong_status_response_family_cannot_confirm_command() -> None:
     """A correlated zero device-status response is not a sender-DPS response."""
     device = _make_device()
     device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    token = _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
 
-    async def emit_wrong_response(_: list[bytes]) -> None:
-        response_to, future = next(iter(device._input_expected_responses.items()))
+    async def emit_wrong_response(
+        session_token: ConnectionSessionToken, _: list[bytes]
+    ) -> None:
+        assert session_token is token
+        response_key, future = next(iter(device._input_expected_responses.items()))
+        response_to = response_key[1]
         assert (
-            device._input_expected_response_codes[response_to]
+            device._input_expected_response_codes[response_key]
             is TuyaBLECode.FUN_SENDER_DPS
         )
         device._handle_command_or_response(
@@ -605,6 +687,7 @@ async def test_v1_wrong_status_response_family_cannot_confirm_command() -> None:
             response_to,
             TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
             bytes([0]),
+            session_token=token,
         )
         assert not future.done()
 
@@ -622,14 +705,19 @@ async def test_v1_correlated_inbound_report_cannot_confirm_command() -> None:
     """A valid inbound DP report is processed but cannot confirm a V1 write."""
     device = _make_device()
     device.datapoints.get_or_create(V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+    token = _install_synthetic_session(device)
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
     device._send_response = AsyncMock()
 
-    async def emit_inbound_report(_: list[bytes]) -> None:
-        response_to, future = next(iter(device._input_expected_responses.items()))
+    async def emit_inbound_report(
+        session_token: ConnectionSessionToken, _: list[bytes]
+    ) -> None:
+        assert session_token is token
+        response_key, future = next(iter(device._input_expected_responses.items()))
+        response_to = response_key[1]
         assert (
-            device._input_expected_response_codes[response_to]
+            device._input_expected_response_codes[response_key]
             is TuyaBLECode.FUN_SENDER_DPS
         )
         device._handle_command_or_response(
@@ -644,6 +732,7 @@ async def test_v1_correlated_inbound_report_cannot_confirm_command() -> None:
                     1,
                 ]
             ),
+            session_token=token,
         )
         assert not future.done()
 
@@ -656,7 +745,7 @@ async def test_v1_correlated_inbound_report_cannot_confirm_command() -> None:
 
     assert device.datapoints[V1_DP_MOTOR_STATE].value is True
     device._send_response.assert_awaited_once_with(
-        TuyaBLECode.FUN_RECEIVE_DP, bytes(0), 2
+        token, TuyaBLECode.FUN_RECEIVE_DP, bytes(0), 2
     )
     assert device._input_expected_responses == {}
     assert device._input_expected_response_codes == {}
@@ -699,12 +788,14 @@ async def test_v1_protocol_drift_during_connect_fails_before_command_write() -> 
 async def test_v1_failed_command_restores_prior_datapoint_provenance() -> None:
     """A failed strict write cannot leave a command value looking confirmed."""
     device = _make_device()
+    token = _install_synthetic_session(device)
     device.datapoints._update_from_device(
         V1_DP_LOCK,
         1.0,
         0,
         TuyaBLEDataPointType.DT_BOOL,
         False,
+        token,
     )
     datapoint = device.datapoints[V1_DP_LOCK]
     device._send_datapoints_once.side_effect = TuyaBLECommandUnconfirmedError()
@@ -722,23 +813,42 @@ def test_protocol_v3_sender_dps_response_status_is_enforced() -> None:
 
     async def exercise() -> None:
         device = _make_device()
+        token = _install_synthetic_session(device)
         loop = asyncio.get_running_loop()
 
         success = loop.create_future()
-        device._input_expected_responses[1] = success
-        device._handle_command_or_response(2, 1, TuyaBLECode.FUN_SENDER_DPS, bytes([0]))
+        device._input_expected_responses[(token, 1)] = success
+        device._handle_command_or_response(
+            2,
+            1,
+            TuyaBLECode.FUN_SENDER_DPS,
+            bytes([0]),
+            session_token=token,
+        )
         assert await success == 0
 
         failure = loop.create_future()
-        device._input_expected_responses[3] = failure
-        device._handle_command_or_response(4, 3, TuyaBLECode.FUN_SENDER_DPS, bytes([1]))
+        device._input_expected_responses[(token, 3)] = failure
+        device._handle_command_or_response(
+            4,
+            3,
+            TuyaBLECode.FUN_SENDER_DPS,
+            bytes([1]),
+            session_token=token,
+        )
         with pytest.raises(TuyaBLEDeviceError):
             await failure
 
         malformed = loop.create_future()
-        device._input_expected_responses[5] = malformed
+        device._input_expected_responses[(token, 5)] = malformed
         with pytest.raises(TuyaBLEDataLengthError):
-            device._handle_command_or_response(6, 5, TuyaBLECode.FUN_SENDER_DPS, b"")
+            device._handle_command_or_response(
+                6,
+                5,
+                TuyaBLECode.FUN_SENDER_DPS,
+                b"",
+                session_token=token,
+            )
         assert not malformed.done()
 
     asyncio.run(exercise())

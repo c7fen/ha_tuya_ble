@@ -47,10 +47,12 @@ async def test_cover(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Cover Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
     device._send_datapoints = AsyncMock()
+    device.update = AsyncMock()
 
     hass.data.setdefault(DOMAIN, {})
     coordinator = TuyaBLECoordinator(hass, device)
@@ -86,7 +88,9 @@ async def test_cover(hass: HomeAssistant) -> None:
     assert entity.current_cover_position == 0
 
     # Update coordinator state: position DP 3 to 20 -> current_cover_position = 80
-    device.datapoints._update_from_device(3, 0, 0, TuyaBLEDataPointType.DT_VALUE, 20)
+    device.datapoints._update_from_device(
+        3, 0, 0, TuyaBLEDataPointType.DT_VALUE, 20, session_token
+    )
     entity._handle_coordinator_update()
     assert entity.current_cover_position == 80
 

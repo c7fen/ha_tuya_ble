@@ -18,6 +18,8 @@ from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDevice,
 )
 
+from . import claim_test_session
+
 SYNTHETIC_DEVICE_ID = "synthetic-s1-device"
 SYNTHETIC_DP70_SAMPLE_LENGTH = 16
 SYNTHETIC_DP70 = hashlib.shake_256(b"tuya-ble-test-only:synthetic-store-dp70").digest(
@@ -53,13 +55,14 @@ def _make_device() -> TuyaBLEDevice:
 async def test_local_datapoints_are_not_inbound_provenance() -> None:
     """Lazy creation and local writes cannot masquerade as device updates."""
     device = _make_device()
+    session_token = claim_test_session(device)
     datapoint = device.datapoints.get_or_create(
         70, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
     )
     assert datapoint.received_from_device is False
 
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_token
     )
     assert datapoint.received_from_device is True
 
@@ -67,7 +70,7 @@ async def test_local_datapoints_are_not_inbound_provenance() -> None:
     assert datapoint.received_from_device is False
 
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_token
     )
     assert device.datapoints[71].received_from_device is True
     await device.set_multiple_values({71: SYNTHETIC_DP71})
@@ -79,6 +82,7 @@ def test_capture_persists_only_valid_inbound_device_templates(
 ) -> None:
     """Only structurally valid raw inbound values enter the device-scoped store."""
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
 
@@ -89,10 +93,10 @@ def test_capture_persists_only_valid_inbound_device_templates(
     assert backing_store.delayed_saves == []
 
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_token
     )
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_token
     )
     assert (
         template_store.capture_inbound(
@@ -124,6 +128,7 @@ def test_capture_rejects_wrong_type_length_and_empty_device_id(
 ) -> None:
     """Invalid or unscoped inbound updates never enter persistent storage."""
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
 
@@ -133,6 +138,7 @@ def test_capture_rejects_wrong_type_length_and_empty_device_id(
         0,
         TuyaBLEDataPointType.DT_RAW,
         b"",
+        session_token,
     )
     device.datapoints._update_from_device(
         71,
@@ -140,6 +146,7 @@ def test_capture_rejects_wrong_type_length_and_empty_device_id(
         0,
         TuyaBLEDataPointType.DT_STRING,
         "synthetic string",
+        session_token,
     )
     updates = [device.datapoints[70], device.datapoints[71]]
     assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, updates) is False
@@ -152,6 +159,7 @@ def test_capture_accepts_variable_length_inbound_templates(
 ) -> None:
     """Live capture preserves valid nonempty DP70 and extended DP71 templates."""
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
     extended_dp70 = hashlib.shake_256(
@@ -162,10 +170,10 @@ def test_capture_accepts_variable_length_inbound_templates(
     ).digest(S1_DP71_MIN_LENGTH + 11)
 
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp70, session_token
     )
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp71
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, extended_dp71, session_token
     )
 
     assert template_store.capture_inbound(
@@ -183,17 +191,18 @@ def test_capture_accepts_separate_batches_for_the_same_device_only(
 ) -> None:
     """DP70 and DP71 may arrive separately but remain in one device record."""
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
 
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_token
     )
     assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[70]])
     assert template_store.templates_for(SYNTHETIC_DEVICE_ID) is None
 
     device.datapoints._update_from_device(
-        71, 2.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71
+        71, 2.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_token
     )
     assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[71]])
     assert template_store.templates_for(SYNTHETIC_DEVICE_ID) == (
@@ -213,10 +222,11 @@ def test_capture_rejects_conflicting_stored_product_metadata(
         }
     }
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, conflicting)
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_token
     )
 
     assert (
@@ -232,13 +242,14 @@ async def test_outgoing_timestamped_dp71_cannot_replace_inbound_template(
 ) -> None:
     """A locally rebuilt outgoing DP71 is never persisted as inbound evidence."""
     device = _make_device()
+    session_token = claim_test_session(device)
     backing_store = _BackingStore()
     template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
     device.datapoints._update_from_device(
-        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_token
     )
     device.datapoints._update_from_device(
-        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71
+        71, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_token
     )
     assert template_store.capture_inbound(
         SYNTHETIC_DEVICE_ID,

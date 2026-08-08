@@ -48,6 +48,7 @@ async def test_light(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Light Product")
 
     # Set up TuyaBLEDeviceCredentials directly
@@ -104,7 +105,9 @@ async def test_light(hass: HomeAssistant) -> None:
     assert entity.is_on is False
 
     # Update coordinator state via updating DP 1
-    device.datapoints._update_from_device(1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    device.datapoints._update_from_device(
+        1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, session_token
+    )
     entity._handle_coordinator_update()
     assert entity.is_on is True
 

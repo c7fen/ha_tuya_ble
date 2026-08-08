@@ -56,6 +56,7 @@ async def test_sensor(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Sensor Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -94,7 +95,9 @@ async def test_sensor(hass: HomeAssistant) -> None:
     assert entity.native_value is None
 
     # Update coordinator state: 600 -> 600
-    device.datapoints._update_from_device(2, 0, 0, TuyaBLEDataPointType.DT_VALUE, 600)
+    device.datapoints._update_from_device(
+        2, 0, 0, TuyaBLEDataPointType.DT_VALUE, 600, session_token
+    )
     entity._handle_coordinator_update()
     assert entity.native_value == 600
 
