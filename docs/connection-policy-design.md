@@ -37,7 +37,9 @@ the three new entities in this implementation.
   according to the selected mode; off persistently suspends HA BLE control.
 * `Bluetooth Connection` is an always-available diagnostic binary sensor with
   connectivity device class. It is on only for an authenticated and paired
-  GATT session.
+  physical GATT session. This physical diagnostic remains on if notification
+  teardown succeeded but GATT release has not yet completed; such a session is
+  not usable for integration traffic.
 
 The control entities are local policy entities. They remain available while
 the entry is disconnected or suspended. No address, UUID, device identifier,
@@ -87,7 +89,8 @@ The policy controller uses these conceptual states:
 * `SUSPENDED`: persistent HA-control suspension with no policy-created GATT;
 * `ALWAYS_CONNECTED_CONNECTING`: an enabled always-connected session is being
   established;
-* `ALWAYS_CONNECTED_ACTIVE`: an authenticated and paired session is retained;
+* `ALWAYS_CONNECTED_ACTIVE`: an authenticated, paired, notification-ready
+  session is retained;
 * `ON_DEMAND_IDLE`: enabled but intentionally disconnected with no lease;
 * `ON_DEMAND_CONNECTING`: an explicit lease is establishing a session;
 * `ON_DEMAND_ACTIVE`: one or more leases protect an active session;
@@ -169,6 +172,23 @@ pairing, and retains the session. In on-demand mode it leaves suspension and
 enters `ON_DEMAND_IDLE` without connecting. If the app still owns GATT, the
 runtime keeps the actual diagnostic off and uses only bounded retry behavior.
 
+### 10.1 Release supersession matrix
+
+| Pending release | Session condition | New desired policy | Result |
+| --- | --- | --- | --- |
+| `SUSPEND` | physical teardown has not begun and the session remains paired and notification-ready | BLE control enabled | Cancel the reversible release and apply the newest mode. |
+| `ON_DEMAND_IDLE` | physical teardown has not begun and the session remains paired and notification-ready | Always connected | Cancel the reversible release and retain the usable session. |
+| `SUSPEND` or `ON_DEMAND_IDLE` | physical teardown is in progress | any visible policy change | Retain the single release owner; apply the newest policy only after verified GATT release. |
+| `SUSPEND` or `ON_DEMAND_IDLE` | notification state became inactive or unknown and GATT release failed | any visible policy change | Convert to mandatory `SETUP_FAILURE`; reject commands and reconnect until verified cleanup. |
+| `SETUP_FAILURE` | connected client remains unusable | any visible policy change | Never supersede; retain the exact client and one disconnect retry owner. |
+| `UNLOAD` | platform teardown fails but notifications are positively restored on the same paired client | latest enabled policy | Cancel unload release ownership and reconcile the latest policy. |
+| `UNLOAD` | notification restoration fails or remains unknown | any policy | Convert to mandatory `SETUP_FAILURE` and retain cleanup ownership. |
+| `STOP` | any | any | Terminal and non-cancellable; retain cleanup ownership until physical release. |
+
+Successful physical release always reconciles the newest persisted policy.
+The controller never starts a reconnect while an unusable connected client or
+an in-progress physical release remains owned.
+
 ## 11. Config-entry unload transaction
 
 Unload preparation is a reversible quiesce rather than terminal stop. It blocks
@@ -187,21 +207,28 @@ idle disconnect was already in progress.
 Platforms unload as one recoverable set. If any platform does not unload, every
 platform is checked and missing platforms are restored directly through the
 Home Assistant entity component while the config entry is still in its unload
-transition. Restoration is retried and the failed unload does not return until
-the complete loaded set has finished entity-platform setup, preventing a loaded
-entry with missing, partial, or duplicate policy entities. Cancellation is
-deferred until that transaction reaches a consistent terminal or rolled-back
-result. A rolled-back Home Assistant entry is restored to `LOADED`, so a later
-clean unload can retry normally. Only a fully successful platform teardown makes
-the device terminally `STOPPED`; a failed transaction returns to the latest
-desired connection policy.
+transition. Restoration has an explicit attempt limit, total timeout, and
+backoff. Cancellation is deferred only until that bounded transaction reaches
+success or exhaustion.
+
+Complete restoration is verified from every expected entity platform's
+setup-complete marker before the entry is returned to `LOADED`. If restoration
+is exhausted, the integration stops all rollback work, returns unload failure,
+keeps the runtime and BLE owner, and leaves the entry honestly in
+`FAILED_UNLOAD`; it never presents a partial platform set as loaded. Home
+Assistant 2025.1 treats `FAILED_UNLOAD` as non-recoverable during the same
+process, so a restart reconstructs the retained entry before a later clean
+unload. Only a fully successful platform teardown makes the device terminally
+`STOPPED`.
 
 ## 12. Entity availability and state freshness
 
 The connectivity binary sensor and both policy entities are available whenever
 the config entry is loaded. The connectivity sensor reads the actual paired
-GATT state immediately and does not use the coordinator's delayed grace
-period.
+physical GATT state immediately and does not use the coordinator's delayed
+grace period. Internal `is_connection_active` is stricter: it additionally
+requires active notifications, because commands and acknowledgements require a
+usable bidirectional session.
 
 `state_data_fresh` is an internal device property. It becomes true only after
 current-session inbound device data is received and becomes false immediately
