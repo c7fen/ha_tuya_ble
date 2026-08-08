@@ -1506,7 +1506,7 @@ async def test_platform_rollback_setup_works_while_entry_is_unloading(
     async def setup_entry(_: object, setup_entry: object) -> bool:
         assert setup_entry is entry
         assert entry.entry_id not in entity_component._platforms
-        entity_component._platforms[entry.entry_id] = object()
+        entity_component._platforms[entry.entry_id] = Mock(_setup_complete=True)
         return True
 
     component = Mock(async_setup_entry=AsyncMock(side_effect=setup_entry))
@@ -1535,6 +1535,138 @@ async def test_platform_rollback_setup_works_while_entry_is_unloading(
     component.async_setup_entry.assert_awaited_once_with(hass, entry)
     forwarded_setup.assert_not_awaited()
     assert list(entity_component._platforms) == [entry.entry_id]
+
+
+async def test_platform_rollback_cleans_partial_setup_before_retry(
+    hass: HomeAssistant,
+) -> None:
+    """Entity-component membership cannot certify an incomplete platform setup."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic partial rollback")
+    entry.add_to_hass(hass)
+    platform = integration.Platform.SELECT
+    entity_component = Mock(_platforms={})
+    setup_attempts = 0
+
+    async def setup_entry(_: object, setup_entry: object) -> bool:
+        nonlocal setup_attempts
+        assert setup_entry is entry
+        setup_attempts += 1
+        marker = Mock(_setup_complete=setup_attempts > 1)
+        entity_component._platforms[entry.entry_id] = marker
+        if setup_attempts == 1:
+            raise RuntimeError("synthetic")
+        return True
+
+    async def unload_entry(_: object, unload_entry: object) -> bool:
+        assert unload_entry is entry
+        entity_component._platforms.pop(entry.entry_id)
+        return True
+
+    component = Mock(
+        async_setup_entry=AsyncMock(side_effect=setup_entry),
+        async_unload_entry=AsyncMock(side_effect=unload_entry),
+    )
+    platform_integration = Mock(async_get_component=AsyncMock(return_value=component))
+
+    with (
+        patch.dict(hass.data, {platform.value: entity_component}),
+        patch.object(
+            integration.loader,
+            "async_get_loaded_integration",
+            return_value=platform_integration,
+        ),
+    ):
+        assert (
+            await integration._async_restore_platform_after_unload_failure(
+                hass, entry, platform
+            )
+            is False
+        )
+        assert entry.entry_id not in entity_component._platforms
+        assert (
+            await integration._async_restore_platform_after_unload_failure(
+                hass, entry, platform
+            )
+            is True
+        )
+
+    assert setup_attempts == 2
+    assert entity_component._platforms[entry.entry_id]._setup_complete is True
+    component.async_unload_entry.assert_awaited_once_with(hass, entry)
+
+
+async def test_cancelled_home_assistant_unload_finishes_runtime_rollback(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation waits for a consistent rollback and leaves unload recoverable."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic cancelled unload")
+    entry.add_to_hass(hass)
+    object.__setattr__(entry, "state", ConfigEntryState.LOADED)
+    object.__setattr__(entry, "supports_unload", True)
+    object.__setattr__(entry, "supports_remove_device", False)
+    object.__setattr__(
+        entry,
+        "_integration_for_domain",
+        Mock(
+            domain=DOMAIN,
+            async_get_component=AsyncMock(return_value=integration),
+        ),
+    )
+    device = _make_device()
+    device._schedule_reconnect_locked = Mock()
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+    rollback_started = asyncio.Event()
+    allow_rollback = asyncio.Event()
+    transaction_calls = 0
+
+    async def platform_transaction(*_: object) -> bool:
+        nonlocal transaction_calls
+        transaction_calls += 1
+        if transaction_calls == 1:
+            rollback_started.set()
+            await allow_rollback.wait()
+            return False
+        return True
+
+    with patch.object(
+        integration,
+        "_async_unload_platforms_transactional",
+        new=AsyncMock(side_effect=platform_transaction),
+    ):
+        unload = asyncio.create_task(hass.config_entries.async_unload(entry.entry_id))
+        await asyncio.wait_for(rollback_started.wait(), 2)
+        unload.cancel()
+        await asyncio.sleep(0)
+        cancellation_deferred = not unload.done()
+        allow_rollback.set()
+        unload_result = (await asyncio.gather(unload, return_exceptions=True))[0]
+        if isinstance(unload_result, asyncio.CancelledError):
+            object.__setattr__(entry, "state", ConfigEntryState.LOADED)
+            await device.async_cancel_unload()
+
+        assert cancellation_deferred is True
+        assert unload_result is False
+
+        assert entry.state is ConfigEntryState.FAILED_UNLOAD
+        assert entry.entry_id in hass.data[DOMAIN]
+        assert device._terminal_stopped is False
+        assert device._unload_quiescing is False
+        assert device._pending_release is None
+        device.ensure_control_available()
+
+        assert await hass.config_entries.async_unload(entry.entry_id) is True
+
+    assert transaction_calls == 2
+    assert entry.entry_id not in hass.data[DOMAIN]
+    assert device._terminal_stopped is True
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    if data.coordinator._unsub_disconnect is not None:
+        data.coordinator._unsub_disconnect()
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
