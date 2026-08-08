@@ -970,6 +970,139 @@ async def test_pending_disconnect_retries_after_a_live_client_failure() -> None:
     await device.stop()
 
 
+@pytest.mark.parametrize("persisted", (False, True), ids=("direct", "persisted"))
+@pytest.mark.parametrize(
+    "mode",
+    (ConnectionMode.ALWAYS_CONNECTED, ConnectionMode.ON_DEMAND),
+    ids=("always-connected", "on-demand"),
+)
+async def test_failed_suspension_release_remains_mandatory_after_reenable(
+    persisted: bool,
+    mode: ConnectionMode,
+) -> None:
+    """A connected session without notifications cannot become command-ready."""
+    device = _make_device(mode=mode)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+
+    with (
+        patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 60),
+        pytest.raises(ServiceValidationError),
+    ):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    retry_owner = device._disconnect_retry_task
+    assert retry_owner is not None
+    assert client.stop_notify.await_count == 1
+
+    if persisted:
+        await device.async_apply_persisted_options(
+            {
+                CONF_CONNECTION_MODE: mode.value,
+                CONF_BLE_CONTROL_ENABLED: True,
+            }
+        )
+    else:
+        await device.async_update_connection_policy(ble_control_enabled=True)
+
+    if device._idle_disconnect_task is not None:
+        device._idle_disconnect_task.cancel()
+        await asyncio.sleep(0)
+
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+    assert device._disconnect_retry_task is retry_owner
+    assert device._client is client
+    assert device._reconnect_task is None
+    assert device._notifications_active is False
+    assert device.is_gatt_connected is True
+    assert device.is_connection_active is False
+    with pytest.raises(TuyaBLEConnectionUnavailableError):
+        device.ensure_control_available()
+    device._send_datapoints.assert_not_awaited()
+
+    async def release_client() -> None:
+        client.is_connected = False
+
+    client.disconnect.side_effect = release_client
+    retry_owner.cancel()
+    await asyncio.sleep(0)
+    device._disconnect_retry_task = None
+    await device._complete_pending_release()
+
+    assert device._pending_release is None
+    assert device._client is None
+    assert device.ble_control_enabled is True
+    if mode is ConnectionMode.ALWAYS_CONNECTED:
+        device._schedule_reconnect_locked.assert_called_once_with(0)
+    else:
+        device._schedule_reconnect_locked.assert_not_called()
+
+
+@pytest.mark.parametrize("persisted", (False, True), ids=("direct", "persisted"))
+async def test_failed_idle_release_remains_mandatory_after_always_connected(
+    persisted: bool,
+) -> None:
+    """Always connected cannot supersede an unusable On-demand GATT session."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+    device._pending_release = PendingRelease(
+        PendingReleaseReason.ON_DEMAND_IDLE,
+        device._policy_revision,
+    )
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 60):
+        await device._complete_pending_release()
+        retry_owner = device._disconnect_retry_task
+        assert retry_owner is not None
+
+        if persisted:
+            await device.async_apply_persisted_options(
+                {
+                    CONF_CONNECTION_MODE: ConnectionMode.ALWAYS_CONNECTED.value,
+                    CONF_BLE_CONTROL_ENABLED: True,
+                }
+            )
+        else:
+            await device.async_update_connection_policy(
+                connection_mode=ConnectionMode.ALWAYS_CONNECTED.value
+            )
+
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+    assert device._disconnect_retry_task is retry_owner
+    assert device._client is client
+    assert device._reconnect_task is None
+    assert device.is_connection_active is False
+    with pytest.raises(TuyaBLEConnectionUnavailableError):
+        device.ensure_control_available()
+    device._send_datapoints.assert_not_awaited()
+
+    async def release_client() -> None:
+        client.is_connected = False
+
+    client.disconnect.side_effect = release_client
+    retry_owner.cancel()
+    await asyncio.sleep(0)
+    device._disconnect_retry_task = None
+    await device._complete_pending_release()
+
+    assert device._pending_release is None
+    assert device._client is None
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+
+
 async def test_stale_disconnect_callback_cannot_mutate_replacement_client() -> None:
     """A late callback from a replaced client must be observational only."""
     device = _make_device()
@@ -1481,6 +1614,37 @@ async def test_platform_rollback_retries_one_failed_setup_without_duplicates(
         for platform, attempts in setup_attempts.items()
         if platform is not setup_failure
     )
+
+
+async def test_permanent_platform_rollback_failure_is_bounded(
+    hass: HomeAssistant,
+) -> None:
+    """A platform that never restores cannot retain unload forever."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic permanent rollback")
+    entry.add_to_hass(hass)
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_unload",
+            new=AsyncMock(return_value=False),
+        ),
+        patch.object(
+            integration,
+            "_async_restore_platform_after_unload_failure",
+            new=AsyncMock(return_value=False),
+        ) as restore_platform,
+        patch.object(integration, "_PLATFORM_ROLLBACK_BACKOFF_SECONDS", 0),
+    ):
+        result = await asyncio.wait_for(
+            integration._async_unload_platforms_transactional(hass, entry),
+            0.2,
+        )
+
+    assert result is False
+    assert 0 < restore_platform.await_count <= len(integration.PLATFORMS) * 3
 
 
 async def test_platform_rollback_setup_works_while_entry_is_unloading(
