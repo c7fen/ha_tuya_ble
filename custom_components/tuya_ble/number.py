@@ -65,6 +65,7 @@ class TuyaBLENumberMapping:
     getter: TuyaBLENumberGetter = None
     setter: TuyaBLENumberSetter = None
     mode: NumberMode = NumberMode.BOX
+    requires_current_session: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -931,6 +932,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(
@@ -1054,10 +1056,14 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the entity value to represent the entity state."""
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            return None
         if self._mapping.getter:
             return self._mapping.getter(self, self._product)
 
-        datapoint = self._device.datapoints[self._mapping.dp_id]
         if datapoint:
             return datapoint.value / self._mapping.coefficient
 

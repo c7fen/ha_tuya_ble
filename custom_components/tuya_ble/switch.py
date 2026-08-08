@@ -54,6 +54,7 @@ class TuyaBLESwitchMapping:
     is_available: TuyaBLESwitchIsAvailable = None
     getter: TuyaBLESwitchGetter = None
     setter: TuyaBLESwitchSetter = None
+    requires_current_session: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -557,6 +558,7 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=smart_lock_automatic_lock_getter,
+                    requires_current_session=True,
                 ),
             ],
             "y2yaegze": [
@@ -919,13 +921,18 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
         self._mapping = mapping
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if switch is on."""
+
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            return None
 
         if self._mapping.getter:
             return self._mapping.getter(self, self._product)
 
-        datapoint = self._device.datapoints[self._mapping.dp_id]
         if datapoint:
             if (
                 datapoint.type

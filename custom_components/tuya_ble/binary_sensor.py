@@ -60,15 +60,6 @@ def motor_state_getter(self: TuyaBLEBinarySensor) -> None:
     self._attr_is_on = value if isinstance(value, bool) else None
 
 
-def is_s1_motor_state_current(
-    self: TuyaBLEBinarySensor, product: TuyaBLEProductInfo
-) -> bool:
-    """Expose S1 motor state only after its DP47 report arrived this session."""
-    del product
-    datapoint = self._device.datapoints[47]
-    return bool(datapoint and datapoint.received_from_device)
-
-
 @dataclass
 class TuyaBLEBinarySensorMapping:
     """Models a BLE binary sensor"""
@@ -82,6 +73,7 @@ class TuyaBLEBinarySensorMapping:
     # coefficient: float = 1.0
     # icons: list[str] | None = None
     is_available: TuyaBLEBinarySensorIsAvailable = None
+    requires_current_session: bool = False
 
 
 @dataclass
@@ -282,7 +274,7 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=motor_state_getter,
-                    is_available=is_s1_motor_state_current,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(
@@ -456,10 +448,16 @@ class TuyaBLEBinarySensor(TuyaBLEEntity, BinarySensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            self._attr_is_on = None
+            self.async_write_ha_state()
+            return
         if self._mapping.getter is not None:
             self._mapping.getter(self)
         else:
-            datapoint = self._device.datapoints[self._mapping.dp_id]
             if datapoint:
                 if self._mapping.bit is not None and datapoint.value is not None:
                     value = _bitmap_value_to_int(datapoint.value)
@@ -495,6 +493,9 @@ class TuyaBLEBinarySensor(TuyaBLEEntity, BinarySensorEntity):
     def available(self) -> bool:
         """Return if entity is available."""
         result = super().available
+        if result and self._mapping.requires_current_session:
+            datapoint = self._device.datapoints[self._mapping.dp_id]
+            result = bool(datapoint and datapoint.received_in_current_session)
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result

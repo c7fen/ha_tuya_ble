@@ -632,7 +632,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if hasattr(hass, "async_create_task"):
             device._startup_task = hass.async_create_task(device.startup_update())
         else:
-            hass.add_job(device.update())
+            hass.add_job(device.startup_update())
 
     @callback
     def _async_update_ble(
@@ -849,6 +849,7 @@ async def _async_unload_entry_transaction(
             return _EntryUnloadOutcome.RESTORED
         return _EntryUnloadOutcome.RESTORATION_FAILED
     await data.device.stop()
+    data.coordinator.shutdown()
     hass.data[DOMAIN].pop(entry.entry_id)
     return _EntryUnloadOutcome.UNLOADED
 

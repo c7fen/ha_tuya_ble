@@ -338,11 +338,10 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return the physical secure state reported by read-only DP47."""
-        if not self._device.state_data_fresh:
-            return None
         motor_state = self._device.datapoints[V1_DP_MOTOR_STATE]
         if (
             motor_state is None
+            or not motor_state.received_in_current_session
             or motor_state.type is not TuyaBLEDataPointType.DT_BOOL
             or not isinstance(motor_state.value, bool)
         ):
@@ -556,10 +555,12 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return true if the S1 motor is in its locked state."""
-        if not self._device.state_data_fresh:
-            return None
         motor_state = self._device.datapoints[S1_DP_MOTOR_STATE]
-        if motor_state is not None and isinstance(motor_state.value, bool):
+        if (
+            motor_state is not None
+            and motor_state.received_in_current_session
+            and isinstance(motor_state.value, bool)
+        ):
             return not motor_state.value
         return None
 

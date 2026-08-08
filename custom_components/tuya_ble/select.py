@@ -45,6 +45,7 @@ class TuyaBLESelectMapping:
     description: SelectEntityDescription
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
+    requires_current_session: bool = False
 
 
 @dataclass
@@ -501,6 +502,7 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
                         entity_category=EntityCategory.CONFIG,
                     ),
                     dp_type=TuyaBLEDataPointType.DT_ENUM,
+                    requires_current_session=True,
                 ),
             ],
             "hc7n0urm": [  # A1 Ultra-JM
@@ -852,6 +854,10 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
     def current_option(self) -> str | None:
         """Return the selected entity option to represent the entity state."""
         datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            return None
         if datapoint:
             value = datapoint.value
             if isinstance(value, int) and 0 <= value < len(self._attr_options):

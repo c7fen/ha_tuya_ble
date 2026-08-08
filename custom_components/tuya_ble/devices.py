@@ -299,9 +299,14 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
         self._disconnected: bool = True
         self._unsub_disconnect: CALLBACK_TYPE | None = None
         self.last_updates: list[TuyaBLEDataPoint] | None = None
-        device.register_connected_callback(self._async_handle_connect)
-        device.register_callback(self._async_handle_update)
-        device.register_disconnected_callback(self._async_handle_disconnect)
+        self._unsub_device_callbacks = [
+            device.register_connected_callback(self._async_handle_connect),
+            device.register_callback(self._async_handle_update),
+            device.register_session_invalidated_callback(
+                self._async_handle_session_invalidated
+            ),
+            device.register_disconnected_callback(self._async_handle_disconnect),
+        ]
 
     @property
     def connected(self) -> bool:
@@ -310,11 +315,19 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
     @callback
     def _async_handle_connect(self) -> None:
         self.last_updates = None
-        if self._unsub_disconnect is not None:
-            self._unsub_disconnect()
+        unsub_disconnect = self._unsub_disconnect
+        self._unsub_disconnect = None
+        if unsub_disconnect is not None:
+            unsub_disconnect()
         if self._disconnected:
             self._disconnected = False
             self.async_update_listeners()
+
+    @callback
+    def _async_handle_session_invalidated(self) -> None:
+        """Publish exact-session data invalidation without ending the grace."""
+        self.last_updates = None
+        self.async_update_listeners()
 
     @callback
     def _async_handle_update(self, updates: list[TuyaBLEDataPoint]) -> None:
@@ -351,6 +364,17 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
             self._unsub_disconnect = async_call_later(
                 self.hass, delay, self._set_disconnected
             )
+
+    @callback
+    def shutdown(self) -> None:
+        """Cancel timers and release every device callback after final unload."""
+        unsub_disconnect = self._unsub_disconnect
+        self._unsub_disconnect = None
+        if unsub_disconnect is not None:
+            unsub_disconnect()
+        for unsubscribe in self._unsub_device_callbacks:
+            unsubscribe()
+        self._unsub_device_callbacks.clear()
 
 
 @dataclass

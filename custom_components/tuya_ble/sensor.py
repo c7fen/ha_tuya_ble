@@ -64,6 +64,7 @@ class TuyaBLESensorMapping:
     coefficient: float = 1.0
     icons: list[str] | None = None
     is_available: TuyaBLESensorIsAvailable = None
+    requires_current_session: bool = False
 
 
 @dataclass
@@ -113,13 +114,6 @@ def is_co2_alarm_enabled(self: TuyaBLESensor, product: TuyaBLEProductInfo) -> bo
     if datapoint:
         result = bool(datapoint.value)
     return result
-
-
-def is_s1_battery_current(self: TuyaBLESensor, product: TuyaBLEProductInfo) -> bool:
-    """Expose S1 Battery only after its DP8 report arrived this session."""
-    del product
-    datapoint = self._device.datapoints[8]
-    return bool(datapoint and datapoint.received_from_device)
 
 
 def battery_enum_getter(self: TuyaBLESensor) -> None:
@@ -539,7 +533,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                 TuyaBLEBatteryMapping(
                     dp_id=8,
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
-                    is_available=is_s1_battery_current,
+                    requires_current_session=True,
                 ),
                 TuyaBLELastUnlockSensorMapping(
                     unlock_methods={
@@ -581,6 +575,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                         ],
                     ),
                     dp_type=TuyaBLEDataPointType.DT_ENUM,
+                    requires_current_session=True,
                 ),
             ],
             "y2yaegze": [
@@ -2040,10 +2035,16 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            self._attr_native_value = None
+            self.async_write_ha_state()
+            return
         if self._mapping.getter is not None:
             self._mapping.getter(self)
         else:
-            datapoint = self._device.datapoints[self._mapping.dp_id]
             if datapoint:
                 if datapoint.type == TuyaBLEDataPointType.DT_ENUM:
                     if self.entity_description.options is not None:
@@ -2072,6 +2073,9 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
     def available(self) -> bool:
         """Return if entity is available."""
         result = super().available
+        if result and self._mapping.requires_current_session:
+            datapoint = self._device.datapoints[self._mapping.dp_id]
+            result = bool(datapoint and datapoint.received_in_current_session)
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result
