@@ -661,7 +661,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     await data.device.stop()
-    if data.device.is_gatt_connected:
+    if data.device.is_gatt_connected or data.device.active_lease_count:
         return False
     hass.data[DOMAIN].pop(entry.entry_id)
     return True

@@ -394,6 +394,56 @@ async def test_reenable_supersedes_timed_out_pending_suspension(
     await device.stop()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    (ConnectionMode.ALWAYS_CONNECTED, ConnectionMode.ON_DEMAND),
+)
+async def test_reenable_reconciles_suspension_during_physical_disconnect(
+    mode: ConnectionMode,
+) -> None:
+    """A completed old disconnect must reconcile to the latest enabled policy."""
+    device = _make_device(mode=mode)
+    disconnect_started = asyncio.Event()
+    allow_disconnect = asyncio.Event()
+    client = _SyntheticConnectedClient()
+
+    async def disconnect() -> None:
+        disconnect_started.set()
+        await allow_disconnect.wait()
+        client.is_connected = False
+
+    client.disconnect.side_effect = disconnect
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._schedule_reconnect_locked = Mock()
+    lease = device.connection_lease("timeout operation", defer_connection=True)
+    await lease.__aenter__()
+
+    with (
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        pytest.raises(ServiceValidationError),
+    ):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    release_lease = asyncio.create_task(lease.__aexit__(None, None, None))
+    await disconnect_started.wait()
+    await device.async_update_connection_policy(ble_control_enabled=True)
+    allow_disconnect.set()
+    await release_lease
+
+    assert device.effective_policy is not EffectiveConnectionPolicy.SUSPENDED
+    assert device.policy_state is not ConnectionPolicyState.SUSPENDED
+    assert device._pending_disconnect_target is None
+    if mode is ConnectionMode.ALWAYS_CONNECTED:
+        device._schedule_reconnect_locked.assert_called_once_with(0)
+    else:
+        assert device._idle_disconnect_task is None
+
+
 async def test_stop_notify_failure_still_releases_gatt_truthfully() -> None:
     """A notification cleanup failure must not suppress the real disconnect."""
     device = _make_device()
@@ -560,10 +610,11 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
             0.01,
         ),
     ):
-        assert await integration.async_unload_entry(hass, entry) is True
+        assert await integration.async_unload_entry(hass, entry) is False
 
     assert disconnect.await_count == 0
     assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    assert hass.data[DOMAIN][entry.entry_id] is data
     await lease.__aexit__(None, None, None)
     if data.coordinator._unsub_disconnect is not None:
         data.coordinator._unsub_disconnect()
@@ -572,6 +623,14 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
     assert device._pending_disconnect_target is None
     assert device.policy_state is ConnectionPolicyState.STOPPED
     assert device.is_authenticated is False
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await integration.async_unload_entry(hass, entry) is True
+
     assert entry.entry_id not in hass.data[DOMAIN]
 
 
@@ -823,6 +882,23 @@ async def test_stop_cancels_pending_protocol_response_task() -> None:
 
     assert not device._response_tasks
     release_response.set()
+
+
+async def test_stop_releases_response_drain_when_task_never_starts() -> None:
+    """Terminal cancellation before task startup cannot strand a live client."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+
+    device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
+    await device.stop()
+    await asyncio.sleep(0)
+
+    assert device._active_response_drain_count == 0
+    assert device._pending_disconnect_target is None
+    assert device.is_gatt_connected is False
 
 
 async def test_response_task_does_not_inherit_lease_context() -> None:

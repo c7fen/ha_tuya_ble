@@ -450,6 +450,8 @@ class TuyaBLEDevice:
         self._reconnect_task: asyncio.Task | None = None
         self._resend_task: asyncio.Task | None = None
         self._response_tasks: set[asyncio.Task] = set()
+        self._response_drain_tasks: set[asyncio.Task] = set()
+        self._response_cleanup_tasks: set[asyncio.Task] = set()
         self._startup_task: asyncio.Task | None = None
         self._persist_options = persist_options
         try:
@@ -826,33 +828,43 @@ class TuyaBLEDevice:
             self._policy_state = ConnectionPolicyState.DISCONNECTING
 
         disconnect_failed = False
+        reconcile_policy = False
+        complete_superseding_target = False
         try:
             await self._execute_disconnect(
                 terminal=target is ConnectionPolicyState.STOPPED
             )
+        except asyncio.CancelledError:
+            disconnect_failed = True
+            raise
         except Exception:
             disconnect_failed = True
             _LOGGER.error("%s: Deferred BLE disconnect failed", self.log_identity)
-        reconcile_policy = False
-        complete_superseding_target = False
-        async with self._policy_lock:
-            self._disconnect_in_progress = False
-            if disconnect_failed:
-                self._schedule_disconnect_retry_locked()
-            elif self._pending_disconnect_target is target:
-                self._pending_disconnect_target = None
-                self._pending_disconnect_revision = None
-                if (
+        finally:
+            async with self._policy_lock:
+                self._disconnect_in_progress = False
+                if disconnect_failed:
+                    self._schedule_disconnect_retry_locked()
+                elif self._pending_disconnect_target is target:
+                    self._pending_disconnect_target = None
+                    self._pending_disconnect_revision = None
+                    if (
+                        target is ConnectionPolicyState.SUSPENDED
+                        and revision != self._policy_revision
+                    ):
+                        self._suspension_requested = False
+                        reconcile_policy = True
+                    else:
+                        self._suspension_requested = True
+                        self._policy_state = target
+                elif (
                     target is ConnectionPolicyState.SUSPENDED
                     and revision != self._policy_revision
                 ):
                     self._suspension_requested = False
                     reconcile_policy = True
                 else:
-                    self._suspension_requested = True
-                    self._policy_state = target
-            elif not disconnect_failed:
-                complete_superseding_target = True
+                    complete_superseding_target = True
 
         if reconcile_policy:
             await self._apply_connection_policy()
@@ -997,7 +1009,25 @@ class TuyaBLEDevice:
             self._response_task_runner(code, data, response_to)
         )
         self._response_tasks.add(task)
+        self._response_drain_tasks.add(task)
         task.add_done_callback(self._response_tasks.discard)
+        task.add_done_callback(self._response_task_done)
+
+    def _response_task_done(self, task: asyncio.Task) -> None:
+        """Release drain ownership when cancellation prevents task startup."""
+        self._release_response_drain(task)
+
+    def _release_response_drain(self, task: asyncio.Task | None) -> None:
+        """Release exactly one response drain and resume pending policy work."""
+        if task is None or task not in self._response_drain_tasks:
+            return
+        self._response_drain_tasks.remove(task)
+        self._active_response_drain_count -= 1
+        if self._active_response_drain_count == 0:
+            self._response_drain_zero_event.set()
+            cleanup_task = self._create_policy_task(self._complete_pending_disconnect())
+            self._response_cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._response_cleanup_tasks.discard)
 
     async def _response_task_runner(
         self,
@@ -1012,10 +1042,7 @@ class TuyaBLEDevice:
         except Exception:
             _LOGGER.debug("%s: Protocol response failed", self.log_identity)
         finally:
-            self._active_response_drain_count -= 1
-            if self._active_response_drain_count == 0:
-                self._response_drain_zero_event.set()
-                await self._complete_pending_disconnect()
+            self._release_response_drain(asyncio.current_task())
 
     async def initialize(self) -> None:
         _LOGGER.debug("%s: Initializing", self.log_identity)
@@ -1407,8 +1434,9 @@ class TuyaBLEDevice:
             self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
             self._cancel_disconnect_retry_locked()
-            for task in self._response_tasks:
+            for task in tuple(self._response_tasks):
                 task.cancel()
+                self._release_response_drain(task)
             self._response_tasks.clear()
             if self._startup_task is not None:
                 self._startup_task.cancel()
@@ -1552,6 +1580,8 @@ class TuyaBLEDevice:
             await asyncio.sleep(0.01)
             if self._client and self._client.is_connected and self._is_paired:
                 return
+            if self._terminal_stopped:
+                raise TuyaBLEConnectionUnavailableError()
             try:
                 async with global_connect_lock:
                     _LOGGER.debug(
