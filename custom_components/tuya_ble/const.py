@@ -38,6 +38,7 @@ class ConnectionPolicyState(StrEnum):
     ON_DEMAND_CONNECTING = "on_demand_connecting"
     ON_DEMAND_ACTIVE = "on_demand_active"
     DISCONNECTING = "disconnecting"
+    DISCONNECT_FAILED = "disconnect_failed"
 
 
 class EffectiveConnectionPolicy(StrEnum):

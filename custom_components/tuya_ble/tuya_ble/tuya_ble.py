@@ -446,6 +446,7 @@ class TuyaBLEDevice:
         self._policy_revision = 0
         self._disconnect_in_progress = False
         self._idle_disconnect_task: asyncio.Task | None = None
+        self._idle_disconnect_in_progress = False
         self._disconnect_retry_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._resend_task: asyncio.Task | None = None
@@ -587,6 +588,11 @@ class TuyaBLEDevice:
     def ensure_control_available(self) -> None:
         """Reject work that cannot safely use the current policy."""
         lease_active = _lease_context_depth(self) > 0
+        if (
+            self._pending_disconnect_target is ConnectionPolicyState.DISCONNECT_FAILED
+            and not lease_active
+        ):
+            raise TuyaBLEConnectionUnavailableError()
         if self._terminal_stopped and not lease_active:
             raise TuyaBLEConnectionUnavailableError()
         if (
@@ -655,23 +661,23 @@ class TuyaBLEDevice:
             if updates:
                 await self._persist_policy_options(updates)
 
-            re_enabled = new_enabled and not self._ble_control_enabled
+            policy_changed = (
+                new_mode is not self._connection_mode
+                or new_enabled != self._ble_control_enabled
+            )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
-            if re_enabled:
+            if policy_changed:
                 async with self._policy_lock:
                     self._policy_revision += 1
                     if (
                         self._pending_disconnect_target
-                        is ConnectionPolicyState.SUSPENDED
+                        is not ConnectionPolicyState.STOPPED
                     ):
                         self._pending_disconnect_target = None
                         self._pending_disconnect_revision = None
                         self._cancel_disconnect_retry_locked()
-                    self._suspension_requested = False
-                    self._cancel_idle_disconnect_locked()
-            elif not new_enabled:
-                self._suspension_requested = True
+            self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
     async def async_apply_persisted_options(self, options: dict[str, Any]) -> None:
@@ -687,8 +693,22 @@ class TuyaBLEDevice:
                 CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
             )
             new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
+            policy_changed = (
+                new_mode is not self._connection_mode
+                or new_enabled != self._ble_control_enabled
+            )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
+            if policy_changed:
+                async with self._policy_lock:
+                    self._policy_revision += 1
+                    if (
+                        self._pending_disconnect_target
+                        is not ConnectionPolicyState.STOPPED
+                    ):
+                        self._pending_disconnect_target = None
+                        self._pending_disconnect_revision = None
+                        self._cancel_disconnect_retry_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
@@ -800,7 +820,8 @@ class TuyaBLEDevice:
             self._lease_zero_event.set()
             pending_disconnect = self._pending_disconnect_target is not None
             if (
-                self._connection_mode is ConnectionMode.ON_DEMAND
+                not pending_disconnect
+                and self._connection_mode is ConnectionMode.ON_DEMAND
                 and self._ble_control_enabled
                 and not self._suspension_requested
                 and not self._terminal_stopped
@@ -829,7 +850,6 @@ class TuyaBLEDevice:
 
         disconnect_failed = False
         reconcile_policy = False
-        complete_superseding_target = False
         try:
             await self._execute_disconnect(
                 terminal=target is ConnectionPolicyState.STOPPED
@@ -843,16 +863,16 @@ class TuyaBLEDevice:
         finally:
             async with self._policy_lock:
                 self._disconnect_in_progress = False
-                if disconnect_failed:
+                request_current = (
+                    self._pending_disconnect_target is target
+                    and self._pending_disconnect_revision == revision
+                )
+                if disconnect_failed and request_current:
                     self._schedule_disconnect_retry_locked()
-                elif self._pending_disconnect_target is target:
+                elif request_current:
                     self._pending_disconnect_target = None
                     self._pending_disconnect_revision = None
-                    if (
-                        target is ConnectionPolicyState.SUSPENDED
-                        and revision != self._policy_revision
-                    ):
-                        self._suspension_requested = False
+                    if target is ConnectionPolicyState.DISCONNECT_FAILED:
                         reconcile_policy = True
                     elif target is ConnectionPolicyState.ON_DEMAND_IDLE:
                         self._suspension_requested = False
@@ -860,25 +880,20 @@ class TuyaBLEDevice:
                     else:
                         self._suspension_requested = True
                         self._policy_state = target
-                elif (
-                    target is ConnectionPolicyState.SUSPENDED
-                    and revision != self._policy_revision
-                ):
-                    self._suspension_requested = False
+                elif target is not ConnectionPolicyState.STOPPED:
                     reconcile_policy = True
-                else:
-                    complete_superseding_target = True
 
         if reconcile_policy:
             await self._apply_connection_policy()
-        elif complete_superseding_target:
-            await self._complete_pending_disconnect()
 
         if disconnect_failed and raise_on_error:
             raise TuyaBLEPolicyTransitionError() from None
 
     def _cancel_idle_disconnect_locked(self) -> None:
-        if self._idle_disconnect_task is not None:
+        if (
+            self._idle_disconnect_task is not None
+            and not self._idle_disconnect_in_progress
+        ):
             self._idle_disconnect_task.cancel()
             self._idle_disconnect_task = None
 
@@ -946,11 +961,10 @@ class TuyaBLEDevice:
                     or self._terminal_stopped
                 ):
                     return
-                self._policy_state = ConnectionPolicyState.DISCONNECTING
-            await self._execute_disconnect()
-            async with self._policy_lock:
-                if not self._terminal_stopped and self._ble_control_enabled:
-                    self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+                self._pending_disconnect_target = ConnectionPolicyState.ON_DEMAND_IDLE
+                self._pending_disconnect_revision = self._policy_revision
+                self._idle_disconnect_in_progress = True
+            await self._complete_pending_disconnect()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -971,6 +985,7 @@ class TuyaBLEDevice:
                     self._pending_disconnect_revision = self._policy_revision
                     self._schedule_disconnect_retry_locked()
         finally:
+            self._idle_disconnect_in_progress = False
             if self._idle_disconnect_task is current_task:
                 self._idle_disconnect_task = None
 
@@ -1565,6 +1580,41 @@ class TuyaBLEDevice:
                 "%s: BLE disconnect reported an error after release", self.log_identity
             )
 
+    async def _cleanup_new_client(
+        self,
+        client: BleakClientWithServiceCache,
+        *,
+        terminal: bool,
+    ) -> None:
+        """Retain a newly connected client until physical release is verified."""
+        self._client = client
+        self._physical_connection_active = client.is_connected
+        self._expected_disconnect = True
+        try:
+            await client.stop_notify(self._characteristic_notify)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if not client.is_connected:
+            if self._client is client:
+                self._client = None
+            self._mark_connection_lost()
+            return
+
+        async with self._policy_lock:
+            self._pending_disconnect_target = (
+                ConnectionPolicyState.STOPPED
+                if terminal
+                else ConnectionPolicyState.DISCONNECT_FAILED
+            )
+            self._pending_disconnect_revision = self._policy_revision
+            self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
+            self._schedule_disconnect_retry_locked()
+
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
@@ -1580,6 +1630,8 @@ class TuyaBLEDevice:
             )
         if self._client and self._client.is_connected and self._is_paired:
             return
+        if self._client and self._client.is_connected:
+            raise TuyaBLEConnectionUnavailableError()
         if self._ble_device is None:
             try:
                 await asyncio.wait_for(
@@ -1640,10 +1692,7 @@ class TuyaBLEDevice:
             if not client or not client.is_connected:
                 raise BleakNotFoundError()
             if self._terminal_stopped:
-                try:
-                    await client.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
+                await self._cleanup_new_client(client, terminal=True)
                 raise TuyaBLEConnectionUnavailableError()
             _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
             self._client = client
@@ -1685,8 +1734,10 @@ class TuyaBLEDevice:
                 ):
                     raise BleakError()
             except Exception as ex:  # noqa: BLE001
-                self._client = None
-                self._mark_connection_lost()
+                await self._cleanup_new_client(
+                    client,
+                    terminal=self._terminal_stopped,
+                )
                 if "Bluetooth is already shutdown" in str(ex):
                     raise self._sanitized_transport_error(ex) from None
                 raise self._sanitized_transport_error(ex) from None

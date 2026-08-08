@@ -289,6 +289,160 @@ async def test_idle_disconnect_failure_stays_pending_for_retry() -> None:
     await asyncio.sleep(0)
 
 
+async def test_mode_change_supersedes_inflight_idle_disconnect() -> None:
+    """An old idle release cannot leave Always connected idle and disconnected."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient()
+    disconnect_started = asyncio.Event()
+    allow_disconnect = asyncio.Event()
+
+    async def disconnect() -> None:
+        disconnect_started.set()
+        await allow_disconnect.wait()
+        client.is_connected = False
+
+    client.disconnect.side_effect = disconnect
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._schedule_reconnect_locked = Mock()
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS",
+        0,
+    ):
+        idle_disconnect = asyncio.create_task(device._idle_disconnect_after_delay())
+        await disconnect_started.wait()
+        await device.async_update_connection_policy(
+            connection_mode=ConnectionMode.ALWAYS_CONNECTED.value
+        )
+        allow_disconnect.set()
+        await idle_disconnect
+
+    assert device.connection_mode is ConnectionMode.ALWAYS_CONNECTED
+    assert device.policy_state is not ConnectionPolicyState.ON_DEMAND_IDLE
+    assert device.is_gatt_connected is False
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+
+
+async def test_mode_change_cancels_pending_idle_disconnect_retry() -> None:
+    """Always connected supersedes a failed On-demand idle release retry."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._pending_disconnect_target = ConnectionPolicyState.ON_DEMAND_IDLE
+    device._pending_disconnect_revision = device._policy_revision
+    device._schedule_disconnect_retry_locked()
+
+    await device.async_update_connection_policy(
+        connection_mode=ConnectionMode.ALWAYS_CONNECTED.value
+    )
+
+    assert device.connection_mode is ConnectionMode.ALWAYS_CONNECTED
+    assert device._pending_disconnect_target is None
+    assert device._disconnect_retry_task is None
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+
+
+def _prepare_new_client(client: _SyntheticConnectedClient) -> None:
+    """Provide the minimum GATT surface required by connection setup."""
+    client.services = Mock()
+    client.services.get_characteristic.return_value = None
+    client.start_notify = AsyncMock()
+
+
+async def test_terminal_stop_retains_live_client_returned_by_connection() -> None:
+    """A terminal in-flight connection remains owned when release fails."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    _prepare_new_client(client)
+    connection_started = asyncio.Event()
+    release_connection = asyncio.Event()
+
+    async def establish(*_: object, **__: object) -> _SyntheticConnectedClient:
+        connection_started.set()
+        await release_connection.wait()
+        return client
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+        new=establish,
+    ):
+        connection = asyncio.create_task(device._ensure_connected())
+        await connection_started.wait()
+        stop = asyncio.create_task(device.stop())
+        await asyncio.sleep(0)
+        assert device._terminal_stopped is True
+        release_connection.set()
+        with pytest.raises(TuyaBLEConnectionUnavailableError):
+            await connection
+        await stop
+
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("start_notify", "device_info", "pairing"),
+)
+async def test_setup_failure_retains_live_client_until_release_is_verified(
+    failure: str,
+) -> None:
+    """Setup failures must not discard a connected client whose release fails."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    _prepare_new_client(client)
+    if failure == "start_notify":
+        client.start_notify.side_effect = RuntimeError("synthetic")
+    else:
+        device._send_packet_while_connected = AsyncMock(
+            side_effect=RuntimeError("synthetic")
+        )
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+        new=AsyncMock(return_value=client),
+    ):
+        with pytest.raises(BleakError):
+            await device._ensure_connected()
+
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_disconnect_target is ConnectionPolicyState.DISCONNECT_FAILED
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_start_notify_failure_reports_release_only_after_success() -> None:
+    """A setup failure reports disconnected only when cleanup releases GATT."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    _prepare_new_client(client)
+    client.start_notify.side_effect = RuntimeError("synthetic")
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+        new=AsyncMock(return_value=client),
+    ):
+        with pytest.raises(BleakError):
+            await device._ensure_connected()
+
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert state_changes == [False]
+    client.disconnect.assert_awaited_once()
+
+
 async def test_lease_cancellation_and_exception_release_count() -> None:
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
     device._ensure_connected = AsyncMock()
@@ -685,6 +839,35 @@ async def test_unload_retains_runtime_when_terminal_disconnect_is_unverified(
     assert device._client is client
     assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
     assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_unload_keeps_platforms_loaded_when_terminal_release_fails(
+    hass: HomeAssistant,
+) -> None:
+    """Platform unload waits until terminal GATT release is verified."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload ordering")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = _make_data(hass, device)
+    unload_platforms = AsyncMock(return_value=True)
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=unload_platforms,
+    ):
+        assert await integration.async_unload_entry(hass, entry) is False
+
+    unload_platforms.assert_not_awaited()
+    assert entry.entry_id in hass.data[DOMAIN]
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
 
