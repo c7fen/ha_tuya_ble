@@ -74,6 +74,9 @@ async def test_lock(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    device.datapoints._update_from_device(
+        DPCode.LOCK_MOTOR_STATE, 0, 0, TuyaBLEDataPointType.DT_BOOL, False
+    )
     coordinator._async_handle_connect()
     assert entity.available is True
     # Initial: not motor_state.value -> True (locked) because get_or_create defaults to False
@@ -167,6 +170,9 @@ async def test_guard_dog_lock(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    device.datapoints._update_from_device(
+        DPCode.LOCK_MOTOR_STATE, 0, 0, TuyaBLEDataPointType.DT_BOOL, False
+    )
     coordinator._async_handle_connect()
     assert entity.available is True
     # Initial: not motor_state.value -> True (locked) because get_or_create defaults to False

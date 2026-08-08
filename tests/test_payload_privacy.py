@@ -322,7 +322,7 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
         "FUN_SENDER_PAIR",
         "FUN_SENDER_DPS",
         "timeout receiving response",
-        "Disconnecting after transport error",
+        "Transport error without command replay",
         "Bluetooth is already shutdown",
         "unexpectedly disconnected",
         "Packet received",

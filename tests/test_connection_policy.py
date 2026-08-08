@@ -1282,7 +1282,7 @@ async def test_operation_response_drains_before_suspension_disconnect() -> None:
     allow_response = asyncio.Event()
     disconnect_started = asyncio.Event()
 
-    async def write_response(*_: object) -> bool:
+    async def write_response(*_: object, **__: object) -> bool:
         response_started.set()
         await allow_response.wait()
         return True
@@ -2390,28 +2390,12 @@ async def test_repeated_suspension_application_is_idempotent() -> None:
     assert device.policy_state is ConnectionPolicyState.SUSPENDED
 
 
-async def test_generic_resend_is_single_flight_and_cancelled_by_mode_change() -> None:
+async def test_transport_has_no_deferred_packet_replay_state() -> None:
+    """Encrypted packet fragments are never retained for a later session."""
     device = _make_device()
 
-    async def wait_for_cancellation(_: list[bytes]) -> None:
-        await asyncio.sleep(60)
-
-    device._resend_packets = AsyncMock(side_effect=wait_for_cancellation)
-
-    device._schedule_resend([b"synthetic-fragment-1"])
-    first_task = device._resend_task
-    device._schedule_resend([b"synthetic-fragment-2"])
-    assert device._resend_task is first_task
-
-    await asyncio.sleep(0)
-    await device.async_update_connection_policy(
-        connection_mode=ConnectionMode.ON_DEMAND.value
-    )
-    await asyncio.sleep(0)
-
-    assert first_task is not None
-    assert first_task.done()
-    device._resend_packets.assert_awaited_once_with([b"synthetic-fragment-1"])
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
 
 
 @pytest.mark.parametrize(
@@ -2430,9 +2414,9 @@ async def test_connected_write_failure_retains_client_for_mandatory_release(
     device._is_paired = True
     device._physical_connection_active = True
     device._notifications_active = True
+    device._state_data_fresh = True
     device._schedule_reconnect = Mock()
     device._schedule_reconnect_locked = Mock()
-    device._schedule_resend = Mock()
     state_changes: list[bool] = []
     device.register_connection_state_callback(state_changes.append)
 
@@ -2447,11 +2431,11 @@ async def test_connected_write_failure_retains_client_for_mandatory_release(
         assert device.is_gatt_connected is True
         assert device.is_authenticated is True
         assert device.is_connection_active is False
+        assert device.state_data_fresh is False
         assert state_changes == []
         assert device._pending_release is not None
         assert device._pending_release.reason is PendingReleaseReason.SESSION_FAILURE
         assert device._reconnect_task is None
-        assert device._resend_task is None
 
     assert client.disconnect.await_count == 1
     assert client.is_connected is False
@@ -2473,7 +2457,6 @@ async def test_actual_write_loss_marks_the_current_client_disconnected_once() ->
     device._notifications_active = True
     device._schedule_reconnect = Mock()
     device._schedule_reconnect_locked = Mock()
-    device._schedule_resend = Mock()
     state_changes: list[bool] = []
     device.register_connection_state_callback(state_changes.append)
 
@@ -2489,16 +2472,58 @@ async def test_actual_write_loss_marks_the_current_client_disconnected_once() ->
     assert device._pending_release is None
 
 
-async def test_generic_resend_waits_for_connected_session_failure_release() -> None:
-    """A generic retry is retained privately until the failed session is released."""
+async def test_session_failure_hides_cached_s1_lock_state_until_new_data_arrives(
+    hass: HomeAssistant,
+) -> None:
+    """A still-connected failed session cannot present cached DP47 as current."""
     device = _make_device()
     client = _SyntheticConnectedClient()
-    packets = [b"synthetic-fragment"]
     client.write_gatt_char.side_effect = BleakError("synthetic write failure")
     device._client = client
     device._is_paired = True
     device._physical_connection_active = True
     device._notifications_active = True
+    device._schedule_reconnect_locked = Mock()
+    device.datapoints._update_from_device(
+        47, 1.0, 0, TuyaBLEDataPointType.DT_BOOL, False
+    )
+    template_store = Mock()
+    template_store.templates_for.return_value = None
+    entity = TuyaBLES1Lock(
+        hass,
+        TuyaBLECoordinator(hass, device),
+        device,
+        TuyaBLEProductInfo("S1-TY-BLE-PRO"),
+        template_store,
+    )
+    entity.async_write_ha_state = Mock()
+    device._disconnected_callbacks.clear()
+
+    assert entity.is_locked is True
+    async with device.connection_lease(
+        "synthetic stale-state check", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic write failure"):
+            await device._send_packets_locked([b"synthetic-fragment"])
+
+        assert device.is_gatt_connected is True
+        assert device.state_data_fresh is False
+        assert entity.is_locked is None
+
+
+async def test_generic_write_failure_never_replays_after_a_replacement_session() -> (
+    None
+):
+    """A new authenticated session is only available for future operations."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    packets = [b"synthetic-fragment-one", b"synthetic-fragment-two"]
+    client.write_gatt_char.side_effect = [None, BleakError("synthetic write failure")]
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._state_data_fresh = True
     device._schedule_reconnect_locked = Mock()
 
     async with device.connection_lease(
@@ -2507,40 +2532,55 @@ async def test_generic_resend_waits_for_connected_session_failure_release() -> N
         with pytest.raises(BleakError, match="synthetic write failure"):
             await device._send_packets_locked(packets)
 
-        assert device._deferred_resend_packets == packets
-        assert device._resend_task is None
+        assert client.write_gatt_char.await_count == 2
+        assert device.state_data_fresh is False
+        assert not hasattr(device, "_deferred_resend_packets")
+        assert not hasattr(device, "_resend_task")
         assert device._reconnect_task is None
 
     assert client.is_connected is False
-    assert device._deferred_resend_packets == packets
 
-    device._client = _SyntheticConnectedClient()
+    replacement = _SyntheticConnectedClient()
+    device._client = replacement
     device._is_paired = True
     device._physical_connection_active = True
     device._notifications_active = True
-    device._resend_packets = AsyncMock()
 
-    await device._resend_after_verified_reconnect()
+    await device._reconnect()
 
-    device._resend_packets.assert_awaited_once_with(packets)
-    assert device._deferred_resend_packets is None
+    replacement.write_gatt_char.assert_not_awaited()
 
 
-async def test_deferred_generic_resend_is_discarded_by_stop_or_policy_change() -> None:
-    """A repair-only retry cannot outlive a new mode or terminal stop."""
+async def test_protocol_response_write_failure_never_defers_old_request_bytes() -> None:
+    """Responses remain bound to their inbound sequence and current session."""
     device = _make_device()
-    device._deferred_resend_packets = [b"synthetic-fragment"]
+    client = _SyntheticConnectedClient()
+    client.write_gatt_char.side_effect = BleakError("synthetic response failure")
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._build_packets = Mock(return_value=[b"synthetic-response-fragment"])
+    device._schedule_reconnect_locked = Mock()
 
-    await device.async_update_connection_policy(
-        connection_mode=ConnectionMode.ON_DEMAND.value
-    )
+    with pytest.raises(BleakError, match="synthetic response failure"):
+        await device._send_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 7)
 
-    assert device._deferred_resend_packets is None
+    client.write_gatt_char.assert_awaited_once()
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+    assert device._pending_release is None
+    assert client.disconnect.await_count == 1
 
-    device._deferred_resend_packets = [b"synthetic-fragment"]
-    await device.stop()
+    replacement = _SyntheticConnectedClient()
+    device._client = replacement
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
 
-    assert device._deferred_resend_packets is None
+    await device._reconnect()
+
+    replacement.write_gatt_char.assert_not_awaited()
 
 
 async def test_session_failure_release_survives_policy_change_and_unload() -> None:
@@ -2589,7 +2629,6 @@ async def test_stop_keeps_session_failure_client_under_terminal_release() -> Non
     assert device._pending_release.reason is PendingReleaseReason.STOP
     assert device._pending_release.terminal is True
     assert device._reconnect_task is None
-    assert device._resend_task is None
 
     assert device._disconnect_retry_task is not None
     device._disconnect_retry_task.cancel()
@@ -2849,6 +2888,7 @@ async def test_s1_lock_lease_wraps_both_unlock_writes(
 ) -> None:
     device = _make_device()
     device._send_datapoints = AsyncMock()
+    device._send_datapoints_no_replay = AsyncMock()
     device._ensure_connected = AsyncMock()
     coordinator = TuyaBLECoordinator(hass, device)
     store = Mock()
@@ -2867,7 +2907,7 @@ async def test_s1_lock_lease_wraps_both_unlock_writes(
     with patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()):
         await entity.async_unlock()
     assert device.active_lease_count == 0
-    assert device._send_datapoints.await_count == 2
+    assert device._send_datapoints_no_replay.await_count == 2
     assert entity.is_unlocking is False
 
 

@@ -3,7 +3,11 @@
 from unittest.mock import Mock, AsyncMock
 from homeassistant.core import HomeAssistant
 from homeassistant.components.sensor import SensorEntityDescription
-from custom_components.tuya_ble.sensor import TuyaBLESensor, TuyaBLESensorMapping, rssi_mapping
+from custom_components.tuya_ble.sensor import (
+    TuyaBLESensor,
+    TuyaBLESensorMapping,
+    rssi_mapping,
+)
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType
 
 from . import *
@@ -19,7 +23,7 @@ CONFIG = {
                 "id": "2",
                 "platform": "sensor",
                 "restore_on_reconnect": False,
-                "address": "12:23:44"
+                "address": "12:23:44",
             }
         ],
     }
@@ -30,7 +34,12 @@ async def test_sensor(hass: HomeAssistant) -> None:
     from pytest_homeassistant_custom_component.common import MockConfigEntry
     from custom_components.tuya_ble.const import DOMAIN
     from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
-    from custom_components.tuya_ble.devices import TuyaBLEDevice, TuyaBLEProductInfo, TuyaBLECoordinator, TuyaBLEData
+    from custom_components.tuya_ble.devices import (
+        TuyaBLEDevice,
+        TuyaBLEProductInfo,
+        TuyaBLECoordinator,
+        TuyaBLEData,
+    )
     from bleak.backends.device import BLEDevice
 
     entry = MockConfigEntry(
@@ -73,13 +82,13 @@ async def test_sensor(hass: HomeAssistant) -> None:
         force_add=True,
     )
 
-    entity = TuyaBLESensor(
-        hass, coordinator, device, product_info, mapping
-    )
+    entity = TuyaBLESensor(hass, coordinator, device, product_info, mapping)
     entity.async_write_ha_state = Mock()
 
     # Initial state
     assert entity.available is False
+    # The connected callback alone is not device data; model a current report.
+    device._state_data_fresh = True
     coordinator._async_handle_connect()
     assert entity.available is True
     assert entity.native_value is None
@@ -94,7 +103,12 @@ async def test_sensor_rssi(hass: HomeAssistant) -> None:
     from pytest_homeassistant_custom_component.common import MockConfigEntry
     from custom_components.tuya_ble.const import DOMAIN
     from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
-    from custom_components.tuya_ble.devices import TuyaBLEDevice, TuyaBLEProductInfo, TuyaBLECoordinator, TuyaBLEData
+    from custom_components.tuya_ble.devices import (
+        TuyaBLEDevice,
+        TuyaBLEProductInfo,
+        TuyaBLECoordinator,
+        TuyaBLEData,
+    )
     from bleak.backends.device import BLEDevice
 
     entry = MockConfigEntry(
@@ -121,9 +135,7 @@ async def test_sensor_rssi(hass: HomeAssistant) -> None:
     coordinator = TuyaBLECoordinator(hass, device)
 
     # Map rssi sensor entity
-    entity = TuyaBLESensor(
-        hass, coordinator, device, product_info, rssi_mapping
-    )
+    entity = TuyaBLESensor(hass, coordinator, device, product_info, rssi_mapping)
     entity.async_write_ha_state = Mock()
 
     # Verify rssi value gets pulled

@@ -250,6 +250,21 @@ class TuyaBLEDataPoint:
             self._received_from_device = previous_received_from_device
             raise
 
+    async def set_value_no_replay(self, value: bytes | bool | int | str) -> None:
+        """Send one datapoint update without retaining it for a later replay."""
+        self._owner._owner.ensure_control_available()
+        previous_value = self._value
+        previous_changed_by_device = self._changed_by_device
+        previous_received_from_device = self._received_from_device
+        self._set_local_value(value)
+        try:
+            await self._owner._update_from_user_no_replay(self._id)
+        except (Exception, asyncio.CancelledError):
+            self._value = previous_value
+            self._changed_by_device = previous_changed_by_device
+            self._received_from_device = previous_received_from_device
+            raise
+
 
 class TuyaBLEDataPoints:
     """Models DPs"""
@@ -339,6 +354,10 @@ class TuyaBLEDataPoints:
     async def _update_from_user_once(self, dp_id: int) -> None:
         """Send one datapoint through the confirmed at-most-once path."""
         await self._owner._send_datapoints_once([dp_id])
+
+    async def _update_from_user_no_replay(self, dp_id: int) -> None:
+        """Send one datapoint without creating replayable transport state."""
+        await self._owner._send_datapoints_no_replay([dp_id])
 
 
 class TuyaBLEConnectionLease(AbstractAsyncContextManager):
@@ -448,8 +467,6 @@ class TuyaBLEDevice:
         self._idle_disconnect_in_progress = False
         self._disconnect_retry_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
-        self._resend_task: asyncio.Task | None = None
-        self._deferred_resend_packets: list[bytes] | None = None
         self._response_tasks: set[asyncio.Task] = set()
         self._response_drain_tasks: set[asyncio.Task] = set()
         self._response_cleanup_tasks: set[asyncio.Task] = set()
@@ -703,7 +720,6 @@ class TuyaBLEDevice:
             if policy_changed:
                 async with self._policy_lock:
                     self._advance_policy_revision_locked()
-                    self._cancel_resend_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
@@ -729,7 +745,6 @@ class TuyaBLEDevice:
             if policy_changed:
                 async with self._policy_lock:
                     self._advance_policy_revision_locked()
-                    self._cancel_resend_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
@@ -746,7 +761,6 @@ class TuyaBLEDevice:
                 or self._disconnect_in_progress
             ):
                 self._cancel_reconnect_locked()
-                self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
                 self._policy_state = (
                     ConnectionPolicyState.DISCONNECT_FAILED
@@ -760,7 +774,6 @@ class TuyaBLEDevice:
                 return
             if self._unload_quiescing:
                 self._cancel_reconnect_locked()
-                self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
                 return
@@ -772,7 +785,6 @@ class TuyaBLEDevice:
         if self._connection_mode is ConnectionMode.ON_DEMAND:
             async with self._policy_lock:
                 self._cancel_reconnect_locked()
-                self._cancel_resend_locked()
                 if self._active_lease_count:
                     self._policy_state = (
                         ConnectionPolicyState.ON_DEMAND_ACTIVE
@@ -788,7 +800,6 @@ class TuyaBLEDevice:
             return
 
         async with self._policy_lock:
-            self._cancel_resend_locked(discard_deferred=False)
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
                 self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
@@ -811,7 +822,6 @@ class TuyaBLEDevice:
                 self._policy_revision,
             )
             self._cancel_reconnect_locked()
-            self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
@@ -998,7 +1008,6 @@ class TuyaBLEDevice:
                     self._policy_revision,
                 )
                 self._cancel_reconnect_locked()
-                self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
             try:
@@ -1063,7 +1072,6 @@ class TuyaBLEDevice:
                     self._policy_revision,
                 )
                 self._cancel_reconnect_locked()
-                self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
                 self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
                 self._schedule_disconnect_retry_locked()
@@ -1100,7 +1108,6 @@ class TuyaBLEDevice:
         self._unload_quiescing = False
         self._expected_disconnect = False
         self._cancel_reconnect_locked()
-        self._cancel_resend_locked()
         self._cancel_idle_disconnect_locked()
 
         if self._terminal_stopped:
@@ -1186,13 +1193,6 @@ class TuyaBLEDevice:
         if self._reconnect_task is not None:
             self._reconnect_task.cancel()
             self._reconnect_task = None
-
-    def _cancel_resend_locked(self, *, discard_deferred: bool = True) -> None:
-        if self._resend_task is not None:
-            self._resend_task.cancel()
-            self._resend_task = None
-        if discard_deferred:
-            self._deferred_resend_packets = None
 
     def _schedule_disconnect_retry_locked(self) -> None:
         """Retry a pending physical release with one bounded-backoff task."""
@@ -1281,7 +1281,6 @@ class TuyaBLEDevice:
     def _schedule_reconnect_locked(self, delay: float) -> None:
         if (
             self._reconnect_task is not None
-            or self._resend_task is not None
             or self._pending_release is not None
             or self._disconnect_in_progress
             or (self.is_gatt_connected and not self.is_connection_active)
@@ -1302,36 +1301,6 @@ class TuyaBLEDevice:
         finally:
             if self._reconnect_task is current_task:
                 self._reconnect_task = None
-
-    def _schedule_resend(self, packets: list[bytes]) -> None:
-        if (
-            self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED
-            or self._terminal_stopped
-            or self._suspension_requested
-            or self._resend_task is not None
-        ):
-            return
-        if (
-            self._pending_release is not None
-            or self._disconnect_in_progress
-            or self._reconnect_task is not None
-            or (self.is_gatt_connected and not self.is_connection_active)
-        ):
-            self._deferred_resend_packets = list(packets)
-            return
-        self._resend_task = self._create_policy_task(self._resend_task_runner(packets))
-
-    async def _resend_task_runner(self, packets: list[bytes]) -> None:
-        current_task = asyncio.current_task()
-        try:
-            await self._resend_packets(packets)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            _LOGGER.debug("%s: Background resend failed", self.log_identity)
-        finally:
-            if self._resend_task is current_task:
-                self._resend_task = None
 
     def _schedule_response(
         self, code: TuyaBLECode, data: bytes, response_to: int
@@ -1767,7 +1736,6 @@ class TuyaBLEDevice:
                 terminal=True,
             )
             self._cancel_reconnect_locked()
-            self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
             for task in tuple(self._response_tasks):
                 task.cancel()
@@ -2077,7 +2045,7 @@ class TuyaBLEDevice:
             _LOGGER.error("%s: No client device", self.log_identity)
 
     async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
+        """Attempt a reconnect for future operations without replaying a command."""
         _LOGGER.debug("%s: Reconnect, ensuring connection", self.log_identity)
         async with self._seq_num_lock:
             self._current_seq_num = 1
@@ -2087,7 +2055,6 @@ class TuyaBLEDevice:
             async with self.connection_lease("policy reconnect", defer_connection=True):
                 await self._ensure_connected()
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
-            await self._resend_after_verified_reconnect()
         except BLEAK_EXCEPTIONS as ex:  # BleakNotFoundError:
             if "Bluetooth is already shutdown" in str(ex):
                 _LOGGER.debug(
@@ -2120,7 +2087,6 @@ class TuyaBLEDevice:
             return
         if (
             self._reconnect_task is None
-            and self._resend_task is None
             and self._pending_release is None
             and not self._disconnect_in_progress
             and not (self.is_gatt_connected and not self.is_connection_active)
@@ -2242,11 +2208,18 @@ class TuyaBLEDevice:
         code: TuyaBLECode,
         data: bytes,
         wait_for_response: bool = True,
+        resend_on_error: bool = True,
         # retry: int | None = None,
     ) -> None:
         """Send packet to device and optional read response."""
         async with self.connection_lease("datapoint"):
-            await self._send_packet_while_connected(code, data, 0, wait_for_response)
+            await self._send_packet_while_connected(
+                code,
+                data,
+                0,
+                wait_for_response,
+                resend_on_error=resend_on_error,
+            )
 
     async def _send_packet_once_confirmed(
         self,
@@ -2285,7 +2258,7 @@ class TuyaBLEDevice:
             if _lease_context_depth(self) > 0:
                 if self._client and self._client.is_connected:
                     await self._send_packet_while_connected(
-                        code, data, response_to, False
+                        code, data, response_to, False, resend_on_error=False
                     )
             else:
                 async with self.connection_lease(
@@ -2293,7 +2266,7 @@ class TuyaBLEDevice:
                 ):
                     if self._client and self._client.is_connected:
                         await self._send_packet_while_connected(
-                            code, data, response_to, False
+                            code, data, response_to, False, resend_on_error=False
                         )
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
@@ -2386,49 +2359,6 @@ class TuyaBLEDevice:
                 )
                 raise
 
-    async def _resend_packets(self, packets: list[bytes]) -> None:
-        """Replay one generic packet sequence after an established reconnect."""
-        if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
-            return
-        if (
-            self._expected_disconnect
-            or self._suspension_requested
-            or self._pending_release is not None
-            or self._disconnect_in_progress
-            or not self.is_connection_active
-        ):
-            return
-        try:
-            async with self.connection_lease("transport resend", defer_connection=True):
-                await self._ensure_connected()
-                await self._int_send_packet_while_connected(
-                    packets, resend_on_error=False
-                )
-        except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
-            return
-        except BLEAK_EXCEPTIONS:
-            _LOGGER.debug(
-                "%s: Transport resend failed",
-                self.log_identity,
-            )
-
-    async def _resend_after_verified_reconnect(self) -> None:
-        """Consume one deferred generic retry only after physical cleanup."""
-        async with self._policy_lock:
-            if (
-                self._deferred_resend_packets is None
-                or self._pending_release is not None
-                or self._disconnect_in_progress
-                or self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED
-                or self._terminal_stopped
-                or self._suspension_requested
-                or not self.is_connection_active
-            ):
-                return
-            packets = self._deferred_resend_packets
-            self._deferred_resend_packets = None
-        await self._resend_packets(packets)
-
     async def _send_packets_locked(
         self, packets: list[bytes], resend_on_error: bool = True
     ) -> None:
@@ -2438,43 +2368,37 @@ class TuyaBLEDevice:
             await self._int_send_packets_locked(packets)
         except BleakDBusError as ex:
             if "Bluetooth is already shutdown" in str(ex):
-                _LOGGER.debug(
-                    "%s: Bluetooth is already shutdown, not resending packets or reconnecting",
-                    self.log_identity,
-                )
+                _LOGGER.debug("%s: Bluetooth is already shutdown", self.log_identity)
                 raise self._sanitized_transport_error(ex) from None
-            # Disconnect so we can reset state and try again
+            # A future reconnect may restore the session, never this command.
             await asyncio.sleep(BLEAK_BACKOFF_TIME)
             _LOGGER.debug(
-                "%s: RSSI: %s; Backing off %ss; Disconnecting after transport error",
+                "%s: RSSI: %s; Backing off %ss after transport error",
                 self.log_identity,
                 self.rssi,
                 BLEAK_BACKOFF_TIME,
             )
-            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
-                if self._is_paired and resend_on_error:
-                    self._schedule_resend(packets)
-                else:
-                    self._schedule_reconnect()
+            if (
+                self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
+                and resend_on_error
+            ):
+                self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
         except BleakError as ex:
             if "Bluetooth is already shutdown" in str(ex):
-                _LOGGER.debug(
-                    "%s: Bluetooth is already shutdown, not resending packets or reconnecting",
-                    self.log_identity,
-                )
+                _LOGGER.debug("%s: Bluetooth is already shutdown", self.log_identity)
                 raise self._sanitized_transport_error(ex) from None
-            # Disconnect so we can reset state and try again
+            # A future reconnect may restore the session, never this command.
             _LOGGER.debug(
-                "%s: RSSI: %s; Disconnecting after transport error",
+                "%s: RSSI: %s; Transport error without command replay",
                 self.log_identity,
                 self.rssi,
             )
-            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
-                if self._is_paired and resend_on_error:
-                    self._schedule_resend(packets)
-                else:
-                    self._schedule_reconnect()
+            if (
+                self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
+                and resend_on_error
+            ):
+                self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
 
     async def _record_write_transport_failure(
@@ -2489,13 +2413,13 @@ class TuyaBLEDevice:
                 self._mark_connection_lost()
                 return
             self._notifications_active = False
+            self._state_data_fresh = False
             self._pending_release = PendingRelease(
                 PendingReleaseReason.SESSION_FAILURE,
                 self._policy_revision,
             )
             self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
             self._cancel_reconnect_locked()
-            self._cancel_resend_locked(discard_deferred=False)
             self._cancel_idle_disconnect_locked()
             self._schedule_disconnect_retry_locked()
 
@@ -2511,6 +2435,7 @@ class TuyaBLEDevice:
                         False,
                     )
                 except Exception as ex:  # noqa: BLE001
+                    await self._record_write_transport_failure(client)
                     if "Bluetooth is already shutdown" in str(ex):
                         _LOGGER.debug(
                             "%s: Bluetooth is already shutdown during sending packet",
@@ -2521,7 +2446,6 @@ class TuyaBLEDevice:
                         "%s: Error during sending packet",
                         self.log_identity,
                     )
-                    await self._record_write_transport_failure(client)
                     raise self._sanitized_transport_error(ex) from None
             else:
                 _LOGGER.error(
@@ -2952,10 +2876,26 @@ class TuyaBLEDevice:
 
         return bytes(data)
 
-    async def _send_datapoints_v3(self, datapoint_ids: list[int]) -> None:
+    async def _send_datapoints_v3(
+        self, datapoint_ids: list[int], *, resend_on_error: bool = True
+    ) -> None:
         """Send new values using the protocol-v3 DP command."""
         data = self._encode_datapoints(datapoint_ids, 1)
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
+        if resend_on_error:
+            await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
+        else:
+            await self._send_packet(
+                TuyaBLECode.FUN_SENDER_DPS, data, resend_on_error=False
+            )
+
+    async def _send_datapoints_no_replay(self, datapoint_ids: list[int]) -> None:
+        """Send one datapoint update without retaining packet bytes for replay."""
+        if self._protocol_version == 3:
+            await self._send_datapoints_v3(datapoint_ids, resend_on_error=False)
+        elif self._protocol_version >= 4:
+            await self._send_datapoints_v4(datapoint_ids, resend_on_error=False)
+        else:
+            raise TuyaBLEDeviceError(0)
 
     async def _send_datapoints_once(self, datapoint_ids: list[int]) -> None:
         """Send one protocol-v3 DP command without replay and require success."""
@@ -2964,12 +2904,19 @@ class TuyaBLEDevice:
         data = self._encode_datapoints(datapoint_ids, 1)
         await self._send_packet_once_confirmed(TuyaBLECode.FUN_SENDER_DPS, data)
 
-    async def _send_datapoints_v4(self, datapoint_ids: list[int]) -> None:
+    async def _send_datapoints_v4(
+        self, datapoint_ids: list[int], *, resend_on_error: bool = True
+    ) -> None:
         """Send new values using the protocol-v4 DP command."""
         dp_seq_num = await self._get_seq_num()
         data = pack(">BI", 0, dp_seq_num)
         data += self._encode_datapoints(datapoint_ids, 2)
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data)
+        if resend_on_error:
+            await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data)
+        else:
+            await self._send_packet(
+                TuyaBLECode.FUN_SENDER_DPS_V4, data, resend_on_error=False
+            )
 
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""

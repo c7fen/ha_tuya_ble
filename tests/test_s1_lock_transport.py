@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakError
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
@@ -21,6 +22,9 @@ from custom_components.tuya_ble.devices import (
     TuyaBLEProductInfo,
 )
 from custom_components.tuya_ble.lock import (
+    S1_DP_LOCK,
+    S1_DP_UNLOCK_CONFIRM,
+    S1_DP_UNLOCK_REQUEST,
     S1_DP71_MIN_LENGTH,
     S1_DP71_TIMESTAMP,
     S1_STORE_KEY,
@@ -78,6 +82,20 @@ class _BackingStore:
         self.delayed_saves.append((data_func, delay))
 
 
+class _ConnectedTransportClient:
+    """Connected client double for ambiguous S1 write failures."""
+
+    def __init__(self, write_side_effect: object) -> None:
+        self.is_connected = True
+        self.stop_notify = AsyncMock()
+        self.write_gatt_char = AsyncMock(side_effect=write_side_effect)
+
+        async def disconnect() -> None:
+            self.is_connected = False
+
+        self.disconnect = AsyncMock(side_effect=disconnect)
+
+
 def _make_device(device_id: str = SYNTHETIC_DEVICE_ID) -> TuyaBLEDevice:
     ble_device = BLEDevice(
         name="Synthetic S1",
@@ -99,6 +117,7 @@ def _make_device(device_id: str = SYNTHETIC_DEVICE_ID) -> TuyaBLEDevice:
         status_range=[],
     )
     device._send_datapoints = AsyncMock()
+    device._send_datapoints_no_replay = AsyncMock()
     return device
 
 
@@ -119,6 +138,27 @@ def _make_entity(
     )
     entity.async_write_ha_state = Mock()
     return entity, device, backing_store
+
+
+def _make_transport_entity(
+    hass: HomeAssistant,
+    write_side_effect: object,
+) -> tuple[TuyaBLES1Lock, TuyaBLEDevice, _ConnectedTransportClient]:
+    """Build a real S1 entity and transport path with synthetic GATT only."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._disconnected_callbacks.clear()
+    del device._send_datapoints
+    del device._send_datapoints_no_replay
+    client = _ConnectedTransportClient(write_side_effect)
+    device._protocol_version = 3
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._state_data_fresh = True
+    device._build_packets = Mock(return_value=[b"synthetic-s1-gatt-fragment"])
+    device._schedule_reconnect_locked = Mock()
+    return entity, device, client
 
 
 async def test_s1_store_uses_private_atomic_legacy_version_one_key(
@@ -285,12 +325,12 @@ async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> Non
         events.append(("time", None, None))
         return SYNTHETIC_TIMESTAMP
 
-    device._send_datapoints.side_effect = record_send
+    device._send_datapoints_no_replay.side_effect = record_send
     await entity.async_lock()
-    assert device._send_datapoints.call_count == 1
+    assert device._send_datapoints_no_replay.call_count == 1
     assert device.datapoints[46].value is True
 
-    device._send_datapoints.reset_mock()
+    device._send_datapoints_no_replay.reset_mock()
     events.clear()
     with (
         patch("custom_components.tuya_ble.lock.asyncio.sleep", record_sleep),
@@ -382,7 +422,7 @@ async def test_s1_unlock_fails_closed_before_writing(
     with pytest.raises(ServiceValidationError) as raised:
         await entity.async_unlock()
 
-    device._send_datapoints.assert_not_awaited()
+    device._send_datapoints_no_replay.assert_not_awaited()
     assert raised.value.translation_domain == "tuya_ble"
     assert raised.value.translation_key == S1_UNLOCK_ERROR_TRANSLATION_KEY
     rendered = str(raised.value)
@@ -416,7 +456,7 @@ async def test_s1_unlock_accepts_variable_length_legacy_templates(
         datapoint_id = datapoint_ids[0]
         writes.append((datapoint_id, bytes(device.datapoints[datapoint_id].value)))
 
-    device._send_datapoints.side_effect = record_send
+    device._send_datapoints_no_replay.side_effect = record_send
     with (
         patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()),
         patch(
@@ -452,7 +492,7 @@ async def test_s1_unlock_rejects_non_raw_transport_slot_before_writing(
     with pytest.raises(ServiceValidationError):
         await entity.async_unlock()
 
-    device._send_datapoints.assert_not_awaited()
+    device._send_datapoints_no_replay.assert_not_awaited()
 
 
 async def test_s1_unlock_sequences_are_serialized(hass: HomeAssistant) -> None:
@@ -475,7 +515,7 @@ async def test_s1_unlock_sequences_are_serialized(hass: HomeAssistant) -> None:
             first_sleep_started.set()
             await release_first_sleep.wait()
 
-    device._send_datapoints.side_effect = record_send
+    device._send_datapoints_no_replay.side_effect = record_send
     with patch("custom_components.tuya_ble.lock.asyncio.sleep", controlled_sleep):
         first = asyncio.create_task(entity.async_unlock())
         await first_sleep_started.wait()
@@ -495,7 +535,9 @@ async def test_s1_unlock_resets_transient_state_on_transport_error(
 ) -> None:
     """Transport failure cannot leave the entity stuck in an unlocking state."""
     entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
-    device._send_datapoints.side_effect = RuntimeError("synthetic transport failure")
+    device._send_datapoints_no_replay.side_effect = RuntimeError(
+        "synthetic transport failure"
+    )
 
     with pytest.raises(RuntimeError, match="synthetic transport failure"):
         await entity.async_unlock()
@@ -522,8 +564,84 @@ async def test_s1_unlock_resets_transient_state_on_cancellation(
         with pytest.raises(asyncio.CancelledError):
             await unlock_task
 
-    assert device._send_datapoints.await_count == 1
+    assert device._send_datapoints_no_replay.await_count == 1
     assert entity.is_unlocking is False
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_attempts"),
+    (("lock", 1), ("unlock_dp70", 1), ("unlock_dp71", 2)),
+)
+async def test_s1_ambiguous_write_never_defers_or_replays_a_command(
+    hass: HomeAssistant,
+    operation: str,
+    expected_attempts: int,
+) -> None:
+    """S1 controls have one semantic attempt, even after a replacement session."""
+    write_side_effect: object
+    if operation == "unlock_dp71":
+        write_side_effect = [None, BleakError("synthetic ambiguous S1 failure")]
+    else:
+        write_side_effect = BleakError("synthetic ambiguous S1 failure")
+    entity, device, client = _make_transport_entity(hass, write_side_effect)
+
+    if operation == "lock":
+        datapoint_id = S1_DP_LOCK
+        datapoint_type = TuyaBLEDataPointType.DT_BOOL
+        original_value: bytes | bool = False
+    elif operation == "unlock_dp70":
+        datapoint_id = S1_DP_UNLOCK_REQUEST
+        datapoint_type = TuyaBLEDataPointType.DT_RAW
+        original_value = b"synthetic-original-dp70"
+    else:
+        datapoint_id = S1_DP_UNLOCK_CONFIRM
+        datapoint_type = TuyaBLEDataPointType.DT_RAW
+        original_value = b"synthetic-original-dp71"
+    device.datapoints.get_or_create(datapoint_id, datapoint_type, original_value)
+
+    if operation == "lock":
+        command = entity.async_lock
+        sleep_patch = None
+    else:
+        command = entity.async_unlock
+        sleep_patch = patch(
+            "custom_components.tuya_ble.lock.asyncio.sleep", new=AsyncMock()
+        )
+    timeout_patch = patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0
+    )
+
+    if sleep_patch is None:
+        with (
+            timeout_patch,
+            pytest.raises(BleakError, match="synthetic ambiguous S1 failure"),
+        ):
+            await command()
+    else:
+        with (
+            sleep_patch,
+            timeout_patch,
+            pytest.raises(BleakError, match="synthetic ambiguous S1 failure"),
+        ):
+            await command()
+
+    assert client.write_gatt_char.await_count == expected_attempts
+    assert device.datapoints[datapoint_id].value == original_value
+    assert getattr(device, "_deferred_resend_packets", None) is None
+    assert getattr(device, "_resend_task", None) is None
+    assert device.state_data_fresh is False
+    assert entity.is_locking is False
+    assert entity.is_unlocking is False
+
+    replacement = _ConnectedTransportClient(None)
+    device._client = replacement
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+
+    await device._reconnect()
+
+    replacement.write_gatt_char.assert_not_awaited()
 
 
 async def test_s1_unlock_does_not_log_templates(

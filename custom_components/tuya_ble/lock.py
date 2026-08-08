@@ -23,7 +23,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import storage
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import ConnectionMode, DOMAIN, DPCode
+from .const import DOMAIN, DPCode
 from .devices import (
     TuyaBLECoordinator,
     TuyaBLEData,
@@ -338,10 +338,7 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return the physical secure state reported by read-only DP47."""
-        if not self._device.state_data_fresh and (
-            self._device.connection_mode is ConnectionMode.ON_DEMAND
-            or getattr(self._device, "_has_disconnected", False)
-        ):
+        if not self._device.state_data_fresh:
             return None
         motor_state = self._device.datapoints[V1_DP_MOTOR_STATE]
         if (
@@ -429,10 +426,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return true if lock is locked."""
-        if not self._device.state_data_fresh and (
-            self._device.connection_mode is ConnectionMode.ON_DEMAND
-            or getattr(self._device, "_has_disconnected", False)
-        ):
+        if not self._device.state_data_fresh:
             return None
         dpid = self.find_dpid(DPCode.LOCK_MOTOR_STATE)
         if dpid is None:
@@ -562,10 +556,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
     @property
     def is_locked(self) -> bool | None:
         """Return true if the S1 motor is in its locked state."""
-        if not self._device.state_data_fresh and (
-            self._device.connection_mode is ConnectionMode.ON_DEMAND
-            or getattr(self._device, "_has_disconnected", False)
-        ):
+        if not self._device.state_data_fresh:
             return None
         motor_state = self._device.datapoints[S1_DP_MOTOR_STATE]
         if motor_state is not None and isinstance(motor_state.value, bool):
@@ -582,7 +573,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
                 manual_lock = self._device.datapoints.get_or_create(
                     S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
                 )
-                await manual_lock.set_value(True)
+                await manual_lock.set_value_no_replay(True)
         finally:
             self._attr_is_locking = False
             self.async_write_ha_state()
@@ -617,7 +608,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
                         TuyaBLEDataPointType.DT_RAW,
                         dp70_payload,
                     )
-                    await dp70.set_value(dp70_payload)
+                    await dp70.set_value_no_replay(dp70_payload)
 
                     await asyncio.sleep(S1_UNLOCK_DELAY)
 
@@ -626,7 +617,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
                         TuyaBLEDataPointType.DT_RAW,
                         bytes(dp71_payload),
                     )
-                    await dp71.set_value(bytes(dp71_payload))
+                    await dp71.set_value_no_replay(bytes(dp71_payload))
             finally:
                 self._attr_is_unlocking = False
                 self.async_write_ha_state()

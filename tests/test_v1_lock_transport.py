@@ -403,7 +403,6 @@ async def test_v1_ambiguous_transport_error_never_replays_command(
         else BleakError("synthetic ambiguous transport error")
     )
     device._int_send_packets_locked = AsyncMock(side_effect=transport_error)
-    device._resend_packets = AsyncMock()
     device._reconnect = AsyncMock()
 
     with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0):
@@ -411,8 +410,9 @@ async def test_v1_ambiguous_transport_error_never_replays_command(
             await TuyaBLEDevice._send_datapoints_once(device, [dp_id])
     await asyncio.sleep(0)
 
-    device._resend_packets.assert_not_awaited()
-    device._reconnect.assert_awaited_once_with()
+    device._reconnect.assert_not_awaited()
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
     assert device._input_expected_responses == {}
 
 
@@ -441,7 +441,6 @@ async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
     device._connection_state_callbacks.clear()
     device._schedule_reconnect = Mock()
     device._schedule_reconnect_locked = Mock()
-    device._schedule_resend = Mock()
 
     async def send_once(_: list[int]) -> None:
         await device._send_packets_locked(
@@ -454,28 +453,27 @@ async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
         await getattr(entity, f"async_{operation}")()
 
     client.write_gatt_char.assert_awaited_once()
-    assert device._deferred_resend_packets is None
-    assert device._resend_task is None
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
     assert client.disconnect.await_count == 1
 
 
-async def test_generic_transport_keeps_existing_paired_packet_replay() -> None:
-    """The opt-in V1 policy does not change generic or S1 transport behavior."""
+async def test_generic_transport_reconnects_without_replaying_packet_bytes() -> None:
+    """Generic transport recovery never reuses encrypted packet fragments."""
     device = _make_device()
     packets = [b"synthetic-fragment"]
     device._is_paired = True
     device._int_send_packets_locked = AsyncMock(
         side_effect=BleakError("synthetic generic transport error")
     )
-    device._resend_packets = AsyncMock()
-    device._reconnect = AsyncMock()
+    device._schedule_reconnect = Mock()
 
     with pytest.raises(BleakError, match="synthetic generic transport error"):
         await device._send_packets_locked(packets)
-    await asyncio.sleep(0)
 
-    device._resend_packets.assert_awaited_once_with(packets)
-    device._reconnect.assert_not_awaited()
+    device._schedule_reconnect.assert_called_once_with()
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
 
 
 async def test_v1_response_timeout_is_an_unconfirmed_failure() -> None:
@@ -485,13 +483,11 @@ async def test_v1_response_timeout_is_an_unconfirmed_failure() -> None:
     device._ensure_connected = AsyncMock()
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
     device._int_send_packets_locked = AsyncMock()
-    device._resend_packets = AsyncMock()
 
     with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0):
         with pytest.raises(TuyaBLECommandUnconfirmedError):
             await TuyaBLEDevice._send_datapoints_once(device, [V1_DP_LOCK])
 
-    device._resend_packets.assert_not_awaited()
     assert device._input_expected_responses == {}
 
 

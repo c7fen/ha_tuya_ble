@@ -87,6 +87,8 @@ async def test_event(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    # The connected callback alone is not device data; model a current report.
+    device._state_data_fresh = True
     coordinator._async_handle_connect()
     assert entity.available is True
 

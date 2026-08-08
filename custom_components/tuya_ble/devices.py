@@ -133,10 +133,7 @@ class TuyaBLEEntity(CoordinatorEntity):
             return self._coordinator.connected or (
                 self._device.connection_mode is ConnectionMode.ON_DEMAND
             )
-        return self._coordinator.connected and (
-            self._device.state_data_fresh
-            or not getattr(self._device, "_has_disconnected", False)
-        )
+        return self._coordinator.connected and self._device.state_data_fresh
 
     @property
     def device(self) -> TuyaBLEDevice:
