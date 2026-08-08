@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
-from unittest.mock import MagicMock
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
@@ -16,19 +15,23 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity import EntityCategory
 
+from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.binary_sensor import (
     TuyaBLEConnectionSensor,
+)
+from custom_components.tuya_ble.binary_sensor import (
     async_setup_entry as async_setup_binary_sensors,
 )
-from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.config_flow import TuyaBLEOptionsFlow
 from custom_components.tuya_ble.const import (
     CONF_BLE_CONTROL_ENABLED,
     CONF_CONNECTION_MODE,
+    DOMAIN,
     ConnectionMode,
     ConnectionPolicyState,
-    DOMAIN,
     EffectiveConnectionPolicy,
+    PendingRelease,
+    PendingReleaseReason,
 )
 from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
@@ -40,17 +43,16 @@ from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
-from custom_components.tuya_ble.tuya_ble.tuya_ble import _lease_context_depth
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEConnectionUnavailableError,
     TuyaBLEControlSuspendedError,
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
+from custom_components.tuya_ble.tuya_ble.tuya_ble import _lease_context_depth
 from custom_components.tuya_ble.vacuum import (
     TuyaBLEVacuumEntity,
     TuyaBLEVacuumMapping,
 )
-
 
 SYNTHETIC_ADDRESS = "00:00:00:00:00:21"
 SYNTHETIC_DEVICE_ID = "synthetic-policy-device"
@@ -283,7 +285,8 @@ async def test_idle_disconnect_failure_stays_pending_for_retry() -> None:
         await asyncio.sleep(0.02)
 
     assert device._client is client
-    assert device._pending_disconnect_target is ConnectionPolicyState.ON_DEMAND_IDLE
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.ON_DEMAND_IDLE
     assert device._disconnect_retry_task is not None
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
@@ -332,8 +335,10 @@ async def test_mode_change_cancels_pending_idle_disconnect_retry() -> None:
     device._client = client
     device._is_paired = True
     device._physical_connection_active = True
-    device._pending_disconnect_target = ConnectionPolicyState.ON_DEMAND_IDLE
-    device._pending_disconnect_revision = device._policy_revision
+    device._pending_release = PendingRelease(
+        PendingReleaseReason.ON_DEMAND_IDLE,
+        device._policy_revision,
+    )
     device._schedule_disconnect_retry_locked()
 
     await device.async_update_connection_policy(
@@ -341,7 +346,7 @@ async def test_mode_change_cancels_pending_idle_disconnect_retry() -> None:
     )
 
     assert device.connection_mode is ConnectionMode.ALWAYS_CONNECTED
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device._disconnect_retry_task is None
     assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
 
@@ -360,7 +365,8 @@ async def _seed_failed_setup_release(
     """Create a real failed-setup release with one retry owner."""
     _prepare_new_client(client)
     await device._cleanup_new_client(client, terminal=False)
-    assert device._pending_disconnect_target is ConnectionPolicyState.DISCONNECT_FAILED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
     assert device._disconnect_retry_task is not None
     return device._disconnect_retry_task
 
@@ -406,9 +412,8 @@ async def test_setup_release_survives_visible_mode_changes(
         retry_owner = await _seed_failed_setup_release(device, client)
         await _apply_mode_change(device, new_mode, persisted)
 
-        assert device._pending_disconnect_target is (
-            ConnectionPolicyState.DISCONNECT_FAILED
-        )
+        assert device._pending_release is not None
+        assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
         assert device._client is client
         assert device._disconnect_retry_task is retry_owner
         assert device._reconnect_task is None
@@ -426,7 +431,7 @@ async def test_setup_release_survives_visible_mode_changes(
         await asyncio.wait_for(retry_owner, 0.2)
 
     assert device._client is None
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device._disconnect_retry_task is None
     assert device.is_authenticated is False
     assert device.connection_mode is new_mode
@@ -468,9 +473,8 @@ async def test_setup_release_survives_ble_control_off_on_sequence() -> None:
         await asyncio.wait_for(second_failure.wait(), 0.2)
         await device.async_update_connection_policy(ble_control_enabled=True)
 
-        assert device._pending_disconnect_target is (
-            ConnectionPolicyState.DISCONNECT_FAILED
-        )
+        assert device._pending_release is not None
+        assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
         assert device._client is client
         assert device._disconnect_retry_task is retry_owner
         assert device._reconnect_task is None
@@ -482,11 +486,42 @@ async def test_setup_release_survives_ble_control_off_on_sequence() -> None:
 
     assert release_attempts == 3
     assert device._client is None
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device._disconnect_retry_task is None
     assert device.ble_control_enabled is True
     assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
     device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_setup_release_reconciles_to_disabled_ble_control() -> None:
+    """Verified mandatory cleanup reconciles to persistent suspension."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+        assert device._pending_release is not None
+        assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+        assert device._disconnect_retry_task is retry_owner
+
+        async def release_client() -> None:
+            client.is_connected = False
+
+        client.disconnect.side_effect = release_client
+        await asyncio.wait_for(retry_owner, 0.2)
+
+    assert device._pending_release is None
+    assert device._disconnect_retry_task is None
+    assert device._client is None
+    assert device.ble_control_enabled is False
+    assert device.policy_state is ConnectionPolicyState.SUSPENDED
+    assert device.effective_policy is EffectiveConnectionPolicy.SUSPENDED
+    device._schedule_reconnect_locked.assert_not_called()
     device._send_datapoints.assert_not_awaited()
 
 
@@ -520,9 +555,8 @@ async def test_setup_release_survives_policy_change_during_physical_retry() -> N
             connection_mode=ConnectionMode.ON_DEMAND.value
         )
 
-        assert device._pending_disconnect_target is (
-            ConnectionPolicyState.DISCONNECT_FAILED
-        )
+        assert device._pending_release is not None
+        assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
         assert device._client is client
         assert device._disconnect_retry_task is retry_owner
         assert device._reconnect_task is None
@@ -533,7 +567,7 @@ async def test_setup_release_survives_policy_change_during_physical_retry() -> N
         await asyncio.wait_for(retry_owner, 0.2)
 
     assert device._client is None
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device._disconnect_retry_task is None
     assert device.connection_mode is ConnectionMode.ON_DEMAND
     assert device.policy_state is ConnectionPolicyState.ON_DEMAND_IDLE
@@ -570,7 +604,8 @@ async def test_terminal_stop_retains_live_client_returned_by_connection() -> Non
 
     assert device._client is client
     assert device.is_gatt_connected is True
-    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.STOP
     assert device._disconnect_retry_task is not None
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
@@ -603,7 +638,8 @@ async def test_setup_failure_retains_live_client_until_release_is_verified(
 
     assert device._client is client
     assert device.is_gatt_connected is True
-    assert device._pending_disconnect_target is ConnectionPolicyState.DISCONNECT_FAILED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
     assert device._disconnect_retry_task is not None
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
@@ -712,11 +748,12 @@ async def test_suspension_timeout_defers_disconnect_until_final_lease_release() 
         await device.async_update_connection_policy(ble_control_enabled=False)
 
     assert disconnect.await_count == 0
-    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SUSPEND
     await lease.__aexit__(None, None, None)
 
     assert disconnect.await_count == 1
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device.policy_state is ConnectionPolicyState.SUSPENDED
     assert device.is_authenticated is False
     assert device.active_lease_count == 0
@@ -747,7 +784,8 @@ async def test_reenable_supersedes_timed_out_pending_suspension(
     ):
         await device.async_update_connection_policy(ble_control_enabled=False)
 
-    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SUSPEND
     await device.async_update_connection_policy(ble_control_enabled=True)
     await lease.__aexit__(None, None, None)
     await asyncio.sleep(0)
@@ -755,7 +793,7 @@ async def test_reenable_supersedes_timed_out_pending_suspension(
     assert device.ble_control_enabled is True
     assert device.effective_policy is not EffectiveConnectionPolicy.SUSPENDED
     assert device.policy_state is not ConnectionPolicyState.SUSPENDED
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert disconnect.await_count <= 1
     await device.stop()
 
@@ -803,7 +841,7 @@ async def test_reenable_reconciles_suspension_during_physical_disconnect(
 
     assert device.effective_policy is not EffectiveConnectionPolicy.SUSPENDED
     assert device.policy_state is not ConnectionPolicyState.SUSPENDED
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     if mode is ConnectionMode.ALWAYS_CONNECTED:
         device._schedule_reconnect_locked.assert_called_once_with(0)
     else:
@@ -871,7 +909,8 @@ async def test_pending_disconnect_retries_after_a_live_client_failure() -> None:
     with pytest.raises(ServiceValidationError):
         await device.async_update_connection_policy(ble_control_enabled=False)
 
-    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SUSPEND
     assert device._disconnect_retry_task is not None
     assert device._client is client
 
@@ -879,9 +918,9 @@ async def test_pending_disconnect_retries_after_a_live_client_failure() -> None:
         client.is_connected = False
 
     client.disconnect.side_effect = release_client
-    await device._complete_pending_disconnect()
+    await device._complete_pending_release()
 
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device.is_gatt_connected is False
     assert client.disconnect.await_count == 2
     await device.stop()
@@ -948,9 +987,10 @@ async def test_operation_response_drains_before_suspension_disconnect() -> None:
         await asyncio.gather(*device._response_tasks, return_exceptions=True)
 
 
-async def test_config_entry_unload_timeout_defers_terminal_disconnect(
+async def test_config_entry_unload_timeout_restores_operational_runtime(
     hass: HomeAssistant,
 ) -> None:
+    """A quiesce timeout restores policy without terminalizing the runtime."""
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload")
@@ -960,6 +1000,7 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
     device._physical_connection_active = True
     disconnect = AsyncMock(wraps=device._execute_disconnect)
     device._execute_disconnect = disconnect
+    device._schedule_reconnect_locked = Mock()
     data = _make_data(hass, device)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
     lease = device.connection_lease("unload operation", defer_connection=True)
@@ -967,10 +1008,10 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
 
     with (
         patch.object(
-            hass.config_entries,
-            "async_unload_platforms",
+            integration,
+            "_async_unload_platforms_transactional",
             new=AsyncMock(return_value=True),
-        ),
+        ) as unload_platforms,
         patch(
             "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
             0.01,
@@ -979,31 +1020,38 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
         assert await integration.async_unload_entry(hass, entry) is False
 
     assert disconnect.await_count == 0
-    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    unload_platforms.assert_not_awaited()
+    assert device._pending_release is None
+    assert device._terminal_stopped is False
+    assert device.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
     assert hass.data[DOMAIN][entry.entry_id] is data
     await lease.__aexit__(None, None, None)
     if data.coordinator._unsub_disconnect is not None:
         data.coordinator._unsub_disconnect()
 
-    assert disconnect.await_count == 1
-    assert device._pending_disconnect_target is None
-    assert device.policy_state is ConnectionPolicyState.STOPPED
-    assert device.is_authenticated is False
+    assert disconnect.await_count == 0
+    assert device._pending_release is None
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    device.ensure_control_available()
 
     with patch.object(
-        hass.config_entries,
-        "async_unload_platforms",
+        integration,
+        "_async_unload_platforms_transactional",
         new=AsyncMock(return_value=True),
     ):
         assert await integration.async_unload_entry(hass, entry) is True
 
     assert entry.entry_id not in hass.data[DOMAIN]
+    assert device._terminal_stopped is True
+    assert device.policy_state is ConnectionPolicyState.STOPPED
+    if data.coordinator._unsub_disconnect is not None:
+        data.coordinator._unsub_disconnect()
 
 
-async def test_unload_retains_runtime_when_terminal_disconnect_is_unverified(
+async def test_unload_release_failure_restores_operational_runtime(
     hass: HomeAssistant,
 ) -> None:
-    """Home Assistant must not unload away the only owner of a live client."""
+    """Failed GATT release restores the loaded entry without a terminal runtime."""
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload failure")
@@ -1015,26 +1063,66 @@ async def test_unload_retains_runtime_when_terminal_disconnect_is_unverified(
     device._physical_connection_active = True
     data = _make_data(hass, device)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+    unload_platforms = AsyncMock(return_value=True)
 
     with patch.object(
-        hass.config_entries,
-        "async_unload_platforms",
-        new=AsyncMock(return_value=True),
+        integration,
+        "_async_unload_platforms_transactional",
+        new=unload_platforms,
     ):
         assert await integration.async_unload_entry(hass, entry) is False
 
+    unload_platforms.assert_not_awaited()
     assert hass.data[DOMAIN][entry.entry_id] is data
     assert device._client is client
-    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    assert device._pending_release is None
+    assert device._disconnect_retry_task is None
+    assert device._terminal_stopped is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+    assert device.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
+    device.ensure_control_available()
+
+
+async def test_unload_release_failure_restores_disabled_policy_repair(
+    hass: HomeAssistant,
+) -> None:
+    """Rollback retains suspension repair when disabled-policy release still fails."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic disabled unload failure")
+    entry.add_to_hass(hass)
+    device = _make_device(enabled=False)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+    unload_platforms = AsyncMock(return_value=True)
+
+    with patch.object(
+        integration,
+        "_async_unload_platforms_transactional",
+        new=unload_platforms,
+    ):
+        assert await integration.async_unload_entry(hass, entry) is False
+
+    unload_platforms.assert_not_awaited()
+    assert hass.data[DOMAIN][entry.entry_id] is data
+    assert device._terminal_stopped is False
+    assert device.effective_policy is EffectiveConnectionPolicy.SUSPENDED
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SUSPEND
     assert device._disconnect_retry_task is not None
+    assert device._client is client
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
 
 
-async def test_unload_keeps_platforms_loaded_when_terminal_release_fails(
+async def test_unload_keeps_platforms_loaded_when_physical_release_fails(
     hass: HomeAssistant,
 ) -> None:
-    """Platform unload waits until terminal GATT release is verified."""
+    """Platform teardown cannot start before physical release is verified."""
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload ordering")
@@ -1048,16 +1136,17 @@ async def test_unload_keeps_platforms_loaded_when_terminal_release_fails(
     unload_platforms = AsyncMock(return_value=True)
 
     with patch.object(
-        hass.config_entries,
-        "async_unload_platforms",
+        integration,
+        "_async_unload_platforms_transactional",
         new=unload_platforms,
     ):
         assert await integration.async_unload_entry(hass, entry) is False
 
     unload_platforms.assert_not_awaited()
     assert entry.entry_id in hass.data[DOMAIN]
-    device._disconnect_retry_task.cancel()
-    await asyncio.sleep(0)
+    assert device._pending_release is None
+    assert device._disconnect_retry_task is None
+    assert device._terminal_stopped is False
 
 
 async def test_platform_unload_failure_restores_nonterminal_runtime(
@@ -1078,8 +1167,8 @@ async def test_platform_unload_failure_restores_nonterminal_runtime(
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
 
     with patch.object(
-        hass.config_entries,
-        "async_unload_platforms",
+        integration,
+        "_async_unload_platforms_transactional",
         new=AsyncMock(return_value=False),
     ):
         assert await integration.async_unload_entry(hass, entry) is False
@@ -1088,11 +1177,70 @@ async def test_platform_unload_failure_restores_nonterminal_runtime(
     assert device._terminal_stopped is False
     assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
     assert device.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device._disconnect_retry_task is None
     assert device._reconnect_task is None
     device._schedule_reconnect_locked.assert_called_once_with(0)
     device.ensure_control_available()
+
+    with patch.object(
+        integration,
+        "_async_unload_platforms_transactional",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await integration.async_unload_entry(hass, entry) is True
+
+    assert entry.entry_id not in hass.data[DOMAIN]
+    assert device._terminal_stopped is True
+    if data.coordinator._unsub_disconnect is not None:
+        data.coordinator._unsub_disconnect()
+
+
+async def test_partial_platform_unload_restores_only_verified_unloads(
+    hass: HomeAssistant,
+) -> None:
+    """Platform rollback restores the exact unloaded set without duplicates."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic platform transaction")
+    entry.add_to_hass(hass)
+    loaded_platforms = set(integration.PLATFORMS)
+    failed_platform = integration.PLATFORMS[2]
+    restored_platforms: list[object] = []
+
+    async def unload_platform(_: object, platform: object) -> bool:
+        if platform is failed_platform:
+            return False
+        assert platform in loaded_platforms
+        loaded_platforms.remove(platform)
+        return True
+
+    async def restore_platforms(_: object, platforms: list[object]) -> None:
+        for platform in platforms:
+            assert platform not in loaded_platforms
+            loaded_platforms.add(platform)
+            restored_platforms.append(platform)
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_unload",
+            new=AsyncMock(side_effect=unload_platform),
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(side_effect=restore_platforms),
+        ),
+    ):
+        assert (
+            await integration._async_unload_platforms_transactional(hass, entry)
+            is False
+        )
+
+    assert loaded_platforms == set(integration.PLATFORMS)
+    assert set(restored_platforms) == set(integration.PLATFORMS) - {failed_platform}
+    assert len(restored_platforms) == len(set(restored_platforms))
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
@@ -1176,7 +1324,11 @@ async def test_repeated_suspension_application_is_idempotent() -> None:
 
 async def test_generic_resend_is_single_flight_and_cancelled_by_mode_change() -> None:
     device = _make_device()
-    device._resend_packets = AsyncMock(side_effect=asyncio.sleep(60))
+
+    async def wait_for_cancellation(_: list[bytes]) -> None:
+        await asyncio.sleep(60)
+
+    device._resend_packets = AsyncMock(side_effect=wait_for_cancellation)
 
     device._schedule_resend([b"synthetic-fragment-1"])
     first_task = device._resend_task
@@ -1327,7 +1479,7 @@ async def test_stop_releases_response_drain_when_task_never_starts() -> None:
     await asyncio.sleep(0)
 
     assert device._active_response_drain_count == 0
-    assert device._pending_disconnect_target is None
+    assert device._pending_release is None
     assert device.is_gatt_connected is False
 
 

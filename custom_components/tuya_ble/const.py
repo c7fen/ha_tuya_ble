@@ -1,12 +1,12 @@
 """The Tuya BLE integration."""
 
 from __future__ import annotations
-from dataclasses import dataclass
 
+from dataclasses import dataclass
 from enum import StrEnum
+
 from tuya_iot import TuyaCloudOpenAPIEndpoint
 from typing_extensions import Final
-
 
 DOMAIN: Final = "tuya_ble"
 
@@ -39,6 +39,25 @@ class ConnectionPolicyState(StrEnum):
     ON_DEMAND_ACTIVE = "on_demand_active"
     DISCONNECTING = "disconnecting"
     DISCONNECT_FAILED = "disconnect_failed"
+
+
+class PendingReleaseReason(StrEnum):
+    """Why a physical GATT release remains owned by the device."""
+
+    SUSPEND = "suspend"
+    ON_DEMAND_IDLE = "on_demand_idle"
+    SETUP_FAILURE = "setup_failure"
+    UNLOAD = "unload"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class PendingRelease:
+    """One revision-bound physical GATT release obligation."""
+
+    reason: PendingReleaseReason
+    revision: int
+    terminal: bool = False
 
 
 class EffectiveConnectionPolicy(StrEnum):

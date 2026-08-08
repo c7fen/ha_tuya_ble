@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS, get_device
-
+from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
+from bleak_retry_connector import get_device
 from homeassistant.components import bluetooth
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
@@ -14,10 +15,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
-
-from .tuya_ble import TuyaBLEDevice
 
 from .cloud import HASSTuyaBLEDeviceManager, normalize_app_type_data
 from .const import (
@@ -29,6 +29,7 @@ from .const import (
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
@@ -654,13 +655,42 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
         await hass.config_entries.async_reload(entry.entry_id)
 
 
+async def _async_unload_platforms_transactional(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> bool:
+    """Unload platforms and restore each verified successful unload on failure."""
+    results = await asyncio.gather(
+        *(
+            hass.config_entries.async_forward_entry_unload(entry, platform)
+            for platform in PLATFORMS
+        ),
+        return_exceptions=True,
+    )
+    if all(result is True for result in results):
+        return True
+
+    unloaded = [
+        platform
+        for platform, result in zip(PLATFORMS, results, strict=True)
+        if result is True
+    ]
+    if unloaded:
+        try:
+            await hass.config_entries.async_forward_entry_setups(entry, unloaded)
+        except Exception:  # noqa: BLE001
+            _LOGGER.error("Failed to restore Tuya BLE platforms after unload failure")
+    return False
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    if not await data.device.async_prepare_unload():
+        return False
+    if not await _async_unload_platforms_transactional(hass, entry):
+        await data.device.async_cancel_unload()
+        return False
     await data.device.stop()
-    if data.device.is_gatt_connected or data.device.active_lease_count:
-        return False
-    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        return False
     hass.data[DOMAIN].pop(entry.entry_id)
     return True
