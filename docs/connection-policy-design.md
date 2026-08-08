@@ -5,11 +5,15 @@
 Config-entry setup currently requires a current `BLEDevice` for the stored
 address. It creates the cloud-backed device manager, loads device credentials,
 decodes advertisement metadata, creates the coordinator, and schedules an
-immediate `device.update()` call. The update lazily opens GATT, starts
-notifications, completes the Tuya device-information and pairing exchange, and
-retains the client. Entity writes use the same lazy connection path.
+immediate `device.startup_update()` call. For the reviewed S1 and V1 products,
+that path establishes the retained session and requests current status once.
+For every unrelated product it delegates to the pre-existing `device.update()`
+behavior. Both paths lazily open GATT, start notifications, complete the Tuya
+device-information and pairing exchange, and retain the client. Entity writes
+use the same lazy connection path.
 
-The transport has one connection lock and one operation lock, but the
+The transport has one connection lock and one operation lock per exact session,
+but the
 `_expected_disconnect` flag currently combines terminal stop, intentional
 disconnect, and reconnect suppression. An unexpected paired disconnect starts
 another reconnect task. A transport failure may reconnect only to restore a
@@ -81,6 +85,49 @@ Desired mode, BLE-control permission, terminal stop, expected transient
 disconnect, physical client state, authenticated state, leases, reconnect
 work, idle-disconnect work, and a suspension request are separate values.
 
+### 4.1 Exact session ownership
+
+Every integration-owned physical connection has an immutable session token
+containing the exact Bleak client object and a monotonically increasing epoch.
+The epoch is allocated after `establish_connection()` returns a connected
+client and before notifications are registered. It is never reused. A token is
+current only while both the stored client is that exact object and the stored
+connection epoch equals the token epoch.
+
+The notification callback registered with Bleak is a per-session closure. It
+captures the token and verifies it before decryption, response correlation,
+protocol-response scheduling, freshness changes, or datapoint parsing. A
+delayed callback from a retired client therefore cannot be decrypted with a
+replacement key, satisfy a replacement response future, or update replacement
+state. Response futures and response tasks are likewise keyed or parameterized
+by the exact token, not by a sequence number alone. Session invalidation cancels
+that token's pending protocol-response tasks. Each token also owns its operation
+lock, so delayed cancellation cleanup from a retired response cannot block
+replacement-session setup or transport.
+
+The Bleak disconnect callback is also a per-establishment closure bound to that
+token. Client identity alone is insufficient because a connector may reuse the
+same client object for a later epoch. A delayed old-epoch disconnect is ignored.
+If callback delivery was missed and connection establishment observes a dead
+owned client, it retires that token, fails its response futures, and publishes
+provenance loss before claiming a replacement. Claiming never forgets a client
+that still reports physically connected.
+
+Connection establishment retains the connection lock through Device-Info,
+pairing, the optional one-shot status request, and connected-state publication.
+Every await boundary rechecks exact ownership. Connected callbacks are
+published once for each successfully finalized token, so completion from a
+retired session cannot activate or republish a replacement session.
+The claim-to-finalization task and every in-flight status owner are registered
+against that exact token. Retirement cancels those owners so Device-Info,
+pairing, or status I/O cannot retain the connection lock ahead of a replacement.
+Status-specific transport boundaries additionally recheck the effective
+Always-connected policy. Tracked startup status work is cancelled when
+suspension, On-demand mode, unload, terminal stop, or token retirement
+supersedes it. An unexpected loss before pairing uses the same bounded future
+reconnect policy as a later session loss; On-demand retirement instead settles
+idle and creates no reconnect or idle-disconnect timer.
+
 ## 5. Connection state machine
 
 The policy controller uses these conceptual states:
@@ -105,21 +152,27 @@ suspended update desired policy but cannot cause a connection.
 `TuyaBLEDevice.connection_lease(reason)` is an asynchronous context manager.
 Acquisition rejects `STOPPED`, `SUSPENDED`, and any lease after a suspension
 request. It cancels the per-device idle task, increments the count under the
-policy lock, and waits for a usable paired session. Release decrements the
-count under the same lock and never permits a negative count.
+policy lock, grants only that acquiring task a temporary setup context, and
+waits for a usable paired session. The setup context is installed only after
+the policy checks succeed and is removed before acquisition returns. Release
+decrements the count under the same lock and never permits a negative count.
 
 Nested and concurrent leases are reference-counted. Always-connected release
 leaves GATT active. On-demand release schedules one cancellable idle task only
 when the count reaches zero. The task uses the internal
 `DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS = 15.0` constant and checks policy
 again before disconnecting. A new lease, mode change, suspension, unload, or
-shutdown cancels it.
+shutdown cancels it. A failed or cancelled setup that has already released GATT
+settles directly in `ON_DEMAND_IDLE` and never creates this timer.
 
 Generic datapoint writes and status updates own a lease. S1 lock and unlock
 operations own one outer lease around their complete operation; nested
 datapoint leases cannot release the physical session early. V1 commands own
 one lease through the correctly correlated confirmation. Lease cleanup runs in
-`finally` blocks so cancellation and exceptions cannot leak the count.
+`finally` blocks so cancellation and exceptions cannot leak the count. Every
+post-increment setup and state-finalization await is covered by the same
+cancellation guard; counted-lease release is allowed to finish before repeated
+cancellation is propagated.
 
 ## 7. Startup without active BLE discovery
 
@@ -138,15 +191,33 @@ the app currently prevents connection.
 ## 8. Reconnect behavior
 
 Always-connected mode schedules at most one reconnect task after an unexpected
-paired disconnect. Each failed attempt uses bounded backoff and rechecks
-policy, terminal stop, and the live target. Suspension, mode changes, unload,
-and shutdown cancel the task. Re-enabling always-connected mode makes at most
-one immediate attempt and then uses the same bounded single-task backoff; it
-does not run the old tight 100-attempt loop.
+paired disconnect. A verified unexpected loss waits at least one second. Each
+short-lived replacement doubles that delay up to 60 seconds; only a session
+that remains stable for at least 30 seconds resets it. A reconnect request that
+arrives while an attempt is active is retained as one bounded follow-up, never
+as a parallel task. A larger delay arriving while the current reconnect owner
+is still sleeping replaces that sleeper, so the later backoff cannot be lost.
+Connection-attempt failures continue to use the existing
+bounded transport backoff. Every attempt rechecks policy, terminal stop, and
+the live target. Suspension, mode changes, unload, and shutdown cancel both the
+active task and pending follow-up. Re-enabling always-connected mode makes at
+most one immediate policy attempt; an unexpected post-connect loss still uses
+the non-zero loss backoff.
+
+Automatic Device Status synchronization is limited to the exact reviewed
+products `jtmspro/xqeob8h6` and `ms/7a4xvbtt`. Each physical session can attempt
+it once, after pairing, with empty data. The request is awaited while exact
+connection-establishment ownership is held; it is not detached, replayed, or
+silently repeated after an ambiguous failure. An acknowledgement alone does
+not make any datapoint current. Synthetic protocol-v3, protocol-v4, and FD50
+products retain their pre-existing setup update behavior and receive no new
+reconnect-specific status request.
 
 On-demand mode never reconnects because an advertisement arrived. It waits for
 an explicit lease-backed operation. An ambiguous transport failure never
 replays a command or starts a delayed background resend for any product.
+Local command rollback is revision-bound: if a newer inbound or local mutation
+wins while an older write is failing, the older failure cannot overwrite it.
 
 ## 9. On-demand idle behavior
 
@@ -168,9 +239,10 @@ command. A timeout returns a translated error and leaves new work blocked.
 
 Turning control on persists first. In always-connected mode it leaves
 suspension, makes one connection attempt, refreshes status after successful
-pairing, and retains the session. In on-demand mode it leaves suspension and
-enters `ON_DEMAND_IDLE` without connecting. If the app still owns GATT, the
-runtime keeps the actual diagnostic off and uses only bounded retry behavior.
+pairing only for the exact reviewed S1/V1 products, and retains the session. In
+on-demand mode it leaves suspension and enters `ON_DEMAND_IDLE` without
+connecting. If the app still owns GATT, the runtime keeps the actual diagnostic
+off and uses only bounded retry behavior.
 
 ### 10.1 Release supersession matrix
 
@@ -192,10 +264,11 @@ an in-progress physical release remains owned.
 
 ### 10.2 Transport failure ownership audit
 
-`_disconnected(client)` is reserved for the Bleak callback. A local transport
-path may clear the current client only after checking that the exact current
-client is no longer physically connected. A connected client is always either
-command-ready or owned by a non-supersedable release obligation.
+`_disconnected(client, token)` is reserved for the session-bound Bleak
+callback. A local transport path may clear the current client only after
+checking that the exact current client is no longer physically connected. A
+connected client is always either command-ready or owned by a
+non-supersedable release obligation.
 
 | Failure point | Client retained? | Physical release attempted? | Retry owner | Replay permitted? |
 | --- | --- | --- | --- | --- |
@@ -257,6 +330,11 @@ process, so a restart reconstructs the retained entry before a later clean
 unload. Only a fully successful platform teardown makes the device terminally
 `STOPPED`.
 
+Terminal success also shuts down the coordinator's device callback
+registrations and cancels any pending ten-minute disconnect-grace handle. A
+failed or rolled-back unload retains those registrations because the runtime
+remains loaded.
+
 ## 12. Entity availability and state freshness
 
 The connectivity binary sensor and both policy entities are available whenever
@@ -266,13 +344,37 @@ grace period. Internal `is_connection_active` is stricter: it additionally
 requires active notifications, because commands and acknowledgements require a
 usable bidirectional session.
 
-`state_data_fresh` is an internal device property. It becomes true only after
-current-session inbound device data is received and becomes false immediately
-on disconnect or a write failure that leaves the GATT client connected but
-notification-unready. Read-only entities are unavailable or return unknown
-when it is false. On-demand command entities remain callable while control is
-enabled. Suspended ordinary entities are unavailable and their write paths
-reject before connecting or writing. Historical HA state is not treated as a
+`state_data_fresh` is an aggregate internal device property. It becomes true
+only after exact-current-session inbound device data is received and becomes
+false immediately on disconnect or a write failure that leaves the GATT client
+connected but notification-unready. The device publishes that session-data
+invalidation to the coordinator immediately. Entity listeners therefore write
+unknown or unavailable current state without waiting for the coordinator's
+existing ten-minute general connectivity grace; that grace remains unchanged
+and independent.
+
+Each accepted inbound datapoint also stores the exact receipt epoch. A
+datapoint is current only when that epoch equals the active exact session epoch.
+The compatibility `received_from_device` property is derived from this
+comparison. Cached values need not be erased on disconnect, and an unrelated
+datapoint in a replacement session cannot make an old value current.
+
+For S1, Battery DP8, Motor State DP47, Authentication Mode DP34, Auto-Lock DP33,
+Auto-Lock Delay DP36, and Door State DP40 require their own current-session
+receipt. After reconnect, a DP8-only report can restore Battery but none of the
+other five values. Configuration entities remain callable when policy permits
+even while their displayed value is unknown. Alarm DP21 and the Last Unlock
+Method datapoints retain their historical/event semantics; they are not proof
+of current configuration and are not cleared merely because a session ended.
+
+The exact reviewed V1 lock likewise exposes read-only Motor State DP47 only
+when DP47 itself was received in the active epoch. A replacement DP8 or another
+unrelated report cannot refresh its cached physical lock state.
+
+Other read-only entities are unavailable when aggregate current-session data
+is absent. On-demand command entities remain callable while control is enabled.
+Suspended ordinary entities are unavailable and their write paths reject before
+connecting or writing. Historical Home Assistant state is not treated as a
 current physical state.
 
 ## 13. Config-entry Options Flow
@@ -308,15 +410,17 @@ and its correlated confirmation. V1 Unlock holds one lease around exactly one
 product-specific DP6 action and its correlated confirmation. Only the expected
 sender-DPS response is accepted. An ambiguous transport error never schedules
 a replay, second lease-based retry, or delayed resend. DP33 remains Auto-Lock
-configuration and DP47 remains read-only; Open is not added.
+configuration and DP47 remains read-only and exact-session gated; Open is not
+added.
 
 ## 16. Unrelated-device compatibility
 
-Only the exact S1 and V1 category/product pairs receive the new entities.
-Existing product and platform mappings remain additive. Default policy values
-preserve the effective always-connected behavior for existing entries, while
-the common transport gates policy work without changing product-specific DP
-selection, S1 template provenance, or V1 at-most-once handling.
+Only the exact S1 and V1 category/product pairs receive the new entities and
+the new reconnect-time automatic status synchronization. Existing product and
+platform mappings remain additive. Default policy values preserve the effective
+always-connected behavior for existing entries, while the common transport
+gates policy work without changing product-specific DP selection, S1 template
+provenance, or V1 at-most-once handling.
 
 ## 17. Privacy
 
@@ -360,3 +464,8 @@ The Tuya app and Home Assistant generally compete for exclusive GATT ownership,
 and simultaneous reliable use is not guaranteed. Discovery and app ownership
 can delay a bounded connection attempt, but the entry remains loaded and local
 connection controls remain usable.
+
+The cause of the observed short S1 post-status disconnect remains
+hardware-indeterminate. The non-zero bounded reconnect policy prevents the
+integration from amplifying that churn; it does not claim to correct the lock,
+radio, firmware, mobile-app ownership, or physical environment.
