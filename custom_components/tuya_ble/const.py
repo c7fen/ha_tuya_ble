@@ -18,6 +18,9 @@ DEFAULT_BLE_CONTROL_ENABLED: Final = True
 DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS: Final = 15.0
 CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS: Final = 30.0
 BLE_TARGET_WAIT_TIMEOUT_SECONDS: Final = 10.0
+UNEXPECTED_RECONNECT_MIN_SECONDS: Final = 1.0
+UNEXPECTED_RECONNECT_MAX_SECONDS: Final = 60.0
+RECONNECT_STABLE_RESET_SECONDS: Final = 30.0
 
 
 class ConnectionMode(StrEnum):
@@ -59,6 +62,7 @@ class PendingRelease:
     reason: PendingReleaseReason
     revision: int
     terminal: bool = False
+    reconnect_delay: float | None = None
 
 
 class EffectiveConnectionPolicy(StrEnum):

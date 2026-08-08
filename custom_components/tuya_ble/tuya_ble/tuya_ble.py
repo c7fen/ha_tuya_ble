@@ -11,7 +11,7 @@ import time
 from collections.abc import Awaitable, Callable, Hashable
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar, Token, copy_context
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from struct import pack, unpack
 from typing import Any, Self
@@ -37,6 +37,9 @@ from ..const import (
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
     DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
+    RECONNECT_STABLE_RESET_SECONDS,
+    UNEXPECTED_RECONNECT_MAX_SECONDS,
+    UNEXPECTED_RECONNECT_MIN_SECONDS,
     ConnectionMode,
     ConnectionPolicyState,
     DPType,
@@ -101,6 +104,12 @@ BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
 
 FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4"})
+RECONNECT_STATUS_SYNC_PRODUCTS = frozenset(
+    {
+        ("jtmspro", "xqeob8h6"),
+        ("ms", "7a4xvbtt"),
+    }
+)
 
 
 # @dataclass
@@ -116,6 +125,18 @@ class TuyaBLEEntityDescription:
     values_defaults: dict[str, dict] | None = None
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class ConnectionSessionToken:
+    """Exact ownership token for one integration-managed BLE client."""
+
+    client: BleakClientWithServiceCache
+    epoch: int
+    operation_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
+
+
 class TuyaBLEDataPoint:
     def __init__(
         self,
@@ -126,7 +147,7 @@ class TuyaBLEDataPoint:
         type: TuyaBLEDataPointType,
         value: bytes | bool | int | str,
         *,
-        received_from_device: bool = False,
+        received_session_epoch: int | None = None,
     ) -> None:
         self._owner = owner
         self._id = id
@@ -135,7 +156,8 @@ class TuyaBLEDataPoint:
         self._type = type
         self._value = value
         self._changed_by_device = False
-        self._received_from_device = received_from_device
+        self._received_session_epoch = received_session_epoch
+        self._value_revision = 0
 
     def __repr__(self) -> str:
         return (
@@ -150,13 +172,15 @@ class TuyaBLEDataPoint:
         flags: int,
         type: TuyaBLEDataPointType,
         value: bytes | bool | int | str,
+        session_epoch: int,
     ) -> None:
         self._timestamp = timestamp
         self._flags = flags
         self._type = type
         self._changed_by_device = self._value != value
         self._value = value
-        self._received_from_device = True
+        self._received_session_epoch = session_epoch
+        self._value_revision += 1
 
     def _get_value(self) -> bytes:
         match self._type:
@@ -202,8 +226,19 @@ class TuyaBLEDataPoint:
 
     @property
     def received_from_device(self) -> bool:
-        """Return whether the current value came from an inbound device update."""
-        return self._received_from_device
+        """Return whether this value was received in the active exact session."""
+        return self.received_in_current_session
+
+    @property
+    def received_session_epoch(self) -> int | None:
+        """Return the exact session epoch that supplied the current value."""
+        return self._received_session_epoch
+
+    @property
+    def received_in_current_session(self) -> bool:
+        """Return whether this datapoint belongs to the active exact session."""
+        epoch = self._received_session_epoch
+        return epoch is not None and epoch == self._owner._owner.current_session_epoch
 
     def __str__(self) -> str:
         return repr(self)
@@ -228,7 +263,23 @@ class TuyaBLEDataPoint:
                 self._value = str(value)
 
         self._changed_by_device = False
-        self._received_from_device = False
+        self._received_session_epoch = None
+        self._value_revision += 1
+
+    def _restore_local_value_if_uncontested(
+        self,
+        local_revision: int,
+        value: bytes | bool | int | str,
+        changed_by_device: bool,
+        received_session_epoch: int | None,
+    ) -> None:
+        """Roll back only if no newer local or inbound update won ownership."""
+        if self._value_revision != local_revision:
+            return
+        self._value = value
+        self._changed_by_device = changed_by_device
+        self._received_session_epoch = received_session_epoch
+        self._value_revision += 1
 
     async def set_value(self, value: bytes | bool | int | str) -> None:
         self._owner._owner.ensure_control_available()
@@ -240,14 +291,18 @@ class TuyaBLEDataPoint:
         self._owner._owner.ensure_control_available()
         previous_value = self._value
         previous_changed_by_device = self._changed_by_device
-        previous_received_from_device = self._received_from_device
+        previous_received_session_epoch = self._received_session_epoch
         self._set_local_value(value)
+        local_revision = self._value_revision
         try:
             await self._owner._update_from_user_once(self._id)
         except (Exception, asyncio.CancelledError):
-            self._value = previous_value
-            self._changed_by_device = previous_changed_by_device
-            self._received_from_device = previous_received_from_device
+            self._restore_local_value_if_uncontested(
+                local_revision,
+                previous_value,
+                previous_changed_by_device,
+                previous_received_session_epoch,
+            )
             raise
 
     async def set_value_no_replay(self, value: bytes | bool | int | str) -> None:
@@ -255,14 +310,18 @@ class TuyaBLEDataPoint:
         self._owner._owner.ensure_control_available()
         previous_value = self._value
         previous_changed_by_device = self._changed_by_device
-        previous_received_from_device = self._received_from_device
+        previous_received_session_epoch = self._received_session_epoch
         self._set_local_value(value)
+        local_revision = self._value_revision
         try:
             await self._owner._update_from_user_no_replay(self._id)
         except (Exception, asyncio.CancelledError):
-            self._value = previous_value
-            self._changed_by_device = previous_changed_by_device
-            self._received_from_device = previous_received_from_device
+            self._restore_local_value_if_uncontested(
+                local_revision,
+                previous_value,
+                previous_changed_by_device,
+                previous_received_session_epoch,
+            )
             raise
 
 
@@ -290,11 +349,9 @@ class TuyaBLEDataPoints:
         """Last data received"""
         return self._last_data_received
 
-    def _clear_session_receipt_provenance(self) -> None:
-        """Forget inbound provenance that belongs to a disconnected session."""
+    def _invalidate_session_receipt_provenance(self) -> None:
+        """Invalidate aggregate receipt time without rewriting cached values."""
         self._last_data_received = None
-        for datapoint in self._datapoints.values():
-            datapoint._received_from_device = False
 
     def has_id(self, id: int, type: TuyaBLEDataPointType | None = None) -> bool:
         return (id in self._datapoints) and (
@@ -332,12 +389,21 @@ class TuyaBLEDataPoints:
         flags: int,
         type: TuyaBLEDataPointType,
         value: bytes | bool | int | str,
+        session_token: ConnectionSessionToken,
     ) -> None:
+        if not self._owner._owns_connection_session(session_token):
+            return
         self._last_data_received = datetime.now(timezone.utc)
-        self._owner._mark_state_data_fresh()
+        self._owner._mark_state_data_fresh(session_token)
         dp = self._datapoints.get(dp_id)
         if dp:
-            dp._update_from_device(timestamp, flags, type, value)
+            dp._update_from_device(
+                timestamp,
+                flags,
+                type,
+                value,
+                session_token.epoch,
+            )
         else:
             self._datapoints[dp_id] = TuyaBLEDataPoint(
                 self,
@@ -346,7 +412,7 @@ class TuyaBLEDataPoints:
                 flags,
                 type,
                 value,
-                received_from_device=True,
+                received_session_epoch=session_token.epoch,
             )
 
     async def _update_from_user(self, dp_id: int) -> None:
@@ -400,7 +466,8 @@ class TuyaBLEConnectionLease(AbstractAsyncContextManager):
                 except ValueError:
                     pass
             try:
-                await self._device._release_connection_lease()
+                if await self._device._finish_connection_lease_release():
+                    raise asyncio.CancelledError()
             finally:
                 self._context_token = None
 
@@ -473,15 +540,24 @@ class TuyaBLEDevice:
         self._idle_disconnect_in_progress = False
         self._disconnect_retry_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        self._scheduled_reconnect_delay: float | None = None
+        self._pending_reconnect_delay: float | None = None
+        self._active_reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempt_active = False
         self._response_tasks: set[asyncio.Task] = set()
+        self._response_task_tokens: dict[asyncio.Task, ConnectionSessionToken] = {}
+        self._session_setup_task_tokens: dict[asyncio.Task, ConnectionSessionToken] = {}
+        self._status_task_tokens: dict[asyncio.Task, ConnectionSessionToken] = {}
         self._response_drain_tasks: set[asyncio.Task] = set()
         self._response_cleanup_tasks: set[asyncio.Task] = set()
         self._startup_task: asyncio.Task | None = None
-        # A status request is read-only protocol traffic, but it is still a
-        # command with an ambiguous transport outcome.  Keep it explicitly
-        # one-shot for each authenticated physical session.
-        self._connection_generation = 0
-        self._status_requested_generation: int | None = None
+        self._connection_epoch = 0
+        self._connection_token: ConnectionSessionToken | None = None
+        self._status_attempted_token: ConnectionSessionToken | None = None
+        self._connected_notified_token: ConnectionSessionToken | None = None
+        self._data_invalidated_token: ConnectionSessionToken | None = None
+        self._session_active_since: float | None = None
+        self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
         self._persist_options = persist_options
         try:
             self._connection_mode = ConnectionMode(connection_mode)
@@ -508,6 +584,7 @@ class TuyaBLEDevice:
         self._physical_connection_active = False
         self._notifications_active = False
         self._connection_state_callbacks: list[Callable[[bool], None]] = []
+        self._session_invalidated_callbacks: list[Callable[[], None]] = []
         self._client: BleakClientWithServiceCache | None = None
         self._characteristic_notify = CHARACTERISTIC_NOTIFY
         self._characteristic_write = CHARACTERISTIC_WRITE
@@ -539,8 +616,12 @@ class TuyaBLEDevice:
         self._input_buffer: bytearray | None = None
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
-        self._input_expected_responses: dict[int, asyncio.Future[int] | None] = {}
-        self._input_expected_response_codes: dict[int, TuyaBLECode] = {}
+        self._input_expected_responses: dict[
+            tuple[ConnectionSessionToken, int], asyncio.Future[int] | None
+        ] = {}
+        self._input_expected_response_codes: dict[
+            tuple[ConnectionSessionToken, int], TuyaBLECode
+        ] = {}
         # self._input_future: asyncio.Future[int] | None = None
 
         self._datapoints = TuyaBLEDataPoints(self)
@@ -610,6 +691,84 @@ class TuyaBLEDevice:
         """Return whether current-session device data has been received."""
         return self._state_data_fresh
 
+    @property
+    def current_session_epoch(self) -> int | None:
+        """Return the exact epoch only while its session is command-ready."""
+        token = self._connection_token
+        if token is None or not self._owns_connection_session(token):
+            return None
+        if not self.is_connection_active:
+            return None
+        return token.epoch
+
+    def _claim_connection_session(
+        self, client: BleakClientWithServiceCache
+    ) -> ConnectionSessionToken:
+        """Claim a newly established exact client with a never-reused epoch."""
+        previous_token = self._connection_token
+        if previous_token is not None:
+            if previous_token.client.is_connected:
+                raise TuyaBLEConnectionUnavailableError()
+            self._mark_connection_lost(
+                previous_token,
+                unexpected=not self._expected_disconnect and self._is_paired,
+            )
+        self._connection_epoch += 1
+        token = ConnectionSessionToken(client, self._connection_epoch)
+        self._client = client
+        self._connection_token = token
+        self._operation_lock = token.operation_lock
+        self._physical_connection_active = True
+        self._notifications_active = False
+        self._is_paired = False
+        self._state_data_fresh = False
+        self._data_invalidated_token = None
+        self._session_active_since = None
+        self._current_seq_num = 1
+        self._clean_input()
+        return token
+
+    def _owns_connection_session(
+        self,
+        token: ConnectionSessionToken,
+        *,
+        require_notifications: bool = False,
+        require_ready: bool = False,
+    ) -> bool:
+        """Return whether one exact token still owns the integration client."""
+        if (
+            self._connection_token is not token
+            or self._client is not token.client
+            or self._connection_epoch != token.epoch
+        ):
+            return False
+        if require_notifications and not self._notifications_active:
+            return False
+        return not require_ready or self.is_connection_active
+
+    def _notification_callback_for_session(
+        self, token: ConnectionSessionToken
+    ) -> Callable[[int, bytearray], None]:
+        """Return a notification callback permanently bound to one session."""
+
+        def notification_callback(sender: int, data: bytearray) -> None:
+            self._notification_handler(token, sender, data)
+
+        return notification_callback
+
+    def _owns_transport_work(
+        self,
+        token: ConnectionSessionToken,
+        *,
+        require_always_connected: bool = False,
+    ) -> bool:
+        """Return whether exact transport work still owns its policy boundary."""
+        if not self._owns_connection_session(token, require_notifications=True):
+            return False
+        return not require_always_connected or (
+            self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
+        )
+
     def connection_lease(
         self, reason: str, *, defer_connection: bool = False
     ) -> TuyaBLEConnectionLease:
@@ -656,12 +815,29 @@ class TuyaBLEDevice:
 
         return unregister_callback
 
+    def register_session_invalidated_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Register an immediate exact-session provenance-loss callback."""
+        self._session_invalidated_callbacks.append(callback)
+
+        def unregister_callback() -> None:
+            if callback in self._session_invalidated_callbacks:
+                self._session_invalidated_callbacks.remove(callback)
+
+        return unregister_callback
+
     def _fire_connection_state_callbacks(self, connected: bool) -> None:
         for callback in tuple(self._connection_state_callbacks):
             callback(connected)
 
-    def _mark_state_data_fresh(self) -> None:
-        self._state_data_fresh = True
+    def _fire_session_invalidated_callbacks(self) -> None:
+        for callback in tuple(self._session_invalidated_callbacks):
+            callback()
+
+    def _mark_state_data_fresh(self, token: ConnectionSessionToken) -> None:
+        if self._owns_connection_session(token, require_notifications=True):
+            self._state_data_fresh = True
 
     async def _persist_policy_options(self, updates: dict[str, Any]) -> None:
         if self._persist_options is None:
@@ -795,6 +971,7 @@ class TuyaBLEDevice:
         self._suspension_requested = False
         if self._connection_mode is ConnectionMode.ON_DEMAND:
             async with self._policy_lock:
+                self._cancel_startup_task_locked()
                 self._cancel_reconnect_locked()
                 if self._active_lease_count:
                     self._policy_state = (
@@ -832,6 +1009,7 @@ class TuyaBLEDevice:
                 PendingReleaseReason.SUSPEND,
                 self._policy_revision,
             )
+            self._cancel_startup_task_locked()
             self._cancel_reconnect_locked()
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
@@ -864,23 +1042,43 @@ class TuyaBLEDevice:
 
         if defer_connection:
             return
+        context_token = _enter_lease_context(self)
         try:
-            await self._ensure_connected()
+            try:
+                await self._ensure_connected()
+            finally:
+                try:
+                    _CONNECTION_LEASE_CONTEXT.reset(context_token)
+                except ValueError:
+                    pass
+            async with self._policy_lock:
+                if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
+                    self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+                else:
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
         except asyncio.CancelledError:
-            await self._release_connection_lease()
+            await self._finish_connection_lease_release()
             raise
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
-            await self._release_connection_lease()
+            if await self._finish_connection_lease_release():
+                raise asyncio.CancelledError() from None
             raise
         except Exception:
-            await self._release_connection_lease()
+            if await self._finish_connection_lease_release():
+                raise asyncio.CancelledError() from None
             raise TuyaBLEConnectionUnavailableError() from None
 
-        async with self._policy_lock:
-            if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED:
-                self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
-            else:
-                self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+    async def _finish_connection_lease_release(self) -> bool:
+        """Finish counted-lease release before propagating cancellation."""
+        cleanup_task = self._create_policy_task(self._release_connection_lease())
+        cancelled_during_cleanup = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled_during_cleanup = True
+        await cleanup_task
+        return cancelled_during_cleanup
 
     async def _release_connection_lease(self) -> None:
         async with self._policy_lock:
@@ -898,10 +1096,7 @@ class TuyaBLEDevice:
                 and not self._suspension_requested
                 and not self._terminal_stopped
             ):
-                if (
-                    self.is_connection_active
-                    or self._policy_state is not ConnectionPolicyState.ON_DEMAND_IDLE
-                ):
+                if self.is_connection_active:
                     self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
                     self._schedule_idle_disconnect_locked()
                 else:
@@ -927,6 +1122,7 @@ class TuyaBLEDevice:
 
         disconnect_failed = False
         reconcile_policy = False
+        session_failure_reconnect_delay: float | None = None
         complete_newer_release = False
         try:
             await self._execute_disconnect(terminal=pending.terminal)
@@ -953,6 +1149,7 @@ class TuyaBLEDevice:
                                 else PendingReleaseReason.SETUP_FAILURE
                             ),
                             self._policy_revision,
+                            reconnect_delay=pending.reconnect_delay,
                         )
                         self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
                     self._schedule_disconnect_retry_locked()
@@ -967,7 +1164,13 @@ class TuyaBLEDevice:
                         PendingReleaseReason.SETUP_FAILURE,
                         PendingReleaseReason.SESSION_FAILURE,
                     }:
-                        reconcile_policy = True
+                        if pending.reason is PendingReleaseReason.SESSION_FAILURE:
+                            session_failure_reconnect_delay = (
+                                pending.reconnect_delay
+                                or UNEXPECTED_RECONNECT_MIN_SECONDS
+                            )
+                        else:
+                            reconcile_policy = True
                     elif pending.reason is PendingReleaseReason.ON_DEMAND_IDLE:
                         if (
                             pending.revision != self._policy_revision
@@ -998,7 +1201,11 @@ class TuyaBLEDevice:
         if complete_newer_release:
             await self._complete_pending_release()
 
-        if reconcile_policy:
+        if session_failure_reconnect_delay is not None:
+            self._reconcile_after_verified_transport_loss(
+                session_failure_reconnect_delay
+            )
+        elif reconcile_policy:
             await self._apply_connection_policy()
 
         if disconnect_failed and raise_on_error:
@@ -1025,6 +1232,7 @@ class TuyaBLEDevice:
                     PendingReleaseReason.UNLOAD,
                     self._policy_revision,
                 )
+                self._cancel_startup_task_locked()
                 self._cancel_reconnect_locked()
                 self._cancel_idle_disconnect_locked()
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
@@ -1172,8 +1380,11 @@ class TuyaBLEDevice:
     async def _restore_notifications_after_unload_failure(self) -> bool:
         """Restore notifications or report that the live session needs repair."""
         client = self._client
+        token = self._connection_token
         if client is None or not client.is_connected:
             return True
+        if token is None or token.client is not client:
+            return False
         if not self._ble_control_enabled:
             return False
         if not self._is_paired:
@@ -1187,9 +1398,15 @@ class TuyaBLEDevice:
             )
             await client.start_notify(
                 self._characteristic_notify,
-                self._notification_handler,
+                self._notification_callback_for_session(token),
                 **notify_kwargs,
             )
+            if (
+                not self._owns_connection_session(token)
+                or not self._is_paired
+                or not self._ble_control_enabled
+            ):
+                return False
             self._notifications_active = True
             return True
         except Exception:  # noqa: BLE001
@@ -1208,9 +1425,22 @@ class TuyaBLEDevice:
             self._idle_disconnect_task = None
 
     def _cancel_reconnect_locked(self) -> None:
+        self._scheduled_reconnect_delay = None
+        self._pending_reconnect_delay = None
         if self._reconnect_task is not None:
+            if self._active_reconnect_task is self._reconnect_task:
+                self._active_reconnect_task = None
+                self._reconnect_attempt_active = False
             self._reconnect_task.cancel()
             self._reconnect_task = None
+
+    def _cancel_startup_task_locked(self) -> None:
+        """Cancel tracked setup status work without self-cancellation."""
+        task = self._startup_task
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        self._startup_task = None
 
     def _schedule_disconnect_retry_locked(self) -> None:
         """Retry a pending physical release with one bounded-backoff task."""
@@ -1298,12 +1528,34 @@ class TuyaBLEDevice:
 
     def _schedule_reconnect_locked(self, delay: float) -> None:
         if (
-            self._reconnect_task is not None
-            or self._pending_release is not None
+            self._terminal_stopped
+            or self._unload_quiescing
+            or self._suspension_requested
+            or not self._ble_control_enabled
+            or self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED
+        ):
+            return
+        if self._reconnect_task is not None:
+            if self._reconnect_attempt_active:
+                self._pending_reconnect_delay = max(
+                    delay,
+                    self._pending_reconnect_delay or 0,
+                )
+            elif delay > (self._scheduled_reconnect_delay or 0):
+                self._reconnect_task.cancel()
+                self._reconnect_task = None
+                self._scheduled_reconnect_delay = delay
+                self._reconnect_task = self._create_policy_task(
+                    self._reconnect_after_delay(delay)
+                )
+            return
+        if (
+            self._pending_release is not None
             or self._disconnect_in_progress
             or (self.is_gatt_connected and not self.is_connection_active)
         ):
             return
+        self._scheduled_reconnect_delay = delay
         self._reconnect_task = self._create_policy_task(
             self._reconnect_after_delay(delay)
         )
@@ -1313,28 +1565,47 @@ class TuyaBLEDevice:
         try:
             if delay:
                 await asyncio.sleep(delay)
+            self._scheduled_reconnect_delay = None
+            self._active_reconnect_task = current_task
+            self._reconnect_attempt_active = True
             await self._reconnect()
         except asyncio.CancelledError:
             return
         finally:
+            if self._active_reconnect_task is current_task:
+                self._active_reconnect_task = None
+                self._reconnect_attempt_active = False
             if self._reconnect_task is current_task:
                 self._reconnect_task = None
+                self._scheduled_reconnect_delay = None
+                followup_delay = self._pending_reconnect_delay
+                self._pending_reconnect_delay = None
+                if followup_delay is not None:
+                    self._schedule_reconnect_locked(followup_delay)
 
     def _schedule_response(
-        self, code: TuyaBLECode, data: bytes, response_to: int
+        self,
+        token: ConnectionSessionToken,
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
     ) -> None:
+        if not self._owns_connection_session(token, require_notifications=True):
+            return
         self._active_response_drain_count += 1
         self._response_drain_zero_event.clear()
         task = self._create_policy_task(
-            self._response_task_runner(code, data, response_to)
+            self._response_task_runner(token, code, data, response_to)
         )
         self._response_tasks.add(task)
+        self._response_task_tokens[task] = token
         self._response_drain_tasks.add(task)
-        task.add_done_callback(self._response_tasks.discard)
         task.add_done_callback(self._response_task_done)
 
     def _response_task_done(self, task: asyncio.Task) -> None:
         """Release drain ownership when cancellation prevents task startup."""
+        self._response_tasks.discard(task)
+        self._response_task_tokens.pop(task, None)
         self._release_response_drain(task)
 
     def _release_response_drain(self, task: asyncio.Task | None) -> None:
@@ -1351,12 +1622,14 @@ class TuyaBLEDevice:
 
     async def _response_task_runner(
         self,
+        token: ConnectionSessionToken,
         code: TuyaBLECode,
         data: bytes,
         response_to: int,
     ) -> None:
         try:
-            await self._send_response(code, data, response_to)
+            if self._owns_connection_session(token, require_notifications=True):
+                await self._send_response(token, code, data, response_to)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1395,13 +1668,18 @@ class TuyaBLEDevice:
 
     async def update(self) -> None:
         _LOGGER.debug("%s: Updating", self.log_identity)
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DEVICE_STATUS, bytes())
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"")
 
     async def startup_update(self) -> None:
         """Run the initial status path without failing config-entry setup."""
         try:
-            async with self.connection_lease("startup status", defer_connection=True):
-                await self._ensure_connected()
+            if (self.category, self.product_id) in RECONNECT_STATUS_SYNC_PRODUCTS:
+                async with self.connection_lease(
+                    "startup status", defer_connection=True
+                ):
+                    await self._ensure_connected(request_status=True)
+            else:
+                await self.update()
         except Exception:
             if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 self._schedule_reconnect()
@@ -1689,7 +1967,7 @@ class TuyaBLEDevice:
 
     def _fire_connected_callbacks(self) -> None:
         """Fire the callbacks."""
-        for callback in self._connected_callbacks:
+        for callback in tuple(self._connected_callbacks):
             callback()
 
     def register_connected_callback(
@@ -1705,7 +1983,7 @@ class TuyaBLEDevice:
 
     def _fire_callbacks(self, datapoints: list[TuyaBLEDataPoint]) -> None:
         """Fire the callbacks."""
-        for callback in self._callbacks:
+        for callback in tuple(self._callbacks):
             callback(datapoints)
 
     def register_callback(
@@ -1722,7 +2000,7 @@ class TuyaBLEDevice:
 
     def _fire_disconnected_callbacks(self) -> None:
         """Fire the callbacks."""
-        for callback in self._disconnected_callbacks:
+        for callback in tuple(self._disconnected_callbacks):
             callback()
 
     def register_disconnected_callback(
@@ -1779,21 +2057,110 @@ class TuyaBLEDevice:
             return
         await self._complete_pending_release()
 
-    def _mark_connection_lost(self) -> None:
+    def _fail_session_response_futures(self, token: ConnectionSessionToken) -> None:
+        """Fail response waiters owned by one retired exact session."""
+        for key, future in tuple(self._input_expected_responses.items()):
+            if key[0] is not token:
+                continue
+            self._input_expected_responses.pop(key, None)
+            self._input_expected_response_codes.pop(key, None)
+            if future is not None and not future.done():
+                future.set_exception(TuyaBLEConnectionUnavailableError())
+
+    def _cancel_session_response_tasks(self, token: ConnectionSessionToken) -> None:
+        """Cancel protocol responses owned by one retired exact session."""
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        for task, task_token in tuple(self._response_task_tokens.items()):
+            if task_token is token and task is not current_task:
+                task.cancel()
+
+    def _cancel_session_transport_tasks(self, token: ConnectionSessionToken) -> None:
+        """Cancel setup and status owners bound to one retired session."""
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        tasks = {
+            task
+            for task, task_token in (
+                *self._session_setup_task_tokens.items(),
+                *self._status_task_tokens.items(),
+            )
+            if task_token is token and task is not current_task
+        }
+        for task in tasks:
+            task.cancel()
+
+    def _invalidate_session_data(self, token: ConnectionSessionToken | None) -> None:
+        """Publish loss of exact-session datapoint validity once."""
+        self._notifications_active = False
+        self._state_data_fresh = False
+        self._datapoints._invalidate_session_receipt_provenance()
+        if token is not None:
+            self._fail_session_response_futures(token)
+            self._cancel_session_response_tasks(token)
+            self._cancel_session_transport_tasks(token)
+        if token is not None and self._data_invalidated_token is token:
+            return
+        self._data_invalidated_token = token
+        self._fire_session_invalidated_callbacks()
+
+    def _next_unexpected_reconnect_delay(self) -> float:
+        """Return and advance bounded backoff for a short-lived session."""
+        if (
+            self._session_active_since is not None
+            and time.monotonic() - self._session_active_since
+            >= RECONNECT_STABLE_RESET_SECONDS
+        ):
+            self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
+        delay = min(
+            UNEXPECTED_RECONNECT_MAX_SECONDS,
+            max(UNEXPECTED_RECONNECT_MIN_SECONDS, self._unexpected_reconnect_delay),
+        )
+        self._unexpected_reconnect_delay = min(
+            UNEXPECTED_RECONNECT_MAX_SECONDS,
+            delay * 2,
+        )
+        return delay
+
+    def _mark_connection_lost(
+        self,
+        token: ConnectionSessionToken | None = None,
+        *,
+        unexpected: bool = False,
+    ) -> float | None:
+        if token is not None and (
+            self._connection_token is not token or self._client is not token.client
+        ):
+            return None
+        if token is None:
+            token = self._connection_token
+        reconnect_delay = (
+            self._next_unexpected_reconnect_delay() if unexpected else None
+        )
         was_connected = self._physical_connection_active or self._is_paired
         self._physical_connection_active = False
-        self._notifications_active = False
         self._is_paired = False
-        self._state_data_fresh = False
-        self._datapoints._clear_session_receipt_provenance()
+        self._notifications_active = False
+        self._connection_token = None
+        if token is None or self._client is token.client:
+            self._client = None
+        self._invalidate_session_data(token)
+        self._session_active_since = None
+        self._session_key = None
+        self._auth_key = None
         if was_connected:
             self._has_disconnected = True
         self._clean_input()
         if was_connected:
             self._fire_disconnected_callbacks()
             self._fire_connection_state_callbacks(False)
+        return reconnect_delay
 
-    def _reconcile_after_verified_transport_loss(self) -> None:
+    def _reconcile_after_verified_transport_loss(self, reconnect_delay: float) -> None:
         """Restore only the policy-owned future session after a physical loss."""
         pending = self._pending_release
         if (
@@ -1828,19 +2195,29 @@ class TuyaBLEDevice:
 
         self._cancel_idle_disconnect_locked()
         self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
-        self._schedule_reconnect_locked(0)
+        self._schedule_reconnect_locked(reconnect_delay)
 
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
+    def _disconnected(
+        self,
+        client: BleakClientWithServiceCache,
+        token: ConnectionSessionToken,
+    ) -> None:
         """Disconnected callback."""
-        if client is not self._client:
+        if (
+            self._connection_token is not token
+            or client is not self._client
+            or token.client is not client
+        ):
             _LOGGER.debug(
                 "%s: Ignoring stale disconnected client callback", self.log_identity
             )
             return
-        was_paired = self._is_paired
-        self._client = None
-        self._mark_connection_lost()
-        if self._expected_disconnect:
+        expected_disconnect = self._expected_disconnect
+        reconnect_delay = self._mark_connection_lost(
+            token,
+            unexpected=not expected_disconnect,
+        )
+        if expected_disconnect:
             _LOGGER.debug(
                 "%s: Disconnected from device; RSSI: %s",
                 self.log_identity,
@@ -1852,13 +2229,14 @@ class TuyaBLEDevice:
             self.log_identity,
             self.rssi,
         )
-        if was_paired:
-            _LOGGER.debug(
-                "%s: Scheduling reconnect; RSSI: %s",
-                self.log_identity,
-                self.rssi,
-            )
-            self._reconcile_after_verified_transport_loss()
+        _LOGGER.debug(
+            "%s: Scheduling reconnect; RSSI: %s",
+            self.log_identity,
+            self.rssi,
+        )
+        self._reconcile_after_verified_transport_loss(
+            reconnect_delay or UNEXPECTED_RECONNECT_MIN_SECONDS
+        )
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -1876,6 +2254,7 @@ class TuyaBLEDevice:
         """Execute disconnection."""
         async with self._connect_lock:
             client = self._client
+            token = self._connection_token
             self._expected_disconnect = True
             if terminal:
                 self._terminal_stopped = True
@@ -1900,14 +2279,10 @@ class TuyaBLEDevice:
                 if stop_notify_error is not None:
                     raise stop_notify_error from None
                 raise BleakError(_TRANSPORT_ERROR_FALLBACK)
-            if self._client is client:
-                self._client = None
-            self._mark_connection_lost()
-        self._clean_input()
-        async with self._seq_num_lock:
-            self._current_seq_num = 1
-        self._session_key = None
-        self._auth_key = None
+            if token is not None and self._connection_token is token:
+                self._mark_connection_lost(token)
+            elif token is None and self._client is client:
+                self._mark_connection_lost()
         if stop_notify_error is not None:
             _LOGGER.warning("%s: BLE notification cleanup failed", self.log_identity)
         if disconnect_error is not None:
@@ -1918,12 +2293,13 @@ class TuyaBLEDevice:
     async def _cleanup_new_client(
         self,
         client: BleakClientWithServiceCache,
+        token: ConnectionSessionToken,
         *,
         terminal: bool,
     ) -> None:
         """Retain a newly connected client until physical release is verified."""
-        self._client = client
-        self._physical_connection_active = client.is_connected
+        if not self._owns_connection_session(token):
+            return
         self._notifications_active = False
         self._expected_disconnect = True
         try:
@@ -1936,9 +2312,7 @@ class TuyaBLEDevice:
             pass
 
         if not client.is_connected:
-            if self._client is client:
-                self._client = None
-            self._mark_connection_lost()
+            self._mark_connection_lost(token)
             return
 
         async with self._policy_lock:
@@ -1954,9 +2328,56 @@ class TuyaBLEDevice:
             self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
             self._schedule_disconnect_retry_locked()
 
-    async def _ensure_connected(self) -> None:
+    async def _cleanup_cancelled_new_client(
+        self,
+        client: BleakClientWithServiceCache,
+        token: ConnectionSessionToken,
+    ) -> None:
+        """Finish claimed-session cleanup before propagating cancellation."""
+        cleanup_task = self._create_policy_task(
+            self._cleanup_new_client(
+                client,
+                token,
+                terminal=self._terminal_stopped,
+            )
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        await cleanup_task
+
+    def _publish_connected_session(self, token: ConnectionSessionToken) -> None:
+        """Publish one successfully finalized exact session once."""
+        if (
+            not self._owns_connection_session(token, require_ready=True)
+            or self._terminal_stopped
+            or self._unload_quiescing
+            or self._suspension_requested
+            or not self._ble_control_enabled
+            or self._connected_notified_token is token
+        ):
+            return
+        self._connected_notified_token = token
+        self._session_active_since = time.monotonic()
+        self._fire_connected_callbacks()
+        self._fire_connection_state_callbacks(True)
+
+    async def _ensure_connected(self, *, request_status: bool = False) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
+        token: ConnectionSessionToken | None = None
+
+        def disconnected_callback(client: BleakClientWithServiceCache) -> None:
+            if token is None:
+                _LOGGER.debug(
+                    "%s: Ignoring disconnect before session ownership",
+                    self.log_identity,
+                )
+                return
+            self._disconnected(client, token)
+
         self.ensure_control_available()
         if self._expected_disconnect and self._active_lease_count == 0:
             raise TuyaBLEConnectionUnavailableError()
@@ -1967,10 +2388,6 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-        if self.is_connection_active:
-            return
-        if self._client and self._client.is_connected:
-            raise TuyaBLEConnectionUnavailableError()
         if self._ble_device is None:
             try:
                 await asyncio.wait_for(
@@ -1985,7 +2402,23 @@ class TuyaBLEDevice:
             # Check again while holding the lock
             await asyncio.sleep(0.01)
             if self.is_connection_active:
+                token = self._connection_token
+                if token is None:
+                    raise TuyaBLEConnectionUnavailableError()
+                if request_status:
+                    await self._request_status_while_connected(token)
+                if not self._owns_connection_session(token, require_ready=True):
+                    raise TuyaBLEConnectionUnavailableError()
+                self._publish_connected_session(token)
                 return
+            if self._client and self._client.is_connected:
+                raise TuyaBLEConnectionUnavailableError()
+            stale_token = self._connection_token
+            if stale_token is not None:
+                self._mark_connection_lost(
+                    stale_token,
+                    unexpected=not self._expected_disconnect and self._is_paired,
+                )
             if self._terminal_stopped:
                 raise TuyaBLEConnectionUnavailableError()
             try:
@@ -2001,7 +2434,7 @@ class TuyaBLEDevice:
                         BleakClientWithServiceCache,
                         self._ble_device,
                         self.address,
-                        self._disconnected,
+                        disconnected_callback,
                         use_services_cache=True,
                         ble_device_callback=lambda: self._ble_device,
                     )
@@ -2030,82 +2463,98 @@ class TuyaBLEDevice:
 
             if not client or not client.is_connected:
                 raise BleakNotFoundError()
-            if self._terminal_stopped:
-                await self._cleanup_new_client(client, terminal=True)
-                raise TuyaBLEConnectionUnavailableError()
-            _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
-            self._client = client
-            self._physical_connection_active = True
-            self._notifications_active = False
-            self._characteristic_notify = CHARACTERISTIC_NOTIFY
-            self._characteristic_write = CHARACTERISTIC_WRITE
-            for notify_uuid, write_uuid in SERVICE_CHARACTERISTICS.values():
-                if client.services.get_characteristic(notify_uuid):
-                    self._characteristic_notify = notify_uuid
-                    self._characteristic_write = write_uuid
-                    break
+            setup_task: asyncio.Task | None = None
             try:
-                notify_kwargs = (
-                    {"bluez": {"use_start_notify": True}}
-                    if self._requires_fd50_device_info_handshake()
-                    else {}
-                )
-                await self._client.start_notify(
-                    self._characteristic_notify,
-                    self._notification_handler,
-                    **notify_kwargs,
-                )
-                self._notifications_active = True
-                if not await self._send_packet_while_connected(
-                    TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                    (
-                        b"\x00\xf3"
+                token = self._claim_connection_session(client)
+                setup_task = asyncio.current_task()
+                if setup_task is not None:
+                    self._session_setup_task_tokens[setup_task] = token
+                if self._terminal_stopped:
+                    await self._cleanup_new_client(client, token, terminal=True)
+                    raise TuyaBLEConnectionUnavailableError()
+                _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
+                self._characteristic_notify = CHARACTERISTIC_NOTIFY
+                self._characteristic_write = CHARACTERISTIC_WRITE
+                for notify_uuid, write_uuid in SERVICE_CHARACTERISTICS.values():
+                    if client.services.get_characteristic(notify_uuid):
+                        self._characteristic_notify = notify_uuid
+                        self._characteristic_write = write_uuid
+                        break
+                try:
+                    notify_kwargs = (
+                        {"bluez": {"use_start_notify": True}}
                         if self._requires_fd50_device_info_handshake()
-                        else bytes(0)
-                    ),
-                    0,
-                    True,
-                ):
-                    raise BleakError()
-                if not await self._send_packet_while_connected(
-                    TuyaBLECode.FUN_SENDER_PAIR,
-                    self._build_pairing_request(),
-                    0,
-                    True,
-                ):
-                    raise BleakError()
-            except Exception as ex:  # noqa: BLE001
-                await self._cleanup_new_client(
-                    client,
-                    terminal=self._terminal_stopped,
-                )
-                if "Bluetooth is already shutdown" in str(ex):
-                    raise self._sanitized_transport_error(ex) from None
-                raise self._sanitized_transport_error(ex) from None
-
-        if self._client:
-            if self._client.is_connected:
-                if self._is_paired:
-                    _LOGGER.debug("%s: Successfully connected", self.log_identity)
-                    self._policy_state = (
-                        ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
-                        if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
-                        else ConnectionPolicyState.ON_DEMAND_ACTIVE
+                        else {}
                     )
-                    self._connection_generation += 1
-                    await self._request_status_while_connected()
-                    if not self.is_connection_active:
+                    await token.client.start_notify(
+                        self._characteristic_notify,
+                        self._notification_callback_for_session(token),
+                        **notify_kwargs,
+                    )
+                    if not self._owns_connection_session(token):
                         raise TuyaBLEConnectionUnavailableError()
-                    self._fire_connected_callbacks()
-                    self._fire_connection_state_callbacks(True)
-                else:
-                    _LOGGER.error("%s: Connected but not paired", self.log_identity)
-            else:
-                _LOGGER.error("%s: Not connected", self.log_identity)
-        else:
-            _LOGGER.error("%s: No client device", self.log_identity)
+                    self._notifications_active = True
+                    if not await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_DEVICE_INFO,
+                        (
+                            b"\x00\xf3"
+                            if self._requires_fd50_device_info_handshake()
+                            else bytes(0)
+                        ),
+                        0,
+                        True,
+                        session_token=token,
+                    ):
+                        raise BleakError()
+                    if not self._owns_connection_session(
+                        token, require_notifications=True
+                    ):
+                        raise TuyaBLEConnectionUnavailableError()
+                    if not await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_PAIR,
+                        self._build_pairing_request(),
+                        0,
+                        True,
+                        session_token=token,
+                    ):
+                        raise BleakError()
+                except Exception as ex:  # noqa: BLE001
+                    await self._cleanup_new_client(
+                        client,
+                        token,
+                        terminal=self._terminal_stopped,
+                    )
+                    if "Bluetooth is already shutdown" in str(ex):
+                        raise self._sanitized_transport_error(ex) from None
+                    raise self._sanitized_transport_error(ex) from None
 
-    async def _request_status_while_connected(self) -> bool:
+                if not self._owns_connection_session(token, require_ready=True):
+                    raise TuyaBLEConnectionUnavailableError()
+                if request_status:
+                    await self._request_status_while_connected(token)
+                if not self._owns_connection_session(token, require_ready=True):
+                    raise TuyaBLEConnectionUnavailableError()
+                _LOGGER.debug("%s: Successfully connected", self.log_identity)
+                self._policy_state = (
+                    ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
+                    if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
+                    else ConnectionPolicyState.ON_DEMAND_ACTIVE
+                )
+                self._publish_connected_session(token)
+            except asyncio.CancelledError:
+                if token is not None:
+                    await self._cleanup_cancelled_new_client(client, token)
+                raise
+            finally:
+                if (
+                    setup_task is not None
+                    and self._session_setup_task_tokens.get(setup_task) is token
+                ):
+                    self._session_setup_task_tokens.pop(setup_task, None)
+
+    async def _request_status_while_connected(
+        self, token: ConnectionSessionToken
+    ) -> bool:
         """Request current status once for an Always-connected session.
 
         The request is intentionally not retried: once it has been handed to
@@ -2113,43 +2562,63 @@ class TuyaBLEDevice:
         uncontrolled traffic during reconnect recovery.  Freshness remains
         false until an inbound datapoint report is parsed.
         """
-        generation = self._connection_generation
         if (
             self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED
-            or not self.is_connection_active
-            or self._status_requested_generation == generation
+            or not self._owns_connection_session(token, require_ready=True)
+            or self._status_attempted_token is token
+            or self._terminal_stopped
         ):
             return False
 
         # Mark before I/O so duplicate callbacks and an ambiguous transport
         # failure cannot replay the request within this physical session.
-        self._status_requested_generation = generation
+        self._status_attempted_token = token
+        status_task = asyncio.current_task()
+        if status_task is not None:
+            self._status_task_tokens[status_task] = token
         try:
-            return await self._send_packet_while_connected(
-                TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
-                bytes(),
-                0,
-                True,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug(
-                "%s: Current status request failed; not retrying this session",
-                self.log_identity,
-            )
-            return False
+            try:
+                result = await self._send_packet_while_connected(
+                    TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+                    b"",
+                    0,
+                    True,
+                    session_token=token,
+                    require_always_connected=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "%s: Current status request failed; not retrying this session",
+                    self.log_identity,
+                )
+                return False
+            if (
+                self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED
+                or not self._owns_connection_session(token, require_ready=True)
+                or self._terminal_stopped
+            ):
+                return False
+            return result
+        finally:
+            if (
+                status_task is not None
+                and self._status_task_tokens.get(status_task) is token
+            ):
+                self._status_task_tokens.pop(status_task, None)
 
     async def _reconnect(self) -> None:
         """Attempt a reconnect for future operations without replaying a command."""
         _LOGGER.debug("%s: Reconnect, ensuring connection", self.log_identity)
-        async with self._seq_num_lock:
-            self._current_seq_num = 1
         try:
             if self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 return
             async with self.connection_lease("policy reconnect", defer_connection=True):
-                await self._ensure_connected()
+                await self._ensure_connected(
+                    request_status=(self.category, self.product_id)
+                    in RECONNECT_STATUS_SYNC_PRODUCTS
+                )
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
         except BLEAK_EXCEPTIONS as ex:  # BleakNotFoundError:
             if "Bluetooth is already shutdown" in str(ex):
@@ -2163,16 +2632,12 @@ class TuyaBLEDevice:
                 self.log_identity,
             )
             async with self._policy_lock:
-                if self._reconnect_task is asyncio.current_task():
-                    self._reconnect_task = None
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                     self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
         except Exception:  # noqa: BLE001
             async with self._policy_lock:
-                if self._reconnect_task is asyncio.current_task():
-                    self._reconnect_task = None
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                     self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
 
@@ -2181,15 +2646,7 @@ class TuyaBLEDevice:
             return
         if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
             return
-        if (
-            self._reconnect_task is None
-            and self._pending_release is None
-            and not self._disconnect_in_progress
-            and not (self.is_gatt_connected and not self.is_connection_active)
-        ):
-            self._reconnect_task = self._create_policy_task(
-                self._reconnect_after_delay(delay)
-            )
+        self._schedule_reconnect_locked(delay)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -2293,8 +2750,14 @@ class TuyaBLEDevice:
 
         return command
 
-    async def _get_seq_num(self) -> int:
+    async def _get_seq_num(
+        self, session_token: ConnectionSessionToken | None = None
+    ) -> int:
         async with self._seq_num_lock:
+            if session_token is not None and not self._owns_connection_session(
+                session_token
+            ):
+                raise TuyaBLEConnectionUnavailableError()
             result = self._current_seq_num
             self._current_seq_num += 1
         return result
@@ -2340,26 +2803,39 @@ class TuyaBLEDevice:
 
     async def _send_response(
         self,
+        session_token: ConnectionSessionToken,
         code: TuyaBLECode,
         data: bytes,
         response_to: int,
     ) -> None:
         """Send response to received packet."""
-        if not self._client or not self._client.is_connected:
+        if not self._owns_connection_session(session_token, require_notifications=True):
             return
         try:
             if _lease_context_depth(self) > 0:
-                if self._client and self._client.is_connected:
+                if self._owns_connection_session(
+                    session_token, require_notifications=True
+                ):
                     await self._send_packet_while_connected(
-                        code, data, response_to, False
+                        code,
+                        data,
+                        response_to,
+                        False,
+                        session_token=session_token,
                     )
             else:
                 async with self.connection_lease(
                     "protocol response", defer_connection=True
                 ):
-                    if self._client and self._client.is_connected:
+                    if self._owns_connection_session(
+                        session_token, require_notifications=True
+                    ):
                         await self._send_packet_while_connected(
-                            code, data, response_to, False
+                            code,
+                            data,
+                            response_to,
+                            False,
+                            session_token=session_token,
                         )
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
@@ -2371,17 +2847,34 @@ class TuyaBLEDevice:
         response_to: int,
         wait_for_response: bool,
         expected_response_code: TuyaBLECode | None = None,
+        *,
+        session_token: ConnectionSessionToken | None = None,
+        require_always_connected: bool = False,
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
+        token = session_token or self._connection_token
+        if token is None or not self._owns_transport_work(
+            token,
+            require_always_connected=require_always_connected,
+        ):
+            raise TuyaBLEConnectionUnavailableError()
         result = True
         future: asyncio.Future | None = None
-        seq_num = await self._get_seq_num()
+        seq_num = await self._get_seq_num(token)
+        if not self._owns_transport_work(
+            token,
+            require_always_connected=require_always_connected,
+        ):
+            raise TuyaBLEConnectionUnavailableError()
+        response_key = (token, seq_num)
         if wait_for_response:
-            future = asyncio.Future()
-            self._input_expected_responses[seq_num] = future
+            future = asyncio.get_running_loop().create_future()
+            self._input_expected_responses[response_key] = future
             if expected_response_code is not None:
-                self._input_expected_response_codes[seq_num] = expected_response_code
+                self._input_expected_response_codes[response_key] = (
+                    expected_response_code
+                )
 
         if response_to > 0:
             _LOGGER.debug(
@@ -2400,7 +2893,19 @@ class TuyaBLEDevice:
             )
         try:
             packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-            await self._int_send_packet_while_connected(packets)
+            if require_always_connected:
+                await self._int_send_packet_while_connected(
+                    token,
+                    packets,
+                    require_always_connected=True,
+                )
+            else:
+                await self._int_send_packet_while_connected(token, packets)
+            if not self._owns_transport_work(
+                token,
+                require_always_connected=require_always_connected,
+            ):
+                raise TuyaBLEConnectionUnavailableError()
             if future:
                 try:
                     await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
@@ -2411,27 +2916,50 @@ class TuyaBLEDevice:
                         self.rssi,
                     )
                     result = False
+                if not self._owns_transport_work(
+                    token,
+                    require_always_connected=require_always_connected,
+                ):
+                    raise TuyaBLEConnectionUnavailableError()
         finally:
             if future:
-                self._input_expected_responses.pop(seq_num, None)
-                self._input_expected_response_codes.pop(seq_num, None)
+                if future.done() and not future.cancelled():
+                    future.exception()
+                self._input_expected_responses.pop(response_key, None)
+                self._input_expected_response_codes.pop(response_key, None)
 
         return result
 
     async def _int_send_packet_while_connected(
         self,
+        session_token: ConnectionSessionToken,
         packets: list[bytes],
+        *,
+        require_always_connected: bool = False,
     ) -> None:
-        if self._operation_lock.locked():
+        operation_lock = session_token.operation_lock
+        if operation_lock.locked():
             _LOGGER.debug(
                 "%s: Operation already in progress, "
                 "waiting for it to complete; RSSI: %s",
                 self.log_identity,
                 self.rssi,
             )
-        async with self._operation_lock:
+        async with operation_lock:
+            if not self._owns_transport_work(
+                session_token,
+                require_always_connected=require_always_connected,
+            ):
+                raise TuyaBLEConnectionUnavailableError()
             try:
-                await self._send_packets_locked(packets)
+                if require_always_connected:
+                    await self._send_packets_locked(
+                        session_token,
+                        packets,
+                        require_always_connected=True,
+                    )
+                else:
+                    await self._send_packets_locked(session_token, packets)
             except BleakNotFoundError:
                 _LOGGER.error(
                     "%s: device not found, no longer in range, or poor RSSI: %s",
@@ -2446,11 +2974,29 @@ class TuyaBLEDevice:
                 )
                 raise
 
-    async def _send_packets_locked(self, packets: list[bytes]) -> None:
+    async def _send_packets_locked(
+        self,
+        session_token: ConnectionSessionToken,
+        packets: list[bytes],
+        *,
+        require_always_connected: bool = False,
+    ) -> None:
         """Send command to device and read response."""
         self.ensure_control_available()
+        if not self._owns_transport_work(
+            session_token,
+            require_always_connected=require_always_connected,
+        ):
+            raise TuyaBLEConnectionUnavailableError()
         try:
-            await self._int_send_packets_locked(packets)
+            if require_always_connected:
+                await self._int_send_packets_locked(
+                    session_token,
+                    packets,
+                    require_always_connected=True,
+                )
+            else:
+                await self._int_send_packets_locked(session_token, packets)
         except BleakDBusError as ex:
             if "Bluetooth is already shutdown" in str(ex):
                 _LOGGER.debug("%s: Bluetooth is already shutdown", self.log_identity)
@@ -2477,33 +3023,50 @@ class TuyaBLEDevice:
             raise self._sanitized_transport_error(ex) from None
 
     async def _record_write_transport_failure(
-        self, client: BleakClientWithServiceCache
+        self, session_token: ConnectionSessionToken
     ) -> None:
         """Keep the exact client owned until a failed write is physically resolved."""
         async with self._policy_lock:
-            if self._client is not client:
+            if not self._owns_connection_session(session_token):
                 return
+            client = session_token.client
             if not client.is_connected:
-                self._client = None
-                self._mark_connection_lost()
-                self._reconcile_after_verified_transport_loss()
+                reconnect_delay = self._mark_connection_lost(
+                    session_token, unexpected=True
+                )
+                self._reconcile_after_verified_transport_loss(
+                    reconnect_delay or UNEXPECTED_RECONNECT_MIN_SECONDS
+                )
                 return
             self._notifications_active = False
-            self._state_data_fresh = False
+            self._invalidate_session_data(session_token)
             self._pending_release = PendingRelease(
                 PendingReleaseReason.SESSION_FAILURE,
                 self._policy_revision,
+                reconnect_delay=self._next_unexpected_reconnect_delay(),
             )
             self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
             self._cancel_reconnect_locked()
             self._cancel_idle_disconnect_locked()
             self._schedule_disconnect_retry_locked()
 
-    async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
+    async def _int_send_packets_locked(
+        self,
+        session_token: ConnectionSessionToken,
+        packets: list[bytes],
+        *,
+        require_always_connected: bool = False,
+    ) -> None:
         """Execute command and read response."""
+        client = session_token.client
         for packet in packets:
-            client = self._client
-            if client:
+            if (
+                self._owns_transport_work(
+                    session_token,
+                    require_always_connected=require_always_connected,
+                )
+                and client.is_connected
+            ):
                 try:
                     await client.write_gatt_char(
                         self._characteristic_write,
@@ -2511,7 +3074,7 @@ class TuyaBLEDevice:
                         False,
                     )
                 except Exception as ex:  # noqa: BLE001
-                    await self._record_write_transport_failure(client)
+                    await self._record_write_transport_failure(session_token)
                     if "Bluetooth is already shutdown" in str(ex):
                         _LOGGER.debug(
                             "%s: Bluetooth is already shutdown during sending packet",
@@ -2523,6 +3086,11 @@ class TuyaBLEDevice:
                         self.log_identity,
                     )
                     raise self._sanitized_transport_error(ex) from None
+                if not self._owns_transport_work(
+                    session_token,
+                    require_always_connected=require_always_connected,
+                ):
+                    raise TuyaBLEConnectionUnavailableError()
             else:
                 _LOGGER.error(
                     "%s: Client disconnected during sending packet",
@@ -2575,6 +3143,7 @@ class TuyaBLEDevice:
 
     def _parse_datapoints(
         self,
+        session_token: ConnectionSessionToken,
         timestamp: float,
         flags: int,
         data: bytes,
@@ -2582,6 +3151,8 @@ class TuyaBLEDevice:
         length_size: int,
     ) -> int:
         """Parse Tuya KLV datapoints with the requested value-length width."""
+        if not self._owns_connection_session(session_token, require_notifications=True):
+            return start_pos
         if length_size not in (1, 2):
             raise ValueError("Tuya KLV length width must be one or two bytes")
 
@@ -2620,7 +3191,14 @@ class TuyaBLEDevice:
                 type.name,
                 data_len,
             )
-            self._datapoints._update_from_device(id, timestamp, flags, type, value)
+            self._datapoints._update_from_device(
+                id,
+                timestamp,
+                flags,
+                type,
+                value,
+                session_token,
+            )
             datapoints.append(self._datapoints[id])
             pos = next_pos
 
@@ -2628,20 +3206,44 @@ class TuyaBLEDevice:
         return pos
 
     def _parse_datapoints_v3(
-        self, timestamp: float, flags: int, data: bytes, start_pos: int
+        self,
+        session_token: ConnectionSessionToken,
+        timestamp: float,
+        flags: int,
+        data: bytes,
+        start_pos: int,
     ) -> int:
         """Parse Tuya BLE protocol-v3 datapoints."""
-        return self._parse_datapoints(timestamp, flags, data, start_pos, 1)
+        return self._parse_datapoints(
+            session_token, timestamp, flags, data, start_pos, 1
+        )
 
     def _parse_datapoints_v4(
-        self, timestamp: float, flags: int, data: bytes, start_pos: int
+        self,
+        session_token: ConnectionSessionToken,
+        timestamp: float,
+        flags: int,
+        data: bytes,
+        start_pos: int,
     ) -> int:
         """Parse Tuya BLE protocol-v4 datapoints."""
-        return self._parse_datapoints(timestamp, flags, data, start_pos, 2)
+        return self._parse_datapoints(
+            session_token, timestamp, flags, data, start_pos, 2
+        )
 
     def _handle_command_or_response(
-        self, seq_num: int, response_to: int, code: TuyaBLECode, data: bytes
+        self,
+        seq_num: int,
+        response_to: int,
+        code: TuyaBLECode,
+        data: bytes,
+        *,
+        session_token: ConnectionSessionToken | None = None,
     ) -> None:
+        if session_token is not None and not self._owns_connection_session(
+            session_token, require_notifications=True
+        ):
+            return
         result: int = 0
 
         match code:
@@ -2689,15 +3291,19 @@ class TuyaBLEDevice:
                 result = data[5]
 
             case TuyaBLECode.FUN_RECEIVE_TIME1_REQ:
+                if session_token is None:
+                    return
                 if len(data) != 0:
                     raise TuyaBLEDataLengthError()
 
                 timestamp = int(time.time_ns() / 1000000)
                 timezone = -int(time.timezone / 36)
                 data = str(timestamp).encode() + pack(">h", timezone)
-                self._schedule_response(code, data, seq_num)
+                self._schedule_response(session_token, code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME2_REQ:
+                if session_token is None:
+                    return
                 if len(data) != 0:
                     raise TuyaBLEDataLengthError()
 
@@ -2714,48 +3320,62 @@ class TuyaBLEDevice:
                     time_str.tm_wday,
                     timezone,
                 )
-                self._schedule_response(code, data, seq_num)
+                self._schedule_response(session_token, code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP:
-                self._parse_datapoints_v3(time.time(), 0, data, 0)
-                self._schedule_response(code, bytes(0), seq_num)
+                if session_token is None:
+                    return
+                self._parse_datapoints_v3(session_token, time.time(), 0, data, 0)
+                self._schedule_response(session_token, code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_DP:
+                if session_token is None:
+                    return
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
-                self._parse_datapoints_v3(time.time(), flags, data, 2)
+                self._parse_datapoints_v3(session_token, time.time(), flags, data, 2)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                self._schedule_response(code, data, seq_num)
+                self._schedule_response(session_token, code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME_DP:
+                if session_token is None:
+                    return
                 timestamp: float
                 pos: int
                 timestamp, pos = self._parse_timestamp(data, 0)
-                self._parse_datapoints_v3(timestamp, 0, data, pos)
-                self._schedule_response(code, bytes(0), seq_num)
+                self._parse_datapoints_v3(session_token, timestamp, 0, data, pos)
+                self._schedule_response(session_token, code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_TIME_DP:
+                if session_token is None:
+                    return
                 timestamp: float
                 pos: int
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
                 timestamp, pos = self._parse_timestamp(data, 3)
-                self._parse_datapoints_v3(time.time(), flags, data, pos)
+                self._parse_datapoints_v3(session_token, time.time(), flags, data, pos)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                self._schedule_response(code, data, seq_num)
+                self._schedule_response(session_token, code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP_V4:
+                if session_token is None:
+                    return
                 if len(data) < 7:
                     raise TuyaBLEDataLengthError()
                 if data[0] != 0:
                     raise TuyaBLEDataFormatError()
                 send_flags = data[5]
                 mode = data[6]
-                self._parse_datapoints_v4(time.time(), mode, data, 7)
+                self._parse_datapoints_v4(session_token, time.time(), mode, data, 7)
                 if (send_flags & 0x80) == 0:
-                    self._schedule_response(code, data[:7] + b"\x00", seq_num)
+                    self._schedule_response(
+                        session_token, code, data[:7] + b"\x00", seq_num
+                    )
 
             case TuyaBLECode.FUN_RECEIVE_TIME_DP_V4:
+                if session_token is None:
+                    return
                 if len(data) < 8:
                     raise TuyaBLEDataLengthError()
                 if data[0] != 0:
@@ -2763,12 +3383,15 @@ class TuyaBLEDevice:
                 send_flags = data[5]
                 mode = data[6]
                 timestamp, pos = self._parse_timestamp(data, 7)
-                self._parse_datapoints_v4(timestamp, mode, data, pos)
+                self._parse_datapoints_v4(session_token, timestamp, mode, data, pos)
                 if (send_flags & 0x80) == 0:
-                    self._schedule_response(code, data[:7] + b"\x00", seq_num)
+                    self._schedule_response(
+                        session_token, code, data[:7] + b"\x00", seq_num
+                    )
 
-        if response_to != 0:
-            expected_code = self._input_expected_response_codes.get(response_to)
+        if response_to != 0 and session_token is not None:
+            response_key = (session_token, response_to)
+            expected_code = self._input_expected_response_codes.get(response_key)
             if expected_code is not None and code is not expected_code:
                 _LOGGER.debug(
                     "%s: Ignoring unexpected %s response to #%s",
@@ -2777,8 +3400,8 @@ class TuyaBLEDevice:
                     response_to,
                 )
             else:
-                future = self._input_expected_responses.pop(response_to, None)
-                self._input_expected_response_codes.pop(response_to, None)
+                future = self._input_expected_responses.pop(response_key, None)
+                self._input_expected_response_codes.pop(response_key, None)
                 if future:
                     _LOGGER.debug(
                         "%s: Received expected response to #%s, result: %s",
@@ -2796,7 +3419,10 @@ class TuyaBLEDevice:
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
 
-    def _parse_input(self) -> None:
+    def _parse_input(self, session_token: ConnectionSessionToken) -> None:
+        if not self._owns_connection_session(session_token, require_notifications=True):
+            self._clean_input()
+            return
         security_flag = self._input_buffer[0]
         key = self._get_key(security_flag)
         iv = self._input_buffer[1:17]
@@ -2857,10 +3483,25 @@ class TuyaBLEDevice:
                 code.name,
             )
 
-        self._handle_command_or_response(seq_num, response_to, code, data)
+        if not self._owns_connection_session(session_token, require_notifications=True):
+            return
+        self._handle_command_or_response(
+            seq_num,
+            response_to,
+            code,
+            data,
+            session_token=session_token,
+        )
 
-    def _notification_handler(self, _sender: int, data: bytearray) -> None:
+    def _notification_handler(
+        self,
+        session_token: ConnectionSessionToken,
+        _sender: int,
+        data: bytearray,
+    ) -> None:
         """Handle notification responses."""
+        if not self._owns_connection_session(session_token, require_notifications=True):
+            return
         pos: int = 0
         packet_num: int
 
@@ -2919,7 +3560,12 @@ class TuyaBLEDevice:
 
         if len(self._input_buffer) == self._input_expected_length:
             try:
-                self._parse_input()
+                if not self._owns_connection_session(
+                    session_token, require_notifications=True
+                ):
+                    self._clean_input()
+                    return
+                self._parse_input(session_token)
             except TuyaBLEError:
                 _LOGGER.error(
                     "%s: Error parsing input",
@@ -2998,19 +3644,7 @@ class TuyaBLEDevice:
             if not dp:
                 continue
 
-            # Update the internal state safely
-            if dp.type in [TuyaBLEDataPointType.DT_RAW, TuyaBLEDataPointType.DT_BITMAP]:
-                dp._value = bytes(value)
-            elif dp.type == TuyaBLEDataPointType.DT_BOOL:
-                dp._value = bool(value)
-            elif dp.type == TuyaBLEDataPointType.DT_VALUE:
-                dp._value = int(value)
-            elif dp.type == TuyaBLEDataPointType.DT_ENUM:
-                dp._value = int(value)
-            elif dp.type == TuyaBLEDataPointType.DT_STRING:
-                dp._value = str(value)
-            dp._changed_by_device = False
-            dp._received_from_device = False
+            dp._set_local_value(value)
             updated_dps.append(dp)
 
         if not updated_dps:
