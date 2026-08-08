@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakError
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.core import HomeAssistant
@@ -53,6 +54,26 @@ from custom_components.tuya_ble.vacuum import (
 
 SYNTHETIC_ADDRESS = "00:00:00:00:00:21"
 SYNTHETIC_DEVICE_ID = "synthetic-policy-device"
+
+
+class _SyntheticConnectedClient:
+    """Minimal connected client whose disconnect behavior is configurable."""
+
+    def __init__(
+        self,
+        *,
+        stop_notify_error: Exception | None = None,
+        disconnect_error: Exception | None = None,
+    ) -> None:
+        self.is_connected = True
+        self.stop_notify = AsyncMock(side_effect=stop_notify_error)
+
+        async def disconnect() -> None:
+            if disconnect_error is not None:
+                raise disconnect_error
+            self.is_connected = False
+
+        self.disconnect = AsyncMock(side_effect=disconnect)
 
 
 def _make_device(
@@ -335,6 +356,182 @@ async def test_suspension_timeout_defers_disconnect_until_final_lease_release() 
     assert device.active_lease_count == 0
 
 
+@pytest.mark.parametrize(
+    "mode",
+    (ConnectionMode.ALWAYS_CONNECTED, ConnectionMode.ON_DEMAND),
+)
+async def test_reenable_supersedes_timed_out_pending_suspension(
+    mode: ConnectionMode,
+) -> None:
+    """A newer enabled policy must win when the final lease drains."""
+    device = _make_device(mode=mode)
+    device._is_paired = True
+    device._physical_connection_active = True
+    disconnect = AsyncMock(wraps=device._execute_disconnect)
+    device._execute_disconnect = disconnect
+    lease = device.connection_lease("timeout operation", defer_connection=True)
+    await lease.__aenter__()
+
+    with (
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        pytest.raises(ServiceValidationError),
+    ):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    await device.async_update_connection_policy(ble_control_enabled=True)
+    await lease.__aexit__(None, None, None)
+    await asyncio.sleep(0)
+
+    assert device.ble_control_enabled is True
+    assert device.effective_policy is not EffectiveConnectionPolicy.SUSPENDED
+    assert device.policy_state is not ConnectionPolicyState.SUSPENDED
+    assert device._pending_disconnect_target is None
+    assert disconnect.await_count <= 1
+    await device.stop()
+
+
+async def test_stop_notify_failure_still_releases_gatt_truthfully() -> None:
+    """A notification cleanup failure must not suppress the real disconnect."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(stop_notify_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    await device._execute_disconnect()
+
+    client.stop_notify.assert_awaited_once()
+    client.disconnect.assert_awaited_once()
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.is_authenticated is False
+    assert state_changes == [False]
+
+
+@pytest.mark.parametrize(
+    "stop_notify_error",
+    (None, RuntimeError("synthetic")),
+    ids=("disconnect-only", "both-operations"),
+)
+async def test_disconnect_failure_retains_truthful_retryable_connection(
+    stop_notify_error: Exception | None,
+) -> None:
+    """A client that remains connected must stay owned until a retry succeeds."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(
+        stop_notify_error=stop_notify_error,
+        disconnect_error=RuntimeError("synthetic"),
+    )
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    with pytest.raises(BleakError):
+        await device._execute_disconnect()
+
+    client.disconnect.assert_awaited_once()
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device.is_authenticated is True
+    assert state_changes == []
+
+
+async def test_pending_disconnect_retries_after_a_live_client_failure() -> None:
+    """A failed policy release stays pending until one later real disconnect."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+
+    with pytest.raises(ServiceValidationError):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    assert device._disconnect_retry_task is not None
+    assert device._client is client
+
+    async def release_client() -> None:
+        client.is_connected = False
+
+    client.disconnect.side_effect = release_client
+    await device._complete_pending_disconnect()
+
+    assert device._pending_disconnect_target is None
+    assert device.is_gatt_connected is False
+    assert client.disconnect.await_count == 2
+    await device.stop()
+
+
+async def test_stale_disconnect_callback_cannot_mutate_replacement_client() -> None:
+    """A late callback from a replaced client must be observational only."""
+    device = _make_device()
+    old_client = _SyntheticConnectedClient()
+    new_client = _SyntheticConnectedClient()
+    device._client = new_client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._state_data_fresh = True
+    device._schedule_reconnect = Mock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    device._disconnected(old_client)
+
+    assert device._client is new_client
+    assert device.is_gatt_connected is True
+    assert device.is_authenticated is True
+    assert device.state_data_fresh is True
+    assert state_changes == []
+    device._schedule_reconnect.assert_not_called()
+
+
+async def test_operation_response_drains_before_suspension_disconnect() -> None:
+    """A response started by an operation owns a drain lifetime of its own."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    response_started = asyncio.Event()
+    allow_response = asyncio.Event()
+    disconnect_started = asyncio.Event()
+
+    async def write_response(*_: object) -> bool:
+        response_started.set()
+        await allow_response.wait()
+        return True
+
+    async def disconnect(*, terminal: bool = False) -> None:
+        del terminal
+        disconnect_started.set()
+
+    device._send_packet_while_connected = write_response
+    device._execute_disconnect = disconnect
+    async with device.connection_lease("operation", defer_connection=True):
+        device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
+        await response_started.wait()
+
+    suspension = asyncio.create_task(
+        device.async_update_connection_policy(ble_control_enabled=False)
+    )
+    try:
+        await asyncio.sleep(0)
+        assert disconnect_started.is_set() is False
+    finally:
+        allow_response.set()
+        await asyncio.gather(suspension, return_exceptions=True)
+        await asyncio.gather(*device._response_tasks, return_exceptions=True)
+
+
 async def test_config_entry_unload_timeout_defers_terminal_disconnect(
     hass: HomeAssistant,
 ) -> None:
@@ -376,6 +573,37 @@ async def test_config_entry_unload_timeout_defers_terminal_disconnect(
     assert device.policy_state is ConnectionPolicyState.STOPPED
     assert device.is_authenticated is False
     assert entry.entry_id not in hass.data[DOMAIN]
+
+
+async def test_unload_retains_runtime_when_terminal_disconnect_is_unverified(
+    hass: HomeAssistant,
+) -> None:
+    """Home Assistant must not unload away the only owner of a live client."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload failure")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await integration.async_unload_entry(hass, entry) is False
+
+    assert hass.data[DOMAIN][entry.entry_id] is data
+    assert device._client is client
+    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
@@ -611,7 +839,7 @@ async def test_response_task_does_not_inherit_lease_context() -> None:
         device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
         await response_started.wait()
 
-    assert observed == [1]
+    assert observed == [0]
     observed.clear()
     response_started.clear()
     device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)

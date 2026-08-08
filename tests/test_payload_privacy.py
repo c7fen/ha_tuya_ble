@@ -308,7 +308,9 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
     ):
         await TuyaBLEDevice._reconnect(device)
 
-    device._disconnected(Mock())
+    current_client = Mock(is_connected=True)
+    device._client = current_client
+    device._disconnected(current_client)
     device._input_expected_packet_num = 1
     device._notification_handler(0, device._pack_int(2))
 
