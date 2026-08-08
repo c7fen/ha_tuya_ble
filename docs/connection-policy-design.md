@@ -188,10 +188,13 @@ Platforms unload as one recoverable set. If any platform does not unload, every
 platform is checked and missing platforms are restored directly through the
 Home Assistant entity component while the config entry is still in its unload
 transition. Restoration is retried and the failed unload does not return until
-the complete loaded set is present, preventing a loaded entry with missing or
-duplicate policy entities. Only a fully successful platform teardown makes the
-device terminally `STOPPED`; a failed transaction returns to the latest desired
-connection policy and a later clean unload can retry normally.
+the complete loaded set has finished entity-platform setup, preventing a loaded
+entry with missing, partial, or duplicate policy entities. Cancellation is
+deferred until that transaction reaches a consistent terminal or rolled-back
+result. A rolled-back Home Assistant entry is restored to `LOADED`, so a later
+clean unload can retry normally. Only a fully successful platform teardown makes
+the device terminally `STOPPED`; a failed transaction returns to the latest
+desired connection policy.
 
 ## 12. Entity availability and state freshness
 

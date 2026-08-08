@@ -1652,7 +1652,8 @@ async def test_cancelled_home_assistant_unload_finishes_runtime_rollback(
         assert cancellation_deferred is True
         assert unload_result is False
 
-        assert entry.state is ConfigEntryState.FAILED_UNLOAD
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.LOADED
         assert entry.entry_id in hass.data[DOMAIN]
         assert device._terminal_stopped is False
         assert device._unload_quiescing is False

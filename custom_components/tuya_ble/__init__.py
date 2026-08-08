@@ -12,7 +12,7 @@ from homeassistant import loader
 from homeassistant.components import bluetooth
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
@@ -703,22 +703,35 @@ async def _async_restore_platform_after_unload_failure(
     """Restore one entity platform without requiring the entry to be LOADED."""
     component_data = hass.data.get(platform.value)
     loaded_platforms = getattr(component_data, "_platforms", {})
-    if entry.entry_id in loaded_platforms:
+    entity_platform = loaded_platforms.get(entry.entry_id)
+    if entity_platform is not None and getattr(
+        entity_platform, "_setup_complete", False
+    ):
         return True
 
     integration = loader.async_get_loaded_integration(hass, platform.value)
     component = await integration.async_get_component()
+    if entity_platform is not None:
+        try:
+            await component.async_unload_entry(hass, entry)
+        except Exception:  # noqa: BLE001
+            return False
     try:
         restored = await component.async_setup_entry(hass, entry)
     except Exception:  # noqa: BLE001
-        return False
+        restored = False
 
     component_data = hass.data.get(platform.value)
     loaded_platforms = getattr(component_data, "_platforms", {})
-    if restored is True and entry.entry_id in loaded_platforms:
+    entity_platform = loaded_platforms.get(entry.entry_id)
+    if (
+        restored is True
+        and entity_platform is not None
+        and getattr(entity_platform, "_setup_complete", False)
+    ):
         return True
 
-    if entry.entry_id in loaded_platforms:
+    if entity_platform is not None:
         try:
             await component.async_unload_entry(hass, entry)
         except Exception:  # noqa: BLE001
@@ -727,13 +740,59 @@ async def _async_restore_platform_after_unload_failure(
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry without exposing an inconsistent cancellation point."""
+    transaction = asyncio.create_task(_async_unload_entry_transaction(hass, entry))
+    cancellation_deferred = False
+    while True:
+        try:
+            return await asyncio.shield(transaction)
+        except asyncio.CancelledError:
+            if transaction.done():
+                if transaction.cancelled():
+                    raise
+                return transaction.result()
+            if not cancellation_deferred:
+                _LOGGER.warning(
+                    "Tuya BLE unload cancellation deferred until transaction cleanup"
+                )
+                cancellation_deferred = True
+
+
+async def _async_unload_entry_transaction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> bool:
     """Unload a config entry."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     if not await data.device.async_prepare_unload():
+        _schedule_loaded_state_after_unload_rollback(hass, entry)
         return False
     if not await _async_unload_platforms_transactional(hass, entry):
         await data.device.async_cancel_unload()
+        _schedule_loaded_state_after_unload_rollback(hass, entry)
         return False
     await data.device.stop()
     hass.data[DOMAIN].pop(entry.entry_id)
     return True
+
+
+def _schedule_loaded_state_after_unload_rollback(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Restore HA's loaded state after its failed-unload bookkeeping completes."""
+
+    @callback
+    def restore_loaded_state() -> None:
+        unload_in_progress = getattr(
+            ConfigEntryState,
+            "UNLOAD_IN_PROGRESS",
+            None,
+        )
+        if unload_in_progress is not None and entry.state is unload_in_progress:
+            hass.loop.call_soon(restore_loaded_state)
+            return
+        if entry.state is ConfigEntryState.FAILED_UNLOAD:
+            entry._async_set_state(hass, ConfigEntryState.LOADED, None)  # noqa: SLF001
+
+    hass.loop.call_soon(restore_loaded_state)
