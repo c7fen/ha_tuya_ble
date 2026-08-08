@@ -356,56 +356,52 @@ class TuyaBLEV1Lock(TuyaBLEEntity, LockEntity):
         """Secure by issuing exactly one DP46 true command."""
         self._device.ensure_control_available()
         async with self._operation_lock:
-            if self._device.protocol_major_version != 3:
-                _raise_v1_command_validation_error()
-            datapoint = self._device.datapoints[V1_DP_LOCK]
-            if datapoint is not None and (
-                datapoint.type is not TuyaBLEDataPointType.DT_BOOL
-                or not isinstance(datapoint.value, bool)
-            ):
-                _raise_v1_command_validation_error()
-            manual_lock = self._device.datapoints.get_or_create(
-                V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
-            )
-
-            self._attr_is_locking = True
-            self.async_write_ha_state()
-            try:
-                async with self._device.connection_lease(
-                    "v1 lock", defer_connection=True
+            async with self._device.connection_lease("v1 lock"):
+                if self._device.protocol_major_version != 3:
+                    _raise_v1_command_validation_error()
+                datapoint = self._device.datapoints[V1_DP_LOCK]
+                if datapoint is not None and (
+                    datapoint.type is not TuyaBLEDataPointType.DT_BOOL
+                    or not isinstance(datapoint.value, bool)
                 ):
-                    await manual_lock.set_value_once(True)
-            finally:
-                self._attr_is_locking = False
+                    _raise_v1_command_validation_error()
+                manual_lock = self._device.datapoints.get_or_create(
+                    V1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+                )
+
+                self._attr_is_locking = True
                 self.async_write_ha_state()
+                try:
+                    await manual_lock.set_value_once(True)
+                finally:
+                    self._attr_is_locking = False
+                    self.async_write_ha_state()
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Enable access using one observed product-specific DP6 action."""
         self._device.ensure_control_available()
         async with self._operation_lock:
-            if self._device.protocol_major_version != 3:
-                _raise_v1_command_validation_error()
-            datapoint = self._device.datapoints[V1_DP_ACCESS]
-            if datapoint is not None and (
-                datapoint.type is not TuyaBLEDataPointType.DT_RAW
-                or not isinstance(datapoint.value, bytes | bytearray)
-            ):
-                _raise_v1_command_validation_error()
-            access_value = _build_v1_access_value()
-            access = self._device.datapoints.get_or_create(
-                V1_DP_ACCESS, TuyaBLEDataPointType.DT_RAW, access_value
-            )
-
-            self._attr_is_unlocking = True
-            self.async_write_ha_state()
-            try:
-                async with self._device.connection_lease(
-                    "v1 unlock", defer_connection=True
+            async with self._device.connection_lease("v1 unlock"):
+                if self._device.protocol_major_version != 3:
+                    _raise_v1_command_validation_error()
+                datapoint = self._device.datapoints[V1_DP_ACCESS]
+                if datapoint is not None and (
+                    datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                    or not isinstance(datapoint.value, bytes | bytearray)
                 ):
-                    await access.set_value_once(access_value)
-            finally:
-                self._attr_is_unlocking = False
+                    _raise_v1_command_validation_error()
+                access_value = _build_v1_access_value()
+                access = self._device.datapoints.get_or_create(
+                    V1_DP_ACCESS, TuyaBLEDataPointType.DT_RAW, access_value
+                )
+
+                self._attr_is_unlocking = True
                 self.async_write_ha_state()
+                try:
+                    await access.set_value_once(access_value)
+                finally:
+                    self._attr_is_unlocking = False
+                    self.async_write_ha_state()
 
 
 class TuyaBLELock(TuyaBLEEntity, LockEntity):

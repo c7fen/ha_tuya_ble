@@ -81,9 +81,23 @@ _LOGGER = logging.getLogger(__name__)
 _LOG_IDENTITY_ALPHABET = "ghjkmnpqrstuvwxyz"
 _LOG_IDENTITY_LENGTH = 16
 _TRANSPORT_ERROR_FALLBACK = "Tuya BLE transport error"
-_CONNECTION_LEASE_CONTEXT: ContextVar[int] = ContextVar(
-    "tuya_ble_connection_lease", default=0
+_ConnectionLeaseContext = dict[int, int]
+_CONNECTION_LEASE_CONTEXT: ContextVar[_ConnectionLeaseContext] = ContextVar(
+    "tuya_ble_connection_lease", default={}
 )
+
+
+def _lease_context_depth(device: object) -> int:
+    """Return the current task's lease depth for one device object."""
+    return _CONNECTION_LEASE_CONTEXT.get().get(id(device), 0)
+
+
+def _enter_lease_context(device: object) -> Token[_ConnectionLeaseContext]:
+    """Add one device-scoped lease to the current task context."""
+    context = dict(_CONNECTION_LEASE_CONTEXT.get())
+    device_key = id(device)
+    context[device_key] = context.get(device_key, 0) + 1
+    return _CONNECTION_LEASE_CONTEXT.set(context)
 
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
@@ -343,16 +357,14 @@ class TuyaBLEConnectionLease(AbstractAsyncContextManager):
         self._reason = reason
         self._defer_connection = defer_connection
         self._acquired = False
-        self._context_token: Token[int] | None = None
+        self._context_token: Token[_ConnectionLeaseContext] | None = None
 
     async def __aenter__(self) -> Self:
         await self._device._acquire_connection_lease(
             self._reason, self._defer_connection
         )
         self._acquired = True
-        self._context_token = _CONNECTION_LEASE_CONTEXT.set(
-            _CONNECTION_LEASE_CONTEXT.get() + 1
-        )
+        self._context_token = _enter_lease_context(self._device)
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
@@ -426,6 +438,7 @@ class TuyaBLEDevice:
         self._lease_zero_event = asyncio.Event()
         self._lease_zero_event.set()
         self._active_lease_count = 0
+        self._pending_disconnect_target: ConnectionPolicyState | None = None
         self._idle_disconnect_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._resend_task: asyncio.Task | None = None
@@ -564,7 +577,7 @@ class TuyaBLEDevice:
 
     def ensure_control_available(self) -> None:
         """Reject work that cannot safely use the current policy."""
-        lease_active = _CONNECTION_LEASE_CONTEXT.get() > 0
+        lease_active = _lease_context_depth(self) > 0
         if self._terminal_stopped and not lease_active:
             raise TuyaBLEConnectionUnavailableError()
         if (
@@ -701,6 +714,7 @@ class TuyaBLEDevice:
             ):
                 return
             self._suspension_requested = True
+            self._pending_disconnect_target = ConnectionPolicyState.SUSPENDED
             self._cancel_reconnect_locked()
             self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
@@ -714,15 +728,7 @@ class TuyaBLEDevice:
             )
         except asyncio.TimeoutError:
             raise TuyaBLEPolicyTransitionError() from None
-
-        async with self._policy_lock:
-            if self._terminal_stopped:
-                return
-            self._policy_state = ConnectionPolicyState.DISCONNECTING
-        await self._execute_disconnect()
-        async with self._policy_lock:
-            if not self._terminal_stopped:
-                self._policy_state = ConnectionPolicyState.SUSPENDED
+        await self._complete_pending_disconnect(raise_on_error=True)
 
     async def _acquire_connection_lease(
         self, reason: str, defer_connection: bool
@@ -768,6 +774,7 @@ class TuyaBLEDevice:
             if self._active_lease_count != 0:
                 return
             self._lease_zero_event.set()
+            pending_disconnect = self._pending_disconnect_target is not None
             if (
                 self._connection_mode is ConnectionMode.ON_DEMAND
                 and self._ble_control_enabled
@@ -776,6 +783,31 @@ class TuyaBLEDevice:
             ):
                 self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
                 self._schedule_idle_disconnect_locked()
+        if pending_disconnect:
+            await self._complete_pending_disconnect()
+
+    async def _complete_pending_disconnect(self, *, raise_on_error: bool = False) -> None:
+        """Complete one deferred disconnect after all protected work drains."""
+        async with self._policy_lock:
+            target = self._pending_disconnect_target
+            if target is None or self._active_lease_count:
+                return
+            self._pending_disconnect_target = None
+            self._policy_state = ConnectionPolicyState.DISCONNECTING
+
+        disconnect_failed = False
+        try:
+            await self._execute_disconnect(terminal=target is ConnectionPolicyState.STOPPED)
+        except Exception:
+            disconnect_failed = True
+            _LOGGER.error("%s: Deferred BLE disconnect failed", self.log_identity)
+        finally:
+            async with self._policy_lock:
+                self._suspension_requested = True
+                self._policy_state = target
+
+        if disconnect_failed and raise_on_error:
+            raise TuyaBLEPolicyTransitionError() from None
 
     def _cancel_idle_disconnect_locked(self) -> None:
         if self._idle_disconnect_task is not None:
@@ -796,7 +828,7 @@ class TuyaBLEDevice:
     def _create_policy_task(coroutine: Any) -> asyncio.Task:
         """Create background policy work without inheriting an operation lease."""
         context = copy_context()
-        context.run(_CONNECTION_LEASE_CONTEXT.set, 0)
+        context.run(_CONNECTION_LEASE_CONTEXT.set, {})
         return context.run(asyncio.create_task, coroutine)
 
     def _schedule_idle_disconnect_locked(self) -> None:
@@ -879,7 +911,7 @@ class TuyaBLEDevice:
     def _schedule_response(
         self, code: TuyaBLECode, data: bytes, response_to: int
     ) -> None:
-        operation_lease_active = _CONNECTION_LEASE_CONTEXT.get() > 0
+        operation_lease_active = _lease_context_depth(self) > 0
         task = self._create_policy_task(
             self._response_task_runner(code, data, response_to, operation_lease_active)
         )
@@ -895,7 +927,7 @@ class TuyaBLEDevice:
     ) -> None:
         try:
             if operation_lease_active:
-                lease_context_token = _CONNECTION_LEASE_CONTEXT.set(1)
+                lease_context_token = _enter_lease_context(self)
                 try:
                     await self._send_response(code, data, response_to)
                 finally:
@@ -1291,6 +1323,7 @@ class TuyaBLEDevice:
             self._terminal_stopped = True
             self._suspension_requested = True
             self._policy_state = ConnectionPolicyState.STOPPED
+            self._pending_disconnect_target = ConnectionPolicyState.STOPPED
             self._cancel_reconnect_locked()
             self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
@@ -1311,7 +1344,7 @@ class TuyaBLEDevice:
                 self.log_identity,
             )
             return
-        await self._execute_disconnect(terminal=True)
+        await self._complete_pending_disconnect()
 
     def _mark_connection_lost(self) -> None:
         was_connected = self._physical_connection_active or self._is_paired
@@ -1719,7 +1752,7 @@ class TuyaBLEDevice:
         if not self._client or not self._client.is_connected:
             return
         try:
-            if _CONNECTION_LEASE_CONTEXT.get() > 0:
+            if _lease_context_depth(self) > 0:
                 if self._client and self._client.is_connected:
                     await self._send_packet_while_connected(
                         code, data, response_to, False

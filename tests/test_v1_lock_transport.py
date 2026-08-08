@@ -66,6 +66,7 @@ def _make_device() -> TuyaBLEDevice:
         status_range=[],
     )
     device._protocol_version = 3
+    device._ensure_connected = AsyncMock()
     device._send_datapoints = AsyncMock()
     device._send_datapoints_once = AsyncMock()
     return device
@@ -160,6 +161,59 @@ async def test_v1_lock_and_unlock_each_write_one_evidenced_datapoint(
     assert entity.unique_id == f"{SYNTHETIC_DEVICE_ID}-manual_lock"
     assert entity.is_locking is False
     assert entity.is_unlocking is False
+
+
+@pytest.mark.parametrize(
+    ("operation", "dp_id"),
+    (("lock", V1_DP_LOCK), ("unlock", V1_DP_ACCESS)),
+)
+async def test_v1_cold_start_negotiates_protocol_before_one_command(
+    hass: HomeAssistant,
+    operation: str,
+    dp_id: int,
+) -> None:
+    """A cold-start lease completes Device-Info negotiation before V1 validation."""
+    entity, device = _make_entity(hass)
+    device._protocol_version = 2
+
+    async def negotiate_v3() -> None:
+        device._protocol_version = 3
+
+    device._ensure_connected.side_effect = negotiate_v3
+    writes: list[int] = []
+
+    async def record_command(datapoint_ids: list[int]) -> None:
+        writes.extend(datapoint_ids)
+
+    device._send_datapoints_once.side_effect = record_command
+
+    await getattr(entity, f"async_{operation}")()
+
+    assert device._ensure_connected.await_count == 1
+    assert writes == [dp_id]
+    assert device._send_datapoints_once.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "dp_id"),
+    (("lock", V1_DP_LOCK), ("unlock", V1_DP_ACCESS)),
+)
+async def test_v1_cold_start_non_v3_performs_zero_command_writes(
+    hass: HomeAssistant,
+    operation: str,
+    dp_id: int,
+) -> None:
+    """A non-v3 negotiated session fails after connection without a V1 command."""
+    entity, device = _make_entity(hass)
+    device._protocol_version = 2
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await getattr(entity, f"async_{operation}")()
+
+    assert device._ensure_connected.await_count == 1
+    device._send_datapoints_once.assert_not_awaited()
+    assert device.datapoints[dp_id] is None
+    assert raised.value.translation_key == V1_COMMAND_ERROR_TRANSLATION_KEY
 
 
 @pytest.mark.parametrize(

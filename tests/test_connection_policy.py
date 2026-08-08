@@ -39,8 +39,9 @@ from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
-from custom_components.tuya_ble.tuya_ble.tuya_ble import _CONNECTION_LEASE_CONTEXT
+from custom_components.tuya_ble.tuya_ble.tuya_ble import _lease_context_depth
 from custom_components.tuya_ble.tuya_ble.exceptions import (
+    TuyaBLEConnectionUnavailableError,
     TuyaBLEControlSuspendedError,
 )
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
@@ -271,7 +272,8 @@ async def test_suspension_persists_before_disconnect_and_blocks_new_leases() -> 
 
     device = _make_device(persist_options=persist)
 
-    async def disconnect() -> None:
+    async def disconnect(*, terminal: bool = False) -> None:
+        del terminal
         events.append("disconnect")
 
     device._execute_disconnect = disconnect
@@ -302,6 +304,75 @@ async def test_suspension_waits_for_existing_lease() -> None:
 
     device._execute_disconnect.assert_awaited_once()
     assert device.active_lease_count == 0
+
+
+async def test_suspension_timeout_defers_disconnect_until_final_lease_release() -> None:
+    device = _make_device()
+    device._is_paired = True
+    device._physical_connection_active = True
+    disconnect = AsyncMock(wraps=device._execute_disconnect)
+    device._execute_disconnect = disconnect
+    lease = device.connection_lease("timeout operation", defer_connection=True)
+    await lease.__aenter__()
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
+        0.01,
+    ), pytest.raises(ServiceValidationError):
+        await device.async_update_connection_policy(ble_control_enabled=False)
+
+    assert disconnect.await_count == 0
+    assert device._pending_disconnect_target is ConnectionPolicyState.SUSPENDED
+    await lease.__aexit__(None, None, None)
+
+    assert disconnect.await_count == 1
+    assert device._pending_disconnect_target is None
+    assert device.policy_state is ConnectionPolicyState.SUSPENDED
+    assert device.is_authenticated is False
+    assert device.active_lease_count == 0
+
+
+async def test_config_entry_unload_timeout_defers_terminal_disconnect(
+    hass: HomeAssistant,
+) -> None:
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    device._is_paired = True
+    device._physical_connection_active = True
+    disconnect = AsyncMock(wraps=device._execute_disconnect)
+    device._execute_disconnect = disconnect
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+    lease = device.connection_lease("unload operation", defer_connection=True)
+    await lease.__aenter__()
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
+            0.01,
+        ),
+    ):
+        assert await integration.async_unload_entry(hass, entry) is True
+
+    assert disconnect.await_count == 0
+    assert device._pending_disconnect_target is ConnectionPolicyState.STOPPED
+    await lease.__aexit__(None, None, None)
+    if data.coordinator._unsub_disconnect is not None:
+        data.coordinator._unsub_disconnect()
+
+    assert disconnect.await_count == 1
+    assert device._pending_disconnect_target is None
+    assert device.policy_state is ConnectionPolicyState.STOPPED
+    assert device.is_authenticated is False
+    assert entry.entry_id not in hass.data[DOMAIN]
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
@@ -484,7 +555,8 @@ async def test_policy_lock_is_available_during_disconnect_wait() -> None:
     disconnect_started = asyncio.Event()
     release_disconnect = asyncio.Event()
 
-    async def wait_for_disconnect() -> None:
+    async def wait_for_disconnect(*, terminal: bool = False) -> None:
+        del terminal
         disconnect_started.set()
         await release_disconnect.wait()
 
@@ -528,7 +600,7 @@ async def test_response_task_does_not_inherit_lease_context() -> None:
     response_started = asyncio.Event()
 
     async def record_response(_: TuyaBLECode, __: bytes, ___: int) -> None:
-        observed.append(_CONNECTION_LEASE_CONTEXT.get())
+        observed.append(_lease_context_depth(device))
         response_started.set()
 
     device._send_response = record_response
@@ -542,6 +614,39 @@ async def test_response_task_does_not_inherit_lease_context() -> None:
     device._schedule_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 1)
     await response_started.wait()
     assert observed == [0]
+
+
+@pytest.mark.parametrize("stopped", (False, True), ids=("suspended", "stopped"))
+async def test_lease_context_is_device_scoped_and_cannot_bypass_other_device(
+    stopped: bool,
+) -> None:
+    device_a = _make_device()
+    device_b = _make_device(enabled=stopped)
+    device_b._ensure_connected = AsyncMock()
+    device_b._send_datapoints = AsyncMock()
+    if stopped:
+        device_b._terminal_stopped = True
+        device_b._policy_state = ConnectionPolicyState.STOPPED
+    datapoint = device_b.datapoints.get_or_create(
+        46, TuyaBLEDataPointType.DT_BOOL, False
+    )
+
+    async with device_a.connection_lease("device A", defer_connection=True):
+        assert _lease_context_depth(device_a) == 1
+        assert _lease_context_depth(device_b) == 0
+        expected_error = (
+            TuyaBLEConnectionUnavailableError
+            if stopped
+            else TuyaBLEControlSuspendedError
+        )
+        with pytest.raises(expected_error):
+            await datapoint.set_value(True)
+
+    assert _lease_context_depth(device_a) == 0
+    assert _lease_context_depth(device_b) == 0
+    device_b._ensure_connected.assert_not_awaited()
+    device_b._send_datapoints.assert_not_awaited()
+    assert datapoint.value is False
 
 
 async def test_mode_change_while_suspended_does_not_connect() -> None:
