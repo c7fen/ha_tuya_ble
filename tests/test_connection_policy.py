@@ -1174,6 +1174,54 @@ async def test_fd50_unload_notification_restore_failure_retains_repair_owner(
     await asyncio.sleep(0)
 
 
+async def test_terminal_stop_cannot_be_overwritten_by_notification_rollback() -> None:
+    """A notification rollback completing after stop cannot supersede STOP."""
+    device = _make_device()
+    assert device._device_info is not None
+    device._device_info.product_id = "jntxv3q4"
+    device._characteristic_notify = CHARACTERISTIC_NOTIFY_FD50
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    notification_restore_started = asyncio.Event()
+    allow_notification_failure = asyncio.Event()
+
+    async def restore_notifications(*_: object, **__: object) -> None:
+        notification_restore_started.set()
+        await allow_notification_failure.wait()
+        raise RuntimeError("synthetic")
+
+    client.start_notify.side_effect = restore_notifications
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._unload_quiescing = True
+    device._pending_release = PendingRelease(
+        PendingReleaseReason.UNLOAD,
+        device._policy_revision,
+    )
+
+    rollback = asyncio.create_task(device.async_cancel_unload())
+    await asyncio.wait_for(notification_restore_started.wait(), 0.2)
+    stop = asyncio.create_task(device.stop())
+    await asyncio.sleep(0)
+    allow_notification_failure.set()
+    await asyncio.gather(rollback, stop)
+
+    assert device._terminal_stopped is True
+    assert device._unload_quiescing is False
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.STOP
+    assert device._pending_release.terminal is True
+    assert device._disconnect_retry_task is not None
+    assert device._reconnect_task is None
+    assert device.policy_state is ConnectionPolicyState.STOPPED
+    with pytest.raises(TuyaBLEConnectionUnavailableError):
+        device.ensure_control_available()
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
 async def test_unload_waits_for_in_progress_on_demand_release_ownership() -> None:
     """Unload rollback cannot erase an in-flight On-demand release failure."""
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
