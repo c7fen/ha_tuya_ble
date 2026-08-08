@@ -42,7 +42,10 @@ from custom_components.tuya_ble.lock import TuyaBLES1Lock, TuyaBLEV1Lock
 from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
-from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
+from custom_components.tuya_ble.tuya_ble.const import (
+    CHARACTERISTIC_NOTIFY_FD50,
+    TuyaBLECode,
+)
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLEConnectionUnavailableError,
     TuyaBLEControlSuspendedError,
@@ -69,6 +72,7 @@ class _SyntheticConnectedClient:
     ) -> None:
         self.is_connected = True
         self.stop_notify = AsyncMock(side_effect=stop_notify_error)
+        self.start_notify = AsyncMock()
 
         async def disconnect() -> None:
             if disconnect_error is not None:
@@ -611,6 +615,45 @@ async def test_terminal_stop_retains_live_client_returned_by_connection() -> Non
     await asyncio.sleep(0)
 
 
+async def test_terminal_stop_retains_in_progress_setup_release_owner() -> None:
+    """Terminal supersession cannot cancel the active physical-release owner."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    retry_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    release_attempts = 0
+
+    async def disconnect() -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise RuntimeError("synthetic")
+        retry_started.set()
+        await allow_release.wait()
+        client.is_connected = False
+
+    client.disconnect.side_effect = disconnect
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await asyncio.wait_for(retry_started.wait(), 0.2)
+        stop = asyncio.create_task(device.stop())
+        await asyncio.sleep(0)
+        pending = device._pending_release
+        retained_owner = device._disconnect_retry_task
+        allow_release.set()
+        await asyncio.gather(stop, retry_owner, return_exceptions=True)
+
+    assert pending is not None
+    assert pending.reason is PendingReleaseReason.STOP
+    assert retained_owner is retry_owner
+    assert release_attempts == 2
+    assert device._client is None
+    assert device._pending_release is None
+    assert device._disconnect_retry_task is None
+    assert device.policy_state is ConnectionPolicyState.STOPPED
+
+
 @pytest.mark.parametrize(
     "failure",
     ("start_notify", "device_info", "pairing"),
@@ -1083,6 +1126,97 @@ async def test_unload_release_failure_restores_operational_runtime(
     device.ensure_control_available()
 
 
+async def test_fd50_unload_notification_restore_failure_retains_repair_owner(
+    hass: HomeAssistant,
+) -> None:
+    """A failed FD50 notification rollback remains unusable and repair-owned."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic FD50 unload failure")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    assert device._device_info is not None
+    device._device_info.product_id = "jntxv3q4"
+    device._characteristic_notify = CHARACTERISTIC_NOTIFY_FD50
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    client.start_notify.side_effect = RuntimeError("synthetic")
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+
+    with patch.object(
+        integration,
+        "_async_unload_platforms_transactional",
+        new=AsyncMock(return_value=True),
+    ) as unload_platforms:
+        assert await integration.async_unload_entry(hass, entry) is False
+
+    unload_platforms.assert_not_awaited()
+    client.stop_notify.assert_awaited_once()
+    client.start_notify.assert_awaited_once_with(
+        CHARACTERISTIC_NOTIFY_FD50,
+        device._notification_handler,
+        bluez={"use_start_notify": True},
+    )
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+    assert device._disconnect_retry_task is not None
+    assert device._reconnect_task is None
+    assert device.policy_state is ConnectionPolicyState.DISCONNECT_FAILED
+    with pytest.raises(TuyaBLEConnectionUnavailableError):
+        device.ensure_control_available()
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_unload_waits_for_in_progress_on_demand_release_ownership() -> None:
+    """Unload rollback cannot erase an in-flight On-demand release failure."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient()
+    disconnect_started = asyncio.Event()
+    allow_failure = asyncio.Event()
+
+    async def disconnect() -> None:
+        disconnect_started.set()
+        await allow_failure.wait()
+        raise RuntimeError("synthetic")
+
+    client.disconnect.side_effect = disconnect
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS",
+        0,
+    ):
+        async with device._policy_lock:
+            device._schedule_idle_disconnect_locked()
+        idle_owner = device._idle_disconnect_task
+        assert idle_owner is not None
+        await asyncio.wait_for(disconnect_started.wait(), 0.2)
+        preparation = asyncio.create_task(device.async_prepare_unload())
+        await asyncio.sleep(0)
+        allow_failure.set()
+        assert await preparation is False
+        await idle_owner
+
+    assert device._terminal_stopped is False
+    assert device._unload_quiescing is False
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.ON_DEMAND_IDLE
+    assert device._disconnect_retry_task is not None
+    assert device._idle_disconnect_task is None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
 async def test_unload_release_failure_restores_disabled_policy_repair(
     hass: HomeAssistant,
 ) -> None:
@@ -1241,6 +1375,59 @@ async def test_partial_platform_unload_restores_only_verified_unloads(
     assert loaded_platforms == set(integration.PLATFORMS)
     assert set(restored_platforms) == set(integration.PLATFORMS) - {failed_platform}
     assert len(restored_platforms) == len(set(restored_platforms))
+
+
+async def test_platform_rollback_retries_one_failed_setup_without_duplicates(
+    hass: HomeAssistant,
+) -> None:
+    """A transient rollback setup failure cannot leave a partially loaded entry."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic rollback retry")
+    entry.add_to_hass(hass)
+    loaded_platforms = set(integration.PLATFORMS)
+    unload_failure = integration.PLATFORMS[-1]
+    setup_failure = integration.PLATFORMS[2]
+    setup_attempts: dict[object, int] = {}
+
+    async def unload_platform(_: object, platform: object) -> bool:
+        if platform is unload_failure:
+            return False
+        loaded_platforms.remove(platform)
+        return True
+
+    async def restore_platforms(_: object, platforms: list[object]) -> None:
+        for platform in platforms:
+            setup_attempts[platform] = setup_attempts.get(platform, 0) + 1
+            if platform is setup_failure and setup_attempts[platform] == 1:
+                raise RuntimeError("synthetic")
+            assert platform not in loaded_platforms
+            loaded_platforms.add(platform)
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_unload",
+            new=AsyncMock(side_effect=unload_platform),
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(side_effect=restore_platforms),
+        ),
+    ):
+        assert (
+            await integration._async_unload_platforms_transactional(hass, entry)
+            is False
+        )
+
+    assert loaded_platforms == set(integration.PLATFORMS)
+    assert setup_attempts[setup_failure] == 2
+    assert all(
+        attempts == 1
+        for platform, attempts in setup_attempts.items()
+        if platform is not setup_failure
+    )
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
