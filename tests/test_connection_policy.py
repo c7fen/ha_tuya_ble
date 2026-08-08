@@ -353,6 +353,194 @@ def _prepare_new_client(client: _SyntheticConnectedClient) -> None:
     client.start_notify = AsyncMock()
 
 
+async def _seed_failed_setup_release(
+    device: TuyaBLEDevice,
+    client: _SyntheticConnectedClient,
+) -> asyncio.Task:
+    """Create a real failed-setup release with one retry owner."""
+    _prepare_new_client(client)
+    await device._cleanup_new_client(client, terminal=False)
+    assert device._pending_disconnect_target is ConnectionPolicyState.DISCONNECT_FAILED
+    assert device._disconnect_retry_task is not None
+    return device._disconnect_retry_task
+
+
+async def _apply_mode_change(
+    device: TuyaBLEDevice,
+    mode: ConnectionMode,
+    persisted: bool,
+) -> None:
+    """Apply one visible policy change through either supported path."""
+    if persisted:
+        await device.async_apply_persisted_options(
+            {
+                CONF_CONNECTION_MODE: mode.value,
+                CONF_BLE_CONTROL_ENABLED: True,
+            }
+        )
+        return
+    await device.async_update_connection_policy(connection_mode=mode.value)
+
+
+@pytest.mark.parametrize("persisted", (False, True), ids=("direct", "persisted"))
+@pytest.mark.parametrize(
+    ("initial_mode", "new_mode"),
+    (
+        (ConnectionMode.ALWAYS_CONNECTED, ConnectionMode.ON_DEMAND),
+        (ConnectionMode.ON_DEMAND, ConnectionMode.ALWAYS_CONNECTED),
+    ),
+    ids=("always-to-on-demand", "on-demand-to-always"),
+)
+async def test_setup_release_survives_visible_mode_changes(
+    persisted: bool,
+    initial_mode: ConnectionMode,
+    new_mode: ConnectionMode,
+) -> None:
+    """Desired policy changes cannot discard mandatory setup cleanup."""
+    device = _make_device(mode=initial_mode)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await _apply_mode_change(device, new_mode, persisted)
+
+        assert device._pending_disconnect_target is (
+            ConnectionPolicyState.DISCONNECT_FAILED
+        )
+        assert device._client is client
+        assert device._disconnect_retry_task is retry_owner
+        assert device._reconnect_task is None
+        assert device.policy_state is ConnectionPolicyState.DISCONNECT_FAILED
+        assert device.is_gatt_connected is True
+        assert device.is_connection_active is False
+        with pytest.raises(TuyaBLEConnectionUnavailableError):
+            device.ensure_control_available()
+        device._send_datapoints.assert_not_awaited()
+
+        async def release_client() -> None:
+            client.is_connected = False
+
+        client.disconnect.side_effect = release_client
+        await asyncio.wait_for(retry_owner, 0.2)
+
+    assert device._client is None
+    assert device._pending_disconnect_target is None
+    assert device._disconnect_retry_task is None
+    assert device.is_authenticated is False
+    assert device.connection_mode is new_mode
+    if new_mode is ConnectionMode.ALWAYS_CONNECTED:
+        assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+        device._schedule_reconnect_locked.assert_called_once_with(0)
+    else:
+        assert device.policy_state is ConnectionPolicyState.ON_DEMAND_IDLE
+        device._schedule_reconnect_locked.assert_not_called()
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_setup_release_survives_ble_control_off_on_sequence() -> None:
+    """Re-enabling BLE control cannot cancel failed-setup cleanup."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    release_attempts = 0
+    second_failure = asyncio.Event()
+    allow_release = asyncio.Event()
+
+    async def disconnect() -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise RuntimeError("synthetic")
+        if release_attempts == 2:
+            second_failure.set()
+            raise RuntimeError("synthetic")
+        await allow_release.wait()
+        client.is_connected = False
+
+    client.disconnect.side_effect = disconnect
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await device.async_update_connection_policy(ble_control_enabled=False)
+        await asyncio.wait_for(second_failure.wait(), 0.2)
+        await device.async_update_connection_policy(ble_control_enabled=True)
+
+        assert device._pending_disconnect_target is (
+            ConnectionPolicyState.DISCONNECT_FAILED
+        )
+        assert device._client is client
+        assert device._disconnect_retry_task is retry_owner
+        assert device._reconnect_task is None
+        with pytest.raises(TuyaBLEConnectionUnavailableError):
+            device.ensure_control_available()
+
+        allow_release.set()
+        await asyncio.wait_for(retry_owner, 0.2)
+
+    assert release_attempts == 3
+    assert device._client is None
+    assert device._pending_disconnect_target is None
+    assert device._disconnect_retry_task is None
+    assert device.ble_control_enabled is True
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_setup_release_survives_policy_change_during_physical_retry() -> None:
+    """An in-progress retry remains authoritative through a policy change."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    retry_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    release_attempts = 0
+
+    async def disconnect() -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise RuntimeError("synthetic")
+        retry_started.set()
+        await allow_release.wait()
+        client.is_connected = False
+
+    client.disconnect.side_effect = disconnect
+    device._send_datapoints = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+
+    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await asyncio.wait_for(retry_started.wait(), 0.2)
+        assert device._disconnect_in_progress is True
+
+        await device.async_update_connection_policy(
+            connection_mode=ConnectionMode.ON_DEMAND.value
+        )
+
+        assert device._pending_disconnect_target is (
+            ConnectionPolicyState.DISCONNECT_FAILED
+        )
+        assert device._client is client
+        assert device._disconnect_retry_task is retry_owner
+        assert device._reconnect_task is None
+        with pytest.raises(TuyaBLEConnectionUnavailableError):
+            device.ensure_control_available()
+
+        allow_release.set()
+        await asyncio.wait_for(retry_owner, 0.2)
+
+    assert device._client is None
+    assert device._pending_disconnect_target is None
+    assert device._disconnect_retry_task is None
+    assert device.connection_mode is ConnectionMode.ON_DEMAND
+    assert device.policy_state is ConnectionPolicyState.ON_DEMAND_IDLE
+    device._schedule_reconnect_locked.assert_not_called()
+    device._send_datapoints.assert_not_awaited()
+
+
 async def test_terminal_stop_retains_live_client_returned_by_connection() -> None:
     """A terminal in-flight connection remains owned when release fails."""
     device = _make_device()
@@ -870,6 +1058,41 @@ async def test_unload_keeps_platforms_loaded_when_terminal_release_fails(
     assert entry.entry_id in hass.data[DOMAIN]
     device._disconnect_retry_task.cancel()
     await asyncio.sleep(0)
+
+
+async def test_platform_unload_failure_restores_nonterminal_runtime(
+    hass: HomeAssistant,
+) -> None:
+    """A failed platform unload must restore a usable loaded config entry."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unload rollback")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._schedule_reconnect_locked = Mock()
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=False),
+    ):
+        assert await integration.async_unload_entry(hass, entry) is False
+
+    assert hass.data[DOMAIN][entry.entry_id] is data
+    assert device._terminal_stopped is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    assert device.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED
+    assert device._pending_disconnect_target is None
+    assert device._disconnect_retry_task is None
+    assert device._reconnect_task is None
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device.ensure_control_available()
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:
