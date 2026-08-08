@@ -17,13 +17,14 @@ reconnect. The coordinator delays ordinary disconnected availability for the
 existing ten-minute grace period, which is unsuitable for an actual
 connectivity diagnostic.
 
-Disabling a config entry unloads its platforms and calls `device.stop()`, which
-stops notifications and disconnects GATT. Disabling only an ordinary entity
-does not own the transport, so it cannot release GATT or prevent a background
-status update or reconnect. The one-way `_expected_disconnect` flag cannot
-represent a reversible suspension: setting it blocks future connections until
-the device object is recreated, while clearing it without a separate policy
-state could revive a terminally unloaded entry.
+Disabling a config entry now starts a reversible unload quiesce before platform
+teardown. The runtime blocks new leases, drains active work, and verifies GATT
+release while it is still nonterminal. Only a complete platform unload is
+followed by terminal stop and runtime removal. A failed platform unload restores
+the complete platform set and the latest desired runtime policy before the
+unload reports failure. Disabling only an ordinary entity does not own the
+transport, so it cannot release GATT or prevent a background status update or
+reconnect.
 
 ## 2. User-visible entities
 
@@ -168,7 +169,31 @@ pairing, and retains the session. In on-demand mode it leaves suspension and
 enters `ON_DEMAND_IDLE` without connecting. If the app still owns GATT, the
 runtime keeps the actual diagnostic off and uses only bounded retry behavior.
 
-## 11. Entity availability and state freshness
+## 11. Config-entry unload transaction
+
+Unload preparation is a reversible quiesce rather than terminal stop. It blocks
+new leases, waits for operation and response-drain ownership, lets any physical
+disconnect already in progress finish, and then verifies that GATT is released.
+An in-progress release is never cancelled merely to change its pending reason.
+
+If release fails while the client remains connected, rollback restarts
+notifications before the runtime is declared usable. FD50 devices retain the
+required BlueZ `use_start_notify` option. A notification restart failure is a
+mandatory setup-repair obligation: ordinary commands and reconnects remain
+blocked, and one release retry retains ownership until physical cleanup is
+verified. On-demand rollback likewise retains a physical-release owner when an
+idle disconnect was already in progress.
+
+Platforms unload as one recoverable set. If any platform does not unload, every
+platform is checked and missing platforms are restored directly through the
+Home Assistant entity component while the config entry is still in its unload
+transition. Restoration is retried and the failed unload does not return until
+the complete loaded set is present, preventing a loaded entry with missing or
+duplicate policy entities. Only a fully successful platform teardown makes the
+device terminally `STOPPED`; a failed transaction returns to the latest desired
+connection policy and a later clean unload can retry normally.
+
+## 12. Entity availability and state freshness
 
 The connectivity binary sensor and both policy entities are available whenever
 the config entry is loaded. The connectivity sensor reads the actual paired
@@ -184,7 +209,7 @@ cached value as current. Suspended ordinary entities are unavailable and their
 write paths reject before connecting or writing. Historical HA state is not
 treated as a current physical state.
 
-## 12. Config-entry Options Flow
+## 13. Config-entry Options Flow
 
 The Options Flow presents a menu with `Connection settings` and `Tuya
 credentials`. Connection settings contain only Connection Mode and Home
@@ -199,7 +224,7 @@ the same policy transition used by entities. It does not reload the complete
 entry merely to show or save the form. A listener applies options again
 idempotently after Home Assistant persists them.
 
-## 13. S1 safety
+## 14. S1 safety
 
 S1 Lock holds one lease around exactly one DP46 true action. S1 Unlock validates
 the complete device-scoped DP70/DP71 template before acquiring or writing,
@@ -208,7 +233,7 @@ and required response handling. No idle task or suspension transition can
 disconnect between DP70 and DP71. Missing or invalid templates perform zero
 BLE writes.
 
-## 14. V1 safety
+## 15. V1 safety
 
 V1 Lock holds one lease around exactly one product-specific DP46 true command
 and its correlated confirmation. V1 Unlock holds one lease around exactly one
@@ -217,7 +242,7 @@ sender-DPS response is accepted. An ambiguous transport error never schedules
 a replay, second lease-based retry, or delayed resend. DP33 remains Auto-Lock
 configuration and DP47 remains read-only; Open is not added.
 
-## 15. Unrelated-device compatibility
+## 16. Unrelated-device compatibility
 
 Only the exact S1 and V1 category/product pairs receive the new entities.
 Existing product and platform mappings remain additive. Default policy values
@@ -225,7 +250,7 @@ preserve the effective always-connected behavior for existing entries, while
 the common transport gates policy work without changing product-specific DP
 selection, S1 template provenance, or V1 at-most-once handling.
 
-## 16. Privacy
+## 17. Privacy
 
 Logs and translated errors use only the process-local opaque device log label
 and payload-free status text. They do not include complete addresses, device
@@ -233,7 +258,7 @@ IDs, UUIDs, keys, access material, passwords, raw DP values, S1 templates, V1
 values, packet bytes, decrypted frames, or foreign exception text. Diagnostic
 entities expose no transport identifiers or sensitive attributes.
 
-## 17. Deployment and hardware test plan
+## 18. Deployment and hardware test plan
 
 Before deployment, the exact reviewed feature head must be bound to a complete
 Home Assistant backup and a draft PR. The agent stops before any host access,
@@ -248,7 +273,7 @@ initially closed. The hardware matrix covers both modes, idle release,
 persistent suspension, app handoff, re-enable behavior, restart persistence,
 duplicate entities, and reauthentication.
 
-## 18. Rollback
+## 19. Rollback
 
 Rollback restores only the prior integration directory from the verified
 integration-only copy, then performs the owner-approved supported Core restart
@@ -257,7 +282,7 @@ options remain backward-compatible and are ignored by older integration code;
 the prior runtime therefore resumes its default always-connected behavior after
 rollback.
 
-## 19. Known limitations
+## 20. Known limitations
 
 On-demand mode cannot observe local device events while GATT is intentionally
 disconnected, so it is unsuitable for complete access-event monitoring or a

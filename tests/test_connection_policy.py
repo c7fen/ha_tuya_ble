@@ -11,6 +11,7 @@ from bleak.backends.device import BLEDevice
 from bleak_retry_connector import BleakError
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.vacuum import VacuumActivity
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity import EntityCategory
@@ -1349,11 +1350,13 @@ async def test_partial_platform_unload_restores_only_verified_unloads(
         loaded_platforms.remove(platform)
         return True
 
-    async def restore_platforms(_: object, platforms: list[object]) -> None:
-        for platform in platforms:
-            assert platform not in loaded_platforms
-            loaded_platforms.add(platform)
-            restored_platforms.append(platform)
+    async def restore_platform(_: object, __: object, platform: object) -> bool:
+        if platform in loaded_platforms:
+            return True
+        assert platform not in loaded_platforms
+        loaded_platforms.add(platform)
+        restored_platforms.append(platform)
+        return True
 
     with (
         patch.object(
@@ -1362,9 +1365,9 @@ async def test_partial_platform_unload_restores_only_verified_unloads(
             new=AsyncMock(side_effect=unload_platform),
         ),
         patch.object(
-            hass.config_entries,
-            "async_forward_entry_setups",
-            new=AsyncMock(side_effect=restore_platforms),
+            integration,
+            "_async_restore_platform_after_unload_failure",
+            new=AsyncMock(side_effect=restore_platform),
         ),
     ):
         assert (
@@ -1396,13 +1399,15 @@ async def test_platform_rollback_retries_one_failed_setup_without_duplicates(
         loaded_platforms.remove(platform)
         return True
 
-    async def restore_platforms(_: object, platforms: list[object]) -> None:
-        for platform in platforms:
-            setup_attempts[platform] = setup_attempts.get(platform, 0) + 1
-            if platform is setup_failure and setup_attempts[platform] == 1:
-                raise RuntimeError("synthetic")
-            assert platform not in loaded_platforms
-            loaded_platforms.add(platform)
+    async def restore_platform(_: object, __: object, platform: object) -> bool:
+        if platform in loaded_platforms:
+            return True
+        setup_attempts[platform] = setup_attempts.get(platform, 0) + 1
+        if platform is setup_failure and setup_attempts[platform] == 1:
+            raise RuntimeError("synthetic")
+        assert platform not in loaded_platforms
+        loaded_platforms.add(platform)
+        return True
 
     with (
         patch.object(
@@ -1411,9 +1416,9 @@ async def test_platform_rollback_retries_one_failed_setup_without_duplicates(
             new=AsyncMock(side_effect=unload_platform),
         ),
         patch.object(
-            hass.config_entries,
-            "async_forward_entry_setups",
-            new=AsyncMock(side_effect=restore_platforms),
+            integration,
+            "_async_restore_platform_after_unload_failure",
+            new=AsyncMock(side_effect=restore_platform),
         ),
     ):
         assert (
@@ -1428,6 +1433,60 @@ async def test_platform_rollback_retries_one_failed_setup_without_duplicates(
         for platform, attempts in setup_attempts.items()
         if platform is not setup_failure
     )
+
+
+async def test_platform_rollback_setup_works_while_entry_is_unloading(
+    hass: HomeAssistant,
+) -> None:
+    """Rollback bypasses forwarded-setup state rejection without duplication."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic unloading rollback")
+    entry.add_to_hass(hass)
+    object.__setattr__(
+        entry,
+        "state",
+        getattr(
+            ConfigEntryState,
+            "UNLOAD_IN_PROGRESS",
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        ),
+    )
+    platform = integration.PLATFORMS[0]
+    entity_component = Mock(_platforms={})
+
+    async def setup_entry(_: object, setup_entry: object) -> bool:
+        assert setup_entry is entry
+        assert entry.entry_id not in entity_component._platforms
+        entity_component._platforms[entry.entry_id] = object()
+        return True
+
+    component = Mock(async_setup_entry=AsyncMock(side_effect=setup_entry))
+    platform_integration = Mock(async_get_component=AsyncMock(return_value=component))
+
+    with (
+        patch.dict(hass.data, {platform.value: entity_component}),
+        patch.object(
+            integration.loader,
+            "async_get_loaded_integration",
+            return_value=platform_integration,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ) as forwarded_setup,
+    ):
+        assert (
+            await integration._async_restore_platform_after_unload_failure(
+                hass, entry, platform
+            )
+            is True
+        )
+
+    component.async_setup_entry.assert_awaited_once_with(hass, entry)
+    forwarded_setup.assert_not_awaited()
+    assert list(entity_component._platforms) == [entry.entry_id]
 
 
 async def test_suspension_does_not_interrupt_nested_existing_operation() -> None:

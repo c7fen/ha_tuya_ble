@@ -441,6 +441,8 @@ class TuyaBLEDevice:
         self._pending_release: PendingRelease | None = None
         self._policy_revision = 0
         self._disconnect_in_progress = False
+        self._disconnect_idle_event = asyncio.Event()
+        self._disconnect_idle_event.set()
         self._unload_quiescing = False
         self._idle_disconnect_task: asyncio.Task | None = None
         self._idle_disconnect_in_progress = False
@@ -866,6 +868,7 @@ class TuyaBLEDevice:
             ):
                 return
             self._disconnect_in_progress = True
+            self._disconnect_idle_event.clear()
             self._policy_state = ConnectionPolicyState.DISCONNECTING
 
         disconnect_failed = False
@@ -882,6 +885,7 @@ class TuyaBLEDevice:
         finally:
             async with self._policy_lock:
                 self._disconnect_in_progress = False
+                self._disconnect_idle_event.set()
                 request_current = self._pending_release is pending
                 if disconnect_failed and request_current:
                     self._schedule_disconnect_retry_locked()
@@ -953,13 +957,13 @@ class TuyaBLEDevice:
                 self._cancel_reconnect_locked()
                 self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
-                self._cancel_disconnect_retry_locked()
                 self._policy_state = ConnectionPolicyState.DISCONNECTING
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
                         self._lease_zero_event.wait(),
                         self._response_drain_zero_event.wait(),
+                        self._disconnect_idle_event.wait(),
                     ),
                     CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
                 )
@@ -967,6 +971,7 @@ class TuyaBLEDevice:
                 await self._cancel_unload_locked_transition()
                 return False
             await self._complete_pending_release()
+            await self._disconnect_idle_event.wait()
             if self.is_gatt_connected or self._active_lease_count:
                 await self._cancel_unload_locked_transition()
                 return False
@@ -981,9 +986,36 @@ class TuyaBLEDevice:
             ):
                 self._pending_release = None
                 self._cancel_disconnect_retry_locked()
-            self._unload_quiescing = False
             self._expected_disconnect = False
-        await self._restore_notifications_after_unload_failure()
+        notifications_restored = (
+            await self._restore_notifications_after_unload_failure()
+        )
+        async with self._policy_lock:
+            self._unload_quiescing = False
+            if not notifications_restored and self.is_gatt_connected:
+                self._pending_release = PendingRelease(
+                    PendingReleaseReason.SETUP_FAILURE,
+                    self._policy_revision,
+                )
+                self._cancel_reconnect_locked()
+                self._cancel_resend_locked()
+                self._cancel_idle_disconnect_locked()
+                self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
+                self._schedule_disconnect_retry_locked()
+                return
+            if (
+                self._ble_control_enabled
+                and self._connection_mode is ConnectionMode.ON_DEMAND
+                and self.is_connection_active
+                and not self._active_lease_count
+            ):
+                self._pending_release = PendingRelease(
+                    PendingReleaseReason.ON_DEMAND_IDLE,
+                    self._policy_revision,
+                )
+                self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+                self._schedule_disconnect_retry_locked()
+                return
         try:
             await self._apply_connection_policy()
         except TuyaBLEPolicyTransitionError:
@@ -998,16 +1030,13 @@ class TuyaBLEDevice:
         async with self._policy_transition_lock:
             await self._cancel_unload_locked_transition()
 
-    async def _restore_notifications_after_unload_failure(self) -> None:
-        """Best-effort restoration when GATT stayed connected during rollback."""
+    async def _restore_notifications_after_unload_failure(self) -> bool:
+        """Restore notifications or report that the live session needs repair."""
         client = self._client
-        if (
-            client is None
-            or not client.is_connected
-            or not self._is_paired
-            or not self._ble_control_enabled
-        ):
-            return
+        if client is None or not client.is_connected or not self._ble_control_enabled:
+            return True
+        if not self._is_paired:
+            return False
         try:
             notify_kwargs = (
                 {"bluez": {"use_start_notify": True}}
@@ -1019,11 +1048,13 @@ class TuyaBLEDevice:
                 self._notification_handler,
                 **notify_kwargs,
             )
+            return True
         except Exception:  # noqa: BLE001
-            _LOGGER.debug(
-                "%s: BLE notifications already active or unavailable after rollback",
+            _LOGGER.error(
+                "%s: BLE notification restoration failed during unload rollback",
                 self.log_identity,
             )
+            return False
 
     def _cancel_idle_disconnect_locked(self) -> None:
         if (
@@ -1604,7 +1635,6 @@ class TuyaBLEDevice:
             self._cancel_reconnect_locked()
             self._cancel_resend_locked()
             self._cancel_idle_disconnect_locked()
-            self._cancel_disconnect_retry_locked()
             for task in tuple(self._response_tasks):
                 task.cancel()
                 self._release_response_drain(task)
@@ -1614,7 +1644,10 @@ class TuyaBLEDevice:
                 self._startup_task = None
         try:
             await asyncio.wait_for(
-                self._lease_zero_event.wait(),
+                asyncio.gather(
+                    self._lease_zero_event.wait(),
+                    self._disconnect_idle_event.wait(),
+                ),
                 CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:

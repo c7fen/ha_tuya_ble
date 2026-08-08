@@ -8,6 +8,7 @@ from typing import Any
 
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
 from bleak_retry_connector import get_device
+from homeassistant import loader
 from homeassistant.components import bluetooth
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
@@ -55,6 +56,7 @@ _MOTOR_STATE_KEY = "lock_motor_state"
 _V1_CATEGORY = "ms"
 _V1_PRODUCT_ID = "7a4xvbtt"
 _V1_MANUAL_LOCK_KEY = "manual_lock"
+_PLATFORM_ROLLBACK_BACKOFF_SECONDS = 0.1
 
 
 def _registry_entry_subentry_id(registry_entry: er.RegistryEntry) -> str | None:
@@ -659,7 +661,7 @@ async def _async_unload_platforms_transactional(
     hass: HomeAssistant,
     entry: ConfigEntry,
 ) -> bool:
-    """Unload platforms and restore each verified successful unload on failure."""
+    """Unload every platform or wait until the complete loaded set is restored."""
     results = await asyncio.gather(
         *(
             hass.config_entries.async_forward_entry_unload(entry, platform)
@@ -670,16 +672,57 @@ async def _async_unload_platforms_transactional(
     if all(result is True for result in results):
         return True
 
-    unloaded = [
-        platform
-        for platform, result in zip(PLATFORMS, results, strict=True)
-        if result is True
-    ]
-    if unloaded:
+    pending = set(PLATFORMS)
+    while pending:
+        platforms = tuple(pending)
+        restored = await asyncio.gather(
+            *(
+                _async_restore_platform_after_unload_failure(hass, entry, platform)
+                for platform in platforms
+            ),
+            return_exceptions=True,
+        )
+        pending = {
+            platform
+            for platform, result in zip(platforms, restored, strict=True)
+            if result is not True
+        }
+        if pending:
+            _LOGGER.error(
+                "Tuya BLE platform rollback is incomplete; retrying restoration"
+            )
+            await asyncio.sleep(_PLATFORM_ROLLBACK_BACKOFF_SECONDS)
+    return False
+
+
+async def _async_restore_platform_after_unload_failure(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    platform: Platform,
+) -> bool:
+    """Restore one entity platform without requiring the entry to be LOADED."""
+    component_data = hass.data.get(platform.value)
+    loaded_platforms = getattr(component_data, "_platforms", {})
+    if entry.entry_id in loaded_platforms:
+        return True
+
+    integration = loader.async_get_loaded_integration(hass, platform.value)
+    component = await integration.async_get_component()
+    try:
+        restored = await component.async_setup_entry(hass, entry)
+    except Exception:  # noqa: BLE001
+        return False
+
+    component_data = hass.data.get(platform.value)
+    loaded_platforms = getattr(component_data, "_platforms", {})
+    if restored is True and entry.entry_id in loaded_platforms:
+        return True
+
+    if entry.entry_id in loaded_platforms:
         try:
-            await hass.config_entries.async_forward_entry_setups(entry, unloaded)
+            await component.async_unload_entry(hass, entry)
         except Exception:  # noqa: BLE001
-            _LOGGER.error("Failed to restore Tuya BLE platforms after unload failure")
+            return False
     return False
 
 
