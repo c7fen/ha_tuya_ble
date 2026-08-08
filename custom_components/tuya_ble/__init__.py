@@ -793,6 +793,6 @@ def _schedule_loaded_state_after_unload_rollback(
             hass.loop.call_soon(restore_loaded_state)
             return
         if entry.state is ConfigEntryState.FAILED_UNLOAD:
-            entry._async_set_state(hass, ConfigEntryState.LOADED, None)  # noqa: SLF001
+            entry._async_set_state(hass, ConfigEntryState.LOADED, None)
 
     hass.loop.call_soon(restore_loaded_state)
