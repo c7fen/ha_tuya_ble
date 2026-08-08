@@ -1807,6 +1807,97 @@ async def test_permanent_platform_rollback_failure_is_bounded(
     )
 
 
+async def test_initial_platform_unload_failure_is_bounded_and_cancels_children(
+    hass: HomeAssistant,
+) -> None:
+    """A platform that hangs before rollback cannot outlive the platform bound."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic initial unload timeout")
+    entry.add_to_hass(hass)
+    unload_started = 0
+    unload_cancelled = 0
+    all_started = asyncio.Event()
+
+    async def never_unload(*_: object) -> bool:
+        nonlocal unload_started, unload_cancelled
+        unload_started += 1
+        if unload_started == len(integration.PLATFORMS):
+            all_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            unload_cancelled += 1
+            raise
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_unload",
+            new=AsyncMock(side_effect=never_unload),
+        ),
+        patch.object(integration, "PLATFORM_ROLLBACK_TIMEOUT_SECONDS", 0.05),
+    ):
+        transaction = asyncio.create_task(
+            integration._async_unload_platforms_transactional(hass, entry)
+        )
+        await asyncio.wait_for(all_started.wait(), 0.2)
+        assert await asyncio.wait_for(transaction, 0.2) is (
+            integration._PlatformUnloadOutcome.RESTORATION_FAILED
+        )
+
+    assert unload_started == len(integration.PLATFORMS)
+    assert unload_cancelled == len(integration.PLATFORMS)
+    assert transaction.done()
+
+
+async def test_stalled_notification_rollback_cannot_extend_unload_cancellation(
+    hass: HomeAssistant,
+) -> None:
+    """The outer entry deadline cancels stalled notification restoration."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, title="Synthetic notification timeout")
+    entry.add_to_hass(hass)
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    notification_restore_started = asyncio.Event()
+    notification_restore_cancelled = asyncio.Event()
+
+    async def never_restore(*_: object, **__: object) -> None:
+        notification_restore_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            notification_restore_cancelled.set()
+            raise
+
+    client.start_notify.side_effect = never_restore
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    data = _make_data(hass, device)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = data
+
+    with patch.object(integration, "ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS", 0.05):
+        unload = asyncio.create_task(integration.async_unload_entry(hass, entry))
+        await asyncio.wait_for(notification_restore_started.wait(), 0.2)
+        unload.cancel()
+        assert await asyncio.wait_for(unload, 0.2) is False
+
+    assert notification_restore_cancelled.is_set()
+    assert device._unload_quiescing is False
+    assert device.is_connection_active is False
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+    assert device._disconnect_retry_task is not None
+    assert device._reconnect_task is None
+    assert hass.data[DOMAIN][entry.entry_id] is data
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
 def _prepare_loaded_entry_for_unload(
     hass: HomeAssistant,
     title: str,
@@ -1951,7 +2042,65 @@ async def test_later_unload_recovers_after_restart_state_recovery(
     assert hass.data[DOMAIN][entry.entry_id] is data
 
     # FAILED_UNLOAD is deliberately non-recoverable in HA 2025.1; a restart
-    # reconstructs the retained runtime as loaded before a later unload retry.
+    # reconstructs platform state and the retained runtime before a later retry.
+    recovered_components: dict[str, Mock] = {}
+    recovered_platform_data: dict[str, Mock] = {}
+    for platform in (integration.Platform.SELECT, integration.Platform.SWITCH):
+        platform_data = Mock(_platforms={entry.entry_id: Mock(_setup_complete=False)})
+
+        async def unload_stale(
+            _: object,
+            unload_entry: object,
+            *,
+            component_data: Mock = platform_data,
+        ) -> bool:
+            assert unload_entry is entry
+            component_data._platforms.pop(entry.entry_id)
+            return True
+
+        async def setup_recovered(
+            _: object,
+            setup_entry: object,
+            *,
+            component_data: Mock = platform_data,
+        ) -> bool:
+            assert setup_entry is entry
+            assert entry.entry_id not in component_data._platforms
+            component_data._platforms[entry.entry_id] = Mock(_setup_complete=True)
+            return True
+
+        recovered_platform_data[platform.value] = platform_data
+        recovered_components[platform.value] = Mock(
+            async_unload_entry=AsyncMock(side_effect=unload_stale),
+            async_setup_entry=AsyncMock(side_effect=setup_recovered),
+        )
+
+    def loaded_platform_integration(_: object, domain: str) -> Mock:
+        return Mock(
+            async_get_component=AsyncMock(return_value=recovered_components[domain])
+        )
+
+    with (
+        patch.dict(hass.data, recovered_platform_data),
+        patch.object(
+            integration.loader,
+            "async_get_loaded_integration",
+            side_effect=loaded_platform_integration,
+        ),
+    ):
+        for platform in (integration.Platform.SELECT, integration.Platform.SWITCH):
+            assert await integration._async_restore_platform_after_unload_failure(
+                hass, entry, platform
+            )
+
+    for platform in (integration.Platform.SELECT, integration.Platform.SWITCH):
+        platform_data = recovered_platform_data[platform.value]
+        component = recovered_components[platform.value]
+        assert list(platform_data._platforms) == [entry.entry_id]
+        assert platform_data._platforms[entry.entry_id]._setup_complete is True
+        component.async_unload_entry.assert_awaited_once_with(hass, entry)
+        component.async_setup_entry.assert_awaited_once_with(hass, entry)
+
     entry._async_set_state(hass, ConfigEntryState.LOADED, None)
     with patch.object(
         hass.config_entries,

@@ -1072,6 +1072,49 @@ class TuyaBLEDevice:
         async with self._policy_transition_lock:
             await self._cancel_unload_locked_transition()
 
+    def abort_unload_transaction(self) -> None:
+        """Leave a timed-out unload fail-closed without awaiting more I/O."""
+        self._unload_quiescing = False
+        self._expected_disconnect = False
+        self._cancel_reconnect_locked()
+        self._cancel_resend_locked()
+        self._cancel_idle_disconnect_locked()
+
+        if self._terminal_stopped:
+            self._policy_state = ConnectionPolicyState.STOPPED
+            if self.is_gatt_connected:
+                self._notifications_active = False
+                self._pending_release = PendingRelease(
+                    PendingReleaseReason.STOP,
+                    self._policy_revision,
+                    terminal=True,
+                )
+                self._schedule_disconnect_retry_locked()
+            return
+
+        if self.is_gatt_connected:
+            self._notifications_active = False
+            self._pending_release = PendingRelease(
+                PendingReleaseReason.SETUP_FAILURE,
+                self._policy_revision,
+            )
+            self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
+            self._schedule_disconnect_retry_locked()
+            return
+
+        if self._pending_release is not None and (
+            self._pending_release.reason is PendingReleaseReason.UNLOAD
+        ):
+            self._pending_release = None
+        self._cancel_disconnect_retry_locked()
+        if not self._ble_control_enabled:
+            self._policy_state = ConnectionPolicyState.SUSPENDED
+        elif self._connection_mode is ConnectionMode.ON_DEMAND:
+            self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+        else:
+            self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+            self._schedule_reconnect_locked(0)
+
     async def _restore_notifications_after_unload_failure(self) -> bool:
         """Restore notifications or report that the live session needs repair."""
         client = self._client

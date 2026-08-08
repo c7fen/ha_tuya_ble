@@ -204,12 +204,20 @@ blocked, and one release retry retains ownership until physical cleanup is
 verified. On-demand rollback likewise retains a physical-release owner when an
 idle disconnect was already in progress.
 
-Platforms unload as one recoverable set. If any platform does not unload, every
-platform is checked and missing platforms are restored directly through the
-Home Assistant entity component while the config entry is still in its unload
-transition. Restoration has an explicit attempt limit, total timeout, and
-backoff. Cancellation is deferred only until that bounded transaction reaches
-success or exhaustion.
+Platforms unload as one recoverable set. The same platform deadline covers the
+initial parallel unload calls as well as restoration, so a platform that hangs
+before rollback begins is cancelled with its siblings. If any platform does not
+unload, every platform is checked and missing platforms are restored directly
+through the Home Assistant entity component while the config entry is still in
+its unload transition. Restoration also has an explicit attempt limit and
+backoff.
+
+The complete shielded entry transaction has a separate outer deadline covering
+GATT quiesce, notification rollback, platform work, and terminal cleanup.
+Cancellation is deferred only until that deadline. If it expires, in-flight
+children are cancelled, the runtime remains owned, a connected session becomes
+notification-unready mandatory repair with one release owner, and the entry is
+reported as `FAILED_UNLOAD` instead of leaving unload or shutdown waiting.
 
 Complete restoration is verified from every expected entity platform's
 setup-complete marker before the entry is returned to `LOADED`. If restoration

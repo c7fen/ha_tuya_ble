@@ -28,6 +28,7 @@ from .const import (
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
     DOMAIN,
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
@@ -60,6 +61,11 @@ _V1_MANUAL_LOCK_KEY = "manual_lock"
 PLATFORM_ROLLBACK_MAX_ATTEMPTS = 3
 PLATFORM_ROLLBACK_TIMEOUT_SECONDS = 2.0
 PLATFORM_ROLLBACK_BACKOFF_SECONDS = 0.1
+ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS = (
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS
+    + PLATFORM_ROLLBACK_TIMEOUT_SECONDS
+    + 1.0
+)
 
 
 class _PlatformUnloadOutcome(StrEnum):
@@ -681,19 +687,19 @@ async def _async_unload_platforms_transactional(
     entry: ConfigEntry,
 ) -> _PlatformUnloadOutcome:
     """Unload every platform or make a bounded attempt to restore the full set."""
-    results = await asyncio.gather(
-        *(
-            hass.config_entries.async_forward_entry_unload(entry, platform)
-            for platform in PLATFORMS
-        ),
-        return_exceptions=True,
-    )
-    if all(result is True for result in results):
-        return _PlatformUnloadOutcome.UNLOADED
-
-    pending = set(PLATFORMS)
     try:
         async with asyncio.timeout(PLATFORM_ROLLBACK_TIMEOUT_SECONDS):
+            results = await asyncio.gather(
+                *(
+                    hass.config_entries.async_forward_entry_unload(entry, platform)
+                    for platform in PLATFORMS
+                ),
+                return_exceptions=True,
+            )
+            if all(result is True for result in results):
+                return _PlatformUnloadOutcome.UNLOADED
+
+            pending = set(PLATFORMS)
             for attempt in range(1, PLATFORM_ROLLBACK_MAX_ATTEMPTS + 1):
                 platforms = tuple(pending)
                 restored = await asyncio.gather(
@@ -783,7 +789,9 @@ async def _async_restore_platform_after_unload_failure(
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry without exposing an inconsistent cancellation point."""
-    transaction = asyncio.create_task(_async_unload_entry_transaction(hass, entry))
+    transaction = asyncio.create_task(
+        _async_bounded_unload_entry_transaction(hass, entry)
+    )
     cancellation_deferred = False
     while True:
         try:
@@ -809,6 +817,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     elif outcome is _EntryUnloadOutcome.RESTORATION_FAILED:
         _schedule_failed_unload_state_after_rollback_exhaustion(hass, entry)
     return outcome is _EntryUnloadOutcome.UNLOADED
+
+
+async def _async_bounded_unload_entry_transaction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> _EntryUnloadOutcome:
+    """Run the complete shielded consistency transaction within one deadline."""
+    data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    try:
+        async with asyncio.timeout(ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS):
+            return await _async_unload_entry_transaction(hass, entry)
+    except TimeoutError:
+        _LOGGER.error("Tuya BLE entry unload transaction reached its time limit")
+        data.device.abort_unload_transaction()
+        return _EntryUnloadOutcome.RESTORATION_FAILED
 
 
 async def _async_unload_entry_transaction(
