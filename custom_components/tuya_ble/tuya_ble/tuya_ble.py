@@ -854,6 +854,9 @@ class TuyaBLEDevice:
                     ):
                         self._suspension_requested = False
                         reconcile_policy = True
+                    elif target is ConnectionPolicyState.ON_DEMAND_IDLE:
+                        self._suspension_requested = False
+                        self._policy_state = target
                     else:
                         self._suspension_requested = True
                         self._policy_state = target
@@ -955,6 +958,18 @@ class TuyaBLEDevice:
                 "%s: On-demand idle disconnect failed",
                 self.log_identity,
             )
+            async with self._policy_lock:
+                if (
+                    self._connection_mode is ConnectionMode.ON_DEMAND
+                    and self._ble_control_enabled
+                    and not self._terminal_stopped
+                    and self.is_gatt_connected
+                ):
+                    self._pending_disconnect_target = (
+                        ConnectionPolicyState.ON_DEMAND_IDLE
+                    )
+                    self._pending_disconnect_revision = self._policy_revision
+                    self._schedule_disconnect_retry_locked()
         finally:
             if self._idle_disconnect_task is current_task:
                 self._idle_disconnect_task = None
@@ -1584,6 +1599,8 @@ class TuyaBLEDevice:
                 raise TuyaBLEConnectionUnavailableError()
             try:
                 async with global_connect_lock:
+                    if self._terminal_stopped:
+                        raise TuyaBLEConnectionUnavailableError()
                     _LOGGER.debug(
                         "%s: Connecting; RSSI: %s",
                         self.log_identity,
@@ -1622,6 +1639,12 @@ class TuyaBLEDevice:
 
             if not client or not client.is_connected:
                 raise BleakNotFoundError()
+            if self._terminal_stopped:
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise TuyaBLEConnectionUnavailableError()
             _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
             self._client = client
             self._physical_connection_active = True

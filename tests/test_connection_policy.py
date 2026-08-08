@@ -265,6 +265,30 @@ async def test_new_lease_cancels_idle_disconnect() -> None:
     await device.stop()
 
 
+async def test_idle_disconnect_failure_stays_pending_for_retry() -> None:
+    """A live client remains owned and retryable after an idle release failure."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    lease = device.connection_lease("idle operation", defer_connection=True)
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS",
+        0.01,
+    ):
+        await lease.__aenter__()
+        await lease.__aexit__(None, None, None)
+        await asyncio.sleep(0.02)
+
+    assert device._client is client
+    assert device._pending_disconnect_target is ConnectionPolicyState.ON_DEMAND_IDLE
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
 async def test_lease_cancellation_and_exception_release_count() -> None:
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
     device._ensure_connected = AsyncMock()
