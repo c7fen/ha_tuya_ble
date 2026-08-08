@@ -888,6 +888,10 @@ class TuyaBLEDevice:
                 self._disconnect_idle_event.set()
                 request_current = self._pending_release is pending
                 if disconnect_failed and request_current:
+                    if pending.reason is PendingReleaseReason.STOP:
+                        self._policy_state = ConnectionPolicyState.STOPPED
+                    elif pending.reason is PendingReleaseReason.SETUP_FAILURE:
+                        self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
                     self._schedule_disconnect_retry_locked()
                 elif request_current:
                     self._pending_release = None
@@ -992,6 +996,20 @@ class TuyaBLEDevice:
         )
         async with self._policy_lock:
             self._unload_quiescing = False
+            if self._terminal_stopped:
+                self._policy_state = ConnectionPolicyState.STOPPED
+                if self.is_gatt_connected:
+                    if (
+                        self._pending_release is None
+                        or self._pending_release.reason is not PendingReleaseReason.STOP
+                    ):
+                        self._pending_release = PendingRelease(
+                            PendingReleaseReason.STOP,
+                            self._policy_revision,
+                            terminal=True,
+                        )
+                    self._schedule_disconnect_retry_locked()
+                return
             if not notifications_restored and self.is_gatt_connected:
                 self._pending_release = PendingRelease(
                     PendingReleaseReason.SETUP_FAILURE,
