@@ -141,6 +141,7 @@ async def test_shutdown_write_keeps_a_connected_client_under_release_ownership(
 
     client.disconnect.assert_awaited_once()
     assert client.is_connected is False
+    device._schedule_reconnect_locked.assert_called_once_with(0)
 
 
 async def test_shutdown_write_marks_an_already_disconnected_client_lost(
@@ -173,7 +174,7 @@ async def test_shutdown_write_marks_an_already_disconnected_client_lost(
     device._is_paired = True
     device._physical_connection_active = True
     device._notifications_active = True
-    device._schedule_reconnect = Mock()
+    device._schedule_reconnect_locked = Mock()
 
     async with device.connection_lease(
         "synthetic shutdown loss", defer_connection=True
@@ -185,4 +186,4 @@ async def test_shutdown_write_marks_an_already_disconnected_client_lost(
     assert device.is_gatt_connected is False
     assert device._pending_release is None
     assert not hasattr(device, "_deferred_resend_packets")
-    device._schedule_reconnect.assert_not_called()
+    device._schedule_reconnect_locked.assert_called_once_with(0)

@@ -2472,6 +2472,215 @@ async def test_actual_write_loss_marks_the_current_client_disconnected_once() ->
     assert device._pending_release is None
 
 
+async def test_no_replay_verified_loss_recovers_one_future_always_session() -> None:
+    """A no-replay write failure still restores the future Always session."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic no-replay physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._state_data_fresh = True
+    device._protocol_version = 3
+    device._build_packets = Mock(return_value=[b"synthetic-no-replay-fragment"])
+    device._schedule_reconnect_locked = Mock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+    device.datapoints.get_or_create(42, TuyaBLEDataPointType.DT_BOOL, True)
+
+    with pytest.raises(BleakError, match="synthetic no-replay physical loss"):
+        await device._send_datapoints_no_replay([42])
+
+    assert client.write_gatt_char.await_count == 1
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    assert device._pending_release is None
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+    device._disconnected(client)
+
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+
+
+async def test_callback_before_no_replay_write_error_recovers_only_once() -> None:
+    """Callback-first physical loss and later write failure share one recovery."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection_then_callback(*_: object) -> None:
+        client.is_connected = False
+        device._disconnected(client)
+        raise BleakError("synthetic callback-first physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection_then_callback
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._protocol_version = 3
+    device._build_packets = Mock(return_value=[b"synthetic-callback-first-fragment"])
+    device._schedule_reconnect_locked = Mock()
+    device._reconnect = AsyncMock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+    device.datapoints.get_or_create(42, TuyaBLEDataPointType.DT_BOOL, True)
+
+    with pytest.raises(BleakError, match="synthetic callback-first physical loss"):
+        await device._send_datapoints_no_replay([42])
+
+    assert client.write_gatt_char.await_count == 1
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+
+async def test_verified_loss_enters_on_demand_idle_without_an_idle_timer() -> None:
+    """A lost On-demand client is idle, not active or pending an idle release."""
+    device = _make_device(mode=ConnectionMode.ON_DEMAND)
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic on-demand physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._protocol_version = 3
+    device._build_packets = Mock(return_value=[b"synthetic-on-demand-fragment"])
+    device._schedule_reconnect_locked = Mock()
+    device.datapoints.get_or_create(42, TuyaBLEDataPointType.DT_BOOL, True)
+
+    try:
+        with pytest.raises(BleakError, match="synthetic on-demand physical loss"):
+            await device._send_datapoints_no_replay([42])
+
+        assert device._client is None
+        assert device.policy_state is ConnectionPolicyState.ON_DEMAND_IDLE
+        assert device._idle_disconnect_task is None
+        device._schedule_reconnect_locked.assert_not_called()
+    finally:
+        if device._idle_disconnect_task is not None:
+            device._idle_disconnect_task.cancel()
+            await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("suspended", "stopped", "unload"),
+)
+async def test_verified_loss_respects_non_reconnecting_runtime_ownership(
+    variant: str,
+) -> None:
+    """Verified loss never supersedes suspension, stop, or unload ownership."""
+    device = _make_device(enabled=variant != "suspended")
+    client = _SyntheticConnectedClient()
+    client.is_connected = False
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._schedule_reconnect_locked = Mock()
+
+    if variant == "stopped":
+        device._terminal_stopped = True
+        device._suspension_requested = True
+        device._policy_state = ConnectionPolicyState.STOPPED
+        expected_state = ConnectionPolicyState.STOPPED
+    elif variant == "unload":
+        device._unload_quiescing = True
+        expected_state = ConnectionPolicyState.DISCONNECTING
+    else:
+        expected_state = ConnectionPolicyState.SUSPENDED
+
+    await device._record_write_transport_failure(client)
+
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.policy_state is expected_state
+    assert device._pending_release is None
+    device._schedule_reconnect_locked.assert_not_called()
+
+
+async def test_protocol_response_verified_loss_recovers_without_response_replay() -> (
+    None
+):
+    """A failed response leaves no response state but restores future traffic."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic response physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._build_packets = Mock(return_value=[b"synthetic-response-fragment"])
+    device._schedule_reconnect_locked = Mock()
+
+    with pytest.raises(BleakError, match="synthetic response physical loss"):
+        await device._send_response(TuyaBLECode.FUN_RECEIVE_DP, b"", 7)
+
+    assert client.write_gatt_char.await_count == 1
+    assert device._client is None
+    assert device._input_expected_responses == {}
+    assert device._input_expected_response_codes == {}
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+
+async def test_generic_verified_loss_recovers_without_packet_replay() -> None:
+    """Generic write loss schedules one future session without replaying bytes."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic generic physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._reconnect = AsyncMock()
+
+    async with device.connection_lease(
+        "synthetic generic physical loss", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic generic physical loss"):
+            await device._send_packets_locked([b"synthetic-generic-fragment"])
+
+    await asyncio.sleep(0)
+
+    assert client.write_gatt_char.await_count == 1
+    assert device._reconnect.await_count == 1
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+
 async def test_session_failure_hides_cached_s1_lock_state_until_new_data_arrives(
     hass: HomeAssistant,
 ) -> None:

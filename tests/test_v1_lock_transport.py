@@ -31,6 +31,7 @@ from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDataPointType,
     TuyaBLEDevice,
 )
+from custom_components.tuya_ble.const import ConnectionPolicyState
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLECommandUnconfirmedError,
@@ -443,9 +444,7 @@ async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
     device._schedule_reconnect_locked = Mock()
 
     async def send_once(_: list[int]) -> None:
-        await device._send_packets_locked(
-            [b"synthetic-v1-command"], resend_on_error=False
-        )
+        await device._send_packets_locked([b"synthetic-v1-command"])
 
     device._send_datapoints_once = send_once
 
@@ -458,8 +457,57 @@ async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
     assert client.disconnect.await_count == 1
 
 
-async def test_generic_transport_reconnects_without_replaying_packet_bytes() -> None:
-    """Generic transport recovery never reuses encrypted packet fragments."""
+@pytest.mark.parametrize("operation", ("lock", "unlock"))
+async def test_v1_verified_loss_recovers_future_session_without_replay(
+    hass: HomeAssistant,
+    operation: str,
+) -> None:
+    """A V1 at-most-once command still restores the next Always session."""
+    entity, device = _make_entity(hass)
+    del device._send_datapoints_once
+    client = Mock()
+    client.is_connected = True
+    client.stop_notify = AsyncMock()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic V1 physical loss")
+
+    client.write_gatt_char = AsyncMock(side_effect=lose_connection)
+    client.disconnect = AsyncMock()
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._build_packets = Mock(return_value=[b"synthetic-v1-command"])
+    device._disconnected_callbacks.clear()
+    device._schedule_reconnect_locked = Mock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    with pytest.raises(BleakError, match="physical loss"):
+        await getattr(entity, f"async_{operation}")()
+
+    assert client.write_gatt_char.await_count == 1
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    assert device._pending_release is None
+    assert entity.is_locking is False
+    assert entity.is_unlocking is False
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+    device._disconnected(client)
+
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+
+
+async def test_unverified_generic_transport_error_does_not_schedule_recovery() -> None:
+    """Recovery remains reserved for a verified physical transport loss."""
     device = _make_device()
     packets = [b"synthetic-fragment"]
     device._is_paired = True
@@ -471,7 +519,7 @@ async def test_generic_transport_reconnects_without_replaying_packet_bytes() -> 
     with pytest.raises(BleakError, match="synthetic generic transport error"):
         await device._send_packets_locked(packets)
 
-    device._schedule_reconnect.assert_called_once_with()
+    device._schedule_reconnect.assert_not_called()
     assert not hasattr(device, "_deferred_resend_packets")
     assert not hasattr(device, "_resend_task")
 

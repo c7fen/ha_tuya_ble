@@ -21,6 +21,7 @@ from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
     TuyaBLEProductInfo,
 )
+from custom_components.tuya_ble.const import ConnectionPolicyState
 from custom_components.tuya_ble.lock import (
     S1_DP_LOCK,
     S1_DP_UNLOCK_CONFIRM,
@@ -642,6 +643,75 @@ async def test_s1_ambiguous_write_never_defers_or_replays_a_command(
     await device._reconnect()
 
     replacement.write_gatt_char.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_attempts"),
+    (("lock", 1), ("unlock_dp70", 1), ("unlock_dp71", 2)),
+)
+async def test_s1_verified_loss_recovers_future_session_without_replay(
+    hass: HomeAssistant,
+    operation: str,
+    expected_attempts: int,
+) -> None:
+    """S1 no-replay commands still recover the next Always-connected session."""
+    entity, device, client = _make_transport_entity(hass, None)
+
+    write_attempts = 0
+
+    async def lose_connection_on_final_attempt(*_: object) -> None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_attempts == expected_attempts:
+            client.is_connected = False
+            raise BleakError("synthetic S1 physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection_on_final_attempt
+
+    if operation == "lock":
+        command = entity.async_lock
+        sleep_patch = None
+    else:
+        command = entity.async_unlock
+        sleep_patch = patch(
+            "custom_components.tuya_ble.lock.asyncio.sleep", new=AsyncMock()
+        )
+    timeout_patch = patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.RESPONSE_WAIT_TIMEOUT", 0
+    )
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    if sleep_patch is None:
+        with (
+            timeout_patch,
+            pytest.raises(BleakError, match="physical loss"),
+        ):
+            await command()
+    else:
+        with (
+            sleep_patch,
+            timeout_patch,
+            pytest.raises(BleakError, match="physical loss"),
+        ):
+            await command()
+
+    assert client.write_gatt_char.await_count == expected_attempts
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert device.policy_state is ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+    assert device._pending_release is None
+    assert entity.is_locking is False
+    assert entity.is_unlocking is False
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+    device._disconnected(client)
+
+    assert state_changes == [False]
+    device._schedule_reconnect_locked.assert_called_once_with(0)
 
 
 async def test_s1_unlock_does_not_log_templates(

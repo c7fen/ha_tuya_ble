@@ -887,8 +887,15 @@ class TuyaBLEDevice:
                 and not self._suspension_requested
                 and not self._terminal_stopped
             ):
-                self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
-                self._schedule_idle_disconnect_locked()
+                if (
+                    self.is_connection_active
+                    or self._policy_state is not ConnectionPolicyState.ON_DEMAND_IDLE
+                ):
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
+                    self._schedule_idle_disconnect_locked()
+                else:
+                    self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+                    self._cancel_idle_disconnect_locked()
         if pending_disconnect:
             await self._complete_pending_release()
 
@@ -1773,6 +1780,43 @@ class TuyaBLEDevice:
             self._fire_disconnected_callbacks()
             self._fire_connection_state_callbacks(False)
 
+    def _reconcile_after_verified_transport_loss(self) -> None:
+        """Restore only the policy-owned future session after a physical loss."""
+        pending = self._pending_release
+        if (
+            pending is not None
+            and pending.reason is PendingReleaseReason.SESSION_FAILURE
+            and not self._disconnect_in_progress
+        ):
+            self._pending_release = None
+            self._cancel_disconnect_retry_locked()
+
+        if self._terminal_stopped:
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+            self._policy_state = ConnectionPolicyState.STOPPED
+            return
+        if self._unload_quiescing:
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+            self._policy_state = ConnectionPolicyState.DISCONNECTING
+            return
+        if not self._ble_control_enabled or self._suspension_requested:
+            self._suspension_requested = True
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+            self._policy_state = ConnectionPolicyState.SUSPENDED
+            return
+        if self._connection_mode is ConnectionMode.ON_DEMAND:
+            self._cancel_reconnect_locked()
+            self._cancel_idle_disconnect_locked()
+            self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+            return
+
+        self._cancel_idle_disconnect_locked()
+        self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_CONNECTING
+        self._schedule_reconnect_locked(0)
+
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
         if client is not self._client:
@@ -1801,7 +1845,7 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-            self._schedule_reconnect()
+            self._reconcile_after_verified_transport_loss()
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -2208,7 +2252,6 @@ class TuyaBLEDevice:
         code: TuyaBLECode,
         data: bytes,
         wait_for_response: bool = True,
-        resend_on_error: bool = True,
         # retry: int | None = None,
     ) -> None:
         """Send packet to device and optional read response."""
@@ -2218,7 +2261,6 @@ class TuyaBLEDevice:
                 data,
                 0,
                 wait_for_response,
-                resend_on_error=resend_on_error,
             )
 
     async def _send_packet_once_confirmed(
@@ -2239,7 +2281,6 @@ class TuyaBLEDevice:
                 data,
                 0,
                 True,
-                resend_on_error=False,
                 expected_response_code=code,
             )
             if not confirmed:
@@ -2258,7 +2299,7 @@ class TuyaBLEDevice:
             if _lease_context_depth(self) > 0:
                 if self._client and self._client.is_connected:
                     await self._send_packet_while_connected(
-                        code, data, response_to, False, resend_on_error=False
+                        code, data, response_to, False
                     )
             else:
                 async with self.connection_lease(
@@ -2266,7 +2307,7 @@ class TuyaBLEDevice:
                 ):
                     if self._client and self._client.is_connected:
                         await self._send_packet_while_connected(
-                            code, data, response_to, False, resend_on_error=False
+                            code, data, response_to, False
                         )
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
@@ -2277,7 +2318,6 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
         wait_for_response: bool,
-        resend_on_error: bool = True,
         expected_response_code: TuyaBLECode | None = None,
         # retry: int | None = None
     ) -> bool:
@@ -2308,9 +2348,7 @@ class TuyaBLEDevice:
             )
         try:
             packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-            await self._int_send_packet_while_connected(
-                packets, resend_on_error=resend_on_error
-            )
+            await self._int_send_packet_while_connected(packets)
             if future:
                 try:
                     await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
@@ -2331,7 +2369,6 @@ class TuyaBLEDevice:
     async def _int_send_packet_while_connected(
         self,
         packets: list[bytes],
-        resend_on_error: bool = True,
     ) -> None:
         if self._operation_lock.locked():
             _LOGGER.debug(
@@ -2342,9 +2379,7 @@ class TuyaBLEDevice:
             )
         async with self._operation_lock:
             try:
-                await self._send_packets_locked(
-                    packets, resend_on_error=resend_on_error
-                )
+                await self._send_packets_locked(packets)
             except BleakNotFoundError:
                 _LOGGER.error(
                     "%s: device not found, no longer in range, or poor RSSI: %s",
@@ -2359,9 +2394,7 @@ class TuyaBLEDevice:
                 )
                 raise
 
-    async def _send_packets_locked(
-        self, packets: list[bytes], resend_on_error: bool = True
-    ) -> None:
+    async def _send_packets_locked(self, packets: list[bytes]) -> None:
         """Send command to device and read response."""
         self.ensure_control_available()
         try:
@@ -2378,11 +2411,6 @@ class TuyaBLEDevice:
                 self.rssi,
                 BLEAK_BACKOFF_TIME,
             )
-            if (
-                self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
-                and resend_on_error
-            ):
-                self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
         except BleakError as ex:
             if "Bluetooth is already shutdown" in str(ex):
@@ -2394,11 +2422,6 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-            if (
-                self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
-                and resend_on_error
-            ):
-                self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
 
     async def _record_write_transport_failure(
@@ -2411,6 +2434,7 @@ class TuyaBLEDevice:
             if not client.is_connected:
                 self._client = None
                 self._mark_connection_lost()
+                self._reconcile_after_verified_transport_loss()
                 return
             self._notifications_active = False
             self._state_data_fresh = False
@@ -2876,24 +2900,17 @@ class TuyaBLEDevice:
 
         return bytes(data)
 
-    async def _send_datapoints_v3(
-        self, datapoint_ids: list[int], *, resend_on_error: bool = True
-    ) -> None:
+    async def _send_datapoints_v3(self, datapoint_ids: list[int]) -> None:
         """Send new values using the protocol-v3 DP command."""
         data = self._encode_datapoints(datapoint_ids, 1)
-        if resend_on_error:
-            await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
-        else:
-            await self._send_packet(
-                TuyaBLECode.FUN_SENDER_DPS, data, resend_on_error=False
-            )
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
 
     async def _send_datapoints_no_replay(self, datapoint_ids: list[int]) -> None:
         """Send one datapoint update without retaining packet bytes for replay."""
         if self._protocol_version == 3:
-            await self._send_datapoints_v3(datapoint_ids, resend_on_error=False)
+            await self._send_datapoints_v3(datapoint_ids)
         elif self._protocol_version >= 4:
-            await self._send_datapoints_v4(datapoint_ids, resend_on_error=False)
+            await self._send_datapoints_v4(datapoint_ids)
         else:
             raise TuyaBLEDeviceError(0)
 
@@ -2904,19 +2921,12 @@ class TuyaBLEDevice:
         data = self._encode_datapoints(datapoint_ids, 1)
         await self._send_packet_once_confirmed(TuyaBLECode.FUN_SENDER_DPS, data)
 
-    async def _send_datapoints_v4(
-        self, datapoint_ids: list[int], *, resend_on_error: bool = True
-    ) -> None:
+    async def _send_datapoints_v4(self, datapoint_ids: list[int]) -> None:
         """Send new values using the protocol-v4 DP command."""
         dp_seq_num = await self._get_seq_num()
         data = pack(">BI", 0, dp_seq_num)
         data += self._encode_datapoints(datapoint_ids, 2)
-        if resend_on_error:
-            await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data)
-        else:
-            await self._send_packet(
-                TuyaBLECode.FUN_SENDER_DPS_V4, data, resend_on_error=False
-            )
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data)
 
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
