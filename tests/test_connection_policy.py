@@ -2107,6 +2107,10 @@ async def test_cancelled_home_assistant_unload_finishes_runtime_rollback(
     rollback_started = asyncio.Event()
     allow_rollback = asyncio.Event()
     transaction_calls = 0
+    restored_platforms = {
+        platform.value: Mock(_platforms={entry.entry_id: Mock(_setup_complete=True)})
+        for platform in integration.PLATFORMS
+    }
 
     async def platform_transaction(*_: object) -> integration._PlatformUnloadOutcome:
         nonlocal transaction_calls
@@ -2117,10 +2121,13 @@ async def test_cancelled_home_assistant_unload_finishes_runtime_rollback(
             return integration._PlatformUnloadOutcome.RESTORED
         return integration._PlatformUnloadOutcome.UNLOADED
 
-    with patch.object(
-        integration,
-        "_async_unload_platforms_transactional",
-        new=AsyncMock(side_effect=platform_transaction),
+    with (
+        patch.dict(hass.data, restored_platforms),
+        patch.object(
+            integration,
+            "_async_unload_platforms_transactional",
+            new=AsyncMock(side_effect=platform_transaction),
+        ),
     ):
         unload = asyncio.create_task(hass.config_entries.async_unload(entry.entry_id))
         await asyncio.wait_for(rollback_started.wait(), 2)
