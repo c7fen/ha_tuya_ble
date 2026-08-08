@@ -290,6 +290,12 @@ class TuyaBLEDataPoints:
         """Last data received"""
         return self._last_data_received
 
+    def _clear_session_receipt_provenance(self) -> None:
+        """Forget inbound provenance that belongs to a disconnected session."""
+        self._last_data_received = None
+        for datapoint in self._datapoints.values():
+            datapoint._received_from_device = False
+
     def has_id(self, id: int, type: TuyaBLEDataPointType | None = None) -> bool:
         return (id in self._datapoints) and (
             (type is None) or (self._datapoints[id].type == type)
@@ -471,6 +477,11 @@ class TuyaBLEDevice:
         self._response_drain_tasks: set[asyncio.Task] = set()
         self._response_cleanup_tasks: set[asyncio.Task] = set()
         self._startup_task: asyncio.Task | None = None
+        # A status request is read-only protocol traffic, but it is still a
+        # command with an ambiguous transport outcome.  Keep it explicitly
+        # one-shot for each authenticated physical session.
+        self._connection_generation = 0
+        self._status_requested_generation: int | None = None
         self._persist_options = persist_options
         try:
             self._connection_mode = ConnectionMode(connection_mode)
@@ -1389,7 +1400,8 @@ class TuyaBLEDevice:
     async def startup_update(self) -> None:
         """Run the initial status path without failing config-entry setup."""
         try:
-            await self.update()
+            async with self.connection_lease("startup status", defer_connection=True):
+                await self._ensure_connected()
         except Exception:
             if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                 self._schedule_reconnect()
@@ -1773,6 +1785,7 @@ class TuyaBLEDevice:
         self._notifications_active = False
         self._is_paired = False
         self._state_data_fresh = False
+        self._datapoints._clear_session_receipt_provenance()
         if was_connected:
             self._has_disconnected = True
         self._clean_input()
@@ -2079,6 +2092,10 @@ class TuyaBLEDevice:
                         if self._connection_mode is ConnectionMode.ALWAYS_CONNECTED
                         else ConnectionPolicyState.ON_DEMAND_ACTIVE
                     )
+                    self._connection_generation += 1
+                    await self._request_status_while_connected()
+                    if not self.is_connection_active:
+                        raise TuyaBLEConnectionUnavailableError()
                     self._fire_connected_callbacks()
                     self._fire_connection_state_callbacks(True)
                 else:
@@ -2087,6 +2104,41 @@ class TuyaBLEDevice:
                 _LOGGER.error("%s: Not connected", self.log_identity)
         else:
             _LOGGER.error("%s: No client device", self.log_identity)
+
+    async def _request_status_while_connected(self) -> bool:
+        """Request current status once for an Always-connected session.
+
+        The request is intentionally not retried: once it has been handed to
+        the transport, a failure is ambiguous and replaying it could create
+        uncontrolled traffic during reconnect recovery.  Freshness remains
+        false until an inbound datapoint report is parsed.
+        """
+        generation = self._connection_generation
+        if (
+            self.effective_policy is not EffectiveConnectionPolicy.ALWAYS_CONNECTED
+            or not self.is_connection_active
+            or self._status_requested_generation == generation
+        ):
+            return False
+
+        # Mark before I/O so duplicate callbacks and an ambiguous transport
+        # failure cannot replay the request within this physical session.
+        self._status_requested_generation = generation
+        try:
+            return await self._send_packet_while_connected(
+                TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+                bytes(),
+                0,
+                True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "%s: Current status request failed; not retrying this session",
+                self.log_identity,
+            )
+            return False
 
     async def _reconnect(self) -> None:
         """Attempt a reconnect for future operations without replaying a command."""

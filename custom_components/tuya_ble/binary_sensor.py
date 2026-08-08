@@ -60,6 +60,15 @@ def motor_state_getter(self: TuyaBLEBinarySensor) -> None:
     self._attr_is_on = value if isinstance(value, bool) else None
 
 
+def is_s1_motor_state_current(
+    self: TuyaBLEBinarySensor, product: TuyaBLEProductInfo
+) -> bool:
+    """Expose S1 motor state only after its DP47 report arrived this session."""
+    del product
+    datapoint = self._device.datapoints[47]
+    return bool(datapoint and datapoint.received_from_device)
+
+
 @dataclass
 class TuyaBLEBinarySensorMapping:
     """Models a BLE binary sensor"""
@@ -273,6 +282,7 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=motor_state_getter,
+                    is_available=is_s1_motor_state_current,
                 ),
             ],
             **dict.fromkeys(

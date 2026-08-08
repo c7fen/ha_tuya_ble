@@ -18,10 +18,14 @@ from homeassistant.helpers.entity import EntityCategory
 
 from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.binary_sensor import (
+    TuyaBLEBinarySensor,
     TuyaBLEConnectionSensor,
 )
 from custom_components.tuya_ble.binary_sensor import (
     async_setup_entry as async_setup_binary_sensors,
+)
+from custom_components.tuya_ble.binary_sensor import (
+    get_mapping_by_device as get_binary_sensor_mapping_by_device,
 )
 from custom_components.tuya_ble.config_flow import TuyaBLEOptionsFlow
 from custom_components.tuya_ble.const import (
@@ -41,6 +45,11 @@ from custom_components.tuya_ble.devices import (
 )
 from custom_components.tuya_ble.lock import TuyaBLES1Lock, TuyaBLEV1Lock
 from custom_components.tuya_ble.select import TuyaBLEConnectionModeSelect
+from custom_components.tuya_ble.sensor import (
+    TuyaBLEBatteryMapping,
+    TuyaBLESensor,
+    get_mapping_by_device as get_sensor_mapping_by_device,
+)
 from custom_components.tuya_ble.switch import TuyaBLEControlSwitch
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.const import (
@@ -2877,7 +2886,7 @@ async def test_stop_cancels_startup_status_task() -> None:
         startup_started.set()
         await release_startup.wait()
 
-    device.update = wait_for_startup
+    device._ensure_connected = wait_for_startup
     startup_task = asyncio.create_task(device.startup_update())
     device._startup_task = startup_task
     await startup_started.wait()
@@ -2886,6 +2895,230 @@ async def test_stop_cancels_startup_status_task() -> None:
         await startup_task
     release_startup.set()
     assert device._startup_task is None
+
+
+async def _connect_always_session(
+    device: TuyaBLEDevice, client: _SyntheticConnectedClient
+) -> AsyncMock:
+    """Connect one synthetic paired session without invoking a real device."""
+    _prepare_new_client(client)
+    device._local_key = b"synthetic-policy-key"
+
+    async def send_packet(
+        code: TuyaBLECode,
+        _data: bytes,
+        _response_to: int,
+        _wait_for_response: bool,
+    ) -> bool:
+        if code is TuyaBLECode.FUN_SENDER_PAIR:
+            device._is_paired = True
+        return True
+
+    sender = AsyncMock(side_effect=send_packet)
+    device._send_packet_while_connected = sender
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+        new=AsyncMock(return_value=client),
+    ):
+        await device._ensure_connected()
+    return sender
+
+
+async def test_initial_always_session_requests_status_once() -> None:
+    """A successful initial Always-connected session requests status once."""
+    device = _make_device()
+    sender = await _connect_always_session(device, _SyntheticConnectedClient())
+
+    assert device._connection_generation == 1
+    assert device._status_requested_generation == 1
+    assert [call.args[0] for call in sender.await_args_list] == [
+        TuyaBLECode.FUN_SENDER_DEVICE_INFO,
+        TuyaBLECode.FUN_SENDER_PAIR,
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+    ]
+
+
+async def test_startup_uses_the_one_shot_session_status_path() -> None:
+    """Startup establishes a session instead of sending a second public update."""
+    device = _make_device()
+    device._ensure_connected = AsyncMock()
+    device.update = AsyncMock()
+
+    await device.startup_update()
+
+    device._ensure_connected.assert_awaited_once()
+    device.update.assert_not_awaited()
+
+
+async def test_reconnect_requests_one_new_status_for_new_session() -> None:
+    """A verified disconnect gives its successful replacement one status request."""
+    device = _make_device()
+    first_client = _SyntheticConnectedClient()
+    first_sender = await _connect_always_session(device, first_client)
+    device._state_data_fresh = True
+    device._schedule_reconnect_locked = Mock()
+
+    device._disconnected(first_client)
+
+    assert device.state_data_fresh is False
+    assert device._connection_generation == 1
+    assert [call.args[0] for call in first_sender.await_args_list].count(
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+    ) == 1
+
+    second_sender = await _connect_always_session(device, _SyntheticConnectedClient())
+
+    assert device._connection_generation == 2
+    assert device._status_requested_generation == 2
+    assert [call.args[0] for call in second_sender.await_args_list].count(
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+    ) == 1
+
+
+async def test_duplicate_status_request_is_suppressed_within_one_session() -> None:
+    """A duplicate connected callback cannot repeat status traffic."""
+    device = _make_device()
+    sender = await _connect_always_session(device, _SyntheticConnectedClient())
+
+    assert await device._request_status_while_connected() is False
+    assert [call.args[0] for call in sender.await_args_list].count(
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+    ) == 1
+
+
+async def test_reconnect_without_inbound_data_keeps_state_stale() -> None:
+    """Physical reconnection does not make read-only state current by itself."""
+    device = _make_device()
+    first_client = _SyntheticConnectedClient()
+    await _connect_always_session(device, first_client)
+    device._state_data_fresh = True
+    device._schedule_reconnect_locked = Mock()
+    device._disconnected(first_client)
+
+    await _connect_always_session(device, _SyntheticConnectedClient())
+
+    assert device.is_connection_active is True
+    assert device.state_data_fresh is False
+    assert device.datapoints[8] is None
+
+
+async def test_inbound_dp8_after_status_makes_battery_current() -> None:
+    """Only an inbound DP8 report makes the new session's battery current."""
+    device = _make_device()
+    await _connect_always_session(device, _SyntheticConnectedClient())
+
+    device.datapoints._update_from_device(8, 0, 0, TuyaBLEDataPointType.DT_VALUE, 73)
+
+    battery = device.datapoints[8]
+    assert device.state_data_fresh is True
+    assert battery is not None
+    assert battery.received_from_device is True
+
+
+async def test_non_battery_inbound_data_does_not_create_battery_snapshot() -> None:
+    """A non-DP8 report may freshen the session but cannot invent battery data."""
+    device = _make_device()
+    await _connect_always_session(device, _SyntheticConnectedClient())
+
+    device.datapoints._update_from_device(47, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+
+    assert device.state_data_fresh is True
+    assert device.datapoints[8] is None
+
+
+async def test_s1_read_only_entities_require_their_current_session_datapoints(
+    hass: HomeAssistant,
+) -> None:
+    """S1 Battery and Motor State cannot reuse values from a prior session."""
+    device = _make_device()
+    coordinator = TuyaBLECoordinator(hass, device)
+    product = TuyaBLEProductInfo("S1-TY-BLE-PRO")
+    battery_mapping = next(
+        mapping
+        for mapping in get_sensor_mapping_by_device(device)
+        if isinstance(mapping, TuyaBLEBatteryMapping) and mapping.dp_id == 8
+    )
+    motor_mapping = next(
+        mapping
+        for mapping in get_binary_sensor_mapping_by_device(device)
+        if mapping.dp_id == 47
+    )
+    battery = TuyaBLESensor(hass, coordinator, device, product, battery_mapping)
+    battery.async_write_ha_state = Mock()
+    motor = TuyaBLEBinarySensor(hass, coordinator, device, product, motor_mapping)
+    motor.async_write_ha_state = Mock()
+
+    first_client = _SyntheticConnectedClient()
+    await _connect_always_session(device, first_client)
+    device.datapoints._update_from_device(8, 0, 0, TuyaBLEDataPointType.DT_VALUE, 73)
+    device.datapoints._update_from_device(47, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    assert battery.available is True
+
+    device._schedule_reconnect_locked = Mock()
+    device._disconnected(first_client)
+    assert device.datapoints[8].received_from_device is False
+    assert device.last_data_received is None
+
+    await _connect_always_session(device, _SyntheticConnectedClient())
+    device.datapoints._update_from_device(21, 0, 0, TuyaBLEDataPointType.DT_ENUM, 0)
+
+    assert device.state_data_fresh is True
+    assert battery.available is False
+    assert motor_mapping.is_available is not None
+    assert motor_mapping.is_available(motor, product) is False
+
+    device.datapoints._update_from_device(8, 0, 0, TuyaBLEDataPointType.DT_VALUE, 72)
+    device.datapoints._update_from_device(47, 0, 0, TuyaBLEDataPointType.DT_BOOL, False)
+    assert battery.available is True
+    assert motor_mapping.is_available(motor, product) is True
+
+
+async def test_status_acknowledgement_does_not_mark_state_fresh() -> None:
+    """A status acknowledgement is not a substitute for an inbound datapoint."""
+    device = _make_device()
+    await _connect_always_session(device, _SyntheticConnectedClient())
+
+    assert device.state_data_fresh is False
+    assert device.datapoints[8] is None
+
+
+async def test_status_request_failure_is_not_replayed_in_same_session() -> None:
+    """An ambiguous status-write failure does not create a retry loop."""
+    device = _make_device()
+    device._client = _SyntheticConnectedClient()
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._connection_generation = 1
+    sender = AsyncMock(side_effect=BleakError("synthetic status failure"))
+    device._send_packet_while_connected = sender
+
+    assert await device._request_status_while_connected() is False
+    assert await device._request_status_while_connected() is False
+    assert sender.await_count == 1
+    assert device._reconnect_task is None
+    assert device.state_data_fresh is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "enabled"),
+    ((ConnectionMode.ON_DEMAND, True), (ConnectionMode.ALWAYS_CONNECTED, False)),
+    ids=("on_demand_idle", "suspended"),
+)
+async def test_background_status_request_is_policy_gated(
+    mode: ConnectionMode, enabled: bool
+) -> None:
+    """Idle On-demand and suspended devices create no automatic status traffic."""
+    device = _make_device(mode=mode, enabled=enabled)
+    device._client = _SyntheticConnectedClient()
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._connection_generation = 1
+    device._send_packet_while_connected = AsyncMock(return_value=True)
+
+    assert await device._request_status_while_connected() is False
+    device._send_packet_while_connected.assert_not_awaited()
 
 
 async def test_late_advertisement_completes_deferred_connection() -> None:

@@ -115,6 +115,13 @@ def is_co2_alarm_enabled(self: TuyaBLESensor, product: TuyaBLEProductInfo) -> bo
     return result
 
 
+def is_s1_battery_current(self: TuyaBLESensor, product: TuyaBLEProductInfo) -> bool:
+    """Expose S1 Battery only after its DP8 report arrived this session."""
+    del product
+    datapoint = self._device.datapoints[8]
+    return bool(datapoint and datapoint.received_from_device)
+
+
 def battery_enum_getter(self: TuyaBLESensor) -> None:
     """For a given sensor, read the datapoints and determine battery info"""
     datapoint = self._device.datapoints[104]
@@ -532,6 +539,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                 TuyaBLEBatteryMapping(
                     dp_id=8,
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    is_available=is_s1_battery_current,
                 ),
                 TuyaBLELastUnlockSensorMapping(
                     unlock_methods={
