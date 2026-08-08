@@ -74,6 +74,7 @@ class _SyntheticConnectedClient:
         self.is_connected = True
         self.stop_notify = AsyncMock(side_effect=stop_notify_error)
         self.start_notify = AsyncMock()
+        self.write_gatt_char = AsyncMock()
 
         async def disconnect() -> None:
             if disconnect_error is not None:
@@ -2411,6 +2412,188 @@ async def test_generic_resend_is_single_flight_and_cancelled_by_mode_change() ->
     assert first_task is not None
     assert first_task.done()
     device._resend_packets.assert_awaited_once_with([b"synthetic-fragment-1"])
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (ConnectionMode.ALWAYS_CONNECTED, ConnectionMode.ON_DEMAND),
+    ids=("always-connected", "on-demand"),
+)
+async def test_connected_write_failure_retains_client_for_mandatory_release(
+    mode: ConnectionMode,
+) -> None:
+    """A write error is not a disconnect while the exact client stays connected."""
+    device = _make_device(mode=mode)
+    client = _SyntheticConnectedClient()
+    client.write_gatt_char.side_effect = BleakError("synthetic write failure")
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._schedule_reconnect = Mock()
+    device._schedule_reconnect_locked = Mock()
+    device._schedule_resend = Mock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    async with device.connection_lease(
+        "synthetic write failure", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic write failure"):
+            await device._send_packets_locked([b"synthetic-fragment"])
+
+        assert client.is_connected is True
+        assert device._client is client
+        assert device.is_gatt_connected is True
+        assert device.is_authenticated is True
+        assert device.is_connection_active is False
+        assert state_changes == []
+        assert device._pending_release is not None
+        assert device._pending_release.reason is PendingReleaseReason.SESSION_FAILURE
+        assert device._reconnect_task is None
+        assert device._resend_task is None
+
+    assert client.disconnect.await_count == 1
+    assert client.is_connected is False
+
+
+async def test_actual_write_loss_marks_the_current_client_disconnected_once() -> None:
+    """A verified lost client is the only local write-error disconnect transition."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+
+    async def lose_connection(*_: object) -> None:
+        client.is_connected = False
+        raise BleakError("synthetic physical loss")
+
+    client.write_gatt_char.side_effect = lose_connection
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._schedule_reconnect = Mock()
+    device._schedule_reconnect_locked = Mock()
+    device._schedule_resend = Mock()
+    state_changes: list[bool] = []
+    device.register_connection_state_callback(state_changes.append)
+
+    async with device.connection_lease(
+        "synthetic physical loss", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic physical loss"):
+            await device._send_packets_locked([b"synthetic-fragment"])
+
+    assert device._client is None
+    assert device.is_gatt_connected is False
+    assert state_changes == [False]
+    assert device._pending_release is None
+
+
+async def test_generic_resend_waits_for_connected_session_failure_release() -> None:
+    """A generic retry is retained privately until the failed session is released."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    packets = [b"synthetic-fragment"]
+    client.write_gatt_char.side_effect = BleakError("synthetic write failure")
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._schedule_reconnect_locked = Mock()
+
+    async with device.connection_lease(
+        "synthetic generic write failure", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic write failure"):
+            await device._send_packets_locked(packets)
+
+        assert device._deferred_resend_packets == packets
+        assert device._resend_task is None
+        assert device._reconnect_task is None
+
+    assert client.is_connected is False
+    assert device._deferred_resend_packets == packets
+
+    device._client = _SyntheticConnectedClient()
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._resend_packets = AsyncMock()
+
+    await device._resend_after_verified_reconnect()
+
+    device._resend_packets.assert_awaited_once_with(packets)
+    assert device._deferred_resend_packets is None
+
+
+async def test_deferred_generic_resend_is_discarded_by_stop_or_policy_change() -> None:
+    """A repair-only retry cannot outlive a new mode or terminal stop."""
+    device = _make_device()
+    device._deferred_resend_packets = [b"synthetic-fragment"]
+
+    await device.async_update_connection_policy(
+        connection_mode=ConnectionMode.ON_DEMAND.value
+    )
+
+    assert device._deferred_resend_packets is None
+
+    device._deferred_resend_packets = [b"synthetic-fragment"]
+    await device.stop()
+
+    assert device._deferred_resend_packets is None
+
+
+async def test_session_failure_release_survives_policy_change_and_unload() -> None:
+    """Visible policy changes cannot supersede a connected write-failure repair."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+
+    await device._record_write_transport_failure(client)
+    await device.async_update_connection_policy(
+        connection_mode=ConnectionMode.ON_DEMAND.value,
+        ble_control_enabled=False,
+    )
+
+    assert device._client is client
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SESSION_FAILURE
+    assert device.policy_state is ConnectionPolicyState.DISCONNECT_FAILED
+    assert await device.async_prepare_unload() is False
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.SESSION_FAILURE
+
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_stop_keeps_session_failure_client_under_terminal_release() -> None:
+    """Shutdown replaces session repair with terminal ownership without forgetting GATT."""
+    device = _make_device()
+    client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+
+    await device._record_write_transport_failure(client)
+    await device.stop()
+
+    assert device._client is client
+    assert device.is_gatt_connected is True
+    assert device._pending_release is not None
+    assert device._pending_release.reason is PendingReleaseReason.STOP
+    assert device._pending_release.terminal is True
+    assert device._reconnect_task is None
+    assert device._resend_task is None
+
+    assert device._disconnect_retry_task is not None
+    device._disconnect_retry_task.cancel()
+    await asyncio.sleep(0)
 
 
 async def test_reconnect_is_single_flight_and_stop_cancels_task() -> None:

@@ -47,6 +47,7 @@ class PendingReleaseReason(StrEnum):
     SUSPEND = "suspend"
     ON_DEMAND_IDLE = "on_demand_idle"
     SETUP_FAILURE = "setup_failure"
+    SESSION_FAILURE = "session_failure"
     UNLOAD = "unload"
     STOP = "stop"
 

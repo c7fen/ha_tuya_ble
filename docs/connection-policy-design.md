@@ -181,6 +181,7 @@ runtime keeps the actual diagnostic off and uses only bounded retry behavior.
 | `SUSPEND` or `ON_DEMAND_IDLE` | physical teardown is in progress | any visible policy change | Retain the single release owner; apply the newest policy only after verified GATT release. |
 | `SUSPEND` or `ON_DEMAND_IDLE` | notification state became inactive or unknown and GATT release failed | any visible policy change | Convert to mandatory `SETUP_FAILURE`; reject commands and reconnect until verified cleanup. |
 | `SETUP_FAILURE` | connected client remains unusable | any visible policy change | Never supersede; retain the exact client and one disconnect retry owner. |
+| `SESSION_FAILURE` | `write_gatt_char()` raised while the exact client still reports connected | any visible policy change | Never infer a callback. Retain the paired GATT client, mark notifications unready, reject ordinary traffic, and retain one physical-release retry owner. |
 | `UNLOAD` | platform teardown fails but notifications are positively restored on the same paired client | latest enabled policy | Cancel unload release ownership and reconcile the latest policy. |
 | `UNLOAD` | notification restoration fails or remains unknown | any policy | Convert to mandatory `SETUP_FAILURE` and retain cleanup ownership. |
 | `STOP` | any | any | Terminal and non-cancellable; retain cleanup ownership until physical release. |
@@ -188,6 +189,32 @@ runtime keeps the actual diagnostic off and uses only bounded retry behavior.
 Successful physical release always reconciles the newest persisted policy.
 The controller never starts a reconnect while an unusable connected client or
 an in-progress physical release remains owned.
+
+### 10.2 Transport failure ownership audit
+
+`_disconnected(client)` is reserved for the Bleak callback. A local transport
+path may clear the current client only after checking that the exact current
+client is no longer physically connected. A connected client is always either
+command-ready or owned by a non-supersedable release obligation.
+
+| Failure point | Client retained? | Physical release attempted? | Retry owner | Replay permitted? |
+| --- | --- | --- | --- | --- |
+| Establish connection | Yes, after a connected client is created | Yes, if notification, Device-Info, or pairing setup fails | `SETUP_FAILURE` or `STOP` | No |
+| Start notifications | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
+| Device-Info | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
+| Pairing | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
+| GATT write | Yes, while `is_connected` remains true; notifications become unready | Yes | `SESSION_FAILURE` | Generic only: one private deferred replay after verified release and a successful reconnect; never V1 or `set_value_once()` |
+| Response timeout | Yes | No; the session remains usable unless another verified failure occurs | None | V1 and `set_value_once()`: no; generic follows its existing response contract |
+| Stop notifications | Yes, until disconnect is verified | Yes | Existing pending reason, or `SETUP_FAILURE` / `STOP` when cleanup fails | No |
+| Disconnect | Yes, until `is_connected` is false | Yes | Existing pending reason, one bounded retry | No |
+| Unexpected callback | No; the exact callback client is already physically gone | Not required | One normal reconnect only for enabled Always connected policy | No |
+| Unload | Yes, until release succeeds or rollback establishes mandatory repair | Yes | `UNLOAD`, then `SETUP_FAILURE` if rollback cannot restore readiness | No |
+| Shutdown | Yes, until terminal release succeeds | Yes | non-cancellable `STOP` | No |
+
+Deferred generic packets remain private transient task state, are never logged
+or exposed through diagnostics, and are discarded on suspension, a policy
+change, unload, or terminal stop. The deferred retry runs inline after the
+successful reconnect, so reconnect and resend never own GATT concurrently.
 
 ## 11. Config-entry unload transaction
 

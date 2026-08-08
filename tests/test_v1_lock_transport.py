@@ -416,6 +416,49 @@ async def test_v1_ambiguous_transport_error_never_replays_command(
     assert device._input_expected_responses == {}
 
 
+@pytest.mark.parametrize("operation", ("lock", "unlock"))
+async def test_v1_connected_write_failure_keeps_one_semantic_attempt(
+    hass: HomeAssistant, operation: str
+) -> None:
+    """V1 commands do not replay when a still-connected GATT write is ambiguous."""
+    entity, device = _make_entity(hass)
+    client = Mock()
+    client.is_connected = True
+    client.stop_notify = AsyncMock()
+    client.write_gatt_char = AsyncMock(
+        side_effect=BleakError("synthetic ambiguous V1 write failure")
+    )
+
+    async def disconnect() -> None:
+        client.is_connected = False
+
+    client.disconnect = AsyncMock(side_effect=disconnect)
+    device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
+    device._disconnected_callbacks.clear()
+    device._connection_state_callbacks.clear()
+    device._schedule_reconnect = Mock()
+    device._schedule_reconnect_locked = Mock()
+    device._schedule_resend = Mock()
+
+    async def send_once(_: list[int]) -> None:
+        await device._send_packets_locked(
+            [b"synthetic-v1-command"], resend_on_error=False
+        )
+
+    device._send_datapoints_once = send_once
+
+    with pytest.raises(BleakError, match="synthetic ambiguous V1 write failure"):
+        await getattr(entity, f"async_{operation}")()
+
+    client.write_gatt_char.assert_awaited_once()
+    assert device._deferred_resend_packets is None
+    assert device._resend_task is None
+    assert client.disconnect.await_count == 1
+
+
 async def test_generic_transport_keeps_existing_paired_packet_replay() -> None:
     """The opt-in V1 policy does not change generic or S1 transport behavior."""
     device = _make_device()

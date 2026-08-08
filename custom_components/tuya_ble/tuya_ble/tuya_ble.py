@@ -449,6 +449,7 @@ class TuyaBLEDevice:
         self._disconnect_retry_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._resend_task: asyncio.Task | None = None
+        self._deferred_resend_packets: list[bytes] | None = None
         self._response_tasks: set[asyncio.Task] = set()
         self._response_drain_tasks: set[asyncio.Task] = set()
         self._response_cleanup_tasks: set[asyncio.Task] = set()
@@ -592,7 +593,11 @@ class TuyaBLEDevice:
         lease_active = _lease_context_depth(self) > 0
         if (
             self._pending_release is not None
-            and self._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+            and self._pending_release.reason
+            in {
+                PendingReleaseReason.SETUP_FAILURE,
+                PendingReleaseReason.SESSION_FAILURE,
+            }
             and not lease_active
         ):
             raise TuyaBLEConnectionUnavailableError()
@@ -698,6 +703,7 @@ class TuyaBLEDevice:
             if policy_changed:
                 async with self._policy_lock:
                     self._advance_policy_revision_locked()
+                    self._cancel_resend_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
@@ -723,6 +729,7 @@ class TuyaBLEDevice:
             if policy_changed:
                 async with self._policy_lock:
                     self._advance_policy_revision_locked()
+                    self._cancel_resend_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
 
@@ -731,7 +738,11 @@ class TuyaBLEDevice:
             return
         async with self._policy_lock:
             if self._pending_release is not None and (
-                self._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+                self._pending_release.reason
+                in {
+                    PendingReleaseReason.SETUP_FAILURE,
+                    PendingReleaseReason.SESSION_FAILURE,
+                }
                 or self._disconnect_in_progress
             ):
                 self._cancel_reconnect_locked()
@@ -740,7 +751,10 @@ class TuyaBLEDevice:
                 self._policy_state = (
                     ConnectionPolicyState.DISCONNECT_FAILED
                     if self._pending_release.reason
-                    is PendingReleaseReason.SETUP_FAILURE
+                    in {
+                        PendingReleaseReason.SETUP_FAILURE,
+                        PendingReleaseReason.SESSION_FAILURE,
+                    }
                     else ConnectionPolicyState.DISCONNECTING
                 )
                 return
@@ -774,7 +788,7 @@ class TuyaBLEDevice:
             return
 
         async with self._policy_lock:
-            self._cancel_resend_locked()
+            self._cancel_resend_locked(discard_deferred=False)
             self._cancel_idle_disconnect_locked()
             if self.is_connection_active:
                 self._policy_state = ConnectionPolicyState.ALWAYS_CONNECTED_ACTIVE
@@ -904,7 +918,12 @@ class TuyaBLEDevice:
                         self._policy_state = ConnectionPolicyState.STOPPED
                     elif self.is_gatt_connected and not self.is_connection_active:
                         self._pending_release = PendingRelease(
-                            PendingReleaseReason.SETUP_FAILURE,
+                            (
+                                PendingReleaseReason.SESSION_FAILURE
+                                if pending.reason
+                                is PendingReleaseReason.SESSION_FAILURE
+                                else PendingReleaseReason.SETUP_FAILURE
+                            ),
                             self._policy_revision,
                         )
                         self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
@@ -916,7 +935,10 @@ class TuyaBLEDevice:
                         and self._disconnect_retry_task is not asyncio.current_task()
                     ):
                         self._cancel_disconnect_retry_locked()
-                    if pending.reason is PendingReleaseReason.SETUP_FAILURE:
+                    if pending.reason in {
+                        PendingReleaseReason.SETUP_FAILURE,
+                        PendingReleaseReason.SESSION_FAILURE,
+                    }:
                         reconcile_policy = True
                     elif pending.reason is PendingReleaseReason.ON_DEMAND_IDLE:
                         if (
@@ -965,6 +987,7 @@ class TuyaBLEDevice:
                     and self._pending_release.reason
                     in {
                         PendingReleaseReason.SETUP_FAILURE,
+                        PendingReleaseReason.SESSION_FAILURE,
                         PendingReleaseReason.STOP,
                     }
                 ):
@@ -1095,7 +1118,13 @@ class TuyaBLEDevice:
         if self.is_gatt_connected:
             self._notifications_active = False
             self._pending_release = PendingRelease(
-                PendingReleaseReason.SETUP_FAILURE,
+                (
+                    PendingReleaseReason.SESSION_FAILURE
+                    if self._pending_release is not None
+                    and self._pending_release.reason
+                    is PendingReleaseReason.SESSION_FAILURE
+                    else PendingReleaseReason.SETUP_FAILURE
+                ),
                 self._policy_revision,
             )
             self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
@@ -1158,10 +1187,12 @@ class TuyaBLEDevice:
             self._reconnect_task.cancel()
             self._reconnect_task = None
 
-    def _cancel_resend_locked(self) -> None:
+    def _cancel_resend_locked(self, *, discard_deferred: bool = True) -> None:
         if self._resend_task is not None:
             self._resend_task.cancel()
             self._resend_task = None
+        if discard_deferred:
+            self._deferred_resend_packets = None
 
     def _schedule_disconnect_retry_locked(self) -> None:
         """Retry a pending physical release with one bounded-backoff task."""
@@ -1248,7 +1279,13 @@ class TuyaBLEDevice:
                 self._idle_disconnect_task = None
 
     def _schedule_reconnect_locked(self, delay: float) -> None:
-        if self._reconnect_task is not None:
+        if (
+            self._reconnect_task is not None
+            or self._resend_task is not None
+            or self._pending_release is not None
+            or self._disconnect_in_progress
+            or (self.is_gatt_connected and not self.is_connection_active)
+        ):
             return
         self._reconnect_task = self._create_policy_task(
             self._reconnect_after_delay(delay)
@@ -1273,6 +1310,14 @@ class TuyaBLEDevice:
             or self._suspension_requested
             or self._resend_task is not None
         ):
+            return
+        if (
+            self._pending_release is not None
+            or self._disconnect_in_progress
+            or self._reconnect_task is not None
+            or (self.is_gatt_connected and not self.is_connection_active)
+        ):
+            self._deferred_resend_packets = list(packets)
             return
         self._resend_task = self._create_policy_task(self._resend_task_runner(packets))
 
@@ -2042,6 +2087,7 @@ class TuyaBLEDevice:
             async with self.connection_lease("policy reconnect", defer_connection=True):
                 await self._ensure_connected()
             _LOGGER.debug("%s: Reconnect, connection ensured", self.log_identity)
+            await self._resend_after_verified_reconnect()
         except BLEAK_EXCEPTIONS as ex:  # BleakNotFoundError:
             if "Bluetooth is already shutdown" in str(ex):
                 _LOGGER.debug(
@@ -2072,7 +2118,13 @@ class TuyaBLEDevice:
             return
         if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
             return
-        if self._reconnect_task is None:
+        if (
+            self._reconnect_task is None
+            and self._resend_task is None
+            and self._pending_release is None
+            and not self._disconnect_in_progress
+            and not (self.is_gatt_connected and not self.is_connection_active)
+        ):
             self._reconnect_task = self._create_policy_task(
                 self._reconnect_after_delay(delay)
             )
@@ -2335,14 +2387,23 @@ class TuyaBLEDevice:
                 raise
 
     async def _resend_packets(self, packets: list[bytes]) -> None:
+        """Replay one generic packet sequence after an established reconnect."""
         if self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED:
             return
-        if self._expected_disconnect or self._suspension_requested:
+        if (
+            self._expected_disconnect
+            or self._suspension_requested
+            or self._pending_release is not None
+            or self._disconnect_in_progress
+            or not self.is_connection_active
+        ):
             return
         try:
             async with self.connection_lease("transport resend", defer_connection=True):
                 await self._ensure_connected()
-                await self._int_send_packet_while_connected(packets)
+                await self._int_send_packet_while_connected(
+                    packets, resend_on_error=False
+                )
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
         except BLEAK_EXCEPTIONS:
@@ -2350,6 +2411,23 @@ class TuyaBLEDevice:
                 "%s: Transport resend failed",
                 self.log_identity,
             )
+
+    async def _resend_after_verified_reconnect(self) -> None:
+        """Consume one deferred generic retry only after physical cleanup."""
+        async with self._policy_lock:
+            if (
+                self._deferred_resend_packets is None
+                or self._pending_release is not None
+                or self._disconnect_in_progress
+                or self._connection_mode is not ConnectionMode.ALWAYS_CONNECTED
+                or self._terminal_stopped
+                or self._suspension_requested
+                or not self.is_connection_active
+            ):
+                return
+            packets = self._deferred_resend_packets
+            self._deferred_resend_packets = None
+        await self._resend_packets(packets)
 
     async def _send_packets_locked(
         self, packets: list[bytes], resend_on_error: bool = True
@@ -2399,12 +2477,35 @@ class TuyaBLEDevice:
                     self._schedule_reconnect()
             raise self._sanitized_transport_error(ex) from None
 
+    async def _record_write_transport_failure(
+        self, client: BleakClientWithServiceCache
+    ) -> None:
+        """Keep the exact client owned until a failed write is physically resolved."""
+        async with self._policy_lock:
+            if self._client is not client:
+                return
+            if not client.is_connected:
+                self._client = None
+                self._mark_connection_lost()
+                return
+            self._notifications_active = False
+            self._pending_release = PendingRelease(
+                PendingReleaseReason.SESSION_FAILURE,
+                self._policy_revision,
+            )
+            self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
+            self._cancel_reconnect_locked()
+            self._cancel_resend_locked(discard_deferred=False)
+            self._cancel_idle_disconnect_locked()
+            self._schedule_disconnect_retry_locked()
+
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
         """Execute command and read response."""
         for packet in packets:
-            if self._client:
+            client = self._client
+            if client:
                 try:
-                    await self._client.write_gatt_char(
+                    await client.write_gatt_char(
                         self._characteristic_write,
                         packet,
                         False,
@@ -2420,8 +2521,7 @@ class TuyaBLEDevice:
                         "%s: Error during sending packet",
                         self.log_identity,
                     )
-                    if self._client and self._client.is_connected:
-                        self._disconnected(self._client)
+                    await self._record_write_transport_failure(client)
                     raise self._sanitized_transport_error(ex) from None
             else:
                 _LOGGER.error(
