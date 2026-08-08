@@ -25,10 +25,10 @@ from .cloud import HASSTuyaBLEDeviceManager, normalize_app_type_data
 from .const import (
     CONF_BLE_CONTROL_ENABLED,
     CONF_CONNECTION_MODE,
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
     DOMAIN,
-    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
