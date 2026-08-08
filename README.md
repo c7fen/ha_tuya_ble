@@ -119,6 +119,10 @@ S1 Motor State is a read-only `binary_sensor`, not a switch. Its registry
 migration is ownership-safe, but automations that refer to the old switch
 entity ID may require an update.
 
+S1 Lock and Unlock are at-most-once operations. An ambiguous transport error
+does not replay DP46, DP70, DP71, or a previously encrypted packet after
+reconnect; inspect the physical state before issuing another action.
+
 The [smart-lock guide](docs/smart-locks.md) documents entities, state semantics,
 GATT exclusivity, ambiguous errors, and safe hardware procedures. The
 [logging and privacy guide](docs/logging-and-privacy.md) explains how to report

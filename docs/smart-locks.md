@@ -56,8 +56,11 @@ file with mode `0600`. There is no global, product-wide, or cross-device
 fallback. Missing, incomplete, foreign, noncanonical, or ambiguous material
 fails before a Bluetooth write.
 
-The S1 transport retains its confirmed response and retry behavior. Do not copy
-template material between devices and do not publish it.
+S1 Lock has exactly one DP46 attempt. S1 Unlock has exactly one protected
+DP70, delay, DP71 sequence. An ambiguous write is reported without replaying a
+datapoint, packet, or sequence after reconnect; inspect the physical state
+before issuing another deliberate action. Do not copy template material between
+devices and do not publish it.
 
 For both products, the Motor State binary sensor mirrors the Boolean DP47 report:
 off corresponds to secure/uncoupled and on corresponds to access-enabled/coupled.

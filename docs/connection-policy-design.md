@@ -12,10 +12,10 @@ retains the client. Entity writes use the same lazy connection path.
 The transport has one connection lock and one operation lock, but the
 `_expected_disconnect` flag currently combines terminal stop, intentional
 disconnect, and reconnect suppression. An unexpected paired disconnect starts
-another reconnect task. Transport failures can also schedule a resend or
-reconnect. The coordinator delays ordinary disconnected availability for the
-existing ten-minute grace period, which is unsuitable for an actual
-connectivity diagnostic.
+another reconnect task. A transport failure may reconnect only to restore a
+future session; it never retains or replays the failed packet. The coordinator
+delays ordinary disconnected availability for the existing ten-minute grace
+period, which is unsuitable for an actual connectivity diagnostic.
 
 Disabling a config entry now starts a reversible unload quiesce before platform
 teardown. The runtime blocks new leases, drains active work, and verifies GATT
@@ -145,8 +145,8 @@ one immediate attempt and then uses the same bounded single-task backoff; it
 does not run the old tight 100-attempt loop.
 
 On-demand mode never reconnects because an advertisement arrived. It waits for
-an explicit lease-backed operation. A transport failure does not cause an
-ambiguous V1 command to be replayed or start a delayed background resend.
+an explicit lease-backed operation. An ambiguous transport failure never
+replays a command or starts a delayed background resend for any product.
 
 ## 9. On-demand idle behavior
 
@@ -203,18 +203,19 @@ command-ready or owned by a non-supersedable release obligation.
 | Start notifications | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
 | Device-Info | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
 | Pairing | Yes, when GATT remains connected | Yes | `SETUP_FAILURE` or `STOP` | No |
-| GATT write | Yes, while `is_connected` remains true; notifications become unready | Yes | `SESSION_FAILURE` | Generic only: one private deferred replay after verified release and a successful reconnect; never V1 or `set_value_once()` |
-| Response timeout | Yes | No; the session remains usable unless another verified failure occurs | None | V1 and `set_value_once()`: no; generic follows its existing response contract |
+| GATT write | Yes, while `is_connected` remains true; notifications become unready | Yes | `SESSION_FAILURE` | No |
+| Protocol response write | Yes, while `is_connected` remains true; notifications become unready | Yes | `SESSION_FAILURE` | No |
+| Response timeout | Yes | No; the session remains usable unless another verified failure occurs | None | No |
 | Stop notifications | Yes, until disconnect is verified | Yes | Existing pending reason, or `SETUP_FAILURE` / `STOP` when cleanup fails | No |
 | Disconnect | Yes, until `is_connected` is false | Yes | Existing pending reason, one bounded retry | No |
 | Unexpected callback | No; the exact callback client is already physically gone | Not required | One normal reconnect only for enabled Always connected policy | No |
 | Unload | Yes, until release succeeds or rollback establishes mandatory repair | Yes | `UNLOAD`, then `SETUP_FAILURE` if rollback cannot restore readiness | No |
 | Shutdown | Yes, until terminal release succeeds | Yes | non-cancellable `STOP` | No |
 
-Deferred generic packets remain private transient task state, are never logged
-or exposed through diagnostics, and are discarded on suspension, a policy
-change, unload, or terminal stop. The deferred retry runs inline after the
-successful reconnect, so reconnect and resend never own GATT concurrently.
+The transport stores no failed packet fragments, encrypted ciphertext, response
+correlation, or semantic command for later replay. After an ambiguous write,
+the release owner may restore GATT according to the latest policy, but only a
+new explicit operation may send a new current-session command.
 
 ## 11. Config-entry unload transaction
 
@@ -267,12 +268,12 @@ usable bidirectional session.
 
 `state_data_fresh` is an internal device property. It becomes true only after
 current-session inbound device data is received and becomes false immediately
-on disconnect. Read-only sensors are unavailable or stale when it is false.
-On-demand command entities remain callable while control is enabled. Lock
-state returns unknown without fresh confirmation, rather than presenting a
-cached value as current. Suspended ordinary entities are unavailable and their
-write paths reject before connecting or writing. Historical HA state is not
-treated as a current physical state.
+on disconnect or a write failure that leaves the GATT client connected but
+notification-unready. Read-only entities are unavailable or return unknown
+when it is false. On-demand command entities remain callable while control is
+enabled. Suspended ordinary entities are unavailable and their write paths
+reject before connecting or writing. Historical HA state is not treated as a
+current physical state.
 
 ## 13. Config-entry Options Flow
 
@@ -296,7 +297,9 @@ the complete device-scoped DP70/DP71 template before acquiring or writing,
 then holds one lease around DP70, the required 0.8-second delay, rebuilt DP71,
 and required response handling. No idle task or suspension transition can
 disconnect between DP70 and DP71. Missing or invalid templates perform zero
-BLE writes.
+BLE writes. An ambiguous DP46, DP70, or DP71 write restores local transient
+state, releases the failed session safely, and never retries either the
+individual datapoint or the protected unlock sequence.
 
 ## 15. V1 safety
 
