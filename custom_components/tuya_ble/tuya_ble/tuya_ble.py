@@ -477,6 +477,7 @@ class TuyaBLEDevice:
         self._state_data_fresh = False
         self._has_disconnected = False
         self._physical_connection_active = False
+        self._notifications_active = False
         self._connection_state_callbacks: list[Callable[[bool], None]] = []
         self._client: BleakClientWithServiceCache | None = None
         self._characteristic_notify = CHARACTERISTIC_NOTIFY
@@ -567,8 +568,8 @@ class TuyaBLEDevice:
 
     @property
     def is_connection_active(self) -> bool:
-        """Return whether an authenticated paired GATT session is active."""
-        return self.is_gatt_connected and self._is_paired
+        """Return whether the current GATT session is usable for traffic."""
+        return self.is_gatt_connected and self._is_paired and self._notifications_active
 
     @property
     def active_lease_count(self) -> int:
@@ -598,6 +599,12 @@ class TuyaBLEDevice:
         if self._unload_quiescing and not lease_active:
             raise TuyaBLEConnectionUnavailableError()
         if self._terminal_stopped and not lease_active:
+            raise TuyaBLEConnectionUnavailableError()
+        if (
+            self.is_gatt_connected
+            and not self.is_connection_active
+            and not lease_active
+        ):
             raise TuyaBLEConnectionUnavailableError()
         if (
             not self._ble_control_enabled or self._suspension_requested
@@ -723,14 +730,19 @@ class TuyaBLEDevice:
         if self._terminal_stopped:
             return
         async with self._policy_lock:
-            if (
-                self._pending_release is not None
-                and self._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+            if self._pending_release is not None and (
+                self._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+                or self._disconnect_in_progress
             ):
                 self._cancel_reconnect_locked()
                 self._cancel_resend_locked()
                 self._cancel_idle_disconnect_locked()
-                self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
+                self._policy_state = (
+                    ConnectionPolicyState.DISCONNECT_FAILED
+                    if self._pending_release.reason
+                    is PendingReleaseReason.SETUP_FAILURE
+                    else ConnectionPolicyState.DISCONNECTING
+                )
                 return
             if self._unload_quiescing:
                 self._cancel_reconnect_locked()
@@ -890,7 +902,11 @@ class TuyaBLEDevice:
                 if disconnect_failed and request_current:
                     if pending.reason is PendingReleaseReason.STOP:
                         self._policy_state = ConnectionPolicyState.STOPPED
-                    elif pending.reason is PendingReleaseReason.SETUP_FAILURE:
+                    elif self.is_gatt_connected and not self.is_connection_active:
+                        self._pending_release = PendingRelease(
+                            PendingReleaseReason.SETUP_FAILURE,
+                            self._policy_revision,
+                        )
                         self._policy_state = ConnectionPolicyState.DISCONNECT_FAILED
                     self._schedule_disconnect_retry_locked()
                 elif request_current:
@@ -1010,6 +1026,14 @@ class TuyaBLEDevice:
                         )
                     self._schedule_disconnect_retry_locked()
                 return
+            if (
+                notifications_restored
+                and self.is_connection_active
+                and self._pending_release is not None
+                and self._pending_release.reason is PendingReleaseReason.SETUP_FAILURE
+            ):
+                self._pending_release = None
+                self._cancel_disconnect_retry_locked()
             if not notifications_restored and self.is_gatt_connected:
                 self._pending_release = PendingRelease(
                     PendingReleaseReason.SETUP_FAILURE,
@@ -1051,10 +1075,13 @@ class TuyaBLEDevice:
     async def _restore_notifications_after_unload_failure(self) -> bool:
         """Restore notifications or report that the live session needs repair."""
         client = self._client
-        if client is None or not client.is_connected or not self._ble_control_enabled:
+        if client is None or not client.is_connected:
             return True
+        if not self._ble_control_enabled:
+            return False
         if not self._is_paired:
             return False
+        self._notifications_active = False
         try:
             notify_kwargs = (
                 {"bluez": {"use_start_notify": True}}
@@ -1066,6 +1093,7 @@ class TuyaBLEDevice:
                 self._notification_handler,
                 **notify_kwargs,
             )
+            self._notifications_active = True
             return True
         except Exception:  # noqa: BLE001
             _LOGGER.error(
@@ -1679,6 +1707,7 @@ class TuyaBLEDevice:
     def _mark_connection_lost(self) -> None:
         was_connected = self._physical_connection_active or self._is_paired
         self._physical_connection_active = False
+        self._notifications_active = False
         self._is_paired = False
         self._state_data_fresh = False
         if was_connected:
@@ -1740,6 +1769,7 @@ class TuyaBLEDevice:
             stop_notify_error: BleakError | None = None
             disconnect_error: BleakError | None = None
             if client and client.is_connected:
+                self._notifications_active = False
                 try:
                     await client.stop_notify(self._characteristic_notify)
                 except Exception as ex:  # noqa: BLE001
@@ -1781,6 +1811,7 @@ class TuyaBLEDevice:
         """Retain a newly connected client until physical release is verified."""
         self._client = client
         self._physical_connection_active = client.is_connected
+        self._notifications_active = False
         self._expected_disconnect = True
         try:
             await client.stop_notify(self._characteristic_notify)
@@ -1823,7 +1854,7 @@ class TuyaBLEDevice:
                 self.log_identity,
                 self.rssi,
             )
-        if self._client and self._client.is_connected and self._is_paired:
+        if self.is_connection_active:
             return
         if self._client and self._client.is_connected:
             raise TuyaBLEConnectionUnavailableError()
@@ -1840,7 +1871,7 @@ class TuyaBLEDevice:
         async with self._connect_lock:
             # Check again while holding the lock
             await asyncio.sleep(0.01)
-            if self._client and self._client.is_connected and self._is_paired:
+            if self.is_connection_active:
                 return
             if self._terminal_stopped:
                 raise TuyaBLEConnectionUnavailableError()
@@ -1892,6 +1923,7 @@ class TuyaBLEDevice:
             _LOGGER.debug("%s: Connected; RSSI: %s", self.log_identity, self.rssi)
             self._client = client
             self._physical_connection_active = True
+            self._notifications_active = False
             self._characteristic_notify = CHARACTERISTIC_NOTIFY
             self._characteristic_write = CHARACTERISTIC_WRITE
             for notify_uuid, write_uuid in SERVICE_CHARACTERISTICS.values():
@@ -1910,6 +1942,7 @@ class TuyaBLEDevice:
                     self._notification_handler,
                     **notify_kwargs,
                 )
+                self._notifications_active = True
                 if not await self._send_packet_while_connected(
                     TuyaBLECode.FUN_SENDER_DEVICE_INFO,
                     (

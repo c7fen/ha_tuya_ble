@@ -21,6 +21,7 @@ CONFIG = {
     }
 }
 
+
 async def test_ensure_connected_bluetooth_shutdown(hass: HomeAssistant) -> None:
     """Test that _ensure_connected terminates immediately on bluetooth shutdown error."""
     entry = MockConfigEntry(
@@ -33,7 +34,9 @@ async def test_ensure_connected_bluetooth_shutdown(hass: HomeAssistant) -> None:
     )
     entry.add_to_hass(hass)
 
-    ble_device = BLEDevice(name="bob", address="11:22:33:44:55:66", details="", rssi=-50)
+    ble_device = BLEDevice(
+        name="bob", address="11:22:33:44:55:66", details="", rssi=-50
+    )
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
@@ -62,14 +65,18 @@ async def test_reconnect_bluetooth_shutdown(hass: HomeAssistant) -> None:
     )
     entry.add_to_hass(hass)
 
-    ble_device = BLEDevice(name="bob", address="11:22:33:44:55:66", details="", rssi=-50)
+    ble_device = BLEDevice(
+        name="bob", address="11:22:33:44:55:66", details="", rssi=-50
+    )
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
 
     # Mock _ensure_connected to raise BleakError("Bluetooth is already shutdown")
     with patch.object(
-        device, "_ensure_connected", side_effect=BleakError("Bluetooth is already shutdown")
+        device,
+        "_ensure_connected",
+        side_effect=BleakError("Bluetooth is already shutdown"),
     ):
         with patch("asyncio.create_task") as mock_create_task:
             await device._reconnect()
@@ -89,15 +96,22 @@ async def test_send_packets_locked_bluetooth_shutdown(hass: HomeAssistant) -> No
     )
     entry.add_to_hass(hass)
 
-    ble_device = BLEDevice(name="bob", address="11:22:33:44:55:66", details="", rssi=-50)
+    ble_device = BLEDevice(
+        name="bob", address="11:22:33:44:55:66", details="", rssi=-50
+    )
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
 
     # Set some device client mock
     client = Mock()
-    client.write_gatt_char = AsyncMock(side_effect=BleakError("Bluetooth is already shutdown"))
+    client.write_gatt_char = AsyncMock(
+        side_effect=BleakError("Bluetooth is already shutdown")
+    )
     device._client = client
+    device._is_paired = True
+    device._physical_connection_active = True
+    device._notifications_active = True
 
     with patch("asyncio.create_task") as mock_create_task:
         with pytest.raises(BleakError, match="Bluetooth is already shutdown"):

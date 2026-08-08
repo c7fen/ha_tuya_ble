@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from enum import StrEnum
 from typing import Any
 
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
@@ -56,7 +57,17 @@ _MOTOR_STATE_KEY = "lock_motor_state"
 _V1_CATEGORY = "ms"
 _V1_PRODUCT_ID = "7a4xvbtt"
 _V1_MANUAL_LOCK_KEY = "manual_lock"
-_PLATFORM_ROLLBACK_BACKOFF_SECONDS = 0.1
+PLATFORM_ROLLBACK_MAX_ATTEMPTS = 3
+PLATFORM_ROLLBACK_TIMEOUT_SECONDS = 2.0
+PLATFORM_ROLLBACK_BACKOFF_SECONDS = 0.1
+
+
+class _PlatformUnloadOutcome(StrEnum):
+    """Result of one all-platform unload transaction."""
+
+    UNLOADED = "unloaded"
+    RESTORED = "restored"
+    RESTORATION_FAILED = "restoration_failed"
 
 
 def _registry_entry_subentry_id(registry_entry: er.RegistryEntry) -> str | None:
@@ -660,8 +671,8 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def _async_unload_platforms_transactional(
     hass: HomeAssistant,
     entry: ConfigEntry,
-) -> bool:
-    """Unload every platform or wait until the complete loaded set is restored."""
+) -> _PlatformUnloadOutcome:
+    """Unload every platform or make a bounded attempt to restore the full set."""
     results = await asyncio.gather(
         *(
             hass.config_entries.async_forward_entry_unload(entry, platform)
@@ -670,29 +681,52 @@ async def _async_unload_platforms_transactional(
         return_exceptions=True,
     )
     if all(result is True for result in results):
-        return True
+        return _PlatformUnloadOutcome.UNLOADED
 
     pending = set(PLATFORMS)
-    while pending:
-        platforms = tuple(pending)
-        restored = await asyncio.gather(
-            *(
-                _async_restore_platform_after_unload_failure(hass, entry, platform)
-                for platform in platforms
-            ),
-            return_exceptions=True,
-        )
-        pending = {
-            platform
-            for platform, result in zip(platforms, restored, strict=True)
-            if result is not True
-        }
-        if pending:
-            _LOGGER.error(
-                "Tuya BLE platform rollback is incomplete; retrying restoration"
-            )
-            await asyncio.sleep(_PLATFORM_ROLLBACK_BACKOFF_SECONDS)
-    return False
+    try:
+        async with asyncio.timeout(PLATFORM_ROLLBACK_TIMEOUT_SECONDS):
+            for attempt in range(1, PLATFORM_ROLLBACK_MAX_ATTEMPTS + 1):
+                platforms = tuple(pending)
+                restored = await asyncio.gather(
+                    *(
+                        _async_restore_platform_after_unload_failure(
+                            hass, entry, platform
+                        )
+                        for platform in platforms
+                    ),
+                    return_exceptions=True,
+                )
+                pending = {
+                    platform
+                    for platform, result in zip(platforms, restored, strict=True)
+                    if result is not True
+                }
+                if not pending:
+                    return _PlatformUnloadOutcome.RESTORED
+                if attempt < PLATFORM_ROLLBACK_MAX_ATTEMPTS:
+                    _LOGGER.error(
+                        "Tuya BLE platform rollback is incomplete; retrying restoration"
+                    )
+                    await asyncio.sleep(PLATFORM_ROLLBACK_BACKOFF_SECONDS)
+    except TimeoutError:
+        _LOGGER.error("Tuya BLE platform rollback reached its time limit")
+
+    _LOGGER.error("Tuya BLE platform rollback is incomplete after bounded restoration")
+    return _PlatformUnloadOutcome.RESTORATION_FAILED
+
+
+def _platforms_fully_restored(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Return whether every expected entity platform completed setup."""
+    for platform in PLATFORMS:
+        component_data = hass.data.get(platform.value)
+        loaded_platforms = getattr(component_data, "_platforms", {})
+        entity_platform = loaded_platforms.get(entry.entry_id)
+        if entity_platform is None or not getattr(
+            entity_platform, "_setup_complete", False
+        ):
+            return False
+    return True
 
 
 async def _async_restore_platform_after_unload_failure(
@@ -767,9 +801,13 @@ async def _async_unload_entry_transaction(
     if not await data.device.async_prepare_unload():
         _schedule_loaded_state_after_unload_rollback(hass, entry)
         return False
-    if not await _async_unload_platforms_transactional(hass, entry):
+    platform_outcome = await _async_unload_platforms_transactional(hass, entry)
+    if platform_outcome is not _PlatformUnloadOutcome.UNLOADED:
         await data.device.async_cancel_unload()
-        _schedule_loaded_state_after_unload_rollback(hass, entry)
+        if platform_outcome is _PlatformUnloadOutcome.RESTORED:
+            _schedule_loaded_state_after_unload_rollback(hass, entry)
+        else:
+            _schedule_failed_unload_state_after_rollback_exhaustion(hass, entry)
         return False
     await data.device.stop()
     hass.data[DOMAIN].pop(entry.entry_id)
@@ -781,18 +819,68 @@ def _schedule_loaded_state_after_unload_rollback(
     entry: ConfigEntry,
 ) -> None:
     """Restore HA's loaded state after its failed-unload bookkeeping completes."""
+    attempts = 0
 
     @callback
     def restore_loaded_state() -> None:
+        nonlocal attempts
+        attempts += 1
+        if not _platforms_fully_restored(hass, entry):
+            _LOGGER.error(
+                "Tuya BLE entry remains failed-unload because platform rollback "
+                "verification is incomplete"
+            )
+            return
         unload_in_progress = getattr(
             ConfigEntryState,
             "UNLOAD_IN_PROGRESS",
             None,
         )
         if unload_in_progress is not None and entry.state is unload_in_progress:
-            hass.loop.call_soon(restore_loaded_state)
+            if attempts < PLATFORM_ROLLBACK_MAX_ATTEMPTS:
+                hass.loop.call_later(
+                    PLATFORM_ROLLBACK_BACKOFF_SECONDS,
+                    restore_loaded_state,
+                )
+            else:
+                _LOGGER.error(
+                    "Tuya BLE entry state rollback did not finish within its bound"
+                )
             return
         if entry.state is ConfigEntryState.FAILED_UNLOAD:
             entry._async_set_state(hass, ConfigEntryState.LOADED, None)
 
     hass.loop.call_soon(restore_loaded_state)
+
+
+def _schedule_failed_unload_state_after_rollback_exhaustion(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Keep an incompletely restored entry honestly failed-unload."""
+    attempts = 0
+
+    @callback
+    def retain_failed_unload_state() -> None:
+        nonlocal attempts
+        attempts += 1
+        unload_in_progress = getattr(
+            ConfigEntryState,
+            "UNLOAD_IN_PROGRESS",
+            None,
+        )
+        if unload_in_progress is not None and entry.state is unload_in_progress:
+            if attempts < PLATFORM_ROLLBACK_MAX_ATTEMPTS:
+                hass.loop.call_later(
+                    PLATFORM_ROLLBACK_BACKOFF_SECONDS,
+                    retain_failed_unload_state,
+                )
+            else:
+                _LOGGER.error(
+                    "Tuya BLE failed-unload state could not be retained within its bound"
+                )
+            return
+        if entry.state is ConfigEntryState.LOADED:
+            entry._async_set_state(hass, ConfigEntryState.FAILED_UNLOAD, None)
+
+    hass.loop.call_soon(retain_failed_unload_state)

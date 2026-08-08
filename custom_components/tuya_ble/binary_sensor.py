@@ -526,8 +526,8 @@ class TuyaBLEConnectionSensor(TuyaBLEEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return whether an authenticated paired GATT session is active."""
-        return self._device.is_connection_active
+        """Return whether an authenticated physical GATT session is active."""
+        return self._device.is_gatt_connected and self._device.is_authenticated
 
     @callback
     def _async_handle_connection_state(self, _: bool) -> None:
