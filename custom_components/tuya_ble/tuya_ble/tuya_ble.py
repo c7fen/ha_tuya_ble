@@ -786,7 +786,9 @@ class TuyaBLEDevice:
         if pending_disconnect:
             await self._complete_pending_disconnect()
 
-    async def _complete_pending_disconnect(self, *, raise_on_error: bool = False) -> None:
+    async def _complete_pending_disconnect(
+        self, *, raise_on_error: bool = False
+    ) -> None:
         """Complete one deferred disconnect after all protected work drains."""
         async with self._policy_lock:
             target = self._pending_disconnect_target
@@ -797,7 +799,9 @@ class TuyaBLEDevice:
 
         disconnect_failed = False
         try:
-            await self._execute_disconnect(terminal=target is ConnectionPolicyState.STOPPED)
+            await self._execute_disconnect(
+                terminal=target is ConnectionPolicyState.STOPPED
+            )
         except Exception:
             disconnect_failed = True
             _LOGGER.error("%s: Deferred BLE disconnect failed", self.log_identity)

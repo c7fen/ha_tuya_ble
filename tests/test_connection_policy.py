@@ -315,10 +315,13 @@ async def test_suspension_timeout_defers_disconnect_until_final_lease_release() 
     lease = device.connection_lease("timeout operation", defer_connection=True)
     await lease.__aenter__()
 
-    with patch(
-        "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
-        0.01,
-    ), pytest.raises(ServiceValidationError):
+    with (
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        pytest.raises(ServiceValidationError),
+    ):
         await device.async_update_connection_policy(ble_control_enabled=False)
 
     assert disconnect.await_count == 0
