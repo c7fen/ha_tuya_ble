@@ -19,6 +19,7 @@ from custom_components.tuya_ble.devices import (
 from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
 from custom_components.tuya_ble.binary_sensor import TuyaBLEBinarySensorMapping
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType
+from custom_components.tuya_ble.tuya_ble.tuya_ble import ConnectionSessionToken
 
 DEVICE_NAME = "1234"
 DEVICE_ADDRESS = "00:11:22:33:44:55"
@@ -40,6 +41,15 @@ CentralBluetoothManager.manager.async_ble_device_from_address.side_effect = (
         mock_ble_device if address == DEVICE_ADDRESS else None
     )
 )
+
+
+def claim_test_session(device: TuyaBLEDevice) -> ConnectionSessionToken:
+    """Claim one exact, command-ready synthetic connection session."""
+    client = Mock(is_connected=True)
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    return token
 
 
 def _dp_type_for_value(value: Any) -> TuyaBLEDataPointType:
@@ -74,6 +84,7 @@ async def init(
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Product")
 
     hass.data.setdefault(DOMAIN, {})
@@ -113,7 +124,7 @@ async def init(
 
     for dp_id in entity_dp_ids:
         device.datapoints._update_from_device(
-            dp_id, 0, 0, TuyaBLEDataPointType.DT_STRING, ""
+            dp_id, 0, 0, TuyaBLEDataPointType.DT_STRING, "", session_token
         )
 
     for entity in entities:
@@ -123,7 +134,7 @@ async def init(
         for dp_id_str, value in status.items():
             dp_id = int(dp_id_str)
             device.datapoints._update_from_device(
-                dp_id, 0, 0, _dp_type_for_value(value), value
+                dp_id, 0, 0, _dp_type_for_value(value), value, session_token
             )
         for entity in entities:
             entity._handle_coordinator_update()

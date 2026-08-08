@@ -9,7 +9,7 @@ from custom_components.tuya_ble.tuya_ble import TuyaBLEDevice
 from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from homeassistant.core import HomeAssistant
-from custom_components.tuya_ble.const import DOMAIN
+from custom_components.tuya_ble.const import DOMAIN, UNEXPECTED_RECONNECT_MIN_SECONDS
 
 CONFIG = {
     "1234": {
@@ -78,10 +78,11 @@ async def test_reconnect_bluetooth_shutdown(hass: HomeAssistant) -> None:
         "_ensure_connected",
         side_effect=BleakError("Bluetooth is already shutdown"),
     ):
-        with patch("asyncio.create_task") as mock_create_task:
+        with patch.object(device, "_schedule_reconnect_locked") as schedule:
             await device._reconnect()
-            # Assert create_task was never called to reschedule _reconnect
-            mock_create_task.assert_not_called()
+            schedule.assert_not_called()
+
+    assert device.active_lease_count == 0
 
 
 async def test_shutdown_write_keeps_a_connected_client_under_release_ownership(
@@ -116,10 +117,10 @@ async def test_shutdown_write_keeps_a_connected_client_under_release_ownership(
         client.is_connected = False
 
     client.disconnect = AsyncMock(side_effect=disconnect)
-    device._client = client
+    token = device._claim_connection_session(client)
     device._is_paired = True
-    device._physical_connection_active = True
     device._notifications_active = True
+    device._connected_notified_token = token
     device._state_data_fresh = True
     device._schedule_reconnect = Mock()
     device._schedule_reconnect_locked = Mock()
@@ -128,7 +129,7 @@ async def test_shutdown_write_keeps_a_connected_client_under_release_ownership(
         "synthetic shutdown write", defer_connection=True
     ):
         with pytest.raises(BleakError, match="Bluetooth is already shutdown"):
-            await device._send_packets_locked([b"\x00"])
+            await device._send_packets_locked(token, [b"\x00"])
 
         assert device._client is client
         assert client.is_connected is True
@@ -141,7 +142,9 @@ async def test_shutdown_write_keeps_a_connected_client_under_release_ownership(
 
     client.disconnect.assert_awaited_once()
     assert client.is_connected is False
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
 
 
 async def test_shutdown_write_marks_an_already_disconnected_client_lost(
@@ -170,20 +173,22 @@ async def test_shutdown_write_marks_an_already_disconnected_client_lost(
         raise BleakError("Bluetooth is already shutdown")
 
     client.write_gatt_char = AsyncMock(side_effect=shutdown_after_physical_loss)
-    device._client = client
+    token = device._claim_connection_session(client)
     device._is_paired = True
-    device._physical_connection_active = True
     device._notifications_active = True
+    device._connected_notified_token = token
     device._schedule_reconnect_locked = Mock()
 
     async with device.connection_lease(
         "synthetic shutdown loss", defer_connection=True
     ):
         with pytest.raises(BleakError, match="Bluetooth is already shutdown"):
-            await device._send_packets_locked([b"\x00"])
+            await device._send_packets_locked(token, [b"\x00"])
 
     assert device._client is None
     assert device.is_gatt_connected is False
     assert device._pending_release is None
     assert not hasattr(device, "_deferred_resend_packets")
-    device._schedule_reconnect_locked.assert_called_once_with(0)
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )

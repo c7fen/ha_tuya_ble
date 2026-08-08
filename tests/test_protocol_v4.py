@@ -3,8 +3,8 @@
 import asyncio
 from unittest.mock import AsyncMock, Mock
 
-from bleak.backends.device import BLEDevice
 import pytest
+from bleak.backends.device import BLEDevice
 
 from custom_components.tuya_ble.tuya_ble import (
     TuyaBLEDataPointType,
@@ -12,6 +12,7 @@ from custom_components.tuya_ble.tuya_ble import (
 )
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import TuyaBLEDeviceError
+from custom_components.tuya_ble.tuya_ble.tuya_ble import ConnectionSessionToken
 
 
 def _make_device() -> TuyaBLEDevice:
@@ -22,6 +23,16 @@ def _make_device() -> TuyaBLEDevice:
         rssi=-50,
     )
     return TuyaBLEDevice(Mock(), ble_device)
+
+
+def _activate_session(device: TuyaBLEDevice) -> ConnectionSessionToken:
+    """Install a command-ready exact session for direct protocol dispatch."""
+    client = Mock()
+    client.is_connected = True
+    token = device._claim_connection_session(client)
+    device._notifications_active = True
+    device._is_paired = True
+    return token
 
 
 async def test_protocol_v4_write_uses_two_byte_datapoint_length() -> None:
@@ -81,10 +92,17 @@ async def test_protocol_v4_atomic_write_uses_v4_encoder() -> None:
 async def test_protocol_v4_report_updates_datapoint_and_is_acknowledged() -> None:
     """Command 0x8006 reports a v4 datapoint and receives a metadata echo."""
     device = _make_device()
+    token = _activate_session(device)
     device._send_response = AsyncMock()
     report = bytes.fromhex("00 01020304 00 00 0b 02 0004 00000057")
 
-    device._handle_command_or_response(23, 0, TuyaBLECode.FUN_RECEIVE_DP_V4, report)
+    device._handle_command_or_response(
+        23,
+        0,
+        TuyaBLECode.FUN_RECEIVE_DP_V4,
+        report,
+        session_token=token,
+    )
     await asyncio.sleep(0)
 
     datapoint = device.datapoints[11]
@@ -93,6 +111,7 @@ async def test_protocol_v4_report_updates_datapoint_and_is_acknowledged() -> Non
     assert datapoint.value == 87
     assert datapoint.flags == 0
     device._send_response.assert_awaited_once_with(
+        token,
         TuyaBLECode.FUN_RECEIVE_DP_V4,
         bytes.fromhex("00 01020304 00 00 00"),
         23,
@@ -102,10 +121,17 @@ async def test_protocol_v4_report_updates_datapoint_and_is_acknowledged() -> Non
 async def test_protocol_v4_report_honors_no_ack_flag() -> None:
     """Bit 7 in the v4 send flags suppresses the acknowledgement."""
     device = _make_device()
+    token = _activate_session(device)
     device._send_response = AsyncMock()
     report = bytes.fromhex("00 01020304 80 00 0b 02 0004 00000057")
 
-    device._handle_command_or_response(23, 0, TuyaBLECode.FUN_RECEIVE_DP_V4, report)
+    device._handle_command_or_response(
+        23,
+        0,
+        TuyaBLECode.FUN_RECEIVE_DP_V4,
+        report,
+        session_token=token,
+    )
     await asyncio.sleep(0)
 
     assert device.datapoints[11].value == 87
@@ -115,11 +141,16 @@ async def test_protocol_v4_report_honors_no_ack_flag() -> None:
 async def test_protocol_v4_timestamped_report() -> None:
     """Command 0x8007 carries a timestamp before its v4 datapoints."""
     device = _make_device()
+    token = _activate_session(device)
     device._send_response = AsyncMock()
     report = bytes.fromhex("00 01020304 00 04 01 66aabbcc 0b 02 0004 00000062")
 
     device._handle_command_or_response(
-        24, 0, TuyaBLECode.FUN_RECEIVE_TIME_DP_V4, report
+        24,
+        0,
+        TuyaBLECode.FUN_RECEIVE_TIME_DP_V4,
+        report,
+        session_token=token,
     )
     await asyncio.sleep(0)
 
@@ -129,6 +160,7 @@ async def test_protocol_v4_timestamped_report() -> None:
     assert datapoint.flags == 4
     assert datapoint.timestamp == 0x66AABBCC
     device._send_response.assert_awaited_once_with(
+        token,
         TuyaBLECode.FUN_RECEIVE_TIME_DP_V4,
         bytes.fromhex("00 01020304 00 04 00"),
         24,
@@ -138,14 +170,16 @@ async def test_protocol_v4_timestamped_report() -> None:
 async def test_protocol_v4_write_response_propagates_device_error() -> None:
     """The final byte of a 0x0027 response is its result code."""
     device = _make_device()
+    token = _activate_session(device)
     response = asyncio.get_running_loop().create_future()
-    device._input_expected_responses[9] = response
+    device._input_expected_responses[(token, 9)] = response
 
     device._handle_command_or_response(
         25,
         9,
         TuyaBLECode.FUN_SENDER_DPS_V4,
         bytes.fromhex("00 01020304 02"),
+        session_token=token,
     )
 
     with pytest.raises(TuyaBLEDeviceError):
