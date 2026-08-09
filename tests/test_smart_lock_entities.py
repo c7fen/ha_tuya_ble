@@ -222,14 +222,17 @@ def test_v1_contract_excludes_generic_and_speculative_entities() -> None:
     switches = _mapping_by_key(switch.get_mapping_by_device(V1_DEVICE))
     assert set(switches) == {"automatic_lock"}
     assert switches["automatic_lock"].dp_id == 33
+    assert switches["automatic_lock"].requires_current_session is True
 
     numbers = _mapping_by_key(number.get_mapping_by_device(V1_DEVICE))
     assert set(numbers) == {"auto_lock_time"}
     assert numbers["auto_lock_time"].dp_id == 36
+    assert numbers["auto_lock_time"].requires_current_session is True
 
     binary_sensors = _mapping_by_key(binary_sensor.get_mapping_by_device(V1_DEVICE))
     assert set(binary_sensors) == {"lock_motor_state"}
     assert binary_sensors["lock_motor_state"].dp_id == 47
+    assert binary_sensors["lock_motor_state"].requires_current_session is True
     assert binary_sensors["lock_motor_state"].description.device_class is None
 
     assert select.get_mapping_by_device(V1_DEVICE) == []

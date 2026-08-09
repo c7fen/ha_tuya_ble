@@ -4234,6 +4234,171 @@ async def test_s1_session_invalidation_immediately_publishes_all_current_state(
     assert not device._response_tasks
 
 
+async def test_v1_session_invalidation_does_not_reuse_cached_configuration_state(
+    hass: HomeAssistant,
+) -> None:
+    """V1 current state becomes unknown until its own replacement-session DP."""
+    device = _make_device()
+    assert device._device_info is not None
+    device._device_info.category = "ms"
+    device._device_info.product_id = "7a4xvbtt"
+    coordinator = TuyaBLECoordinator(hass, device)
+    product = TuyaBLEProductInfo("V1 Smart Lock")
+
+    motor_mapping = next(
+        item for item in get_binary_sensor_mapping_by_device(device) if item.dp_id == 47
+    )
+    auto_lock_mapping = next(
+        item for item in get_switch_mapping_by_device(device) if item.dp_id == 33
+    )
+    auto_lock_delay_mapping = next(
+        item for item in get_number_mapping_by_device(device) if item.dp_id == 36
+    )
+    motor = TuyaBLEBinarySensor(hass, coordinator, device, product, motor_mapping)
+    auto_lock = TuyaBLESwitch(hass, coordinator, device, product, auto_lock_mapping)
+    auto_lock_delay = TuyaBLENumber(
+        hass,
+        coordinator,
+        device,
+        product,
+        auto_lock_delay_mapping,
+    )
+    entities = (motor, auto_lock, auto_lock_delay)
+    listeners = []
+    for entity in entities:
+        entity.async_write_ha_state = Mock()
+        listeners.append(
+            coordinator.async_add_listener(entity._handle_coordinator_update)
+        )
+
+    device._send_response = AsyncMock()
+    first_client = _SyntheticConnectedClient()
+    first_token = _install_connected_session(device, first_client)
+    _configure_synthetic_session_crypto(device, b"V1ONE1")
+    first_callback = device._notification_callback_for_session(first_token)
+    first_report = bytes(
+        (
+            47,
+            TuyaBLEDataPointType.DT_BOOL.value,
+            1,
+            1,
+            33,
+            TuyaBLEDataPointType.DT_BOOL.value,
+            1,
+            1,
+            36,
+            TuyaBLEDataPointType.DT_VALUE.value,
+            4,
+            0,
+            0,
+            0,
+            10,
+        )
+    )
+    first_packets = device._build_packets(
+        401,
+        TuyaBLECode.FUN_RECEIVE_DP,
+        first_report,
+    )
+    for packet in first_packets:
+        first_callback(0, packet)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert motor.is_on is True
+    assert auto_lock.is_on is True
+    assert auto_lock_delay.native_value == 10.0
+
+    for entity in entities:
+        entity.async_write_ha_state.reset_mock()
+    device._schedule_reconnect_locked = Mock()
+    first_client.is_connected = False
+    device._disconnected(first_client, first_token)
+
+    assert coordinator.connected is True
+    assert coordinator._unsub_disconnect is not None
+    coordinator._unsub_disconnect()
+    coordinator._unsub_disconnect = None
+    assert motor.is_on is None
+    assert auto_lock.is_on is None
+    assert auto_lock_delay.native_value is None
+    for entity in entities:
+        entity.async_write_ha_state.assert_called()
+
+    second_client = _SyntheticConnectedClient()
+    second_token = _install_connected_session(device, second_client)
+    _configure_synthetic_session_crypto(device, b"V1TWO2")
+    second_callback = device._notification_callback_for_session(second_token)
+    second_report = bytes(
+        (
+            8,
+            TuyaBLEDataPointType.DT_VALUE.value,
+            4,
+            0,
+            0,
+            0,
+            74,
+        )
+    )
+    for packet in device._build_packets(
+        402,
+        TuyaBLECode.FUN_RECEIVE_DP,
+        second_report,
+    ):
+        second_callback(0, packet)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert motor.is_on is None
+    assert auto_lock.is_on is None
+    assert auto_lock_delay.native_value is None
+    assert auto_lock.available is True
+    assert auto_lock_delay.available is True
+
+    response_count = device._send_response.await_count
+    for packet in first_packets:
+        first_callback(0, packet)
+    await asyncio.sleep(0)
+    assert device._send_response.await_count == response_count
+    assert device.datapoints[47].received_in_current_session is False
+    assert device.datapoints[33].received_in_current_session is False
+    assert device.datapoints[36].received_in_current_session is False
+    assert motor.is_on is None
+    assert auto_lock.is_on is None
+    assert auto_lock_delay.native_value is None
+    assert not device._response_tasks
+
+    for packet in device._build_packets(
+        403,
+        TuyaBLECode.FUN_RECEIVE_DP,
+        first_report,
+    ):
+        second_callback(0, packet)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert motor.is_on is True
+    assert auto_lock.is_on is True
+    assert auto_lock_delay.native_value == 10.0
+
+    for entity in entities:
+        entity.async_write_ha_state.reset_mock()
+    device._schedule_reconnect_locked = Mock()
+    second_client.is_connected = False
+    device._disconnected(second_client, second_token)
+    assert motor.is_on is None
+    assert auto_lock.is_on is None
+    assert auto_lock_delay.native_value is None
+    for entity in entities:
+        entity.async_write_ha_state.assert_called()
+    assert coordinator._unsub_disconnect is not None
+    coordinator._unsub_disconnect()
+    coordinator._unsub_disconnect = None
+
+    for remove_listener in listeners:
+        remove_listener()
+    coordinator.shutdown()
+
+
 async def test_status_acknowledgement_does_not_mark_state_fresh() -> None:
     """A status acknowledgement is not a substitute for an inbound datapoint."""
     device = _make_device()
