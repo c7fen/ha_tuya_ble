@@ -4399,6 +4399,125 @@ async def test_v1_session_invalidation_does_not_reuse_cached_configuration_state
     coordinator.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("replacement_dp_id", "replacement_type", "replacement_value", "expected"),
+    (
+        (47, TuyaBLEDataPointType.DT_BOOL, False, (False, None, None)),
+        (33, TuyaBLEDataPointType.DT_BOOL, False, (None, False, None)),
+        (36, TuyaBLEDataPointType.DT_VALUE, 12, (None, None, 12.0)),
+    ),
+    ids=("motor-only", "auto-lock-only", "auto-lock-delay-only"),
+)
+async def test_v1_current_state_and_commands_remain_independent_per_session(
+    hass: HomeAssistant,
+    replacement_dp_id: int,
+    replacement_type: TuyaBLEDataPointType,
+    replacement_value: bool | int,
+    expected: tuple[bool | None, bool | None, float | None],
+) -> None:
+    """Each V1 datapoint owns only its own current display state."""
+    device = _make_device()
+    assert device._device_info is not None
+    device._device_info.category = "ms"
+    device._device_info.product_id = "7a4xvbtt"
+    coordinator = TuyaBLECoordinator(hass, device)
+    product = TuyaBLEProductInfo("V1 Smart Lock")
+    motor = TuyaBLEBinarySensor(
+        hass,
+        coordinator,
+        device,
+        product,
+        next(
+            item
+            for item in get_binary_sensor_mapping_by_device(device)
+            if item.dp_id == 47
+        ),
+    )
+    motor.async_write_ha_state = Mock()
+    auto_lock = TuyaBLESwitch(
+        hass,
+        coordinator,
+        device,
+        product,
+        next(item for item in get_switch_mapping_by_device(device) if item.dp_id == 33),
+    )
+    auto_lock_delay = TuyaBLENumber(
+        hass,
+        coordinator,
+        device,
+        product,
+        next(item for item in get_number_mapping_by_device(device) if item.dp_id == 36),
+    )
+
+    first_client = _SyntheticConnectedClient()
+    first_token = _install_connected_session(device, first_client)
+    for dp_id, dp_type, value in (
+        (47, TuyaBLEDataPointType.DT_BOOL, True),
+        (33, TuyaBLEDataPointType.DT_BOOL, True),
+        (36, TuyaBLEDataPointType.DT_VALUE, 10),
+    ):
+        device.datapoints._update_from_device(
+            dp_id,
+            0,
+            0,
+            dp_type,
+            value,
+            first_token,
+        )
+
+    device._schedule_reconnect_locked = Mock()
+    first_client.is_connected = False
+    device._disconnected(first_client, first_token)
+    assert coordinator._unsub_disconnect is not None
+    coordinator._unsub_disconnect()
+    coordinator._unsub_disconnect = None
+
+    second_token = _install_connected_session(device, _SyntheticConnectedClient())
+    device._send_response = AsyncMock()
+    _configure_synthetic_session_crypto(device, b"V1THRE")
+    second_callback = device._notification_callback_for_session(second_token)
+    replacement_payload = bytes(
+        (
+            replacement_dp_id,
+            replacement_type.value,
+            1 if replacement_type is TuyaBLEDataPointType.DT_BOOL else 4,
+        )
+    ) + (
+        bytes((int(replacement_value),))
+        if replacement_type is TuyaBLEDataPointType.DT_BOOL
+        else int(replacement_value).to_bytes(4, "big")
+    )
+    for packet in device._build_packets(
+        404,
+        TuyaBLECode.FUN_RECEIVE_DP,
+        replacement_payload,
+    ):
+        second_callback(0, packet)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    datapoint = device.datapoints[replacement_dp_id]
+    assert datapoint is not None
+    assert datapoint.received_in_current_session is True
+    motor._handle_coordinator_update()
+    assert (motor.is_on, auto_lock.is_on, auto_lock_delay.native_value) == expected
+
+    device._send_datapoints = AsyncMock()
+    auto_lock.turn_off()
+    auto_lock_delay.set_native_value(15)
+    await hass.async_block_till_done()
+
+    assert device._send_datapoints.await_count == 2
+    assert device.datapoints[33].value is False
+    assert device.datapoints[36].value == 15
+    assert device.datapoints[47].received_in_current_session is (
+        replacement_dp_id == 47
+    )
+    assert motor.is_on is expected[0]
+    assert auto_lock.is_on is None
+    assert auto_lock_delay.native_value is None
+    coordinator.shutdown()
+
+
 async def test_status_acknowledgement_does_not_mark_state_fresh() -> None:
     """A status acknowledgement is not a substitute for an inbound datapoint."""
     device = _make_device()
