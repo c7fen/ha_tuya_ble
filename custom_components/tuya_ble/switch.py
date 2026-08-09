@@ -441,6 +441,7 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=smart_lock_automatic_lock_getter,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(

@@ -158,6 +158,7 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=motor_state_getter,
+                    requires_current_session=True,
                 ),
             ],
             # TODO: Review how many of these are better off as a switch only?

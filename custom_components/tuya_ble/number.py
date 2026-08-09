@@ -894,6 +894,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(
