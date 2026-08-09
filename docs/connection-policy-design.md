@@ -367,9 +367,14 @@ even while their displayed value is unknown. Alarm DP21 and the Last Unlock
 Method datapoints retain their historical/event semantics; they are not proof
 of current configuration and are not cleared merely because a session ended.
 
-The exact reviewed V1 lock likewise exposes read-only Motor State DP47 only
-when DP47 itself was received in the active epoch. A replacement DP8 or another
-unrelated report cannot refresh its cached physical lock state.
+The exact reviewed V1 lock exposes read-only Motor State DP47 only when DP47
+itself was received in the active epoch. V1 Auto-Lock DP33 and Auto-Lock Delay
+DP36 likewise display unknown until their own datapoint arrives in the active
+session; their commands remain callable whenever policy permits. A replacement
+DP8 or another unrelated report cannot refresh any of these cached values. V1
+Alarm DP21 and Last Unlock Method retain their documented historical/event
+semantics. This does not change V1 command behavior. The physical S1 connection
+churn remains indeterminate and hardware has not been verified.
 
 Other read-only entities are unavailable when aggregate current-session data
 is absent. On-demand command entities remain callable while control is enabled.
