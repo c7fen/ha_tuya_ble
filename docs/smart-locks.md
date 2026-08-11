@@ -45,7 +45,7 @@ Product `jtmspro/xqeob8h6` exposes a `LockEntity` with fail-closed Unlock.
 | Home Assistant behavior | Contract |
 | --- | --- |
 | Lock | The separately evidenced DP46 secure operation |
-| Unlock | Uses complete DP70/DP71 templates from the same authenticated device |
+| Unlock | Uses a complete DP70/DP71 template pair from the same authenticated device |
 | State | Read-only DP47; `false` is secure/uncoupled and `true` is access-enabled/coupled |
 | Auto-Lock | Configuration only |
 | Auto-Lock Delay | Configuration only |
@@ -56,11 +56,27 @@ file with mode `0600`. There is no global, product-wide, or cross-device
 fallback. Missing, incomplete, foreign, noncanonical, or ambiguous material
 fails before a Bluetooth write.
 
+In On demand mode, S1 Unlock first establishes its authenticated session, then
+selects the latest complete validated device-scoped pair. A complete DP70/DP71
+pair received from that exact session supersedes the persisted pair. If the
+session supplies no complete pair, the most recent complete validated
+same-device pair remains available. Partial session pairs stay private and
+pending: they neither replace one persisted half nor combine with a half from a
+different session. Store promotion replaces both halves atomically. Always
+connected mode uses the same device-scoped template rule.
+
 S1 Lock has exactly one DP46 attempt. S1 Unlock has exactly one protected
 DP70, delay, DP71 sequence. An ambiguous write is reported without replaying a
 datapoint, packet, or sequence after reconnect; inspect the physical state
 before issuing another deliberate action. Do not copy template material between
 devices and do not publish it.
+
+A synthetic ordering test reproduced a preconnection template-selection race
+in the prior implementation. The root cause of the originally observed
+physical On-demand Unlock failure remains indeterminate; a transient BLE,
+proxy-routing, GATT-session, or transport failure remains plausible. The local
+candidate has not been installed or tested on hardware, so it makes no hardware
+success claim.
 
 For both products, the Motor State binary sensor mirrors the Boolean DP47 report:
 off corresponds to secure/uncoupled and on corresponds to access-enabled/coupled.

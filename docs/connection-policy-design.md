@@ -399,14 +399,32 @@ idempotently after Home Assistant persists them.
 
 ## 14. S1 safety
 
-S1 Lock holds one lease around exactly one DP46 true action. S1 Unlock validates
-the complete device-scoped DP70/DP71 template before acquiring or writing,
-then holds one lease around DP70, the required 0.8-second delay, rebuilt DP71,
-and required response handling. No idle task or suspension transition can
-disconnect between DP70 and DP71. Missing or invalid templates perform zero
-BLE writes. An ambiguous DP46, DP70, or DP71 write restores local transient
-state, releases the failed session safely, and never retries either the
-individual datapoint or the protected unlock sequence.
+S1 Lock and Unlock share one per-device operation lock, so a DP46 action cannot
+interleave with an Unlock sequence. On demand Unlock first establishes its
+authenticated session, then selects the effective complete validated
+device-scoped DP70/DP71 pair. A complete pair received from that exact session
+supersedes the persisted pair; when the session supplies no complete pair, the
+most recent complete validated same-device pair remains available. Session-local
+halves remain private and pending until both belong to the same exact session.
+They cannot replace one persisted half, combine across session epochs, or create
+an intermediate Store snapshot. Complete-pair promotion updates DP70 and DP71
+atomically. Always connected uses the same device-scoped rule.
+
+Unlock holds one outer lease around connection, selection, DP70, the required
+0.8-second delay, rebuilt DP71, and required response handling. The timestamp is
+rebuilt only after the effective pair is selected. No idle task or suspension
+transition can disconnect between DP70 and DP71. Missing or invalid templates
+perform zero BLE writes. An ambiguous DP46, DP70, or DP71 write restores local
+transient state, releases the failed session safely, and never retries either
+the individual datapoint or the protected unlock sequence.
+
+An executable synthetic ordering reproduced the previous preconnection
+template-selection race: Pair A was selected before Session 2 connected and
+remained outgoing after Session 2 supplied complete Pair B during setup. The
+root cause of the original physical On-demand Unlock failure remains
+indeterminate, and transient BLE, proxy-routing, GATT-session, or transport
+failure remains plausible. This local candidate has not been installed or
+hardware-tested and therefore makes no physical-success claim.
 
 ## 15. V1 safety
 
