@@ -4895,6 +4895,7 @@ async def test_s1_lock_lease_wraps_both_unlock_writes(
     device._send_datapoints = AsyncMock()
     device._send_datapoints_no_replay = AsyncMock()
     device._ensure_connected = AsyncMock()
+    _install_connected_session(device, _SyntheticConnectedClient())
     coordinator = TuyaBLECoordinator(hass, device)
     store = Mock()
     store.templates_for.return_value = (

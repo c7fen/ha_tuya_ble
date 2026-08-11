@@ -17,21 +17,22 @@ from bleak_retry_connector import BleakError
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
+from custom_components.tuya_ble.const import (
+    UNEXPECTED_RECONNECT_MIN_SECONDS,
+    ConnectionMode,
+    ConnectionPolicyState,
+)
 from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
     TuyaBLEProductInfo,
 )
-from custom_components.tuya_ble.const import (
-    UNEXPECTED_RECONNECT_MIN_SECONDS,
-    ConnectionPolicyState,
-)
 from custom_components.tuya_ble.lock import (
+    S1_DP71_MIN_LENGTH,
+    S1_DP71_TIMESTAMP,
     S1_DP_LOCK,
     S1_DP_MOTOR_STATE,
     S1_DP_UNLOCK_CONFIRM,
     S1_DP_UNLOCK_REQUEST,
-    S1_DP71_MIN_LENGTH,
-    S1_DP71_TIMESTAMP,
     S1_STORE_KEY,
     S1_STORE_VERSION,
     S1_UNLOCK_DELAY,
@@ -156,6 +157,12 @@ def _make_entity(
         template_store,
     )
     entity.async_write_ha_state = Mock()
+
+    async def ensure_synthetic_session() -> None:
+        if device.current_session_epoch is None:
+            _install_synthetic_session(device)
+
+    device._ensure_connected = AsyncMock(side_effect=ensure_synthetic_session)
     return entity, device, backing_store
 
 
@@ -427,6 +434,323 @@ async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> Non
     assert entity.unique_id == f"{SYNTHETIC_DEVICE_ID}-ble_unlock_lock"
 
 
+async def test_s1_on_demand_unlock_selects_refreshed_templates_after_connection(
+    hass: HomeAssistant,
+) -> None:
+    """On-demand S1 unlock selects a refreshed pair after connecting."""
+    session_two_dp70 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-session-two-dp70"
+    ).digest(SYNTHETIC_DP70_SAMPLE_LENGTH)
+    session_two_dp71 = hashlib.shake_256(
+        b"tuya-ble-test-only:synthetic-session-two-dp71"
+    ).digest(S1_DP71_MIN_LENGTH)
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._protocol_version = 3
+    del device._send_datapoints_no_replay
+    device._execute_disconnect = AsyncMock()
+    sent_payloads: list[bytes] = []
+    ensure_count = 0
+
+    async def establish_session_two() -> None:
+        nonlocal ensure_count
+        ensure_count += 1
+        if ensure_count != 1:
+            return
+        token = _install_synthetic_session(device)
+        device.datapoints._update_from_device(
+            S1_DP_UNLOCK_REQUEST,
+            1.0,
+            0,
+            TuyaBLEDataPointType.DT_RAW,
+            session_two_dp70,
+            token,
+        )
+        device.datapoints._update_from_device(
+            S1_DP_UNLOCK_CONFIRM,
+            2.0,
+            0,
+            TuyaBLEDataPointType.DT_RAW,
+            session_two_dp71,
+            token,
+        )
+        device._fire_callbacks(
+            [
+                device.datapoints[S1_DP_UNLOCK_REQUEST],
+                device.datapoints[S1_DP_UNLOCK_CONFIRM],
+            ]
+        )
+
+    async def record_packet(_, data: bytes, *__: object) -> bool:
+        sent_payloads.append(data)
+        return True
+
+    device._ensure_connected = AsyncMock(side_effect=establish_session_two)
+    device._send_packet_while_connected = AsyncMock(side_effect=record_packet)
+    with (
+        patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()),
+        patch(
+            "custom_components.tuya_ble.lock.time.time",
+            return_value=SYNTHETIC_TIMESTAMP,
+        ),
+    ):
+        await entity.async_unlock()
+
+    sent_session_two_pair = (
+        session_two_dp70 in sent_payloads[0]
+        and session_two_dp71[: S1_DP71_TIMESTAMP.start] in sent_payloads[1]
+    )
+    sent_persistent_pair = (
+        SYNTHETIC_DP70 in sent_payloads[0]
+        or SYNTHETIC_DP71[: S1_DP71_TIMESTAMP.start] in sent_payloads[1]
+    )
+    assert sent_session_two_pair
+    assert not sent_persistent_pair
+
+
+async def test_s1_on_demand_unlock_uses_persisted_pair_without_session_templates(
+    hass: HomeAssistant,
+) -> None:
+    """On-demand S1 unlock retains a validated persisted-pair fallback."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._execute_disconnect = AsyncMock()
+
+    async def establish_session_without_templates() -> None:
+        if device._connection_token is None:
+            _install_synthetic_session(device)
+
+    device._ensure_connected = AsyncMock(
+        side_effect=establish_session_without_templates
+    )
+
+    await entity.async_unlock()
+
+    assert device._send_datapoints_no_replay.await_args_list == [
+        (([S1_DP_UNLOCK_REQUEST],), {}),
+        (([S1_DP_UNLOCK_CONFIRM],), {}),
+    ]
+    assert device._ensure_connected.await_count == 1
+    assert entity.is_unlocking is False
+    if device._idle_disconnect_task is not None:
+        device._idle_disconnect_task.cancel()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("partial_dp_id", (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM))
+async def test_s1_on_demand_partial_refresh_uses_only_persisted_complete_pair(
+    hass: HomeAssistant, partial_dp_id: int
+) -> None:
+    """A Session-2 half cannot mix with the persisted Session-1 pair."""
+    partial_value = hashlib.shake_256(
+        f"tuya-ble-test-only:partial-session-two-{partial_dp_id}".encode()
+    ).digest(
+        SYNTHETIC_DP70_SAMPLE_LENGTH
+        if partial_dp_id == S1_DP_UNLOCK_REQUEST
+        else S1_DP71_MIN_LENGTH
+    )
+    entity, device, backing_store = _make_entity(
+        hass, {SYNTHETIC_DEVICE_ID: _stored_pair()}
+    )
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._execute_disconnect = AsyncMock()
+    writes: list[tuple[int, bytes]] = []
+
+    async def establish_partial_session() -> None:
+        token = _install_synthetic_session(device)
+        device.datapoints._update_from_device(
+            partial_dp_id,
+            1.0,
+            0,
+            TuyaBLEDataPointType.DT_RAW,
+            partial_value,
+            token,
+        )
+        device._fire_callbacks([device.datapoints[partial_dp_id]])
+
+    async def record_send(datapoint_ids: list[int]) -> None:
+        datapoint_id = datapoint_ids[0]
+        writes.append((datapoint_id, bytes(device.datapoints[datapoint_id].value)))
+
+    device._ensure_connected = AsyncMock(side_effect=establish_partial_session)
+    device._send_datapoints_no_replay.side_effect = record_send
+    with (
+        patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()),
+        patch(
+            "custom_components.tuya_ble.lock.time.time",
+            return_value=SYNTHETIC_TIMESTAMP,
+        ),
+    ):
+        await entity.async_unlock()
+
+    assert writes[0] == (S1_DP_UNLOCK_REQUEST, SYNTHETIC_DP70)
+    assert writes[1][0] == S1_DP_UNLOCK_CONFIRM
+    assert (
+        writes[1][1][: S1_DP71_TIMESTAMP.start]
+        == SYNTHETIC_DP71[: S1_DP71_TIMESTAMP.start]
+    )
+    assert backing_store.delayed_saves == []
+    if device._idle_disconnect_task is not None:
+        device._idle_disconnect_task.cancel()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("partial_dp_id", (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM))
+async def test_s1_on_demand_partial_pair_without_fallback_writes_nothing(
+    hass: HomeAssistant, partial_dp_id: int
+) -> None:
+    """One current-session half without a persisted pair fails before DP70."""
+    partial_value = hashlib.shake_256(
+        f"tuya-ble-test-only:no-fallback-partial-{partial_dp_id}".encode()
+    ).digest(
+        SYNTHETIC_DP70_SAMPLE_LENGTH
+        if partial_dp_id == S1_DP_UNLOCK_REQUEST
+        else S1_DP71_MIN_LENGTH
+    )
+    entity, device, backing_store = _make_entity(hass, {})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._execute_disconnect = AsyncMock()
+
+    async def establish_partial_session() -> None:
+        token = _install_synthetic_session(device)
+        device.datapoints._update_from_device(
+            partial_dp_id,
+            1.0,
+            0,
+            TuyaBLEDataPointType.DT_RAW,
+            partial_value,
+            token,
+        )
+        device._fire_callbacks([device.datapoints[partial_dp_id]])
+
+    device._ensure_connected = AsyncMock(side_effect=establish_partial_session)
+
+    with pytest.raises(ServiceValidationError):
+        await entity.async_unlock()
+
+    device._send_datapoints_no_replay.assert_not_awaited()
+    assert backing_store.delayed_saves == []
+    assert entity.is_unlocking is False
+    if device._idle_disconnect_task is not None:
+        device._idle_disconnect_task.cancel()
+        await asyncio.sleep(0)
+
+
+async def test_s1_on_demand_outer_lease_protects_connection_and_both_writes(
+    hass: HomeAssistant,
+) -> None:
+    """Idle release begins only after the complete unlock operation drains."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._schedule_idle_disconnect_locked = Mock()
+    observed_counts: list[int] = []
+
+    async def record_send(_: list[int]) -> None:
+        observed_counts.append(device.active_lease_count)
+        device._schedule_idle_disconnect_locked.assert_not_called()
+
+    async def record_delay(delay: float) -> None:
+        assert delay >= S1_UNLOCK_DELAY
+        observed_counts.append(device.active_lease_count)
+        device._schedule_idle_disconnect_locked.assert_not_called()
+
+    device._send_datapoints_no_replay.side_effect = record_send
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", record_delay):
+        await entity.async_unlock()
+
+    assert observed_counts == [1, 1, 1]
+    assert device.active_lease_count == 0
+    device._schedule_idle_disconnect_locked.assert_called_once_with()
+
+
+async def test_s1_cancelled_unlock_releases_shared_operation_lock(
+    hass: HomeAssistant,
+) -> None:
+    """Cancelling an unlock cannot block a later S1 lock operation."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    writes: list[int] = []
+    unlock_delay_started = asyncio.Event()
+
+    async def record_send(datapoint_ids: list[int]) -> None:
+        writes.extend(datapoint_ids)
+
+    async def wait_until_cancelled(delay: float) -> None:
+        assert delay == S1_UNLOCK_DELAY
+        unlock_delay_started.set()
+        await asyncio.Event().wait()
+
+    device._send_datapoints_no_replay.side_effect = record_send
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", wait_until_cancelled):
+        unlock_task = asyncio.create_task(entity.async_unlock())
+        await unlock_delay_started.wait()
+        unlock_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await unlock_task
+        await entity.async_lock()
+
+    assert writes == [S1_DP_UNLOCK_REQUEST, S1_DP_LOCK]
+
+
+async def test_s1_cancelled_lock_releases_shared_operation_lock(
+    hass: HomeAssistant,
+) -> None:
+    """Cancelling an active Lock cannot block a later Unlock sequence."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    lock_send_started = asyncio.Event()
+
+    async def wait_until_cancelled(datapoint_ids: list[int]) -> None:
+        assert datapoint_ids == [S1_DP_LOCK]
+        lock_send_started.set()
+        await asyncio.Event().wait()
+
+    device._send_datapoints_no_replay.side_effect = wait_until_cancelled
+    lock_task = asyncio.create_task(entity.async_lock())
+    await lock_send_started.wait()
+    lock_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lock_task
+
+    device._send_datapoints_no_replay.side_effect = None
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", AsyncMock()):
+        await entity.async_unlock()
+
+    assert entity.is_locking is False
+    assert entity.is_unlocking is False
+    assert device._send_datapoints_no_replay.await_args_list[-2:] == [
+        (([S1_DP_UNLOCK_REQUEST],), {}),
+        (([S1_DP_UNLOCK_CONFIRM],), {}),
+    ]
+
+
+async def test_s1_cancelled_waiter_does_not_orphan_operation_lock(
+    hass: HomeAssistant,
+) -> None:
+    """A cancelled waiting Lock leaves later operations able to acquire the lock."""
+    entity, _, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def controlled_delay(delay: float) -> None:
+        assert delay == S1_UNLOCK_DELAY
+        delay_started.set()
+        await release_delay.wait()
+
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", controlled_delay):
+        unlock_task = asyncio.create_task(entity.async_unlock())
+        await delay_started.wait()
+        waiting_lock = asyncio.create_task(entity.async_lock())
+        await real_sleep(0)
+        waiting_lock.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting_lock
+        release_delay.set()
+        await unlock_task
+
+    await entity.async_lock()
+    assert entity.is_locking is False
+
+
 @pytest.mark.parametrize(
     "stored_data",
     [
@@ -589,6 +913,78 @@ async def test_s1_unlock_sequences_are_serialized(hass: HomeAssistant) -> None:
     assert writes == [70, 71, 70, 71]
     assert sleep_count == 2
     assert entity.is_unlocking is False
+
+
+async def test_s1_lock_waits_for_the_complete_unlock_sequence(
+    hass: HomeAssistant,
+) -> None:
+    """A manual S1 lock cannot interrupt the protected unlock pair."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    writes: list[int] = []
+    unlock_delay_started = asyncio.Event()
+    release_unlock_delay = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def record_send(datapoint_ids: list[int]) -> None:
+        writes.extend(datapoint_ids)
+
+    async def controlled_sleep(delay: float) -> None:
+        assert delay == S1_UNLOCK_DELAY
+        unlock_delay_started.set()
+        await release_unlock_delay.wait()
+
+    device._send_datapoints_no_replay.side_effect = record_send
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", controlled_sleep):
+        unlock_task = asyncio.create_task(entity.async_unlock())
+        await unlock_delay_started.wait()
+        lock_task = asyncio.create_task(entity.async_lock())
+        await real_sleep(0)
+        assert writes == [S1_DP_UNLOCK_REQUEST]
+        assert entity.is_locking is False
+        release_unlock_delay.set()
+        await asyncio.gather(unlock_task, lock_task)
+
+    assert writes == [S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM, S1_DP_LOCK]
+
+
+async def test_s1_operation_locks_are_independent_between_devices(
+    hass: HomeAssistant,
+) -> None:
+    """An active sequence on one S1 does not block another S1 device."""
+    first, _, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    second_device_id = SYNTHETIC_OTHER_DEVICE_ID
+    second_device = _make_device(second_device_id)
+    second_store_data = {second_device_id: _stored_pair()}
+    second_store = TuyaBLES1TemplateStore(
+        hass, _BackingStore(second_store_data), second_store_data
+    )
+    second = TuyaBLES1Lock(
+        hass,
+        TuyaBLECoordinator(hass, second_device),
+        second_device,
+        TuyaBLEProductInfo("Synthetic second S1", lock=1),
+        second_store,
+    )
+    second.async_write_ha_state = Mock()
+    _install_synthetic_session(second_device)
+    second_device._ensure_connected = AsyncMock()
+    second_device._send_datapoints_no_replay = AsyncMock()
+    first_delay_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def controlled_delay(delay: float) -> None:
+        assert delay == S1_UNLOCK_DELAY
+        if not first_delay_started.is_set():
+            first_delay_started.set()
+            await release_first.wait()
+
+    with patch("custom_components.tuya_ble.lock.asyncio.sleep", controlled_delay):
+        first_task = asyncio.create_task(first.async_unlock())
+        await first_delay_started.wait()
+        await second.async_lock()
+        second_device._send_datapoints_no_replay.assert_awaited_once_with([S1_DP_LOCK])
+        release_first.set()
+        await first_task
 
 
 async def test_s1_unlock_resets_transient_state_on_transport_error(

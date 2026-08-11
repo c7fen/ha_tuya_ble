@@ -9,6 +9,7 @@ import os
 import stat
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from homeassistant.components.lock import (
@@ -124,6 +125,20 @@ def _build_v1_access_value() -> bytes:
     return bytes([int(True)] * V1_ACCESS_FIELD_COUNT)
 
 
+@dataclass(slots=True, repr=False)
+class _S1PendingTemplatePair:
+    """Private template material received during one exact BLE session."""
+
+    session_epoch: int
+    dp70: bytes | None = None
+    dp71: bytes | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Return whether both template halves belong to this pending pair."""
+        return self.dp70 is not None and self.dp71 is not None
+
+
 class TuyaBLES1TemplateStore:
     """Device-scoped version 1 store for S1 live unlock templates."""
 
@@ -136,6 +151,7 @@ class TuyaBLES1TemplateStore:
         self._hass = hass
         self._backing_store = backing_store
         self._data: dict[str, object] = data if isinstance(data, dict) else {}
+        self._pending: dict[str, _S1PendingTemplatePair] = {}
 
     @classmethod
     async def async_load(cls, hass: HomeAssistant) -> TuyaBLES1TemplateStore:
@@ -152,10 +168,23 @@ class TuyaBLES1TemplateStore:
         )
         return cls(hass, backing_store, await backing_store.async_load())
 
-    def templates_for(self, device_id: str) -> tuple[bytes, bytes] | None:
-        """Return one device's complete valid template pair, if available."""
+    def templates_for(
+        self, device_id: str, session_epoch: int | None = None
+    ) -> tuple[bytes, bytes] | None:
+        """Return a current-session pair, or the persisted complete fallback."""
         if not device_id:
             return None
+        pending = self._pending.get(device_id)
+        if (
+            session_epoch is not None
+            and pending is not None
+            and pending.session_epoch == session_epoch
+            and pending.complete
+        ):
+            assert pending.dp70 is not None
+            assert pending.dp71 is not None
+            return pending.dp70, pending.dp71
+
         device_data = self._data.get(device_id)
         if not isinstance(device_data, dict):
             return None
@@ -176,6 +205,10 @@ class TuyaBLES1TemplateStore:
             return None
         return dp70, dp71
 
+    def discard_pending(self, device_id: str) -> None:
+        """Forget incomplete or complete session-local material for one device."""
+        self._pending.pop(device_id, None)
+
     def capture_inbound(
         self, device_id: str, datapoints: list[TuyaBLEDataPoint]
     ) -> bool:
@@ -183,54 +216,76 @@ class TuyaBLES1TemplateStore:
         if not device_id:
             return False
 
-        captured: dict[str, str] = {}
-        for datapoint in datapoints:
-            if (
-                not datapoint.received_from_device
-                or datapoint.type is not TuyaBLEDataPointType.DT_RAW
-                or not isinstance(datapoint.value, (bytes, bytearray))
-            ):
-                continue
-            raw_value = bytes(datapoint.value)
-            if (
-                datapoint.id == S1_DP_UNLOCK_REQUEST
-                and len(raw_value) >= S1_DP70_MIN_LENGTH
-            ):
-                captured["dp70_b64"] = base64.b64encode(raw_value).decode("ascii")
-            elif (
-                datapoint.id == S1_DP_UNLOCK_CONFIRM
-                and len(raw_value) >= S1_DP71_MIN_LENGTH
-            ):
-                captured["dp71_b64"] = base64.b64encode(raw_value).decode("ascii")
-
-        if not captured:
-            return False
-
-        previous = self._data.get(device_id)
-        device_data = dict(previous) if isinstance(previous, dict) else {}
         expected_metadata = {
             "category": S1_CATEGORY,
             "product_id": S1_PRODUCT_ID,
             "format_version": S1_STORE_VERSION,
         }
-        if any(
-            key in device_data and device_data[key] != expected
+        previous = self._data.get(device_id)
+        if isinstance(previous, dict) and any(
+            key in previous and previous[key] != expected
             for key, expected in expected_metadata.items()
         ):
             return False
-        changed = False
-        for key, expected in expected_metadata.items():
-            if device_data.get(key) != expected:
-                device_data[key] = expected
-                changed = True
-        for key, encoded in captured.items():
-            if device_data.get(key) != encoded:
-                device_data[key] = encoded
-                changed = True
-        if not changed:
+
+        captured: dict[int, bytes] = {}
+        captured_epoch: int | None = None
+        for datapoint in datapoints:
+            if (
+                not datapoint.received_from_device
+                or datapoint.received_session_epoch is None
+                or datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                or not isinstance(datapoint.value, (bytes, bytearray))
+            ):
+                continue
+            if captured_epoch is None:
+                captured_epoch = datapoint.received_session_epoch
+            elif captured_epoch != datapoint.received_session_epoch:
+                return False
+            raw_value = bytes(datapoint.value)
+            if (
+                datapoint.id == S1_DP_UNLOCK_REQUEST
+                and len(raw_value) >= S1_DP70_MIN_LENGTH
+            ):
+                captured[S1_DP_UNLOCK_REQUEST] = raw_value
+            elif (
+                datapoint.id == S1_DP_UNLOCK_CONFIRM
+                and len(raw_value) >= S1_DP71_MIN_LENGTH
+            ):
+                captured[S1_DP_UNLOCK_CONFIRM] = raw_value
+
+        if not captured or captured_epoch is None:
             return False
 
-        self._data[device_id] = device_data
+        pending = self._pending.get(device_id)
+        if (
+            pending is None
+            or pending.session_epoch != captured_epoch
+            or pending.complete
+        ):
+            pending = _S1PendingTemplatePair(captured_epoch)
+        if S1_DP_UNLOCK_REQUEST in captured:
+            pending.dp70 = captured[S1_DP_UNLOCK_REQUEST]
+        if S1_DP_UNLOCK_CONFIRM in captured:
+            pending.dp71 = captured[S1_DP_UNLOCK_CONFIRM]
+        self._pending[device_id] = pending
+
+        if not pending.complete:
+            return True
+        assert pending.dp70 is not None
+        assert pending.dp71 is not None
+
+        device_data = dict(previous) if isinstance(previous, dict) else {}
+        replacement = {
+            **device_data,
+            **expected_metadata,
+            "dp70_b64": base64.b64encode(pending.dp70).decode("ascii"),
+            "dp71_b64": base64.b64encode(pending.dp71).decode("ascii"),
+        }
+        if replacement == device_data:
+            return True
+
+        self._data[device_id] = replacement
         self._backing_store.async_delay_save(self._snapshot, 0)
         return True
 
@@ -531,7 +586,8 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
         self._attr_is_locking = False
         self._attr_is_unlocking = False
         self._template_store = template_store
-        self._unlock_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+        self._template_store.discard_pending(self._device.device_id)
         current_templates = [
             datapoint
             for dp_id in (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM)
@@ -541,16 +597,28 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
         self._unsub_template_callback: Callable[[], None] | None = (
             device.register_callback(self._capture_inbound_templates)
         )
+        self._unsub_template_session_callback: Callable[[], None] | None = (
+            device.register_session_invalidated_callback(
+                self._discard_pending_templates
+            )
+        )
 
     async def async_will_remove_from_hass(self) -> None:
         """Stop capturing templates when the entity is removed."""
         if self._unsub_template_callback is not None:
             self._unsub_template_callback()
             self._unsub_template_callback = None
+        if self._unsub_template_session_callback is not None:
+            self._unsub_template_session_callback()
+            self._unsub_template_session_callback = None
+        self._discard_pending_templates()
         await super().async_will_remove_from_hass()
 
     def _capture_inbound_templates(self, datapoints: list[TuyaBLEDataPoint]) -> None:
         self._template_store.capture_inbound(self._device.device_id, datapoints)
+
+    def _discard_pending_templates(self) -> None:
+        self._template_store.discard_pending(self._device.device_id)
 
     @property
     def is_locked(self) -> bool | None:
@@ -567,43 +635,49 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock by issuing the S1's one-way manual-lock command."""
         self._device.ensure_control_available()
-        self._attr_is_locking = True
-        self.async_write_ha_state()
-        try:
-            async with self._device.connection_lease("s1 lock", defer_connection=True):
-                manual_lock = self._device.datapoints.get_or_create(
-                    S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
-                )
-                await manual_lock.set_value_no_replay(True)
-        finally:
-            self._attr_is_locking = False
+        async with self._operation_lock:
+            self._attr_is_locking = True
             self.async_write_ha_state()
+            try:
+                async with self._device.connection_lease(
+                    "s1 lock", defer_connection=True
+                ):
+                    manual_lock = self._device.datapoints.get_or_create(
+                        S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
+                    )
+                    await manual_lock.set_value_no_replay(True)
+            finally:
+                self._attr_is_locking = False
+                self.async_write_ha_state()
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock using one validated, serialized S1 DP70/DP71 sequence."""
         self._device.ensure_control_available()
-        async with self._unlock_lock:
-            templates = self._template_store.templates_for(self._device.device_id)
-            if templates is None:
-                _raise_s1_unlock_validation_error()
-            for dp_id in (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM):
-                datapoint = self._device.datapoints[dp_id]
-                if (
-                    datapoint is not None
-                    and datapoint.type is not TuyaBLEDataPointType.DT_RAW
-                ):
-                    _raise_s1_unlock_validation_error()
-            dp70_payload, dp71_template = templates
-            dp71_payload = bytearray(dp71_template)
-            timestamp = int(time.time()).to_bytes(4, "big", signed=False)
-            dp71_payload[S1_DP71_TIMESTAMP] = timestamp
-
+        async with self._operation_lock:
             self._attr_is_unlocking = True
             self.async_write_ha_state()
             try:
-                async with self._device.connection_lease(
-                    "s1 unlock", defer_connection=True
-                ):
+                async with self._device.connection_lease("s1 unlock"):
+                    session_epoch = self._device.current_session_epoch
+                    if session_epoch is None:
+                        _raise_s1_unlock_validation_error()
+                    templates = self._template_store.templates_for(
+                        self._device.device_id, session_epoch
+                    )
+                    if templates is None:
+                        _raise_s1_unlock_validation_error()
+                    for dp_id in (S1_DP_UNLOCK_REQUEST, S1_DP_UNLOCK_CONFIRM):
+                        datapoint = self._device.datapoints[dp_id]
+                        if (
+                            datapoint is not None
+                            and datapoint.type is not TuyaBLEDataPointType.DT_RAW
+                        ):
+                            _raise_s1_unlock_validation_error()
+                    dp70_payload, dp71_template = templates
+                    dp71_payload = bytearray(dp71_template)
+                    timestamp = int(time.time()).to_bytes(4, "big", signed=False)
+                    dp71_payload[S1_DP71_TIMESTAMP] = timestamp
+
                     dp70 = self._device.datapoints.get_or_create(
                         S1_DP_UNLOCK_REQUEST,
                         TuyaBLEDataPointType.DT_RAW,

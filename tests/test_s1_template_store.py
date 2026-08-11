@@ -6,6 +6,7 @@ import base64
 import hashlib
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant
 
@@ -200,6 +201,7 @@ def test_capture_accepts_separate_batches_for_the_same_device_only(
     )
     assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[70]])
     assert template_store.templates_for(SYNTHETIC_DEVICE_ID) is None
+    assert backing_store.delayed_saves == []
 
     device.datapoints._update_from_device(
         71, 2.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_token
@@ -209,6 +211,152 @@ def test_capture_accepts_separate_batches_for_the_same_device_only(
         SYNTHETIC_DP70,
         SYNTHETIC_DP71,
     )
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID, session_token.epoch) == (
+        SYNTHETIC_DP70,
+        SYNTHETIC_DP71,
+    )
+    assert len(backing_store.delayed_saves) == 1
+
+
+@pytest.mark.parametrize("partial_dp_id", (70, 71))
+def test_partial_current_session_pair_cannot_replace_persisted_half(
+    hass: HomeAssistant, partial_dp_id: int
+) -> None:
+    """A partial refresh remains pending and leaves Pair A unchanged."""
+    pair_b_dp70 = hashlib.shake_256(
+        b"tuya-ble-test-only:partial-refresh-pair-b-dp70"
+    ).digest(SYNTHETIC_DP70_SAMPLE_LENGTH)
+    pair_b_dp71 = hashlib.shake_256(
+        b"tuya-ble-test-only:partial-refresh-pair-b-dp71"
+    ).digest(S1_DP71_MIN_LENGTH)
+    persisted = {
+        SYNTHETIC_DEVICE_ID: {
+            "dp70_b64": base64.b64encode(SYNTHETIC_DP70).decode("ascii"),
+            "dp71_b64": base64.b64encode(SYNTHETIC_DP71).decode("ascii"),
+        }
+    }
+    device = _make_device()
+    session_token = claim_test_session(device)
+    backing_store = _BackingStore()
+    template_store = TuyaBLES1TemplateStore(hass, backing_store, persisted)
+    value = pair_b_dp70 if partial_dp_id == 70 else pair_b_dp71
+
+    device.datapoints._update_from_device(
+        partial_dp_id,
+        1.0,
+        0,
+        TuyaBLEDataPointType.DT_RAW,
+        value,
+        session_token,
+    )
+
+    assert template_store.capture_inbound(
+        SYNTHETIC_DEVICE_ID, [device.datapoints[partial_dp_id]]
+    )
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID) == (
+        SYNTHETIC_DP70,
+        SYNTHETIC_DP71,
+    )
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID, session_token.epoch) == (
+        SYNTHETIC_DP70,
+        SYNTHETIC_DP71,
+    )
+    assert backing_store.delayed_saves == []
+
+
+def test_new_partial_after_promotion_cannot_mix_with_completed_pair(
+    hass: HomeAssistant,
+) -> None:
+    """A later DP70 starts a new pending pair instead of reusing promoted DP71."""
+    pair_b_dp70 = hashlib.shake_256(b"tuya-ble-test-only:promoted-pair-b-dp70").digest(
+        SYNTHETIC_DP70_SAMPLE_LENGTH
+    )
+    pair_b_dp71 = hashlib.shake_256(b"tuya-ble-test-only:promoted-pair-b-dp71").digest(
+        S1_DP71_MIN_LENGTH
+    )
+    pair_c_dp70 = hashlib.shake_256(b"tuya-ble-test-only:pending-pair-c-dp70").digest(
+        SYNTHETIC_DP70_SAMPLE_LENGTH
+    )
+    device = _make_device()
+    session_token = claim_test_session(device)
+    backing_store = _BackingStore()
+    template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
+
+    for dp_id, value in ((70, pair_b_dp70), (71, pair_b_dp71)):
+        device.datapoints._update_from_device(
+            dp_id, 1.0, 0, TuyaBLEDataPointType.DT_RAW, value, session_token
+        )
+    assert template_store.capture_inbound(
+        SYNTHETIC_DEVICE_ID, [device.datapoints[70], device.datapoints[71]]
+    )
+    assert len(backing_store.delayed_saves) == 1
+
+    device.datapoints._update_from_device(
+        70, 2.0, 0, TuyaBLEDataPointType.DT_RAW, pair_c_dp70, session_token
+    )
+    assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[70]])
+
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID, session_token.epoch) == (
+        pair_b_dp70,
+        pair_b_dp71,
+    )
+    assert len(backing_store.delayed_saves) == 1
+
+
+def test_template_halves_from_different_session_epochs_never_combine(
+    hass: HomeAssistant,
+) -> None:
+    """DP70 from Session 1 cannot pair with DP71 from Session 2."""
+    device = _make_device()
+    session_one = claim_test_session(device)
+    backing_store = _BackingStore()
+    template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
+    device.datapoints._update_from_device(
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_one
+    )
+    assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[70]])
+
+    session_one.client.is_connected = False
+    session_two = claim_test_session(device)
+    device.datapoints._update_from_device(
+        71, 2.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_two
+    )
+    assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[71]])
+
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID) is None
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID, session_two.epoch) is None
+    assert backing_store.delayed_saves == []
+
+
+def test_delayed_old_session_update_cannot_restore_pending_readiness(
+    hass: HomeAssistant,
+) -> None:
+    """An update carrying a retired token cannot enter pending state or Store."""
+    device = _make_device()
+    session_one = claim_test_session(device)
+    backing_store = _BackingStore()
+    template_store = TuyaBLES1TemplateStore(hass, backing_store, {})
+    device.datapoints._update_from_device(
+        70, 1.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_one
+    )
+
+    session_one.client.is_connected = False
+    session_two = claim_test_session(device)
+    device.datapoints._update_from_device(
+        71, 2.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP71, session_two
+    )
+    assert template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[71]])
+    device.datapoints._update_from_device(
+        70, 3.0, 0, TuyaBLEDataPointType.DT_RAW, SYNTHETIC_DP70, session_one
+    )
+
+    assert (
+        template_store.capture_inbound(SYNTHETIC_DEVICE_ID, [device.datapoints[70]])
+        is False
+    )
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID) is None
+    assert template_store.templates_for(SYNTHETIC_DEVICE_ID, session_two.epoch) is None
+    assert backing_store.delayed_saves == []
 
 
 def test_capture_rejects_conflicting_stored_product_metadata(
