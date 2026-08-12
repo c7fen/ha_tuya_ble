@@ -4868,6 +4868,101 @@ async def test_policy_entities_are_available_while_disconnected(
     assert connection.device_class is BinarySensorDeviceClass.CONNECTIVITY
 
 
+@pytest.mark.parametrize(
+    ("gatt", "paired", "notifications", "expected_sensor", "expected_ready"),
+    (
+        (False, False, False, False, False),
+        (True, True, False, True, False),
+        (True, True, True, True, True),
+    ),
+    ids=("disconnected", "authenticated-gatt", "session-ready"),
+)
+async def test_connection_sensor_reports_authenticated_physical_gatt(
+    hass: HomeAssistant,
+    gatt: bool,
+    paired: bool,
+    notifications: bool,
+    expected_sensor: bool,
+    expected_ready: bool,
+) -> None:
+    """Connectivity intentionally differs from full command-session readiness."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    client.is_connected = gatt
+    device._client = client if gatt else None
+    device._is_paired = paired
+    device._notifications_active = notifications
+    coordinator = TuyaBLECoordinator(hass, device)
+    connection = TuyaBLEConnectionSensor(
+        hass,
+        coordinator,
+        device,
+        TuyaBLEProductInfo("Synthetic connection"),
+    )
+
+    assert connection.is_on is expected_sensor
+    assert device.is_connection_active is expected_ready
+    await connection.async_will_remove_from_hass()
+    coordinator.shutdown()
+
+
+async def test_connection_sensor_ignores_stale_replaced_client_callback(
+    hass: HomeAssistant,
+) -> None:
+    """A stale old-client callback cannot publish a false disconnect."""
+    device = _make_device()
+    old_client = _SyntheticConnectedClient()
+    old_token = _install_connected_session(device, old_client)
+    old_client.is_connected = False
+    device._mark_connection_lost(old_token)
+    replacement = _SyntheticConnectedClient()
+    _install_connected_session(device, replacement)
+    coordinator = TuyaBLECoordinator(hass, device)
+    connection = TuyaBLEConnectionSensor(
+        hass,
+        coordinator,
+        device,
+        TuyaBLEProductInfo("Synthetic connection"),
+    )
+    connection.async_write_ha_state = Mock()
+    device._schedule_reconnect_locked = Mock()
+
+    device._disconnected(old_client, old_token)
+
+    assert connection.is_on is True
+    assert device.is_connection_active is True
+    connection.async_write_ha_state.assert_not_called()
+    await connection.async_will_remove_from_hass()
+    coordinator.shutdown()
+
+
+async def test_connection_sensor_publishes_current_disconnect_promptly(
+    hass: HomeAssistant,
+) -> None:
+    """The owned current-client callback immediately publishes GATT loss."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    token = _install_connected_session(device, client)
+    coordinator = TuyaBLECoordinator(hass, device)
+    connection = TuyaBLEConnectionSensor(
+        hass,
+        coordinator,
+        device,
+        TuyaBLEProductInfo("Synthetic connection"),
+    )
+    connection.async_write_ha_state = Mock()
+    device._schedule_reconnect_locked = Mock()
+    client.is_connected = False
+
+    device._disconnected(client, token)
+
+    assert connection.is_on is False
+    assert device.is_connection_active is False
+    connection.async_write_ha_state.assert_called_once_with()
+    await connection.async_will_remove_from_hass()
+    coordinator.shutdown()
+
+
 async def test_target_connection_entity_is_added_only_for_s1_and_v1(
     hass: HomeAssistant,
 ) -> None:

@@ -450,6 +450,132 @@ async def test_s1_lock_and_unlock_transport_contract(hass: HomeAssistant) -> Non
     assert entity.unique_id == f"{SYNTHETIC_DEVICE_ID}-ble_unlock_lock"
 
 
+async def test_s1_on_demand_cold_start_lock_connects_before_one_dp46(
+    hass: HomeAssistant,
+) -> None:
+    """A cold On-demand Lock negotiates its protocol before one DP46 write."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    del device._send_datapoints_no_replay
+    device._schedule_idle_disconnect_locked = Mock()
+    events: list[tuple[str, int]] = []
+
+    async def connect_and_negotiate() -> None:
+        events.append(("connect", device.active_lease_count))
+        device._protocol_version = 3
+        _install_synthetic_session(device)
+
+    async def send_v3(datapoint_ids: list[int]) -> None:
+        events.append(("write", device.active_lease_count))
+        assert datapoint_ids == [S1_DP_LOCK]
+        assert device._protocol_version == 3
+
+    device._ensure_connected = AsyncMock(side_effect=connect_and_negotiate)
+    device._send_datapoints_v3 = AsyncMock(side_effect=send_v3)
+
+    await entity.async_lock()
+
+    assert events == [("connect", 1), ("write", 1)]
+    device._ensure_connected.assert_awaited_once_with()
+    device._send_datapoints_v3.assert_awaited_once_with([S1_DP_LOCK])
+    assert device.active_lease_count == 0
+    device._schedule_idle_disconnect_locked.assert_called_once_with()
+
+
+async def test_s1_on_demand_cold_start_connection_failure_writes_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """A failed cold connection is translated without retaining DP46 work."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._ensure_connected = AsyncMock(
+        side_effect=BleakError("synthetic cold-start connection failure")
+    )
+
+    with pytest.raises(ServiceValidationError, match="connection is unavailable"):
+        await entity.async_lock()
+
+    device._ensure_connected.assert_awaited_once_with()
+    device._send_datapoints_no_replay.assert_not_awaited()
+    _assert_s1_operation_drained(entity, device)
+
+
+async def test_s1_on_demand_lock_retains_outer_lease_until_dp46_completes(
+    hass: HomeAssistant,
+) -> None:
+    """On-demand idle release starts only after the DP46 write completes."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._schedule_idle_disconnect_locked = Mock()
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def send_dp46(datapoint_ids: list[int]) -> None:
+        assert datapoint_ids == [S1_DP_LOCK]
+        assert device.active_lease_count == 1
+        device._schedule_idle_disconnect_locked.assert_not_called()
+        write_started.set()
+        await release_write.wait()
+
+    device._send_datapoints_no_replay.side_effect = send_dp46
+    lock_task = asyncio.create_task(entity.async_lock())
+    await write_started.wait()
+
+    assert device.active_lease_count == 1
+    release_write.set()
+    await lock_task
+
+    assert device.active_lease_count == 0
+    device._schedule_idle_disconnect_locked.assert_called_once_with()
+
+
+async def test_s1_failed_cold_lock_is_not_replayed_by_next_explicit_request(
+    hass: HomeAssistant,
+) -> None:
+    """A failed connection retains no DP46 for a later replacement session."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+    device._connection_mode = ConnectionMode.ON_DEMAND
+    device._schedule_idle_disconnect_locked = Mock()
+    connection_attempts = 0
+
+    async def fail_then_connect() -> None:
+        nonlocal connection_attempts
+        connection_attempts += 1
+        if connection_attempts == 1:
+            raise BleakError("synthetic first connection failure")
+        _install_synthetic_session(device)
+
+    device._ensure_connected = AsyncMock(side_effect=fail_then_connect)
+
+    with pytest.raises(ServiceValidationError, match="connection is unavailable"):
+        await entity.async_lock()
+
+    device._send_datapoints_no_replay.assert_not_awaited()
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+    _assert_s1_operation_drained(entity, device)
+
+    await entity.async_lock()
+
+    assert connection_attempts == 2
+    device._send_datapoints_no_replay.assert_awaited_once_with([S1_DP_LOCK])
+    assert not hasattr(device, "_deferred_resend_packets")
+    assert not hasattr(device, "_resend_task")
+
+
+async def test_s1_always_connected_lock_remains_one_dp46(
+    hass: HomeAssistant,
+) -> None:
+    """The normal lease preserves one semantic Always-connected Lock write."""
+    entity, device, _ = _make_entity(hass, {SYNTHETIC_DEVICE_ID: _stored_pair()})
+
+    await entity.async_lock()
+
+    device._ensure_connected.assert_awaited_once_with()
+    device._send_datapoints_no_replay.assert_awaited_once_with([S1_DP_LOCK])
+    assert device.active_lease_count == 0
+
+
 async def test_s1_on_demand_unlock_selects_refreshed_templates_after_connection(
     hass: HomeAssistant,
 ) -> None:
