@@ -104,6 +104,7 @@ BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
 
 FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4"})
+DEVICE_INFO_HANDSHAKE_MAJOR_THREE_PRODUCTS = frozenset({("jtmspro", "xqeob8h6")})
 RECONNECT_STATUS_SYNC_PRODUCTS = frozenset(
     {
         ("jtmspro", "xqeob8h6"),
@@ -1649,6 +1650,17 @@ class TuyaBLEDevice:
             and self.product_id in FD50_DEVICE_INFO_PRODUCT_IDS
         )
 
+    def _device_info_handshake_protocol_major(self) -> int:
+        """Return product-scoped wire metadata for the Device Info request."""
+        if self._requires_fd50_device_info_handshake():
+            return 2
+        if (
+            self.category,
+            self.product_id,
+        ) in DEVICE_INFO_HANDSHAKE_MAJOR_THREE_PRODUCTS:
+            return 3
+        return self._protocol_version
+
     def _build_pairing_request(self) -> bytes:
         result = bytearray()
 
@@ -2702,10 +2714,6 @@ class TuyaBLEDevice:
         key: bytes
         iv = secrets.token_bytes(16)
         security_flag: bytes
-        fd50_device_info = (
-            code == TuyaBLECode.FUN_SENDER_DEVICE_INFO
-            and self._requires_fd50_device_info_handshake()
-        )
         if code == TuyaBLECode.FUN_SENDER_DEVICE_INFO:
             key = self._login_key
             security_flag = pack(">B", self._security_material.login_flag)
@@ -2735,7 +2743,9 @@ class TuyaBLEDevice:
             if packet_num == 0:
                 packet += self._pack_int(length)
                 packet_protocol_version = (
-                    2 if fd50_device_info else self._protocol_version
+                    self._device_info_handshake_protocol_major()
+                    if code == TuyaBLECode.FUN_SENDER_DEVICE_INFO
+                    else self._protocol_version
                 )
                 packet += pack(">B", packet_protocol_version << 4)
 
