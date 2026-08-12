@@ -639,9 +639,7 @@ class TuyaBLES1Lock(TuyaBLEEntity, LockEntity):
             self._attr_is_locking = True
             self.async_write_ha_state()
             try:
-                async with self._device.connection_lease(
-                    "s1 lock", defer_connection=True
-                ):
+                async with self._device.connection_lease("s1 lock"):
                     manual_lock = self._device.datapoints.get_or_create(
                         S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True
                     )

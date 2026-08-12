@@ -3610,7 +3610,7 @@ class TuyaBLEDevice:
         elif self._protocol_version >= 4:
             await self._send_datapoints_v4(datapoint_ids)
         else:
-            raise TuyaBLEDeviceError(0)
+            raise TuyaBLEConnectionUnavailableError()
 
     async def _send_datapoints_once(self, datapoint_ids: list[int]) -> None:
         """Send one protocol-v3 DP command without replay and require success."""

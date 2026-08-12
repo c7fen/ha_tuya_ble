@@ -1044,7 +1044,16 @@ async def test_s1_cancellation_boundaries_release_lock_lease_and_tasks(
 
         device._send_datapoints_no_replay.reset_mock()
         device._send_datapoints_no_replay.side_effect = None
+
+        async def connect_for_later_explicit_lock() -> None:
+            if device.current_session_epoch is None:
+                _install_synthetic_session(device)
+
+        device._ensure_connected = AsyncMock(
+            side_effect=connect_for_later_explicit_lock
+        )
         await entity.async_lock()
+        device._ensure_connected.assert_awaited_once_with()
         device._send_datapoints_no_replay.assert_awaited_once_with([S1_DP_LOCK])
         _assert_s1_operation_drained(entity, device)
     finally:
