@@ -500,6 +500,16 @@ async def test_s1_on_demand_cold_start_connection_failure_writes_nothing(
     _assert_s1_operation_drained(entity, device)
 
 
+async def test_s1_no_replay_unknown_protocol_is_connection_unavailable() -> None:
+    """Local protocol unreadiness cannot impersonate device result code zero."""
+    device = _make_device()
+    del device._send_datapoints_no_replay
+    device.datapoints.get_or_create(S1_DP_LOCK, TuyaBLEDataPointType.DT_BOOL, True)
+
+    with pytest.raises(ServiceValidationError, match="connection is unavailable"):
+        await device._send_datapoints_no_replay([S1_DP_LOCK])
+
+
 async def test_s1_on_demand_lock_retains_outer_lease_until_dp46_completes(
     hass: HomeAssistant,
 ) -> None:
