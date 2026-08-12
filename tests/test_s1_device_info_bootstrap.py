@@ -17,7 +17,6 @@ from custom_components.tuya_ble.tuya_ble.const import (
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
 from custom_components.tuya_ble.tuya_ble.security import TuyaBLESecurityMaterial
 
-
 SYNTHETIC_LOCAL_KEY = "SYNTHETICKEY0001"
 S1_PRODUCT = ("jtmspro", "xqeob8h6")
 V1_PRODUCT = ("ms", "7a4xvbtt")
