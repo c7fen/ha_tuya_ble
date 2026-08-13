@@ -675,9 +675,9 @@ def test_v1_migration_restores_target_after_post_normalization_failure(
         assert restored.name == target.name
         assert restored.config_entry_id == target.config_entry_id
         assert restored.device_id == target.device_id
-        assert _registry_entry_subentry_id(restored) == _registry_entry_subentry_id(
-            target
-        )
+        assert integration._registry_entry_subentry_id(
+            restored
+        ) == integration._registry_entry_subentry_id(target)
 
     asyncio.run(exercise())
 

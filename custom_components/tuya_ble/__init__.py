@@ -170,18 +170,63 @@ def _validate_binary_sensor_target(registry_entry: er.RegistryEntry) -> None:
 
 
 def _validate_lock_target(registry_entry: er.RegistryEntry) -> None:
-    """Reject target-domain state that cannot safely survive V1 migration."""
+    """Validate the structural identity of a V1 lock migration target."""
+    if registry_entry.domain != Platform.LOCK or registry_entry.platform != DOMAIN:
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target identity "
+            "is ambiguous"
+        )
+
     if registry_entry.device_class is not None:
         raise ConfigEntryError(
             "Cannot safely migrate the V1 Lock entity because the lock target has "
             "an invalid device class"
         )
 
-    if any(option_domain != Platform.LOCK for option_domain in registry_entry.options):
-        raise ConfigEntryError(
-            "Cannot safely migrate the V1 Lock entity because the lock target has "
-            "invalid entity options"
+
+def _restore_v1_lock_target(
+    registry: er.EntityRegistry,
+    snapshot: er.RegistryEntry,
+) -> None:
+    """Restore every V1 target field changed by the migration transaction."""
+    current = registry.async_get(snapshot.entity_id)
+    if current is None:
+        raise ConfigEntryError("Unable to restore the V1 Lock migration target")
+
+    for namespace in tuple(current.options):
+        if namespace not in snapshot.options:
+            registry.async_update_entity_options(snapshot.entity_id, namespace, None)
+    for namespace, options in snapshot.options.items():
+        registry.async_update_entity_options(
+            snapshot.entity_id, namespace, dict(options)
         )
+
+    update_kwargs: dict[str, Any] = {}
+    if hasattr(snapshot, "config_subentry_id"):
+        update_kwargs["config_subentry_id"] = _registry_entry_subentry_id(snapshot)
+    registry.async_update_entity(
+        snapshot.entity_id,
+        aliases=snapshot.aliases,
+        area_id=snapshot.area_id,
+        categories=snapshot.categories,
+        config_entry_id=snapshot.config_entry_id,
+        device_class=snapshot.device_class,
+        device_id=snapshot.device_id,
+        disabled_by=snapshot.disabled_by,
+        entity_category=snapshot.entity_category,
+        hidden_by=snapshot.hidden_by,
+        icon=snapshot.icon,
+        has_entity_name=snapshot.has_entity_name,
+        labels=snapshot.labels,
+        name=snapshot.name,
+        original_device_class=snapshot.original_device_class,
+        original_icon=snapshot.original_icon,
+        original_name=snapshot.original_name,
+        supported_features=snapshot.supported_features,
+        translation_key=snapshot.translation_key,
+        unit_of_measurement=snapshot.unit_of_measurement,
+        **update_kwargs,
+    )
 
 
 @callback
@@ -406,8 +451,30 @@ def _async_migrate_v1_manual_lock_entity(
     old_entry = old_entries[0]
     _validate_registry_association(hass, entry, device, old_entry, migration_name)
 
+    target_entries = [
+        registry_entry
+        for registry_entry in registry.entities.values()
+        if registry_entry.unique_id == unique_id
+        and registry_entry.entity_id != old_entry.entity_id
+    ]
+    if len(target_entries) > 1 or any(
+        registry_entry.domain != Platform.LOCK or registry_entry.platform != DOMAIN
+        for registry_entry in target_entries
+    ):
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target registry "
+            "entry is ambiguous"
+        )
+
     new_entity_id = registry.async_get_entity_id(Platform.LOCK, DOMAIN, unique_id)
     new_entry = registry.async_get(new_entity_id) if new_entity_id else None
+    if target_entries and (
+        new_entry is None or target_entries[0].entity_id != new_entry.entity_id
+    ):
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target registry "
+            "entry is ambiguous"
+        )
     if new_entry is not None:
         _validate_registry_association(hass, entry, device, new_entry, migration_name)
         _validate_lock_target(new_entry)
@@ -433,6 +500,7 @@ def _async_migrate_v1_manual_lock_entity(
             )
 
     created_entity_id: str | None = None
+    target_snapshot = new_entry
     try:
         if new_entry is None:
             create_kwargs: dict[str, Any] = {}
@@ -455,6 +523,22 @@ def _async_migrate_v1_manual_lock_entity(
             )
             created_entity_id = new_entry.entity_id
             _validate_lock_target(new_entry)
+
+        expected_target_options = {
+            namespace: options
+            for namespace, options in new_entry.options.items()
+            if namespace != Platform.BUTTON
+        }
+        if Platform.BUTTON in new_entry.options:
+            new_entry = registry.async_update_entity_options(
+                new_entry.entity_id,
+                Platform.BUTTON,
+                None,
+            )
+        if new_entry.options != expected_target_options:
+            raise ConfigEntryError(
+                "Unable to normalize the V1 Lock migration target options"
+            )
 
         if isinstance(new_entry.aliases, set):
             merged_aliases: Any = set(new_entry.aliases)
@@ -527,8 +611,18 @@ def _async_migrate_v1_manual_lock_entity(
             or verified_entry.config_entry_id != entry.entry_id
             or verified_entry.device_id != expected_device_id
             or _registry_entry_subentry_id(verified_entry) != config_subentry_id
+            or verified_entry.device_class is not None
+            or verified_entry.options != expected_target_options
+            or Platform.BUTTON in verified_entry.options
+            or verified_entry.entity_category is not None
+            or verified_entry.translation_key != "lock"
+            or verified_entry.supported_features != 0
         ):
             raise ConfigEntryError("Unable to verify the migrated V1 Lock entity")
+        _validate_registry_association(
+            hass, entry, device, verified_entry, migration_name
+        )
+        _validate_lock_target(verified_entry)
 
         registry.async_remove(old_entry.entity_id)
         if registry.async_get(old_entry.entity_id) is not None:
@@ -538,6 +632,11 @@ def _async_migrate_v1_manual_lock_entity(
     except Exception as err:
         if created_entity_id is not None:
             registry.async_remove(created_entity_id)
+        elif target_snapshot is not None:
+            try:
+                _restore_v1_lock_target(registry, target_snapshot)
+            except Exception:  # noqa: BLE001 - keep rollback failures sanitized
+                _LOGGER.error("Unable to restore the V1 Lock migration target")
         _LOGGER.error("Unable to safely migrate the V1 Lock entity")
         if isinstance(err, ConfigEntryError):
             raise
