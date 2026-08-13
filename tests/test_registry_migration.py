@@ -179,6 +179,24 @@ def _create_old_v1_button_entry(
     )
 
 
+def _create_v1_lock_target(
+    context: SimpleNamespace,
+    options: dict,
+    *,
+    platform: str = DOMAIN,
+):
+    """Create a visibly synthetic V1 lock migration target."""
+    return context.registry.async_get_or_create(
+        Platform.LOCK,
+        platform,
+        V1_UNIQUE_ID,
+        suggested_object_id="synthetic_v1_target",
+        get_initial_options=lambda: options,
+        config_entry=context.entry,
+        device_id=context.device_entry.id,
+    )
+
+
 def _v1_device() -> SimpleNamespace:
     """Return the exact V1 identity used by the registry migration."""
     return SimpleNamespace(
@@ -505,6 +523,203 @@ def test_v1_migration_merges_existing_lock_target(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+    "target_options",
+    (
+        {
+            "cloud.alexa": {"synthetic_exposure": False},
+            "conversation": {"synthetic_exposure": True},
+        },
+        {
+            "cloud.alexa": {"synthetic_exposure": False},
+            "cloud.google_assistant": {"synthetic_exposure": True},
+            "conversation": {"synthetic_exposure": True},
+        },
+        {
+            "lock": {"synthetic_lock_option": "target"},
+            "cloud.alexa": {"synthetic_exposure": False},
+            "conversation": {"synthetic_exposure": True},
+        },
+        {
+            "button": {"synthetic_source_option": "obsolete"},
+            "cloud.alexa": {"synthetic_exposure": False},
+            "conversation": {"synthetic_exposure": True},
+        },
+        {
+            "lock": {"synthetic_lock_option": "target"},
+            "button": {"synthetic_source_option": "obsolete"},
+            "cloud.alexa": {"synthetic_exposure": False},
+            "conversation": {"synthetic_exposure": True},
+        },
+        {
+            "example.integration": {"synthetic_extension_option": "preserved"},
+        },
+    ),
+)
+def test_v1_migration_preserves_every_non_button_target_option_namespace(
+    tmp_path,
+    target_options: dict,
+) -> None:
+    """Cross-cutting and extensible target option namespaces survive migration."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-target-options")
+        old_entry = _create_old_v1_button_entry(context)
+        target = _create_v1_lock_target(context, target_options)
+        expected_options = {
+            namespace: values
+            for namespace, values in target_options.items()
+            if namespace != Platform.BUTTON
+        }
+
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+
+        assert context.registry.async_get(old_entry.entity_id) is None
+        migrated = context.registry.async_get(target.entity_id)
+        assert migrated is not None
+        assert migrated.options == expected_options
+        assert (
+            context.registry.async_get_entity_id(Platform.LOCK, DOMAIN, V1_UNIQUE_ID)
+            == target.entity_id
+        )
+
+        before_repeat = migrated
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+        assert context.registry.async_get(target.entity_id) == before_repeat
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_never_copies_old_button_options_to_target(tmp_path) -> None:
+    """The lock target remains authoritative for every option namespace."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-target-authoritative")
+        old_entry = _create_old_v1_button_entry(context)
+        context.registry.async_update_entity_options(
+            old_entry.entity_id,
+            "cloud.alexa",
+            {"synthetic_exposure": "old-button"},
+        )
+        target_options = {
+            "conversation": {"synthetic_exposure": "lock-target"},
+            "example.integration": {"synthetic_extension_option": "target"},
+        }
+        target = _create_v1_lock_target(context, target_options)
+
+        integration._async_migrate_v1_manual_lock_entity(
+            context.hass, context.entry, _v1_device()
+        )
+
+        assert context.registry.async_get(old_entry.entity_id) is None
+        migrated = context.registry.async_get(target.entity_id)
+        assert migrated is not None
+        assert migrated.options == target_options
+        assert "cloud.alexa" not in migrated.options
+
+    asyncio.run(exercise())
+
+
+def test_v1_migration_restores_target_after_post_normalization_failure(
+    tmp_path,
+) -> None:
+    """A failure after button-option removal restores the complete target."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-options-rollback")
+        old_entry = _create_old_v1_button_entry(context)
+        target_options = {
+            "button": {"synthetic_source_option": "restore"},
+            "cloud.alexa": {"synthetic_exposure": False},
+            "conversation": {"synthetic_exposure": True},
+        }
+        target = _create_v1_lock_target(context, target_options)
+        target = context.registry.async_update_entity(
+            target.entity_id,
+            aliases=["Synthetic target alias"],
+            categories={"synthetic_scope": "target"},
+            icon="mdi:lock-check",
+            name="Synthetic target name",
+        )
+        original_update = context.registry.async_update_entity
+        failure_injected = False
+
+        def fail_once(entity_id, **kwargs):
+            nonlocal failure_injected
+            if not failure_injected:
+                failure_injected = True
+                raise RuntimeError("synthetic post-normalization failure")
+            return original_update(entity_id, **kwargs)
+
+        with (
+            patch.object(
+                context.registry, "async_update_entity", side_effect=fail_once
+            ),
+            pytest.raises(ConfigEntryError, match="Unable to safely migrate"),
+        ):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+
+        assert failure_injected
+        assert context.registry.async_get(old_entry.entity_id) is not None
+        restored = context.registry.async_get(target.entity_id)
+        assert restored is not None
+        assert restored.options == target_options
+        assert restored.aliases == target.aliases
+        assert restored.categories == target.categories
+        assert restored.icon == target.icon
+        assert restored.name == target.name
+        assert restored.config_entry_id == target.config_entry_id
+        assert restored.device_id == target.device_id
+        assert _registry_entry_subentry_id(restored) == _registry_entry_subentry_id(
+            target
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("domain", "platform"),
+    (
+        (Platform.SENSOR, DOMAIN),
+        (Platform.LOCK, "synthetic_foreign_integration"),
+    ),
+)
+def test_v1_migration_rejects_foreign_stable_identity_target(
+    tmp_path,
+    domain: Platform,
+    platform: str,
+) -> None:
+    """A non-lock or non-Tuya-BLE target cannot share the stable identity."""
+
+    async def exercise() -> None:
+        context = await _registry_context(tmp_path, "v1-foreign-identity-target")
+        old_entry = _create_old_v1_button_entry(context)
+        foreign_target = context.registry.async_get_or_create(
+            domain,
+            platform,
+            V1_UNIQUE_ID,
+            suggested_object_id="synthetic_foreign_target",
+            config_entry=context.entry,
+            device_id=context.device_entry.id,
+        )
+
+        with pytest.raises(ConfigEntryError, match="target.*ambiguous"):
+            integration._async_migrate_v1_manual_lock_entity(
+                context.hass, context.entry, _v1_device()
+            )
+
+        assert context.registry.async_get(old_entry.entity_id) == old_entry
+        assert context.registry.async_get(foreign_target.entity_id) == foreign_target
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
     ("category", "product_id"),
     (("jtmspro", "xqeob8h6"), ("ms", "other-product")),
 )
@@ -626,11 +841,6 @@ def test_v1_migration_rejects_device_and_target_ownership_conflicts(
             SwitchDeviceClass.SWITCH,
             {"lock": {"synthetic_target_option": True}},
             "invalid device class",
-        ),
-        (
-            None,
-            {"button": {"synthetic_target_option": True}},
-            "invalid entity options",
         ),
     ),
 )
