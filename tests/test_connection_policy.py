@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import BleakError
+from bleak_retry_connector import BLEAK_BACKOFF_TIME, BleakError
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.vacuum import VacuumActivity
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -489,7 +489,7 @@ async def test_setup_release_survives_visible_mode_changes(
     device._send_datapoints = AsyncMock()
     device._schedule_reconnect_locked = Mock()
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         retry_owner = await _seed_failed_setup_release(device, client)
         await _apply_mode_change(device, new_mode, persisted)
 
@@ -548,7 +548,7 @@ async def test_setup_release_survives_ble_control_off_on_sequence() -> None:
     device._send_datapoints = AsyncMock()
     device._schedule_reconnect_locked = Mock()
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         retry_owner = await _seed_failed_setup_release(device, client)
         await device.async_update_connection_policy(ble_control_enabled=False)
         await asyncio.wait_for(second_failure.wait(), 0.2)
@@ -582,7 +582,7 @@ async def test_setup_release_reconciles_to_disabled_ble_control() -> None:
     device._send_datapoints = AsyncMock()
     device._schedule_reconnect_locked = Mock()
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         retry_owner = await _seed_failed_setup_release(device, client)
         await device.async_update_connection_policy(ble_control_enabled=False)
 
@@ -627,7 +627,7 @@ async def test_setup_release_survives_policy_change_during_physical_retry() -> N
     device._send_datapoints = AsyncMock()
     device._schedule_reconnect_locked = Mock()
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         retry_owner = await _seed_failed_setup_release(device, client)
         await asyncio.wait_for(retry_started.wait(), 0.2)
         assert device._disconnect_in_progress is True
@@ -711,7 +711,7 @@ async def test_terminal_stop_retains_in_progress_setup_release_owner() -> None:
 
     client.disconnect.side_effect = disconnect
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         retry_owner = await _seed_failed_setup_release(device, client)
         await asyncio.wait_for(retry_started.wait(), 0.2)
         stop = asyncio.create_task(device.stop())
@@ -1210,7 +1210,7 @@ async def test_policy_change_while_failed_release_retry_is_in_progress() -> None
         device._policy_revision,
     )
 
-    with patch("custom_components.tuya_ble.tuya_ble.tuya_ble.BLEAK_BACKOFF_TIME", 0.01):
+    with patch.object(device, "_disconnect_retry_delay", return_value=0.01):
         await device._complete_pending_release()
         retry_owner = device._disconnect_retry_task
         assert retry_owner is not None
@@ -3245,6 +3245,91 @@ async def test_s1_setup_failures_never_use_generic_bleak_backoff() -> None:
         S1_RECONNECT_COOLDOWN_SECONDS,
         S1_RECONNECT_COOLDOWN_SECONDS,
     ]
+
+
+async def test_s1_setup_failure_retains_backoff_through_pending_release() -> None:
+    """Successful deferred cleanup schedules the retained S1 failure delay."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    device._execute_disconnect = AsyncMock(side_effect=BleakError("synthetic release"))
+    device._schedule_disconnect_retry_locked = Mock()
+
+    async def fail_with_pending_release(*, request_status: bool = False) -> None:
+        assert request_status is True
+        device._client = client
+        device._physical_connection_active = True
+        device._pending_release = PendingRelease(
+            PendingReleaseReason.SETUP_FAILURE,
+            device._policy_revision,
+        )
+        raise BleakError("synthetic setup")
+
+    device._ensure_connected = fail_with_pending_release
+
+    await device._reconnect()
+
+    pending = device._pending_release
+    assert pending is not None
+    assert pending.reconnect_delay == UNEXPECTED_RECONNECT_MIN_SECONDS
+    assert device._reconnect_task is None
+
+    device._execute_disconnect = AsyncMock()
+    device._schedule_reconnect_locked = Mock()
+    await device._complete_pending_release()
+
+    device._schedule_reconnect_locked.assert_called_once_with(
+        UNEXPECTED_RECONNECT_MIN_SECONDS
+    )
+
+
+async def test_s1_disconnect_retries_enter_battery_safe_cooldown() -> None:
+    """A stuck S1 physical release cannot spin on the generic 0.1s delay."""
+    device = _make_device()
+    device._pending_release = PendingRelease(
+        PendingReleaseReason.SETUP_FAILURE,
+        device._policy_revision,
+    )
+    sleep_delays: list[float] = []
+    attempts = 0
+    real_sleep = asyncio.sleep
+
+    async def controlled_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        await real_sleep(0)
+
+    async def complete_release() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 5:
+            device._pending_release = None
+
+    device._complete_pending_release = complete_release
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.asyncio.sleep",
+        new=controlled_sleep,
+    ):
+        await device._disconnect_retry_runner()
+
+    assert sleep_delays == [
+        1.0,
+        2.0,
+        4.0,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+    ]
+    assert device._unexpected_reconnect_failures == 0
+
+
+def test_v1_disconnect_retries_keep_generic_backoff() -> None:
+    """S1 physical-release protection does not change V1 retry pacing."""
+    device = _make_device()
+    assert device._device_info is not None
+    device._device_info.category = "ms"
+    device._device_info.product_id = "7a4xvbtt"
+
+    assert device._disconnect_retry_delay(1) == BLEAK_BACKOFF_TIME
+    assert device._disconnect_retry_delay(5) == BLEAK_BACKOFF_TIME
 
 
 async def test_short_status_sessions_use_real_single_flight_backoff() -> None:

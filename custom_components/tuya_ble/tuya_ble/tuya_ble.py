@@ -1127,7 +1127,7 @@ class TuyaBLEDevice:
 
         disconnect_failed = False
         reconcile_policy = False
-        session_failure_reconnect_delay: float | None = None
+        failure_reconnect_delay: float | None = None
         complete_newer_release = False
         try:
             await self._execute_disconnect(terminal=pending.terminal)
@@ -1170,10 +1170,12 @@ class TuyaBLEDevice:
                         PendingReleaseReason.SESSION_FAILURE,
                     }:
                         if pending.reason is PendingReleaseReason.SESSION_FAILURE:
-                            session_failure_reconnect_delay = (
+                            failure_reconnect_delay = (
                                 pending.reconnect_delay
                                 or UNEXPECTED_RECONNECT_MIN_SECONDS
                             )
+                        elif pending.reconnect_delay is not None:
+                            failure_reconnect_delay = pending.reconnect_delay
                         else:
                             reconcile_policy = True
                     elif pending.reason is PendingReleaseReason.ON_DEMAND_IDLE:
@@ -1206,10 +1208,8 @@ class TuyaBLEDevice:
         if complete_newer_release:
             await self._complete_pending_release()
 
-        if session_failure_reconnect_delay is not None:
-            self._reconcile_after_verified_transport_loss(
-                session_failure_reconnect_delay
-            )
+        if failure_reconnect_delay is not None:
+            self._reconcile_after_verified_transport_loss(failure_reconnect_delay)
         elif reconcile_policy:
             await self._apply_connection_policy()
 
@@ -1458,9 +1458,11 @@ class TuyaBLEDevice:
     async def _disconnect_retry_runner(self) -> None:
         """Retry a failed policy disconnect without reconnecting or writing."""
         current_task = asyncio.current_task()
+        retry_failures = 0
         try:
             while self._pending_release is not None:
-                await asyncio.sleep(BLEAK_BACKOFF_TIME)
+                retry_failures += 1
+                await asyncio.sleep(self._disconnect_retry_delay(retry_failures))
                 await self._complete_pending_release()
         except asyncio.CancelledError:
             return
@@ -1468,6 +1470,17 @@ class TuyaBLEDevice:
             async with self._policy_lock:
                 if self._disconnect_retry_task is current_task:
                     self._disconnect_retry_task = None
+
+    def _disconnect_retry_delay(self, retry_failures: int) -> float:
+        """Return physical-release retry pacing without advancing reconnect state."""
+        if not self._uses_s1_reconnect_protection:
+            return BLEAK_BACKOFF_TIME
+        if retry_failures > S1_RECONNECT_FAILURES_BEFORE_COOLDOWN:
+            return S1_RECONNECT_COOLDOWN_SECONDS
+        return min(
+            UNEXPECTED_RECONNECT_MAX_SECONDS,
+            UNEXPECTED_RECONNECT_MIN_SECONDS * (2 ** (retry_failures - 1)),
+        )
 
     def _cancel_disconnect_retry_locked(self) -> None:
         if self._disconnect_retry_task is not None:
@@ -1698,7 +1711,13 @@ class TuyaBLEDevice:
                 await self.update()
         except Exception:
             if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
-                self._schedule_reconnect()
+                async with self._policy_lock:
+                    if self._uses_s1_reconnect_protection:
+                        self._retain_or_schedule_reconnect_locked(
+                            self._next_unexpected_reconnect_delay()
+                        )
+                    else:
+                        self._schedule_reconnect_locked(0)
         finally:
             if self._startup_task is asyncio.current_task():
                 self._startup_task = None
@@ -2126,13 +2145,9 @@ class TuyaBLEDevice:
 
     def _next_unexpected_reconnect_delay(self) -> float:
         """Return and advance bounded backoff for a short-lived session."""
-        s1_battery_protection = (self.category, self.product_id) == (
-            "jtmspro",
-            "xqeob8h6",
-        )
         stable_reset_seconds = (
             S1_RECONNECT_STABLE_RESET_SECONDS
-            if s1_battery_protection
+            if self._uses_s1_reconnect_protection
             else RECONNECT_STABLE_RESET_SECONDS
         )
         if (
@@ -2141,9 +2156,10 @@ class TuyaBLEDevice:
         ):
             self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
             self._unexpected_reconnect_failures = 0
+            self._session_active_since = None
         self._unexpected_reconnect_failures += 1
         if (
-            s1_battery_protection
+            self._uses_s1_reconnect_protection
             and self._unexpected_reconnect_failures
             > S1_RECONNECT_FAILURES_BEFORE_COOLDOWN
         ):
@@ -2166,6 +2182,25 @@ class TuyaBLEDevice:
             delay * 2,
         )
         return delay
+
+    @property
+    def _uses_s1_reconnect_protection(self) -> bool:
+        return (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+
+    def _retain_or_schedule_reconnect_locked(self, delay: float) -> None:
+        pending = self._pending_release
+        if pending is not None and pending.reason in {
+            PendingReleaseReason.SETUP_FAILURE,
+            PendingReleaseReason.SESSION_FAILURE,
+        }:
+            self._pending_release = PendingRelease(
+                pending.reason,
+                pending.revision,
+                terminal=pending.terminal,
+                reconnect_delay=max(delay, pending.reconnect_delay or 0),
+            )
+            return
+        self._schedule_reconnect_locked(delay)
 
     def _mark_connection_lost(
         self,
@@ -2676,10 +2711,10 @@ class TuyaBLEDevice:
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                     reconnect_delay = (
                         self._next_unexpected_reconnect_delay()
-                        if (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+                        if self._uses_s1_reconnect_protection
                         else BLEAK_BACKOFF_TIME
                     )
-                    self._schedule_reconnect_locked(reconnect_delay)
+                    self._retain_or_schedule_reconnect_locked(reconnect_delay)
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
         except Exception:  # noqa: BLE001
@@ -2687,10 +2722,10 @@ class TuyaBLEDevice:
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
                     reconnect_delay = (
                         self._next_unexpected_reconnect_delay()
-                        if (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+                        if self._uses_s1_reconnect_protection
                         else BLEAK_BACKOFF_TIME
                     )
-                    self._schedule_reconnect_locked(reconnect_delay)
+                    self._retain_or_schedule_reconnect_locked(reconnect_delay)
 
     def _schedule_reconnect(self, delay: float = 0) -> None:
         if self._terminal_stopped or self._suspension_requested:

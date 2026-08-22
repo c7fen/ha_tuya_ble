@@ -198,8 +198,15 @@ S1. S1 `jtmspro/xqeob8h6` uses the same 1, 2, and 4 second initial sequence,
 then enters a 15-minute cooldown. S1 setup failures use this sequence rather
 than the dependency's 0.1-second generic transport delay, and only an
 authenticated session lasting 15 minutes resets the S1 failure pressure. A
-continuously failing S1 therefore makes at most seven background attempts in
-its first hour and four per hour after that.
+continuously failing S1 therefore makes at most seven background connection
+attempts in its first hour and four per hour after that.
+
+If an S1 setup or session failure leaves GATT physically connected, the
+computed reconnect delay remains attached to that mandatory release and is
+scheduled only after physical cleanup is verified. Physical-release retries
+have an independent 1, 2, and 4 second sequence followed by the same 15-minute
+cooldown. They do not advance reconnect failure pressure. Other products,
+including V1, retain the dependency's generic physical-release retry delay.
 
 A reconnect request that arrives while an attempt is active is retained as one
 bounded follow-up, never as a parallel task. A larger delay arriving while the
