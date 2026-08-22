@@ -83,6 +83,10 @@ off corresponds to secure/uncoupled and on corresponds to access-enabled/coupled
 It is diagnostic state only and never writes the device. Battery, alarm,
 last-unlock method, signal strength, and other configuration or diagnostic
 entities depend on the product metadata and remain separate from lock control.
+Integral battery percentages are exposed as integers with a suggested display
+precision of zero. Home Assistant still honors an explicit user-configured
+sensor precision. Invalid percentages are unavailable rather than displayed,
+and fractional values from products with scaling coefficients remain precise.
 
 ## Bluetooth ownership
 
@@ -104,9 +108,13 @@ S1 `jtmspro/xqeob8h6` and V1 `ms/7a4xvbtt` expose three local controls:
 
 On demand uses a fixed 15-second idle disconnect. It does not reconnect for an
 advertisement alone, and local access events can be missed while disconnected.
+Use On demand for S1 unless continuous access-event monitoring is required.
 Use Always connected for access-event monitoring and any future Passage Mode
-Guard. Repeated connection and pairing work has an energy cost, but this
-integration makes no unsupported battery-percentage claim.
+Guard. Existing saved policy choices are not rewritten. Repeated connection and
+pairing work has an energy cost; after three failed S1 sessions, background
+reconnects use a 15-minute cooldown that resets only after a 15-minute stable
+authenticated session. This limits connection pressure but makes no unsupported
+battery-capacity or lifetime claim.
 
 To let the Tuya app take the peripheral, turn **Home Assistant BLE Control**
 off. Wait for **Bluetooth Connection** to turn off, use the app, close or

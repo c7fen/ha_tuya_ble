@@ -33,6 +33,8 @@ from custom_components.tuya_ble.const import (
     CONF_CONNECTION_MODE,
     DOMAIN,
     RECONNECT_STABLE_RESET_SECONDS,
+    S1_RECONNECT_COOLDOWN_SECONDS,
+    S1_RECONNECT_STABLE_RESET_SECONDS,
     UNEXPECTED_RECONNECT_MAX_SECONDS,
     UNEXPECTED_RECONNECT_MIN_SECONDS,
     ConnectionMode,
@@ -3184,6 +3186,9 @@ async def test_reconnect_is_single_flight_and_stop_cancels_task() -> None:
 def test_unexpected_reconnect_delay_is_bounded_and_increasing() -> None:
     """Repeated short-lived sessions advance to, but never exceed, the cap."""
     device = _make_device()
+    assert device._device_info is not None
+    device._device_info.category = "synthetic-category"
+    device._device_info.product_id = "synthetic-product"
     device._schedule_reconnect_locked = Mock()
     expected_delays = [
         UNEXPECTED_RECONNECT_MIN_SECONDS,
@@ -3208,6 +3213,40 @@ def test_unexpected_reconnect_delay_is_bounded_and_increasing() -> None:
     ] == expected_delays
 
 
+def test_s1_reconnect_failures_enter_battery_safe_cooldown() -> None:
+    """Repeated short S1 sessions enter cooldown after three bounded retries."""
+    device = _make_device()
+
+    assert [device._next_unexpected_reconnect_delay() for _ in range(5)] == [
+        1.0,
+        2.0,
+        4.0,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+    ]
+
+
+async def test_s1_setup_failures_never_use_generic_bleak_backoff() -> None:
+    """S1 setup failures share the battery-safe session-failure backoff."""
+    device = _make_device()
+    device._ensure_connected = AsyncMock(side_effect=BleakError("synthetic setup"))
+    device._schedule_reconnect_locked = Mock()
+
+    for _ in range(5):
+        await device._reconnect()
+
+    assert [
+        invocation.args[0]
+        for invocation in device._schedule_reconnect_locked.call_args_list
+    ] == [
+        1.0,
+        2.0,
+        4.0,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+        S1_RECONNECT_COOLDOWN_SECONDS,
+    ]
+
+
 async def test_short_status_sessions_use_real_single_flight_backoff() -> None:
     """Repeated status/disconnect cycles cannot form a zero-delay reconnect loop."""
     device = _make_device()
@@ -3224,7 +3263,7 @@ async def test_short_status_sessions_use_real_single_flight_backoff() -> None:
             await real_sleep(0)
             return
         reconnect_delays.append(delay)
-        if delay == 8.0:
+        if delay == S1_RECONNECT_COOLDOWN_SECONDS:
             device._terminal_stopped = True
         await real_sleep(0)
 
@@ -3273,7 +3312,7 @@ async def test_short_status_sessions_use_real_single_flight_backoff() -> None:
                 break
 
     assert status_sessions == 4
-    assert reconnect_delays == [1.0, 2.0, 4.0, 8.0]
+    assert reconnect_delays == [1.0, 2.0, 4.0, S1_RECONNECT_COOLDOWN_SECONDS]
     assert connector.await_count == 4
     assert not {
         TuyaBLECode.FUN_SENDER_DPS,
@@ -3334,6 +3373,9 @@ async def test_larger_backoff_replaces_a_sleeping_reconnect_owner() -> None:
 def test_stable_session_resets_unexpected_reconnect_backoff() -> None:
     """Only the defined stable interval resets a previously elevated delay."""
     device = _make_device()
+    assert device._device_info is not None
+    device._device_info.category = "synthetic-category"
+    device._device_info.product_id = "synthetic-product"
     device._unexpected_reconnect_delay = 32.0
     token = _install_connected_session(
         device, _SyntheticConnectedClient(), notified=False
@@ -3346,6 +3388,35 @@ def test_stable_session_resets_unexpected_reconnect_backoff() -> None:
     with patch(
         "custom_components.tuya_ble.tuya_ble.tuya_ble.time.monotonic",
         return_value=10.0 + RECONNECT_STABLE_RESET_SECONDS,
+    ):
+        assert device._next_unexpected_reconnect_delay() == (
+            UNEXPECTED_RECONNECT_MIN_SECONDS
+        )
+
+
+def test_s1_backoff_resets_only_after_a_genuinely_stable_session() -> None:
+    """A 30-second S1 session cannot clear its accumulated failure pressure."""
+    device = _make_device()
+    device._unexpected_reconnect_delay = 32.0
+    device._unexpected_reconnect_failures = 3
+    token = _install_connected_session(
+        device, _SyntheticConnectedClient(), notified=False
+    )
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.time.monotonic",
+        return_value=10.0,
+    ):
+        device._publish_connected_session(token)
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.time.monotonic",
+        return_value=10.0 + RECONNECT_STABLE_RESET_SECONDS,
+    ):
+        assert (
+            device._next_unexpected_reconnect_delay() == S1_RECONNECT_COOLDOWN_SECONDS
+        )
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.time.monotonic",
+        return_value=10.0 + S1_RECONNECT_STABLE_RESET_SECONDS,
     ):
         assert device._next_unexpected_reconnect_delay() == (
             UNEXPECTED_RECONNECT_MIN_SECONDS

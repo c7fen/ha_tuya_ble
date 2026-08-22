@@ -193,16 +193,23 @@ the app currently prevents connection.
 Always-connected mode schedules at most one reconnect task after an unexpected
 paired disconnect. A verified unexpected loss waits at least one second. Each
 short-lived replacement doubles that delay up to 60 seconds; only a session
-that remains stable for at least 30 seconds resets it. A reconnect request that
-arrives while an attempt is active is retained as one bounded follow-up, never
-as a parallel task. A larger delay arriving while the current reconnect owner
-is still sleeping replaces that sleeper, so the later backoff cannot be lost.
-Connection-attempt failures continue to use the existing
-bounded transport backoff. Every attempt rechecks policy, terminal stop, and
-the live target. Suspension, mode changes, unload, and shutdown cancel both the
-active task and pending follow-up. Re-enabling always-connected mode makes at
-most one immediate policy attempt; an unexpected post-connect loss still uses
-the non-zero loss backoff.
+that remains stable for at least 30 seconds resets it for products other than
+S1. S1 `jtmspro/xqeob8h6` uses the same 1, 2, and 4 second initial sequence,
+then enters a 15-minute cooldown. S1 setup failures use this sequence rather
+than the dependency's 0.1-second generic transport delay, and only an
+authenticated session lasting 15 minutes resets the S1 failure pressure. A
+continuously failing S1 therefore makes at most seven background attempts in
+its first hour and four per hour after that.
+
+A reconnect request that arrives while an attempt is active is retained as one
+bounded follow-up, never as a parallel task. A larger delay arriving while the
+current reconnect owner is still sleeping replaces that sleeper, so the later
+backoff cannot be lost. Other products retain the existing bounded transport
+backoff for connection-attempt failures. Every attempt rechecks policy,
+terminal stop, and the live target. Suspension, mode changes, unload, and
+shutdown cancel both the active task and pending follow-up. Re-enabling
+always-connected mode makes at most one immediate policy attempt; an unexpected
+post-connect loss still uses the non-zero loss backoff.
 
 Automatic Device Status synchronization is limited to the exact reviewed
 products `jtmspro/xqeob8h6` and `ms/7a4xvbtt`. Each physical session can attempt

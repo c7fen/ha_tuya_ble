@@ -38,6 +38,9 @@ from ..const import (
     DEFAULT_CONNECTION_MODE,
     DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
     RECONNECT_STABLE_RESET_SECONDS,
+    S1_RECONNECT_COOLDOWN_SECONDS,
+    S1_RECONNECT_FAILURES_BEFORE_COOLDOWN,
+    S1_RECONNECT_STABLE_RESET_SECONDS,
     UNEXPECTED_RECONNECT_MAX_SECONDS,
     UNEXPECTED_RECONNECT_MIN_SECONDS,
     ConnectionMode,
@@ -559,6 +562,7 @@ class TuyaBLEDevice:
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
         self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
+        self._unexpected_reconnect_failures = 0
         self._persist_options = persist_options
         try:
             self._connection_mode = ConnectionMode(connection_mode)
@@ -2122,12 +2126,37 @@ class TuyaBLEDevice:
 
     def _next_unexpected_reconnect_delay(self) -> float:
         """Return and advance bounded backoff for a short-lived session."""
+        s1_battery_protection = (self.category, self.product_id) == (
+            "jtmspro",
+            "xqeob8h6",
+        )
+        stable_reset_seconds = (
+            S1_RECONNECT_STABLE_RESET_SECONDS
+            if s1_battery_protection
+            else RECONNECT_STABLE_RESET_SECONDS
+        )
         if (
             self._session_active_since is not None
-            and time.monotonic() - self._session_active_since
-            >= RECONNECT_STABLE_RESET_SECONDS
+            and time.monotonic() - self._session_active_since >= stable_reset_seconds
         ):
             self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
+            self._unexpected_reconnect_failures = 0
+        self._unexpected_reconnect_failures += 1
+        if (
+            s1_battery_protection
+            and self._unexpected_reconnect_failures
+            > S1_RECONNECT_FAILURES_BEFORE_COOLDOWN
+        ):
+            if (
+                self._unexpected_reconnect_failures
+                == S1_RECONNECT_FAILURES_BEFORE_COOLDOWN + 1
+            ):
+                _LOGGER.warning(
+                    "%s: S1 reconnect cooldown active after repeated session failures",
+                    self.log_identity,
+                )
+            self._unexpected_reconnect_delay = S1_RECONNECT_COOLDOWN_SECONDS
+            return S1_RECONNECT_COOLDOWN_SECONDS
         delay = min(
             UNEXPECTED_RECONNECT_MAX_SECONDS,
             max(UNEXPECTED_RECONNECT_MIN_SECONDS, self._unexpected_reconnect_delay),
@@ -2645,13 +2674,23 @@ class TuyaBLEDevice:
             )
             async with self._policy_lock:
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
-                    self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
+                    reconnect_delay = (
+                        self._next_unexpected_reconnect_delay()
+                        if (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+                        else BLEAK_BACKOFF_TIME
+                    )
+                    self._schedule_reconnect_locked(reconnect_delay)
         except (TuyaBLEControlSuspendedError, TuyaBLEConnectionUnavailableError):
             return
         except Exception:  # noqa: BLE001
             async with self._policy_lock:
                 if self.effective_policy is EffectiveConnectionPolicy.ALWAYS_CONNECTED:
-                    self._schedule_reconnect_locked(BLEAK_BACKOFF_TIME)
+                    reconnect_delay = (
+                        self._next_unexpected_reconnect_delay()
+                        if (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+                        else BLEAK_BACKOFF_TIME
+                    )
+                    self._schedule_reconnect_locked(reconnect_delay)
 
     def _schedule_reconnect(self, delay: float = 0) -> None:
         if self._terminal_stopped or self._suspension_requested:
