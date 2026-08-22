@@ -157,6 +157,7 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert battery.dp_id == 8
     assert battery.description.device_class is SensorDeviceClass.BATTERY
     assert battery.description.native_unit_of_measurement == PERCENTAGE
+    assert battery.description.suggested_display_precision == 0
     assert battery.description.entity_category is EntityCategory.DIAGNOSTIC
     assert battery.requires_current_session is True
 
@@ -349,6 +350,71 @@ def test_v1_battery_rejects_invalid_percentages(raw_value: Any, expected: Any) -
     sensor.v1_battery_getter(entity)
 
     assert entity._attr_native_value == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (-1, None),
+        (0, 0),
+        (1, 1),
+        (50, 50),
+        (99, 99),
+        (100, 100),
+        (101, None),
+        (True, None),
+        (None, None),
+    ],
+)
+def test_battery_percentage_values_are_validated_and_normalized(
+    raw_value: Any, expected: Any
+) -> None:
+    """Battery percentages are bounded and integral results remain integers."""
+    mapping = sensor.TuyaBLEBatteryMapping(dp_id=8)
+    entity = SimpleNamespace(
+        _device=SimpleNamespace(
+            datapoints={
+                8: SimpleNamespace(
+                    type=TuyaBLEDataPointType.DT_VALUE,
+                    value=raw_value,
+                )
+            }
+        ),
+        _mapping=mapping,
+        entity_description=mapping.description,
+        _attr_native_value="stale",
+        async_write_ha_state=lambda: None,
+    )
+
+    sensor.TuyaBLESensor._handle_coordinator_update(entity)
+
+    assert entity._attr_native_value == expected
+    if expected is not None:
+        assert type(entity._attr_native_value) is int
+
+
+def test_battery_percentage_coefficient_preserves_fractional_values() -> None:
+    """Scaled battery mappings retain valid non-integral percentages."""
+    mapping = sensor.TuyaBLEBatteryMapping(dp_id=8, coefficient=10.0)
+    entity = SimpleNamespace(
+        _device=SimpleNamespace(
+            datapoints={
+                8: SimpleNamespace(
+                    type=TuyaBLEDataPointType.DT_VALUE,
+                    value=995,
+                )
+            }
+        ),
+        _mapping=mapping,
+        entity_description=mapping.description,
+        _attr_native_value="stale",
+        async_write_ha_state=lambda: None,
+    )
+
+    sensor.TuyaBLESensor._handle_coordinator_update(entity)
+
+    assert entity._attr_native_value == 99.5
+    assert type(entity._attr_native_value) is float
 
 
 @pytest.mark.parametrize("device", (S1_DEVICE, V1_DEVICE), ids=("s1", "v1"))

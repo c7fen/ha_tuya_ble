@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 from typing import Callable
 from homeassistant.components.sensor import (
@@ -89,10 +89,25 @@ class TuyaBLEBatteryMapping(TuyaBLESensorMapping):
             key="battery",
             device_class=SensorDeviceClass.BATTERY,
             native_unit_of_measurement=PERCENTAGE,
+            suggested_display_precision=0,
             entity_category=EntityCategory.DIAGNOSTIC,
             state_class=SensorStateClass.MEASUREMENT,
         )
     )
+
+    def __post_init__(self) -> None:
+        if self.description.suggested_display_precision is None:
+            self.description = replace(self.description, suggested_display_precision=0)
+
+
+def _normalize_battery_percentage(value: object) -> int | float | None:
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not 0 <= value <= 100
+    ):
+        return None
+    return int(value) if float(value).is_integer() else value
 
 
 @dataclass
@@ -2062,11 +2077,21 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
                         ):
                             self._attr_icon = self._mapping.icons[datapoint.value]
                 elif datapoint.type == TuyaBLEDataPointType.DT_VALUE:
-                    self._attr_native_value = (
-                        datapoint.value / self._mapping.coefficient
-                    )
+                    if isinstance(self._mapping, TuyaBLEBatteryMapping) and (
+                        not isinstance(datapoint.value, int | float)
+                        or isinstance(datapoint.value, bool)
+                    ):
+                        self._attr_native_value = None
+                    else:
+                        self._attr_native_value = (
+                            datapoint.value / self._mapping.coefficient
+                        )
                 else:
                     self._attr_native_value = datapoint.value
+        if isinstance(self._mapping, TuyaBLEBatteryMapping):
+            self._attr_native_value = _normalize_battery_percentage(
+                self._attr_native_value
+            )
         self.async_write_ha_state()
 
     @property
