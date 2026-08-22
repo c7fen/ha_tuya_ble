@@ -2289,9 +2289,16 @@ class TuyaBLEDevice:
             )
             return
         expected_disconnect = self._expected_disconnect
+        pending = self._pending_release
+        recorded_failure_delay = (
+            pending.reconnect_delay or UNEXPECTED_RECONNECT_MIN_SECONDS
+            if pending is not None
+            and pending.reason is PendingReleaseReason.SESSION_FAILURE
+            else None
+        )
         reconnect_delay = self._mark_connection_lost(
             token,
-            unexpected=not expected_disconnect,
+            unexpected=not expected_disconnect and recorded_failure_delay is None,
         )
         if expected_disconnect:
             _LOGGER.debug(
@@ -2311,7 +2318,9 @@ class TuyaBLEDevice:
             self.rssi,
         )
         self._reconcile_after_verified_transport_loss(
-            reconnect_delay or UNEXPECTED_RECONNECT_MIN_SECONDS
+            recorded_failure_delay
+            or reconnect_delay
+            or UNEXPECTED_RECONNECT_MIN_SECONDS
         )
 
     def _disconnect(self) -> None:

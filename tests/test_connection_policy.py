@@ -2885,6 +2885,32 @@ async def test_callback_before_no_replay_write_error_recovers_only_once() -> Non
     assert not hasattr(device, "_resend_task")
 
 
+async def test_callback_after_connected_write_error_reuses_failure_delay() -> None:
+    """A callback after a retained write failure does not count the session twice."""
+    device = _make_device()
+    client = _SyntheticConnectedClient()
+    client.write_gatt_char.side_effect = BleakError("synthetic retained loss")
+    token = _install_connected_session(device, client)
+    device._schedule_disconnect_retry_locked = Mock()
+    device._schedule_reconnect_locked = Mock()
+
+    async with device.connection_lease(
+        "synthetic retained loss", defer_connection=True
+    ):
+        with pytest.raises(BleakError, match="synthetic retained loss"):
+            await device._send_packets_locked(token, [b"synthetic-fragment"])
+
+        assert device._unexpected_reconnect_failures == 1
+        client.is_connected = False
+        device._disconnected(client, token)
+
+        assert device._unexpected_reconnect_failures == 1
+        assert device._pending_release is None
+        device._schedule_reconnect_locked.assert_called_once_with(
+            UNEXPECTED_RECONNECT_MIN_SECONDS
+        )
+
+
 async def test_verified_loss_enters_on_demand_idle_without_an_idle_timer() -> None:
     """A lost On-demand client is idle, not active or pending an idle release."""
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
@@ -3321,15 +3347,43 @@ async def test_s1_disconnect_retries_enter_battery_safe_cooldown() -> None:
     assert device._unexpected_reconnect_failures == 0
 
 
-def test_v1_disconnect_retries_keep_generic_backoff() -> None:
-    """S1 physical-release protection does not change V1 retry pacing."""
+async def test_v1_failed_release_retries_with_generic_backoff() -> None:
+    """S1 physical-release protection does not change V1 retry scheduling."""
     device = _make_device()
     assert device._device_info is not None
     device._device_info.category = "ms"
     device._device_info.product_id = "7a4xvbtt"
+    client = _SyntheticConnectedClient()
+    release_attempts = 0
+    sleep_delays: list[float] = []
+    real_sleep = asyncio.sleep
 
-    assert device._disconnect_retry_delay(1) == BLEAK_BACKOFF_TIME
-    assert device._disconnect_retry_delay(5) == BLEAK_BACKOFF_TIME
+    async def disconnect() -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise BleakError("synthetic V1 release")
+        client.is_connected = False
+
+    async def controlled_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        await real_sleep(0)
+
+    client.disconnect.side_effect = disconnect
+    device._schedule_reconnect_locked = Mock()
+
+    with patch(
+        "custom_components.tuya_ble.tuya_ble.tuya_ble.asyncio.sleep",
+        new=controlled_sleep,
+    ):
+        retry_owner = await _seed_failed_setup_release(device, client)
+        await retry_owner
+
+    assert release_attempts == 2
+    assert sleep_delays == [BLEAK_BACKOFF_TIME]
+    assert device._client is None
+    assert device._pending_release is None
+    assert device._unexpected_reconnect_failures == 0
 
 
 async def test_short_status_sessions_use_real_single_flight_backoff() -> None:
