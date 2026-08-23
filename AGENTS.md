@@ -9,6 +9,25 @@
 - Release only after documentation, CI, security, exact-head review, and any
   required hardware gates pass.
 
+## Local linked worktrees
+
+On Felix's primary WSL2 workstation, the canonical checkout for this repository
+is `/home/fengemann/projects/ha_tuya_ble-s1`. This historical local directory
+name differs from the current GitHub repository name, `ha_tuya_ble`. Persistent
+linked Git worktrees for this repository MUST be created under
+`/home/fengemann/worktrees/ha_tuya_ble/<task>`.
+
+Do not create persistent linked worktrees directly under
+`/home/fengemann/projects`, inside the canonical checkout, inside another
+linked worktree, or under `/tmp`. `/tmp` is allowed only for ephemeral
+read-only or no-push checkouts that are removed in the same bounded task.
+
+Before creating a linked worktree, inspect existing worktrees, branches,
+issue/PR ownership, and active processes. Preserve unrelated work. On another
+host, use `$WORKTREE_ROOT/ha_tuya_ble/<task>` only when `WORKTREE_ROOT` is
+explicitly configured. That root must remain outside all canonical checkouts
+and outside the parent directory containing canonical project roots.
+
 ## Device and behavior changes
 
 - Do not add tests only for a simple device mapping. Add coverage when existing
