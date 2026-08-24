@@ -151,12 +151,15 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert alarm.description.options == S1_ALARM_OPTIONS
     assert alarm.description.icon == "mdi:alert"
     assert alarm.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert alarm.requires_current_session is False
 
     battery = mappings["battery"]
     assert battery.dp_id == 8
     assert battery.description.device_class is SensorDeviceClass.BATTERY
     assert battery.description.native_unit_of_measurement == PERCENTAGE
+    assert battery.description.suggested_display_precision == 0
     assert battery.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert battery.requires_current_session is True
 
     last_unlock = mappings["last_unlock_method"]
     assert last_unlock.unlock_methods == S1_LAST_UNLOCK_METHODS
@@ -170,6 +173,32 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert door.description.options == ["unknown", "open", "closed"]
     assert door.description.entity_registry_enabled_default is False
     assert door.description.entity_category is EntityCategory.DIAGNOSTIC
+    assert door.requires_current_session is True
+
+
+def test_s1_current_configuration_has_exact_per_datapoint_provenance_scope() -> None:
+    """Only S1 current-state/configuration mappings require the active epoch."""
+    authentication = _mapping_by_key(select.get_mapping_by_device(S1_DEVICE))[
+        "unlock_switch"
+    ]
+    auto_lock = _mapping_by_key(switch.get_mapping_by_device(S1_DEVICE))[
+        "automatic_lock"
+    ]
+    auto_lock_delay = _mapping_by_key(number.get_mapping_by_device(S1_DEVICE))[
+        "auto_lock_time"
+    ]
+    motor = _mapping_by_key(binary_sensor.get_mapping_by_device(S1_DEVICE))[
+        "lock_motor_state"
+    ]
+
+    assert authentication.dp_id == 34
+    assert authentication.requires_current_session is True
+    assert auto_lock.dp_id == 33
+    assert auto_lock.requires_current_session is True
+    assert auto_lock_delay.dp_id == 36
+    assert auto_lock_delay.requires_current_session is True
+    assert motor.dp_id == 47
+    assert motor.requires_current_session is True
 
 
 def test_v1_contract_excludes_generic_and_speculative_entities() -> None:
@@ -194,14 +223,17 @@ def test_v1_contract_excludes_generic_and_speculative_entities() -> None:
     switches = _mapping_by_key(switch.get_mapping_by_device(V1_DEVICE))
     assert set(switches) == {"automatic_lock"}
     assert switches["automatic_lock"].dp_id == 33
+    assert switches["automatic_lock"].requires_current_session is True
 
     numbers = _mapping_by_key(number.get_mapping_by_device(V1_DEVICE))
     assert set(numbers) == {"auto_lock_time"}
     assert numbers["auto_lock_time"].dp_id == 36
+    assert numbers["auto_lock_time"].requires_current_session is True
 
     binary_sensors = _mapping_by_key(binary_sensor.get_mapping_by_device(V1_DEVICE))
     assert set(binary_sensors) == {"lock_motor_state"}
     assert binary_sensors["lock_motor_state"].dp_id == 47
+    assert binary_sensors["lock_motor_state"].requires_current_session is True
     assert binary_sensors["lock_motor_state"].description.device_class is None
 
     assert select.get_mapping_by_device(V1_DEVICE) == []
@@ -318,6 +350,71 @@ def test_v1_battery_rejects_invalid_percentages(raw_value: Any, expected: Any) -
     sensor.v1_battery_getter(entity)
 
     assert entity._attr_native_value == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (-1, None),
+        (0, 0),
+        (1, 1),
+        (50, 50),
+        (99, 99),
+        (100, 100),
+        (101, None),
+        (True, None),
+        (None, None),
+    ],
+)
+def test_battery_percentage_values_are_validated_and_normalized(
+    raw_value: Any, expected: Any
+) -> None:
+    """Battery percentages are bounded and integral results remain integers."""
+    mapping = sensor.TuyaBLEBatteryMapping(dp_id=8)
+    entity = SimpleNamespace(
+        _device=SimpleNamespace(
+            datapoints={
+                8: SimpleNamespace(
+                    type=TuyaBLEDataPointType.DT_VALUE,
+                    value=raw_value,
+                )
+            }
+        ),
+        _mapping=mapping,
+        entity_description=mapping.description,
+        _attr_native_value="stale",
+        async_write_ha_state=lambda: None,
+    )
+
+    sensor.TuyaBLESensor._handle_coordinator_update(entity)
+
+    assert entity._attr_native_value == expected
+    if expected is not None:
+        assert type(entity._attr_native_value) is int
+
+
+def test_battery_percentage_coefficient_preserves_fractional_values() -> None:
+    """Scaled battery mappings retain valid non-integral percentages."""
+    mapping = sensor.TuyaBLEBatteryMapping(dp_id=8, coefficient=10.0)
+    entity = SimpleNamespace(
+        _device=SimpleNamespace(
+            datapoints={
+                8: SimpleNamespace(
+                    type=TuyaBLEDataPointType.DT_VALUE,
+                    value=995,
+                )
+            }
+        ),
+        _mapping=mapping,
+        entity_description=mapping.description,
+        _attr_native_value="stale",
+        async_write_ha_state=lambda: None,
+    )
+
+    sensor.TuyaBLESensor._handle_coordinator_update(entity)
+
+    assert entity._attr_native_value == 99.5
+    assert type(entity._attr_native_value) is float
 
 
 @pytest.mark.parametrize("device", (S1_DEVICE, V1_DEVICE), ids=("s1", "v1"))

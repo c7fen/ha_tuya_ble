@@ -541,6 +541,7 @@ class TuyaBLELight(TuyaBLEEntity, LightEntity):
     """Representation of a Tuya BLE Light."""
 
     platform = Platform.LIGHT
+    _is_command_entity = True
 
     entity_description: TuyaLightEntityDescription
 

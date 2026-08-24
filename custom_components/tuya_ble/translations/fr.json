@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "ID d'accès Tuya IoT",
                     "access_secret": "Clé secrète d'accès Tuya IoT",
+                    "sec_key": "SecKey Tuya BLE (facultative)",
                     "country_code": "Pays",
                     "password": "Mot de passe",
                     "username": "Compte"
@@ -29,12 +30,27 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Le déverrouillage local n'est pas initialisé pour cet appareil. Un modèle propre à l'appareil doit d'abord être reçu."
+        },
         "v1_command_unavailable": {
             "message": "Les points de données de commande V1 sont indisponibles ou non valides."
+        },
+        "ble_control_suspended": {
+            "message": "Le contrôle BLE de Home Assistant est suspendu."
+        },
+        "ble_connection_unavailable": {
+            "message": "La connexion Bluetooth est indisponible."
+        },
+        "ble_policy_transition_failed": {
+            "message": "La politique de connexion Bluetooth n'a pas pu être modifiée en toute sécurité."
         }
     },
     "entity": {
         "binary_sensor": {
+            "bluetooth_connection": {
+                "name": "Connexion Bluetooth"
+            },
             "fault": {
                 "name": "Défaut"
             },
@@ -124,6 +140,13 @@
             }
         },
         "select": {
+            "connection_mode": {
+                "name": "Mode de connexion",
+                "state": {
+                    "always_connected": "Toujours connecté",
+                    "on_demand": "À la demande"
+                }
+            },
             "beep_volume": {
                 "name": "Volume de la serrure"
             },
@@ -342,6 +365,9 @@
             }
         },
         "switch": {
+            "ble_control_enabled": {
+                "name": "Contrôle BLE de Home Assistant"
+            },
             "antifreeze": {
                 "name": "Antigel"
             },
@@ -416,15 +442,31 @@
     },
     "options": {
         "error": {
+            "ble_policy_transition_failed": "La politique de connexion Bluetooth n'a pas pu être modifiée en toute sécurité.",
             "device_not_registered": "L'appareil n'est pas enregistré dans le cloud Tuya",
             "invalid_auth": "Authentification invalide",
             "login_error": "Erreur de connexion ({code}) : {msg}"
         },
         "step": {
+            "init": {
+                "title": "Configurer Tuya BLE",
+                "menu_options": {
+                    "connection_settings": "Paramètres de connexion",
+                    "login": "Identifiants Tuya"
+                }
+            },
+            "connection_settings": {
+                "data": {
+                    "connection_mode": "Mode de connexion",
+                    "ble_control_enabled": "Contrôle BLE de Home Assistant"
+                },
+                "description": "Choisissez comment Home Assistant utilise la connexion Bluetooth."
+            },
             "login": {
                 "data": {
                     "access_id": "ID d'accès Tuya IoT",
                     "access_secret": "Clé secrète d'accès Tuya IoT",
+                    "sec_key": "SecKey Tuya BLE (facultative)",
                     "country_code": "Pays",
                     "password": "Mot de passe",
                     "username": "Compte"

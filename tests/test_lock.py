@@ -52,6 +52,7 @@ async def test_lock(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Lock Product", lock=1)
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -74,6 +75,14 @@ async def test_lock(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    device.datapoints._update_from_device(
+        DPCode.LOCK_MOTOR_STATE,
+        0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        False,
+        session_token,
+    )
     coordinator._async_handle_connect()
     assert entity.available is True
     # Initial: not motor_state.value -> True (locked) because get_or_create defaults to False
@@ -81,7 +90,12 @@ async def test_lock(hass: HomeAssistant) -> None:
 
     # Update coordinator state to unlocked: "lock_motor_state" = True
     device.datapoints._update_from_device(
-        DPCode.LOCK_MOTOR_STATE, 0, 0, TuyaBLEDataPointType.DT_BOOL, True
+        DPCode.LOCK_MOTOR_STATE,
+        0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        True,
+        session_token,
     )
     entity._handle_coordinator_update()
     assert entity.is_locked is False
@@ -126,6 +140,7 @@ async def test_guard_dog_lock(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
 
     # Set credentials with wgv4haro
     device._device_info = TuyaBLEDeviceCredentials(
@@ -167,6 +182,14 @@ async def test_guard_dog_lock(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    device.datapoints._update_from_device(
+        DPCode.LOCK_MOTOR_STATE,
+        0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        False,
+        session_token,
+    )
     coordinator._async_handle_connect()
     assert entity.available is True
     # Initial: not motor_state.value -> True (locked) because get_or_create defaults to False
@@ -174,7 +197,12 @@ async def test_guard_dog_lock(hass: HomeAssistant) -> None:
 
     # Update coordinator state to unlocked: "lock_motor_state" = True
     device.datapoints._update_from_device(
-        DPCode.LOCK_MOTOR_STATE, 0, 0, TuyaBLEDataPointType.DT_BOOL, True
+        DPCode.LOCK_MOTOR_STATE,
+        0,
+        0,
+        TuyaBLEDataPointType.DT_BOOL,
+        True,
+        session_token,
     )
     entity._handle_coordinator_update()
     assert entity.is_locked is False

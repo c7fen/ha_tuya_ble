@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 from typing import Callable
 from homeassistant.components.sensor import (
@@ -64,6 +64,7 @@ class TuyaBLESensorMapping:
     coefficient: float = 1.0
     icons: list[str] | None = None
     is_available: TuyaBLESensorIsAvailable = None
+    requires_current_session: bool = False
 
 
 @dataclass
@@ -88,10 +89,25 @@ class TuyaBLEBatteryMapping(TuyaBLESensorMapping):
             key="battery",
             device_class=SensorDeviceClass.BATTERY,
             native_unit_of_measurement=PERCENTAGE,
+            suggested_display_precision=0,
             entity_category=EntityCategory.DIAGNOSTIC,
             state_class=SensorStateClass.MEASUREMENT,
         )
     )
+
+    def __post_init__(self) -> None:
+        if self.description.suggested_display_precision is None:
+            self.description = replace(self.description, suggested_display_precision=0)
+
+
+def _normalize_battery_percentage(value: object) -> int | float | None:
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not 0 <= value <= 100
+    ):
+        return None
+    return int(value) if float(value).is_integer() else value
 
 
 @dataclass
@@ -532,6 +548,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                 TuyaBLEBatteryMapping(
                     dp_id=8,
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
+                    requires_current_session=True,
                 ),
                 TuyaBLELastUnlockSensorMapping(
                     unlock_methods={
@@ -573,6 +590,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                         ],
                     ),
                     dp_type=TuyaBLEDataPointType.DT_ENUM,
+                    requires_current_session=True,
                 ),
             ],
             "y2yaegze": [
@@ -2032,10 +2050,16 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            self._attr_native_value = None
+            self.async_write_ha_state()
+            return
         if self._mapping.getter is not None:
             self._mapping.getter(self)
         else:
-            datapoint = self._device.datapoints[self._mapping.dp_id]
             if datapoint:
                 if datapoint.type == TuyaBLEDataPointType.DT_ENUM:
                     if self.entity_description.options is not None:
@@ -2053,17 +2077,30 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
                         ):
                             self._attr_icon = self._mapping.icons[datapoint.value]
                 elif datapoint.type == TuyaBLEDataPointType.DT_VALUE:
-                    self._attr_native_value = (
-                        datapoint.value / self._mapping.coefficient
-                    )
+                    if isinstance(self._mapping, TuyaBLEBatteryMapping) and (
+                        not isinstance(datapoint.value, int | float)
+                        or isinstance(datapoint.value, bool)
+                    ):
+                        self._attr_native_value = None
+                    else:
+                        self._attr_native_value = (
+                            datapoint.value / self._mapping.coefficient
+                        )
                 else:
                     self._attr_native_value = datapoint.value
+        if isinstance(self._mapping, TuyaBLEBatteryMapping):
+            self._attr_native_value = _normalize_battery_percentage(
+                self._attr_native_value
+            )
         self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
         result = super().available
+        if result and self._mapping.requires_current_session:
+            datapoint = self._device.datapoints[self._mapping.dp_id]
+            result = bool(datapoint and datapoint.received_in_current_session)
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result

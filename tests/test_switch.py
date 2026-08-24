@@ -47,6 +47,7 @@ async def test_switch(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Switch Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -85,7 +86,9 @@ async def test_switch(hass: HomeAssistant) -> None:
     assert entity.is_on is False
 
     # Update coordinator state
-    device.datapoints._update_from_device(1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    device.datapoints._update_from_device(
+        1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, session_token
+    )
     entity._handle_coordinator_update()
     assert entity.is_on is True
 
@@ -123,6 +126,7 @@ async def test_switch_bitmap(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Switch Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -160,12 +164,16 @@ async def test_switch_bitmap(hass: HomeAssistant) -> None:
     assert entity.is_on is False
 
     # Update coordinator state with bitmap b"\x02" -> should be on
-    device.datapoints._update_from_device(11, 0, 0, TuyaBLEDataPointType.DT_BITMAP, b"\x02")
+    device.datapoints._update_from_device(
+        11, 0, 0, TuyaBLEDataPointType.DT_BITMAP, b"\x02", session_token
+    )
     entity._handle_coordinator_update()
     assert entity.is_on is True
 
     # Update coordinator state with bitmap b"\x01" -> should be off (doesn't match b"\x02")
-    device.datapoints._update_from_device(11, 0, 0, TuyaBLEDataPointType.DT_BITMAP, b"\x01")
+    device.datapoints._update_from_device(
+        11, 0, 0, TuyaBLEDataPointType.DT_BITMAP, b"\x01", session_token
+    )
     entity._handle_coordinator_update()
     assert entity.is_on is False
 

@@ -1,14 +1,81 @@
 """The Tuya BLE integration."""
 
 from __future__ import annotations
-from dataclasses import dataclass
 
+from dataclasses import dataclass
 from enum import StrEnum
+
 from tuya_iot import TuyaCloudOpenAPIEndpoint
 from typing_extensions import Final
 
-
 DOMAIN: Final = "tuya_ble"
+
+CONF_CONNECTION_MODE: Final = "connection_mode"
+CONF_BLE_CONTROL_ENABLED: Final = "ble_control_enabled"
+
+DEFAULT_CONNECTION_MODE: Final = "always_connected"
+DEFAULT_BLE_CONTROL_ENABLED: Final = True
+DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS: Final = 15.0
+CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS: Final = 30.0
+BLE_TARGET_WAIT_TIMEOUT_SECONDS: Final = 10.0
+UNEXPECTED_RECONNECT_MIN_SECONDS: Final = 1.0
+UNEXPECTED_RECONNECT_MAX_SECONDS: Final = 60.0
+RECONNECT_STABLE_RESET_SECONDS: Final = 30.0
+S1_RECONNECT_FAILURES_BEFORE_COOLDOWN: Final = 3
+S1_RECONNECT_COOLDOWN_SECONDS: Final = 15 * 60.0
+S1_RECONNECT_STABLE_RESET_SECONDS: Final = 15 * 60.0
+
+
+class ConnectionMode(StrEnum):
+    """Supported per-device connection modes."""
+
+    ALWAYS_CONNECTED = "always_connected"
+    ON_DEMAND = "on_demand"
+
+
+class ConnectionPolicyState(StrEnum):
+    """Runtime states of the per-device connection policy."""
+
+    STOPPED = "stopped"
+    SUSPENDED = "suspended"
+    ALWAYS_CONNECTED_CONNECTING = "always_connected_connecting"
+    ALWAYS_CONNECTED_ACTIVE = "always_connected_active"
+    ON_DEMAND_IDLE = "on_demand_idle"
+    ON_DEMAND_CONNECTING = "on_demand_connecting"
+    ON_DEMAND_ACTIVE = "on_demand_active"
+    DISCONNECTING = "disconnecting"
+    DISCONNECT_FAILED = "disconnect_failed"
+
+
+class PendingReleaseReason(StrEnum):
+    """Why a physical GATT release remains owned by the device."""
+
+    SUSPEND = "suspend"
+    ON_DEMAND_IDLE = "on_demand_idle"
+    SETUP_FAILURE = "setup_failure"
+    SESSION_FAILURE = "session_failure"
+    UNLOAD = "unload"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class PendingRelease:
+    """One revision-bound physical GATT release obligation."""
+
+    reason: PendingReleaseReason
+    revision: int
+    terminal: bool = False
+    reconnect_delay: float | None = None
+
+
+class EffectiveConnectionPolicy(StrEnum):
+    """Effective policy after applying permission and terminal lifecycle."""
+
+    STOPPED = "stopped"
+    SUSPENDED = "suspended"
+    ALWAYS_CONNECTED = "always_connected"
+    ON_DEMAND = "on_demand"
+
 
 DEVICE_METADATA_UUIDS: Final = "uuids"
 

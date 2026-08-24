@@ -128,6 +128,7 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
         fake_device = SimpleNamespace(
             initialize=AsyncMock(),
             update=Mock(return_value="scheduled update"),
+            startup_update=Mock(return_value="scheduled startup update"),
             stop=AsyncMock(),
             category="jtmspro",
             product_id="xqeob8h6",
@@ -184,6 +185,9 @@ def test_synthetic_b2_entry_loads_without_reconfiguration() -> None:
             assert await integration.async_setup_entry(hass, entry) is True
 
         assert setup_order == ["s1_migration", "v1_migration", "forward"]
+        fake_device.startup_update.assert_called_once_with()
+        fake_device.update.assert_not_called()
+        hass.add_job.assert_called_once_with("scheduled startup update")
         assert dict(entry.options) == original_options
         assert dict(entry.data) == {CONF_ADDRESS: ADDRESS}
         assert entry.unique_id == ADDRESS

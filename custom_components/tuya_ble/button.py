@@ -20,7 +20,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.entity import EntityCategory
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -263,6 +268,7 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
     """Representation of a Tuya BLE Button."""
 
     platform = Platform.BUTTON
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -277,6 +283,7 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
 
     def press(self) -> None:
         """Press the button."""
+        ensure_control_available(self._device)
         initial_value = (
             self._mapping.press_value
             if self._mapping.press_value is not None

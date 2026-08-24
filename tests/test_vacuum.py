@@ -58,6 +58,7 @@ async def test_vacuum_bool_control(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Vacuum Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -107,41 +108,47 @@ async def test_vacuum_bool_control(hass: HomeAssistant) -> None:
 
     # Test Activity when status DP is None (falls back to start bool DP)
     assert entity.activity == VacuumActivity.IDLE
-    device.datapoints._update_from_device(1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    device.datapoints._update_from_device(
+        1, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, session_token
+    )
     assert entity.activity == VacuumActivity.CLEANING
-    device.datapoints._update_from_device(1, 0, 0, TuyaBLEDataPointType.DT_BOOL, False)
+    device.datapoints._update_from_device(
+        1, 0, 0, TuyaBLEDataPointType.DT_BOOL, False, session_token
+    )
     assert entity.activity == VacuumActivity.IDLE
 
     # Test Activity from status DP (string / enum)
     device.datapoints._update_from_device(
-        4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 0
+        4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 0, session_token
     )  # 0 maps to "standby"
     assert entity.activity == VacuumActivity.IDLE
 
     device.datapoints._update_from_device(
-        4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1
+        4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1, session_token
     )  # 1 maps to "cleaning"
     assert entity.activity == VacuumActivity.CLEANING
 
     # Test unknown status value defaults to VacuumActivity.IDLE
-    device.datapoints._update_from_device(4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 99)
+    device.datapoints._update_from_device(
+        4, 0, 0, TuyaBLEDataPointType.DT_ENUM, 99, session_token
+    )
     assert entity.activity == VacuumActivity.IDLE
 
     # Test raw string status value mapping
     device.datapoints._update_from_device(
-        4, 0, 0, TuyaBLEDataPointType.DT_STRING, "pause"
+        4, 0, 0, TuyaBLEDataPointType.DT_STRING, "pause", session_token
     )
     assert entity.activity == VacuumActivity.PAUSED
 
     # Test fan speed tracking
     assert entity.fan_speed is None
     device.datapoints._update_from_device(
-        2, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1
+        2, 0, 0, TuyaBLEDataPointType.DT_ENUM, 1, session_token
     )  # 1 maps to "z_mode"
     assert entity.fan_speed == "z_mode"
 
     device.datapoints._update_from_device(
-        2, 0, 0, TuyaBLEDataPointType.DT_ENUM, 9
+        2, 0, 0, TuyaBLEDataPointType.DT_ENUM, 9, session_token
     )  # out of range defaults to string
     assert entity.fan_speed == "9"
 

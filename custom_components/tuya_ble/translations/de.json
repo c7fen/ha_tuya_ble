@@ -20,6 +20,7 @@
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "Tuya BLE SecKey (optional)",
                     "country_code": "Land",
                     "password": "Passwort",
                     "username": "Konto"
@@ -29,12 +30,27 @@
         }
     },
     "exceptions": {
+        "s1_unlock_templates_unavailable": {
+            "message": "Die lokale Entriegelung ist für dieses Gerät nicht initialisiert. Zuerst muss eine gerätespezifische Vorlage empfangen werden."
+        },
         "v1_command_unavailable": {
             "message": "Die V1-Befehlsdatenpunkte sind nicht verfügbar oder ungültig."
+        },
+        "ble_control_suspended": {
+            "message": "Die Home-Assistant-BLE-Steuerung ist ausgesetzt."
+        },
+        "ble_connection_unavailable": {
+            "message": "Die Bluetooth-Verbindung ist nicht verfügbar."
+        },
+        "ble_policy_transition_failed": {
+            "message": "Die Bluetooth-Verbindungsrichtlinie konnte nicht sicher geändert werden."
         }
     },
     "entity": {
         "binary_sensor": {
+            "bluetooth_connection": {
+                "name": "Bluetooth-Verbindung"
+            },
             "fault": {
                 "name": "Fehler"
             },
@@ -124,6 +140,13 @@
             }
         },
         "select": {
+            "connection_mode": {
+                "name": "Verbindungsmodus",
+                "state": {
+                    "always_connected": "Immer verbunden",
+                    "on_demand": "Bei Bedarf"
+                }
+            },
             "beep_volume": {
                 "name": "Lautstärke sperren"
             },
@@ -342,6 +365,9 @@
             }
         },
         "switch": {
+            "ble_control_enabled": {
+                "name": "Home-Assistant-BLE-Steuerung"
+            },
             "antifreeze": {
                 "name": "Frostschutz"
             },
@@ -416,15 +442,31 @@
     },
     "options": {
         "error": {
+            "ble_policy_transition_failed": "Die Bluetooth-Verbindungsrichtlinie konnte nicht sicher geändert werden.",
             "device_not_registered": "Gerät ist nicht in der Tuya-Cloud registriert",
             "invalid_auth": "Ungültige Authentifizierung",
             "login_error": "Anmeldefehler ({code}): {msg}"
         },
         "step": {
+            "init": {
+                "title": "Tuya BLE konfigurieren",
+                "menu_options": {
+                    "connection_settings": "Verbindungseinstellungen",
+                    "login": "Tuya-Zugangsdaten"
+                }
+            },
+            "connection_settings": {
+                "data": {
+                    "connection_mode": "Verbindungsmodus",
+                    "ble_control_enabled": "Home-Assistant-BLE-Steuerung"
+                },
+                "description": "Wählen Sie, wie Home Assistant die Bluetooth-Verbindung verwendet."
+            },
             "login": {
                 "data": {
                     "access_id": "Tuya IoT Access ID",
                     "access_secret": "Tuya IoT Access Secret",
+                    "sec_key": "Tuya BLE SecKey (optional)",
                     "country_code": "Land",
                     "password": "Passwort",
                     "username": "Konto"

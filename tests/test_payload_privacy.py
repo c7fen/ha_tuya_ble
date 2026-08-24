@@ -26,6 +26,7 @@ from custom_components.tuya_ble.tuya_ble import (
 )
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
+from custom_components.tuya_ble.tuya_ble.tuya_ble import ConnectionSessionToken
 
 SYNTHETIC_BLE_ADDRESS = "02:00:00:00:00:01"
 SYNTHETIC_DEVICE_ID = "synthetic-privacy-device-id"
@@ -50,6 +51,19 @@ def _make_device(address: str = SYNTHETIC_BLE_ADDRESS) -> TuyaBLEDevice:
         rssi=-50,
     )
     return TuyaBLEDevice(object(), ble_device)
+
+
+def _install_synthetic_session(
+    device: TuyaBLEDevice, client: Mock | None = None
+) -> tuple[Mock, ConnectionSessionToken]:
+    """Install one exact synthetic session for privacy-focused transport tests."""
+    if client is None:
+        client = Mock(is_connected=True)
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    device._connected_notified_token = token
+    return client, token
 
 
 def _protected_identifier_forms(device: TuyaBLEDevice) -> set[str]:
@@ -266,6 +280,7 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
     with patch.object(device, "_send_packet", AsyncMock()):
         await device.update()
 
+    _, token = _install_synthetic_session(device)
     device._build_packets = Mock(return_value=[b"synthetic-fragment"])
     with patch.object(device, "_int_send_packet_while_connected", AsyncMock()):
         await device._send_packet_while_connected(
@@ -282,11 +297,10 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
                 TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", 0, True
             )
 
-    device._is_paired = False
     device._int_send_packets_locked = AsyncMock(side_effect=BleakError(exception_text))
     device._reconnect = AsyncMock()
     with pytest.raises(BleakError) as raised:
-        await device._send_packets_locked([b"synthetic-fragment"])
+        await device._send_packets_locked(token, [b"synthetic-fragment"])
     await asyncio.sleep(0)
     rendered_error = "".join(
         traceback.format_exception(
@@ -308,9 +322,15 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
     ):
         await TuyaBLEDevice._reconnect(device)
 
-    device._disconnected(Mock())
+    token.client.is_connected = False
+    device._mark_connection_lost(token)
+    current_client = Mock(is_connected=True)
+    _, current_token = _install_synthetic_session(device, current_client)
+    device._disconnected(current_client, current_token)
+    device._cancel_reconnect_locked()
+    _, notification_token = _install_synthetic_session(device)
     device._input_expected_packet_num = 1
-    device._notification_handler(0, device._pack_int(2))
+    device._notification_handler(notification_token, 0, device._pack_int(2))
 
     log_text = caplog.text
     assert device.log_identity in log_text
@@ -320,7 +340,7 @@ async def test_lifecycle_and_transport_logs_redact_synthetic_identifiers(
         "FUN_SENDER_PAIR",
         "FUN_SENDER_DPS",
         "timeout receiving response",
-        "Disconnecting after transport error",
+        "Transport error without command replay",
         "Bluetooth is already shutdown",
         "unexpectedly disconnected",
         "Packet received",
@@ -344,7 +364,7 @@ async def test_disconnect_transport_errors_redact_synthetic_identifiers(
     client.stop_notify = AsyncMock()
     client.disconnect = AsyncMock()
     getattr(client, failing_operation).side_effect = BleakError(exception_text)
-    device._client = client
+    _install_synthetic_session(device, client)
 
     with pytest.raises(BleakError) as raised:
         await device._execute_disconnect()
@@ -392,8 +412,9 @@ def test_payload_values_and_encodings_never_enter_protocol_logs(caplog) -> None:
         logger="custom_components.tuya_ble.tuya_ble.tuya_ble",
     )
 
+    _, token = _install_synthetic_session(device)
     incoming = bytes((70, TuyaBLEDataPointType.DT_RAW.value, len(marker))) + marker
-    device._parse_datapoints_v3(0, 0, incoming, 0)
+    device._parse_datapoints_v3(token, 0, 0, incoming, 0)
     outgoing = device.datapoints.get_or_create(71, TuyaBLEDataPointType.DT_RAW, marker)
     device._encode_datapoints([71], 1)
 
@@ -412,7 +433,7 @@ def test_payload_values_and_encodings_never_enter_protocol_logs(caplog) -> None:
         + bytes((0x30,))
         + protected_message
     )
-    device._notification_handler(0, packet)
+    device._notification_handler(token, 0, packet)
 
     assert marker_text not in repr(outgoing)
     assert marker_text not in repr(device.datapoint_log_payload())

@@ -47,6 +47,7 @@ async def test_climate(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Climate Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -94,13 +95,21 @@ async def test_climate(hass: HomeAssistant) -> None:
 
     # Test status updates for temperature
     # Update DP 102 (current_temp) to 220 -> 22.0
-    device.datapoints._update_from_device(102, 0, 0, TuyaBLEDataPointType.DT_VALUE, 220)
+    device.datapoints._update_from_device(
+        102, 0, 0, TuyaBLEDataPointType.DT_VALUE, 220, session_token
+    )
     # Update DP 103 (target_temp) to 42 -> 42 * 0.5 = 21.0
-    device.datapoints._update_from_device(103, 0, 0, TuyaBLEDataPointType.DT_VALUE, 42)
+    device.datapoints._update_from_device(
+        103, 0, 0, TuyaBLEDataPointType.DT_VALUE, 42, session_token
+    )
     # Update DP 101 (hvac switch) to True -> HVACMode.HEAT
-    device.datapoints._update_from_device(101, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    device.datapoints._update_from_device(
+        101, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, session_token
+    )
     # Update DP 106 (preset) to True -> PRESET_AWAY
-    device.datapoints._update_from_device(106, 0, 0, TuyaBLEDataPointType.DT_BOOL, True)
+    device.datapoints._update_from_device(
+        106, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, session_token
+    )
 
     entity._handle_coordinator_update()
 

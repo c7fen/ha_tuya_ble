@@ -1,15 +1,17 @@
 """Test for dynamic GATT characteristic selection."""
 
 from unittest.mock import AsyncMock, Mock, call, patch
+
 import pytest
 from bleak.backends.device import BLEDevice
-from custom_components.tuya_ble.tuya_ble import TuyaBLEDevice
-from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
-from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
-from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.tuya_ble.cloud import HASSTuyaBLEDeviceManager
 from custom_components.tuya_ble.const import DOMAIN
+from custom_components.tuya_ble.tuya_ble import TuyaBLEDevice
+from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
+from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
 
 CONFIG = {
     "1234": {
@@ -20,6 +22,48 @@ CONFIG = {
         "friendly_name": "Local 3G",
     }
 }
+
+
+def _session_handshake_sender(device: TuyaBLEDevice) -> AsyncMock:
+    """Return a sender that completes pairing for the claimed exact session."""
+
+    async def send_packet(
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
+        wait_for_response: bool,
+        expected_response_code: TuyaBLECode | None = None,
+        *,
+        session_token: object | None = None,
+    ) -> bool:
+        assert session_token is device._connection_token
+        if code is TuyaBLECode.FUN_SENDER_PAIR:
+            device._is_paired = True
+        _ = data, response_to, wait_for_response, expected_response_code
+        return True
+
+    return AsyncMock(side_effect=send_packet)
+
+
+def _assert_session_bound_notification(
+    device: TuyaBLEDevice,
+    client: Mock,
+    characteristic: str,
+    expected_kwargs: dict[str, object] | None = None,
+) -> None:
+    """Assert start-notify received a callback bound to the exact session."""
+    notify_call = client.start_notify.await_args
+    assert notify_call is not None
+    assert notify_call.args[0] == characteristic
+    assert notify_call.kwargs == (expected_kwargs or {})
+
+    callback = notify_call.args[1]
+    token = device._connection_token
+    assert token is not None
+    payload = bytearray()
+    with patch.object(device, "_notification_handler") as notification_handler:
+        callback(7, payload)
+    notification_handler.assert_called_once_with(token, 7, payload)
 
 
 @pytest.mark.asyncio
@@ -56,7 +100,6 @@ async def test_gatt_characteristic_selection_classic(hass: HomeAssistant) -> Non
     with patch.object(manager, "get_device_credentials", return_value=credentials):
         device = TuyaBLEDevice(manager, ble_device)
         await device.initialize()
-        device._is_paired = True
 
         # Mock Client
         client = Mock()
@@ -70,27 +113,28 @@ async def test_gatt_characteristic_selection_classic(hass: HomeAssistant) -> Non
             return None
 
         client.services.get_characteristic = Mock(side_effect=get_char)
+        send_packet = _session_handshake_sender(device)
 
-        with patch(
-            "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
-            return_value=client,
+        with (
+            patch(
+                "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+                return_value=client,
+            ),
+            patch.object(device, "_send_packet_while_connected", send_packet),
         ):
-            with patch.object(
-                device, "_send_packet_while_connected", return_value=True
-            ):
-                await device._ensure_connected()
+            await device._ensure_connected()
 
-                assert (
-                    device._characteristic_notify
-                    == "00002b10-0000-1000-8000-00805f9b34fb"
-                )
-                assert (
-                    device._characteristic_write
-                    == "00002b11-0000-1000-8000-00805f9b34fb"
-                )
-                client.start_notify.assert_called_with(
-                    "00002b10-0000-1000-8000-00805f9b34fb", device._notification_handler
-                )
+            assert (
+                device._characteristic_notify == "00002b10-0000-1000-8000-00805f9b34fb"
+            )
+            assert (
+                device._characteristic_write == "00002b11-0000-1000-8000-00805f9b34fb"
+            )
+            _assert_session_bound_notification(
+                device,
+                client,
+                "00002b10-0000-1000-8000-00805f9b34fb",
+            )
 
 
 @pytest.mark.asyncio
@@ -127,7 +171,6 @@ async def test_gatt_characteristic_selection_fd50(hass: HomeAssistant) -> None:
     with patch.object(manager, "get_device_credentials", return_value=credentials):
         device = TuyaBLEDevice(manager, ble_device)
         await device.initialize()
-        device._is_paired = True
         device._protocol_version = 4
 
         # Mock Client
@@ -142,33 +185,34 @@ async def test_gatt_characteristic_selection_fd50(hass: HomeAssistant) -> None:
             return None
 
         client.services.get_characteristic = Mock(side_effect=get_char)
+        send_packet = _session_handshake_sender(device)
 
-        with patch(
-            "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
-            return_value=client,
+        with (
+            patch(
+                "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
+                return_value=client,
+            ),
+            patch.object(device, "_send_packet_while_connected", send_packet),
         ):
-            with patch.object(
-                device, "_send_packet_while_connected", return_value=True
-            ):
-                await device._ensure_connected()
+            await device._ensure_connected()
 
-                assert (
-                    device._characteristic_notify
-                    == "00000002-0000-1001-8001-00805f9b07d0"
-                )
-                assert (
-                    device._characteristic_write
-                    == "00000001-0000-1001-8001-00805f9b07d0"
-                )
-                client.start_notify.assert_called_with(
-                    "00000002-0000-1001-8001-00805f9b07d0", device._notification_handler
-                )
-                packets = device._build_packets(
-                    1,
-                    TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                    bytes(),
-                )
-                assert packets[0][2] == 0x40
+            assert (
+                device._characteristic_notify == "00000002-0000-1001-8001-00805f9b07d0"
+            )
+            assert (
+                device._characteristic_write == "00000001-0000-1001-8001-00805f9b07d0"
+            )
+            _assert_session_bound_notification(
+                device,
+                client,
+                "00000002-0000-1001-8001-00805f9b07d0",
+            )
+            packets = device._build_packets(
+                1,
+                TuyaBLECode.FUN_SENDER_DEVICE_INFO,
+                b"",
+            )
+            assert packets[0][2] == 0x40
 
 
 @pytest.mark.asyncio
@@ -204,7 +248,6 @@ async def test_yzd02b_fd50_device_info_handshake(hass: HomeAssistant) -> None:
     with patch.object(manager, "get_device_credentials", return_value=credentials):
         device = TuyaBLEDevice(manager, ble_device)
         await device.initialize()
-        device._is_paired = True
         device._protocol_version = 4
 
         client = Mock()
@@ -215,28 +258,31 @@ async def test_yzd02b_fd50_device_info_handshake(hass: HomeAssistant) -> None:
                 Mock() if uuid == "00000002-0000-1001-8001-00805f9b07d0" else None
             )
         )
+        send_packet = _session_handshake_sender(device)
 
         with (
             patch(
                 "custom_components.tuya_ble.tuya_ble.tuya_ble.establish_connection",
                 return_value=client,
             ),
-            patch.object(
-                device, "_send_packet_while_connected", return_value=True
-            ) as send_packet,
+            patch.object(device, "_send_packet_while_connected", send_packet),
         ):
             await device._ensure_connected()
 
-        client.start_notify.assert_awaited_once_with(
+        _assert_session_bound_notification(
+            device,
+            client,
             "00000002-0000-1001-8001-00805f9b07d0",
-            device._notification_handler,
-            bluez={"use_start_notify": True},
+            {"bluez": {"use_start_notify": True}},
         )
+        token = device._connection_token
+        assert token is not None
         assert send_packet.await_args_list[0] == call(
             TuyaBLECode.FUN_SENDER_DEVICE_INFO,
             b"\x00\xf3",
             0,
             True,
+            session_token=token,
         )
 
         packets = device._build_packets(

@@ -29,7 +29,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +65,7 @@ class TuyaBLENumberMapping:
     getter: TuyaBLENumberGetter = None
     setter: TuyaBLENumberSetter = None
     mode: NumberMode = NumberMode.BOX
+    requires_current_session: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -888,6 +894,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(
@@ -926,6 +933,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
+                    requires_current_session=True,
                 ),
             ],
             **dict.fromkeys(
@@ -1032,6 +1040,7 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     """Representation of a Tuya BLE Number."""
 
     platform = Platform.NUMBER
+    _is_command_entity = True
 
     def __init__(
         self,
@@ -1048,10 +1057,14 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the entity value to represent the entity state."""
+        datapoint = self._device.datapoints[self._mapping.dp_id]
+        if self._mapping.requires_current_session and not (
+            datapoint and datapoint.received_in_current_session
+        ):
+            return None
         if self._mapping.getter:
             return self._mapping.getter(self, self._product)
 
-        datapoint = self._device.datapoints[self._mapping.dp_id]
         if datapoint:
             return datapoint.value / self._mapping.coefficient
 
@@ -1059,6 +1072,7 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
 
     def set_native_value(self, value: float) -> None:
         """Set new value."""
+        ensure_control_available(self._device)
         if self._mapping.setter:
             self._mapping.setter(self, self._product, value)
             return

@@ -52,6 +52,7 @@ async def test_event(hass: HomeAssistant) -> None:
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
+    session_token = claim_test_session(device)
     product_info = TuyaBLEProductInfo("Fake Event Product")
 
     # Mock _send_datapoints to prevent actual BLE calls and exceptions
@@ -87,11 +88,15 @@ async def test_event(hass: HomeAssistant) -> None:
 
     # Initial state
     assert entity.available is False
+    # The connected callback alone is not device data; model a current report.
+    device._state_data_fresh = True
     coordinator._async_handle_connect()
     assert entity.available is True
 
     # 1. Update unrelated DP (DP 10) to coordinator
-    device.datapoints._update_from_device(10, 0, 0, TuyaBLEDataPointType.DT_VALUE, 80)
+    device.datapoints._update_from_device(
+        10, 0, 0, TuyaBLEDataPointType.DT_VALUE, 80, session_token
+    )
     dp10 = device.datapoints[10]
 
     # Send update packet containing only DP 10
@@ -102,7 +107,7 @@ async def test_event(hass: HomeAssistant) -> None:
 
     # 2. Update DP 1 (value "single_click" as string) to coordinator
     device.datapoints._update_from_device(
-        1, 0, 0, TuyaBLEDataPointType.DT_STRING, "single_click"
+        1, 0, 0, TuyaBLEDataPointType.DT_STRING, "single_click", session_token
     )
     dp1 = device.datapoints[1]
 
@@ -118,7 +123,9 @@ async def test_event(hass: HomeAssistant) -> None:
     entity._trigger_event.assert_not_called()
 
     # 4. Update DP 1 (value 2 as integer/enum index -> "long_press") to coordinator
-    device.datapoints._update_from_device(1, 0, 0, TuyaBLEDataPointType.DT_ENUM, 2)
+    device.datapoints._update_from_device(
+        1, 0, 0, TuyaBLEDataPointType.DT_ENUM, 2, session_token
+    )
     dp1_enum = device.datapoints[1]
 
     coordinator._async_handle_update([dp1_enum])

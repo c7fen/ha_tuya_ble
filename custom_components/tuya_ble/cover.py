@@ -23,7 +23,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
+from .const import ConnectionMode
+from .devices import (
+    TuyaBLEData,
+    TuyaBLEEntity,
+    TuyaBLEProductInfo,
+    ensure_control_available,
+)
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -158,6 +164,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
     """Representation of a Tuya BLE Cover."""
 
     platform = Platform.COVER
+    _is_command_entity = True
 
     _attr_is_closed = False
     _attr_current_cover_position = 0
@@ -234,6 +241,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
 
     async def async_open_cover_tilt(self, **kwargs: Any) -> None:
         """Open the cover tilt."""
+        ensure_control_available(self._device)
         if self._mapping.cover_tilt_dp_id != 0:
             datapoint = self._device.datapoints.get_or_create(
                 self._mapping.cover_tilt_dp_id,
@@ -245,6 +253,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
 
     async def async_close_cover_tilt(self, **kwargs: Any) -> None:
         """Close the cover tilt."""
+        ensure_control_available(self._device)
         if self._mapping.cover_tilt_dp_id != 0:
             datapoint = self._device.datapoints.get_or_create(
                 self._mapping.cover_tilt_dp_id,
@@ -256,6 +265,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
 
     async def async_set_cover_tilt_position(self, **kwargs: Any) -> None:
         """Move the cover tilt to a specific position."""
+        ensure_control_available(self._device)
         tilt_position = kwargs[ATTR_TILT_POSITION]
         new_tilt_position = round(tilt_position / 100 * 9 + 1)
         if self._mapping.cover_tilt_dp_id != 0:
@@ -280,6 +290,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
         await self._update_cover_state(TuyaCoverState.CLOSE)
 
     async def _update_cover_state(self, state: TuyaCoverState) -> None:
+        ensure_control_available(self._device)
         if self._mapping.cover_state_dp_id != 0:
             # In some circumstances (presumably due to a communication error in between where packets were lost)
             # It can be the case that the device does not update the state of the cover and does not accept new commands.
@@ -311,6 +322,11 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
     ) -> None:
         time_now = time_now or datetime.now(timezone.utc)
         await asyncio.sleep(sleep_ms / 1000.0)
+        if (
+            self._device.connection_mode is ConnectionMode.ON_DEMAND
+            or not self._device.ble_control_enabled
+        ):
+            return
         if self._device._is_paired and (
             not self._device.last_data_received
             or self._device.last_data_received < time_now
@@ -339,6 +355,7 @@ class TuyaBLECover(TuyaBLEEntity, CoverEntity):
 
     async def async_set_cover_position(self, **kwargs: logging.Any) -> None:
         """Set cover position"""
+        ensure_control_available(self._device)
         position = 100 - kwargs[ATTR_POSITION]
         if self._mapping.cover_position_set_dp != 0:
             datapoint = self._device.datapoints.get_or_create(

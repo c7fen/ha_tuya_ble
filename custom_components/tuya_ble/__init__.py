@@ -2,26 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from enum import StrEnum
 from typing import Any
 
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS, get_device
-
+from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
+from bleak_retry_connector import get_device
+from homeassistant import loader
 from homeassistant.components import bluetooth
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
 
-from .tuya_ble import TuyaBLEDevice
-
 from .cloud import HASSTuyaBLEDeviceManager, normalize_app_type_data
-from .const import DOMAIN
+from .const import (
+    CONF_BLE_CONTROL_ENABLED,
+    CONF_CONNECTION_MODE,
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
+    DEFAULT_BLE_CONTROL_ENABLED,
+    DEFAULT_CONNECTION_MODE,
+    DOMAIN,
+    ConnectionMode,
+)
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [
     Platform.BUTTON,
@@ -47,6 +58,30 @@ _MOTOR_STATE_KEY = "lock_motor_state"
 _V1_CATEGORY = "ms"
 _V1_PRODUCT_ID = "7a4xvbtt"
 _V1_MANUAL_LOCK_KEY = "manual_lock"
+PLATFORM_ROLLBACK_MAX_ATTEMPTS = 3
+PLATFORM_ROLLBACK_TIMEOUT_SECONDS = 2.0
+PLATFORM_ROLLBACK_BACKOFF_SECONDS = 0.1
+ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS = (
+    CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS
+    + PLATFORM_ROLLBACK_TIMEOUT_SECONDS
+    + 1.0
+)
+
+
+class _PlatformUnloadOutcome(StrEnum):
+    """Result of one all-platform unload transaction."""
+
+    UNLOADED = "unloaded"
+    RESTORED = "restored"
+    RESTORATION_FAILED = "restoration_failed"
+
+
+class _EntryUnloadOutcome(StrEnum):
+    """Result of the internal entry unload transaction."""
+
+    UNLOADED = "unloaded"
+    RESTORED = "restored"
+    RESTORATION_FAILED = "restoration_failed"
 
 
 def _registry_entry_subentry_id(registry_entry: er.RegistryEntry) -> str | None:
@@ -135,18 +170,63 @@ def _validate_binary_sensor_target(registry_entry: er.RegistryEntry) -> None:
 
 
 def _validate_lock_target(registry_entry: er.RegistryEntry) -> None:
-    """Reject target-domain state that cannot safely survive V1 migration."""
+    """Validate the structural identity of a V1 lock migration target."""
+    if registry_entry.domain != Platform.LOCK or registry_entry.platform != DOMAIN:
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target identity "
+            "is ambiguous"
+        )
+
     if registry_entry.device_class is not None:
         raise ConfigEntryError(
             "Cannot safely migrate the V1 Lock entity because the lock target has "
             "an invalid device class"
         )
 
-    if any(option_domain != Platform.LOCK for option_domain in registry_entry.options):
-        raise ConfigEntryError(
-            "Cannot safely migrate the V1 Lock entity because the lock target has "
-            "invalid entity options"
+
+def _restore_v1_lock_target(
+    registry: er.EntityRegistry,
+    snapshot: er.RegistryEntry,
+) -> None:
+    """Restore every V1 target field changed by the migration transaction."""
+    current = registry.async_get(snapshot.entity_id)
+    if current is None:
+        raise ConfigEntryError("Unable to restore the V1 Lock migration target")
+
+    for namespace in tuple(current.options):
+        if namespace not in snapshot.options:
+            registry.async_update_entity_options(snapshot.entity_id, namespace, None)
+    for namespace, options in snapshot.options.items():
+        registry.async_update_entity_options(
+            snapshot.entity_id, namespace, dict(options)
         )
+
+    update_kwargs: dict[str, Any] = {}
+    if hasattr(snapshot, "config_subentry_id"):
+        update_kwargs["config_subentry_id"] = _registry_entry_subentry_id(snapshot)
+    registry.async_update_entity(
+        snapshot.entity_id,
+        aliases=snapshot.aliases,
+        area_id=snapshot.area_id,
+        categories=snapshot.categories,
+        config_entry_id=snapshot.config_entry_id,
+        device_class=snapshot.device_class,
+        device_id=snapshot.device_id,
+        disabled_by=snapshot.disabled_by,
+        entity_category=snapshot.entity_category,
+        hidden_by=snapshot.hidden_by,
+        icon=snapshot.icon,
+        has_entity_name=snapshot.has_entity_name,
+        labels=snapshot.labels,
+        name=snapshot.name,
+        original_device_class=snapshot.original_device_class,
+        original_icon=snapshot.original_icon,
+        original_name=snapshot.original_name,
+        supported_features=snapshot.supported_features,
+        translation_key=snapshot.translation_key,
+        unit_of_measurement=snapshot.unit_of_measurement,
+        **update_kwargs,
+    )
 
 
 @callback
@@ -371,8 +451,30 @@ def _async_migrate_v1_manual_lock_entity(
     old_entry = old_entries[0]
     _validate_registry_association(hass, entry, device, old_entry, migration_name)
 
+    target_entries = [
+        registry_entry
+        for registry_entry in registry.entities.values()
+        if registry_entry.unique_id == unique_id
+        and registry_entry.entity_id != old_entry.entity_id
+    ]
+    if len(target_entries) > 1 or any(
+        registry_entry.domain != Platform.LOCK or registry_entry.platform != DOMAIN
+        for registry_entry in target_entries
+    ):
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target registry "
+            "entry is ambiguous"
+        )
+
     new_entity_id = registry.async_get_entity_id(Platform.LOCK, DOMAIN, unique_id)
     new_entry = registry.async_get(new_entity_id) if new_entity_id else None
+    if target_entries and (
+        new_entry is None or target_entries[0].entity_id != new_entry.entity_id
+    ):
+        raise ConfigEntryError(
+            "Cannot safely migrate the V1 Lock entity because its target registry "
+            "entry is ambiguous"
+        )
     if new_entry is not None:
         _validate_registry_association(hass, entry, device, new_entry, migration_name)
         _validate_lock_target(new_entry)
@@ -398,6 +500,7 @@ def _async_migrate_v1_manual_lock_entity(
             )
 
     created_entity_id: str | None = None
+    target_snapshot = new_entry
     try:
         if new_entry is None:
             create_kwargs: dict[str, Any] = {}
@@ -420,6 +523,22 @@ def _async_migrate_v1_manual_lock_entity(
             )
             created_entity_id = new_entry.entity_id
             _validate_lock_target(new_entry)
+
+        expected_target_options = {
+            namespace: options
+            for namespace, options in new_entry.options.items()
+            if namespace != Platform.BUTTON
+        }
+        if Platform.BUTTON in new_entry.options:
+            new_entry = registry.async_update_entity_options(
+                new_entry.entity_id,
+                Platform.BUTTON,
+                None,
+            )
+        if new_entry.options != expected_target_options:
+            raise ConfigEntryError(
+                "Unable to normalize the V1 Lock migration target options"
+            )
 
         if isinstance(new_entry.aliases, set):
             merged_aliases: Any = set(new_entry.aliases)
@@ -492,8 +611,18 @@ def _async_migrate_v1_manual_lock_entity(
             or verified_entry.config_entry_id != entry.entry_id
             or verified_entry.device_id != expected_device_id
             or _registry_entry_subentry_id(verified_entry) != config_subentry_id
+            or verified_entry.device_class is not None
+            or verified_entry.options != expected_target_options
+            or Platform.BUTTON in verified_entry.options
+            or verified_entry.entity_category is not None
+            or verified_entry.translation_key != "lock"
+            or verified_entry.supported_features != 0
         ):
             raise ConfigEntryError("Unable to verify the migrated V1 Lock entity")
+        _validate_registry_association(
+            hass, entry, device, verified_entry, migration_name
+        )
+        _validate_lock_target(verified_entry)
 
         registry.async_remove(old_entry.entity_id)
         if registry.async_get(old_entry.entity_id) is not None:
@@ -503,6 +632,11 @@ def _async_migrate_v1_manual_lock_entity(
     except Exception as err:
         if created_entity_id is not None:
             registry.async_remove(created_entity_id)
+        elif target_snapshot is not None:
+            try:
+                _restore_v1_lock_target(registry, target_snapshot)
+            except Exception:  # noqa: BLE001 - keep rollback failures sanitized
+                _LOGGER.error("Unable to restore the V1 Lock migration target")
         _LOGGER.error("Unable to safely migrate the V1 Lock entity")
         if isinstance(err, ConfigEntryError):
             raise
@@ -523,15 +657,57 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from err
 
     address: str = entry.data[CONF_ADDRESS]
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, address.upper(), True
-    ) or await get_device(address)
-    if not ble_device:
-        raise ConfigEntryNotReady("Could not find the configured Tuya BLE device")
+    ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
+    raw_mode = entry.options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+    try:
+        connection_mode = ConnectionMode(raw_mode)
+    except (TypeError, ValueError):
+        connection_mode = ConnectionMode.ALWAYS_CONNECTED
+    ble_control_enabled = entry.options.get(
+        CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+    )
+    if not isinstance(ble_control_enabled, bool):
+        ble_control_enabled = DEFAULT_BLE_CONTROL_ENABLED
+    if (
+        ble_device is None
+        and ble_control_enabled
+        and connection_mode is ConnectionMode.ALWAYS_CONNECTED
+    ):
+        try:
+            ble_device = await get_device(address)
+        except BLEAK_EXCEPTIONS:
+            ble_device = None
 
     manager = HASSTuyaBLEDeviceManager(hass, manager_data)
-    device = TuyaBLEDevice(manager, ble_device)
-    await device.initialize()
+    device = TuyaBLEDevice(
+        manager,
+        ble_device,
+        address=address,
+        connection_mode=connection_mode.value,
+        ble_control_enabled=ble_control_enabled,
+    )
+
+    async def _async_persist_policy_options(updates: dict[str, Any]) -> None:
+        merged_options = dict(entry.options)
+        merged_options.update(updates)
+        try:
+            result = hass.config_entries.async_update_entry(
+                entry, options=merged_options
+            )
+        except Exception:
+            raise ConfigEntryError(
+                "Unable to persist the Tuya BLE connection policy"
+            ) from None
+        if result is False:
+            raise ConfigEntryError("Unable to persist the Tuya BLE connection policy")
+
+    device._persist_options = _async_persist_policy_options
+    try:
+        await device.initialize()
+    except ValueError:
+        raise ConfigEntryNotReady(
+            "Could not load the stored Tuya BLE device credentials"
+        ) from None
     product_info = get_device_product_info(device)
 
     _async_migrate_s1_motor_state_entity(hass, entry, device)
@@ -547,7 +723,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from ex
     """
 
-    hass.add_job(device.update())
+    if (
+        getattr(device, "ble_control_enabled", True)
+        and getattr(device, "connection_mode", ConnectionMode.ALWAYS_CONNECTED)
+        is ConnectionMode.ALWAYS_CONNECTED
+    ):
+        if hasattr(hass, "async_create_task"):
+            device._startup_task = hass.async_create_task(device.startup_update())
+        else:
+            hass.add_job(device.startup_update())
 
     @callback
     def _async_update_ble(
@@ -592,14 +776,212 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    await data.device.async_apply_persisted_options(dict(entry.options))
     if entry.title != data.title:
         await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        data: TuyaBLEData = hass.data[DOMAIN].pop(entry.entry_id)
-        await data.device.stop()
+async def _async_unload_platforms_transactional(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> _PlatformUnloadOutcome:
+    """Unload every platform or make a bounded attempt to restore the full set."""
+    try:
+        async with asyncio.timeout(PLATFORM_ROLLBACK_TIMEOUT_SECONDS):
+            results = await asyncio.gather(
+                *(
+                    hass.config_entries.async_forward_entry_unload(entry, platform)
+                    for platform in PLATFORMS
+                ),
+                return_exceptions=True,
+            )
+            if all(result is True for result in results):
+                return _PlatformUnloadOutcome.UNLOADED
 
-    return unload_ok
+            pending = set(PLATFORMS)
+            for attempt in range(1, PLATFORM_ROLLBACK_MAX_ATTEMPTS + 1):
+                platforms = tuple(pending)
+                restored = await asyncio.gather(
+                    *(
+                        _async_restore_platform_after_unload_failure(
+                            hass, entry, platform
+                        )
+                        for platform in platforms
+                    ),
+                    return_exceptions=True,
+                )
+                pending = {
+                    platform
+                    for platform, result in zip(platforms, restored, strict=True)
+                    if result is not True
+                }
+                if not pending:
+                    return _PlatformUnloadOutcome.RESTORED
+                if attempt < PLATFORM_ROLLBACK_MAX_ATTEMPTS:
+                    _LOGGER.error(
+                        "Tuya BLE platform rollback is incomplete; retrying restoration"
+                    )
+                    await asyncio.sleep(PLATFORM_ROLLBACK_BACKOFF_SECONDS)
+    except TimeoutError:
+        _LOGGER.error("Tuya BLE platform rollback reached its time limit")
+
+    _LOGGER.error("Tuya BLE platform rollback is incomplete after bounded restoration")
+    return _PlatformUnloadOutcome.RESTORATION_FAILED
+
+
+def _platforms_fully_restored(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Return whether every expected entity platform completed setup."""
+    for platform in PLATFORMS:
+        component_data = hass.data.get(platform.value)
+        loaded_platforms = getattr(component_data, "_platforms", {})
+        entity_platform = loaded_platforms.get(entry.entry_id)
+        if entity_platform is None or not getattr(
+            entity_platform, "_setup_complete", False
+        ):
+            return False
+    return True
+
+
+async def _async_restore_platform_after_unload_failure(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    platform: Platform,
+) -> bool:
+    """Restore one entity platform without requiring the entry to be LOADED."""
+    component_data = hass.data.get(platform.value)
+    loaded_platforms = getattr(component_data, "_platforms", {})
+    entity_platform = loaded_platforms.get(entry.entry_id)
+    if entity_platform is not None and getattr(
+        entity_platform, "_setup_complete", False
+    ):
+        return True
+
+    integration = loader.async_get_loaded_integration(hass, platform.value)
+    component = await integration.async_get_component()
+    if entity_platform is not None:
+        try:
+            await component.async_unload_entry(hass, entry)
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        restored = await component.async_setup_entry(hass, entry)
+    except Exception:  # noqa: BLE001
+        restored = False
+
+    component_data = hass.data.get(platform.value)
+    loaded_platforms = getattr(component_data, "_platforms", {})
+    entity_platform = loaded_platforms.get(entry.entry_id)
+    if (
+        restored is True
+        and entity_platform is not None
+        and getattr(entity_platform, "_setup_complete", False)
+    ):
+        return True
+
+    if entity_platform is not None:
+        try:
+            await component.async_unload_entry(hass, entry)
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry without exposing an inconsistent cancellation point."""
+    transaction = asyncio.create_task(
+        _async_bounded_unload_entry_transaction(hass, entry)
+    )
+    cancellation_deferred = False
+    while True:
+        try:
+            outcome = await asyncio.shield(transaction)
+            break
+        except asyncio.CancelledError:
+            if transaction.done():
+                if transaction.cancelled():
+                    raise
+                outcome = transaction.result()
+                break
+            if not cancellation_deferred:
+                _LOGGER.warning(
+                    "Tuya BLE unload cancellation deferred until transaction cleanup"
+                )
+                cancellation_deferred = True
+
+    # Schedule state reconciliation from this outer coroutine, immediately
+    # before returning to Home Assistant. Its unload bookkeeping therefore runs
+    # before either callback, across both supported HA state models.
+    if outcome is _EntryUnloadOutcome.RESTORED:
+        _schedule_loaded_state_after_unload_rollback(hass, entry)
+    elif outcome is _EntryUnloadOutcome.RESTORATION_FAILED:
+        _schedule_failed_unload_state_after_rollback_exhaustion(hass, entry)
+    return outcome is _EntryUnloadOutcome.UNLOADED
+
+
+async def _async_bounded_unload_entry_transaction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> _EntryUnloadOutcome:
+    """Run the complete shielded consistency transaction within one deadline."""
+    data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    try:
+        async with asyncio.timeout(ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS):
+            return await _async_unload_entry_transaction(hass, entry)
+    except TimeoutError:
+        _LOGGER.error("Tuya BLE entry unload transaction reached its time limit")
+        data.device.abort_unload_transaction()
+        return _EntryUnloadOutcome.RESTORATION_FAILED
+
+
+async def _async_unload_entry_transaction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> _EntryUnloadOutcome:
+    """Unload a config entry."""
+    data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    if not await data.device.async_prepare_unload():
+        return _EntryUnloadOutcome.RESTORED
+    platform_outcome = await _async_unload_platforms_transactional(hass, entry)
+    if platform_outcome is not _PlatformUnloadOutcome.UNLOADED:
+        await data.device.async_cancel_unload()
+        if platform_outcome is _PlatformUnloadOutcome.RESTORED:
+            return _EntryUnloadOutcome.RESTORED
+        return _EntryUnloadOutcome.RESTORATION_FAILED
+    await data.device.stop()
+    data.coordinator.shutdown()
+    hass.data[DOMAIN].pop(entry.entry_id)
+    return _EntryUnloadOutcome.UNLOADED
+
+
+def _schedule_loaded_state_after_unload_rollback(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Restore HA's loaded state after its failed-unload bookkeeping completes."""
+
+    @callback
+    def restore_loaded_state() -> None:
+        if not _platforms_fully_restored(hass, entry):
+            _LOGGER.error(
+                "Tuya BLE entry remains failed-unload because platform rollback "
+                "verification is incomplete"
+            )
+            return
+        if entry.state is ConfigEntryState.FAILED_UNLOAD:
+            entry._async_set_state(hass, ConfigEntryState.LOADED, None)
+
+    hass.loop.call_soon(restore_loaded_state)
+
+
+def _schedule_failed_unload_state_after_rollback_exhaustion(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Keep an incompletely restored entry honestly failed-unload."""
+
+    @callback
+    def retain_failed_unload_state() -> None:
+        if entry.state is ConfigEntryState.LOADED:
+            entry._async_set_state(hass, ConfigEntryState.FAILED_UNLOAD, None)
+
+    hass.loop.call_soon(retain_failed_unload_state)

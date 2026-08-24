@@ -58,6 +58,38 @@ expecting reliable Home Assistant communication. Never test a smart lock unless
 the door is open, alternate authorized access is available, and nobody depends
 on the current lock state.
 
+### BLE connection policy
+
+S1-TY-BLE-PRO and V1 / Lock P1 devices expose local connection controls:
+
+- **Connection Mode**: **Always connected** retains an authenticated GATT
+   session and is recommended for access-event monitoring and any future
+   Passage Mode Guard. **On demand** keeps the device disconnected while idle
+   and opens one temporary session for an explicit Home Assistant command.
+- **Home Assistant BLE Control**: turn this config switch off to persistently
+   release GATT for the Tuya app. The config entry and these local controls stay
+   loaded, ordinary device commands are blocked, and no automatic reconnect is
+   attempted. Re-enable it from the entity or the integration Options Flow to
+   restore control.
+- **Bluetooth Connection**: this diagnostic is on only while an authenticated
+   and paired GATT session is active. A raw or unpaired link is reported off.
+
+On-demand sessions disconnect after a fixed 15-second idle interval. The delay
+is not configurable in this release. On-demand mode can reduce persistent GATT
+ownership and may help rarely used devices, but repeated connections and
+pairing also consume energy; no battery percentage is promised. Events received
+while Home Assistant is disconnected can be missed, so Always connected is the
+recommended mode for access-event monitoring. The Tuya app and Home Assistant
+normally cannot use the same peripheral simultaneously, and on-demand mode does
+not guarantee simultaneous app and HA access.
+
+Use the integration's **Configure** action and choose **Connection settings**
+to change these options without re-entering Tuya credentials. The settings do
+not require a current advertisement or a BLE connection, so they remain a
+recovery path while the app owns GATT or HA control is suspended. See the
+[smart-lock guide](docs/smart-locks.md) for the exact state and hardware-safety
+semantics.
+
 ### V1 / Lock P1
 
 The registered V1 product `ms/7a4xvbtt` is a Home Assistant `LockEntity`:
@@ -86,6 +118,10 @@ closed before a Bluetooth command is written.
 S1 Motor State is a read-only `binary_sensor`, not a switch. Its registry
 migration is ownership-safe, but automations that refer to the old switch
 entity ID may require an update.
+
+S1 Lock and Unlock are at-most-once operations. An ambiguous transport error
+does not replay DP46, DP70, DP71, or a previously encrypted packet after
+reconnect; inspect the physical state before issuing another action.
 
 The [smart-lock guide](docs/smart-locks.md) documents entities, state semantics,
 GATT exclusivity, ambiguous errors, and safe hardware procedures. The

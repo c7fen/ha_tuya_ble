@@ -31,8 +31,10 @@ from .tuya_ble import (
 
 from .cloud import HASSTuyaBLEDeviceManager
 from .const import (
+    ConnectionMode,
     DEVICE_DEF_MANUFACTURER,
     DOMAIN,
+    EffectiveConnectionPolicy,
     FINGERBOT_BUTTON_EVENT,
     SET_DISCONNECTED_DELAY,
     DPCode,
@@ -42,6 +44,13 @@ from .const import (
 from .base import IntegerTypeData, EnumTypeData
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def ensure_control_available(device: Any) -> None:
+    """Apply the runtime policy guard when a full device object is present."""
+    guard = getattr(device, "ensure_control_available", None)
+    if guard is not None:
+        guard()
 
 
 @dataclass
@@ -84,6 +93,8 @@ class TuyaBLEEntity(CoordinatorEntity):
     """Tuya BLE base entity."""
 
     platform: Platform = Platform.SENSOR
+    _is_command_entity = False
+    _is_connection_policy_entity = False
 
     def __init__(
         self,
@@ -111,7 +122,18 @@ class TuyaBLEEntity(CoordinatorEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self._coordinator.connected
+        if self._is_connection_policy_entity:
+            return True
+        if not self._device.ble_control_enabled or self._device.effective_policy in {
+            EffectiveConnectionPolicy.STOPPED,
+            EffectiveConnectionPolicy.SUSPENDED,
+        }:
+            return False
+        if self._is_command_entity:
+            return self._coordinator.connected or (
+                self._device.connection_mode is ConnectionMode.ON_DEMAND
+            )
+        return self._coordinator.connected and self._device.state_data_fresh
 
     @property
     def device(self) -> TuyaBLEDevice:
@@ -129,6 +151,7 @@ class TuyaBLEEntity(CoordinatorEntity):
         dp_type: TuyaBLEDataPointType,
         value: bytes | bool | int | str | None = None,
     ) -> None:
+        ensure_control_available(self._device)
         dpid = self.find_dpid(key)
         if dpid is not None:
             datapoint = self._device.datapoints.get_or_create(
@@ -140,6 +163,7 @@ class TuyaBLEEntity(CoordinatorEntity):
 
     def _send_command(self, commands: list[dict[str, Any]]) -> None:
         """Send the commands to the device"""
+        ensure_control_available(self._device)
         for command in commands:
             code = command.get("code")
             value = command.get("value")
@@ -275,9 +299,14 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
         self._disconnected: bool = True
         self._unsub_disconnect: CALLBACK_TYPE | None = None
         self.last_updates: list[TuyaBLEDataPoint] | None = None
-        device.register_connected_callback(self._async_handle_connect)
-        device.register_callback(self._async_handle_update)
-        device.register_disconnected_callback(self._async_handle_disconnect)
+        self._unsub_device_callbacks = [
+            device.register_connected_callback(self._async_handle_connect),
+            device.register_callback(self._async_handle_update),
+            device.register_session_invalidated_callback(
+                self._async_handle_session_invalidated
+            ),
+            device.register_disconnected_callback(self._async_handle_disconnect),
+        ]
 
     @property
     def connected(self) -> bool:
@@ -286,11 +315,19 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
     @callback
     def _async_handle_connect(self) -> None:
         self.last_updates = None
-        if self._unsub_disconnect is not None:
-            self._unsub_disconnect()
+        unsub_disconnect = self._unsub_disconnect
+        self._unsub_disconnect = None
+        if unsub_disconnect is not None:
+            unsub_disconnect()
         if self._disconnected:
             self._disconnected = False
             self.async_update_listeners()
+
+    @callback
+    def _async_handle_session_invalidated(self) -> None:
+        """Publish exact-session data invalidation without ending the grace."""
+        self.last_updates = None
+        self.async_update_listeners()
 
     @callback
     def _async_handle_update(self, updates: list[TuyaBLEDataPoint]) -> None:
@@ -327,6 +364,17 @@ class TuyaBLECoordinator(DataUpdateCoordinator[None]):
             self._unsub_disconnect = async_call_later(
                 self.hass, delay, self._set_disconnected
             )
+
+    @callback
+    def shutdown(self) -> None:
+        """Cancel timers and release every device callback after final unload."""
+        unsub_disconnect = self._unsub_disconnect
+        self._unsub_disconnect = None
+        if unsub_disconnect is not None:
+            unsub_disconnect()
+        for unsubscribe in self._unsub_device_callbacks:
+            unsubscribe()
+        self._unsub_device_callbacks.clear()
 
 
 @dataclass
