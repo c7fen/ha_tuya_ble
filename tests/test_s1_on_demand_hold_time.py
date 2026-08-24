@@ -8,12 +8,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
-from homeassistant.components import (
-    number as number_platform,
-    select as select_platform,
-    switch as switch_platform,
-)
+from homeassistant.components import number as number_platform
+from homeassistant.components import select as select_platform
+from homeassistant.components import switch as switch_platform
 from homeassistant.components.number.const import ATTR_VALUE
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -473,6 +472,30 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
             lambda entities: add_entities(Platform.SWITCH, entities),
         )
 
+    async def forward_entry_unload(config_entry: object, platform: Platform) -> bool:
+        """Remove the real entities created by this synthetic entry."""
+        assert config_entry is entry
+        component = components[platform]
+        for entity in tuple(component.entities):
+            await component.async_remove_entity(entity.entity_id)
+        return True
+
+    entry.supports_unload = True
+    entry.supports_remove_device = False
+    entry_integration = Mock(domain=DOMAIN)
+    entry_integration.async_get_component = AsyncMock(return_value=integration)
+    entry_integration.async_get_platform = AsyncMock()
+
+    async def reload_entry(entry_id: str) -> None:
+        """Exercise the integration's supported ConfigEntry reconstruction."""
+        assert entry_id == entry.entry_id
+        await entry.setup_lock.acquire()
+        try:
+            assert await entry.async_unload(hass, integration=entry_integration) is True
+            await entry.async_setup(hass, integration=entry_integration)
+        finally:
+            entry.setup_lock.release()
+
     with (
         patch.object(
             integration,
@@ -491,7 +514,16 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
             "async_forward_entry_setups",
             new=forward_entry_setups,
         ),
-        patch.object(hass.config_entries, "async_reload", new=AsyncMock()) as reload,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_unload",
+            new=forward_entry_unload,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new=AsyncMock(side_effect=reload_entry),
+        ) as reload,
     ):
         assert await integration.async_setup_entry(hass, entry) is True
         await hass.async_block_till_done()
@@ -584,6 +616,174 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
         reload.assert_not_awaited()
         device._ensure_connected.assert_not_awaited()
         device._send_datapoints.assert_not_awaited()
+
+        # The normal production setup lifecycle marks an entry loaded before a
+        # title change invokes Home Assistant's reload path.
+        entry._async_set_state(hass, ConfigEntryState.LOADED, None)
+        hass.config_entries.async_update_entry(
+            entry,
+            title="Synthetic listener S1 renamed",
+            options={
+                **entry.options,
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 100,
+            },
+        )
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.LOADED
+        reload.assert_awaited_once_with(entry.entry_id)
+        device = hass.data[DOMAIN][entry.entry_id].device
+        number_entity = next(
+            candidate
+            for candidate in components[Platform.NUMBER].entities
+            if isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+        )
+        assert device.on_demand_connection_hold_time == 100
+        assert float(hass.states.get(number_entity.entity_id).state) == 100
+        assert (
+            sum(
+                isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+                for candidate in components[Platform.NUMBER].entities
+            )
+            == 1
+        )
+        assert len(entry.update_listeners) == 1
+        device._ensure_connected = AsyncMock()
+        device._send_datapoints = AsyncMock()
+        device._ensure_connected.assert_not_awaited()
+        device._send_datapoints.assert_not_awaited()
+
+        # Exercise a separate explicit unload and reconstruction after an
+        # ordinary listener update. The forwarding stubs only replace Home
+        # Assistant platform loading; entity setup and removal remain real.
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 105,
+            },
+        )
+        await hass.async_block_till_done()
+        assert device.on_demand_connection_hold_time == 105
+        assert float(hass.states.get(number_entity.entity_id).state) == 105
+        reload.assert_awaited_once_with(entry.entry_id)
+
+        old_number_entity = number_entity
+        old_number_entity.async_write_ha_state = Mock()
+        old_coordinator = hass.data[DOMAIN][entry.entry_id].coordinator
+
+        await entry.setup_lock.acquire()
+        try:
+            assert await entry.async_unload(hass, integration=entry_integration) is True
+        finally:
+            entry.setup_lock.release()
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert entry.entry_id not in hass.data[DOMAIN]
+        assert not entry.update_listeners
+        assert not any(
+            isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+            for candidate in components[Platform.NUMBER].entities
+        )
+        assert hass.states.get(old_number_entity.entity_id).state == "unavailable"
+
+        # A ConfigEntry update after unload cannot notify the discarded entity.
+        old_number_entity.async_write_ha_state.reset_mock()
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 105,
+            },
+        )
+        await hass.async_block_till_done()
+        old_number_entity.async_write_ha_state.assert_not_called()
+        assert old_coordinator._unsub_device_callbacks == []
+
+        await entry.setup_lock.acquire()
+        try:
+            await entry.async_setup(hass, integration=entry_integration)
+        finally:
+            entry.setup_lock.release()
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.LOADED
+        reconstructed_device = hass.data[DOMAIN][entry.entry_id].device
+        reconstructed_number_entity = next(
+            candidate
+            for candidate in components[Platform.NUMBER].entities
+            if isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+        )
+        assert reconstructed_number_entity is not old_number_entity
+        assert reconstructed_device.on_demand_connection_hold_time == 105
+        assert (
+            float(hass.states.get(reconstructed_number_entity.entity_id).state) == 105
+        )
+        assert (
+            sum(
+                isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+                for candidate in components[Platform.NUMBER].entities
+            )
+            == 1
+        )
+        assert len(entry.update_listeners) == 1
+        reload.assert_awaited_once_with(entry.entry_id)
+
+        # Application failure must not publish a requested value, notify policy
+        # entities, or take the title-triggered reload path.
+        reconstructed_device._ensure_connected = AsyncMock()
+        reconstructed_device._send_datapoints = AsyncMock()
+        listener_tasks: list[asyncio.Task[object]] = []
+        create_task_internal = hass.async_create_task_internal
+
+        def track_listener_task(
+            coro: object,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[object]:
+            task = create_task_internal(coro, name=name, eager_start=eager_start)
+            listener_tasks.append(task)
+            return task
+
+        with (
+            patch.object(
+                reconstructed_device,
+                "async_apply_persisted_options",
+                new=AsyncMock(side_effect=RuntimeError("synthetic apply failure")),
+            ),
+            patch.object(
+                hass.data[DOMAIN][entry.entry_id].coordinator,
+                "async_update_listeners",
+            ) as notify_policy_entities,
+            patch.object(
+                hass,
+                "async_create_task_internal",
+                new=track_listener_task,
+            ),
+        ):
+            hass.config_entries.async_update_entry(
+                entry,
+                title="Synthetic listener S1 failed policy",
+                options={
+                    **entry.options,
+                    CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 100,
+                },
+            )
+            assert len(listener_tasks) == 1
+            with pytest.raises(RuntimeError, match="synthetic apply failure"):
+                await listener_tasks[0]
+        await hass.async_block_till_done()
+
+        assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 100
+        assert reconstructed_device.on_demand_connection_hold_time == 105
+        assert (
+            float(hass.states.get(reconstructed_number_entity.entity_id).state) == 105
+        )
+        notify_policy_entities.assert_not_called()
+        reload.assert_awaited_once_with(entry.entry_id)
+        reconstructed_device._ensure_connected.assert_not_awaited()
+        reconstructed_device._send_datapoints.assert_not_awaited()
 
 
 async def test_number_entity_persists_and_reschedules_current_session(
