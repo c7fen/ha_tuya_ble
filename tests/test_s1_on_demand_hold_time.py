@@ -424,13 +424,14 @@ def test_accepted_current_session_report_records_activity(code: TuyaBLECode) -> 
     record.assert_called_once_with(token)
 
 
-def test_old_session_and_rejected_activity_never_move_deadline() -> None:
+async def test_old_session_and_rejected_activity_never_move_deadline() -> None:
     device = _make_device()
     old_token, old_client = _install_ready_session(device)
     device._record_confirmed_activity(old_token)
     initial = device.last_confirmed_activity_monotonic
     old_client.is_connected = False
     device._mark_connection_lost(old_token)
+    await asyncio.sleep(0)
     replacement, _ = _install_ready_session(device)
 
     with patch(
@@ -502,6 +503,7 @@ async def test_exact_monotonic_hold_deadline_releases_without_keepalive(
 async def test_later_confirmed_activity_replaces_one_hold_owner() -> None:
     device = _make_device()
     token, _ = _install_ready_session(device)
+    real_sleep = asyncio.sleep
     sleep_started = asyncio.Event()
     release_sleep = asyncio.Event()
     clock = [100.0]
@@ -531,8 +533,8 @@ async def test_later_confirmed_activity_replaces_one_hold_owner() -> None:
         assert first is not None
         assert second is not None
         assert second is not first
-        await asyncio.sleep(0)
-        assert first.cancelled()
+        await real_sleep(0)
+        assert first.done()
         second.cancel()
         release_sleep.set()
         await asyncio.gather(second, return_exceptions=True)

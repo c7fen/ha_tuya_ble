@@ -33,9 +33,11 @@ from ..const import (
     BLE_TARGET_WAIT_TIMEOUT_SECONDS,
     CONF_BLE_CONTROL_ENABLED,
     CONF_CONNECTION_MODE,
+    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
     CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
+    DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
     DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS,
     RECONNECT_STABLE_RESET_SECONDS,
     S1_RECONNECT_COOLDOWN_SECONDS,
@@ -49,6 +51,8 @@ from ..const import (
     EffectiveConnectionPolicy,
     PendingRelease,
     PendingReleaseReason,
+    normalize_on_demand_connection_hold_time,
+    validate_on_demand_connection_hold_time,
 )
 from .const import (
     CHARACTERISTIC_NOTIFY,
@@ -84,6 +88,7 @@ _LOGGER = logging.getLogger(__name__)
 _LOG_IDENTITY_ALPHABET = "ghjkmnpqrstuvwxyz"
 _LOG_IDENTITY_LENGTH = 16
 _TRANSPORT_ERROR_FALLBACK = "Tuya BLE transport error"
+_HOLD_TIME_UNSET = object()
 _ConnectionLeaseContext = dict[int, int]
 _CONNECTION_LEASE_CONTEXT: ContextVar[_ConnectionLeaseContext] = ContextVar(
     "tuya_ble_connection_lease", default={}
@@ -508,6 +513,7 @@ class TuyaBLEDevice:
         address: str | None = None,
         connection_mode: str = DEFAULT_CONNECTION_MODE,
         ble_control_enabled: bool = DEFAULT_BLE_CONTROL_ENABLED,
+        on_demand_connection_hold_time: object = _HOLD_TIME_UNSET,
         persist_options: (
             Callable[[dict[str, Any]], Awaitable[None] | None] | None
         ) = None,
@@ -561,6 +567,8 @@ class TuyaBLEDevice:
         self._connected_notified_token: ConnectionSessionToken | None = None
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
+        self._last_confirmed_activity_monotonic: float | None = None
+        self._confirmed_activity_session: ConnectionSessionToken | None = None
         self._unexpected_reconnect_delay = UNEXPECTED_RECONNECT_MIN_SECONDS
         self._unexpected_reconnect_failures = 0
         self._persist_options = persist_options
@@ -572,6 +580,13 @@ class TuyaBLEDevice:
             ble_control_enabled
             if isinstance(ble_control_enabled, bool)
             else DEFAULT_BLE_CONTROL_ENABLED
+        )
+        self._on_demand_connection_hold_time = (
+            None
+            if on_demand_connection_hold_time is _HOLD_TIME_UNSET
+            else normalize_on_demand_connection_hold_time(
+                on_demand_connection_hold_time
+            )
         )
         self._suspension_requested = not self._ble_control_enabled
         self._terminal_stopped = False
@@ -654,6 +669,32 @@ class TuyaBLEDevice:
         return self._ble_control_enabled
 
     @property
+    def supports_on_demand_connection_hold_time(self) -> bool:
+        """Return whether this is the exact reviewed S1 product."""
+        return (self.category, self.product_id) == ("jtmspro", "xqeob8h6")
+
+    @property
+    def on_demand_connection_hold_time(self) -> float:
+        """Return the effective local S1 hold time in seconds."""
+        if not self.supports_on_demand_connection_hold_time:
+            return DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
+        if self._on_demand_connection_hold_time is None:
+            # Preserve the established injectable delay for synthetic policy
+            # tests while the production default remains exactly 15 seconds.
+            return DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS
+        return self._on_demand_connection_hold_time
+
+    @property
+    def last_confirmed_activity_monotonic(self) -> float | None:
+        """Return the current exact session's last confirmed activity time."""
+        return self._last_confirmed_activity_monotonic
+
+    @property
+    def confirmed_activity_session(self) -> ConnectionSessionToken | None:
+        """Return the exact session owning the confirmed activity deadline."""
+        return self._confirmed_activity_session
+
+    @property
     def effective_policy(self) -> EffectiveConnectionPolicy:
         """Return the effective policy after applying suspension and stop."""
         if self._terminal_stopped:
@@ -729,6 +770,8 @@ class TuyaBLEDevice:
         self._state_data_fresh = False
         self._data_invalidated_token = None
         self._session_active_since = None
+        self._last_confirmed_activity_monotonic = None
+        self._confirmed_activity_session = None
         self._current_seq_num = 1
         self._clean_input()
         return token
@@ -844,6 +887,26 @@ class TuyaBLEDevice:
         if self._owns_connection_session(token, require_notifications=True):
             self._state_data_fresh = True
 
+    def _record_confirmed_activity(self, token: ConnectionSessionToken) -> None:
+        """Move the S1 hold deadline for accepted current-session activity."""
+        if not self.supports_on_demand_connection_hold_time or not (
+            self._owns_connection_session(token, require_notifications=True)
+        ):
+            return
+        self._last_confirmed_activity_monotonic = time.monotonic()
+        self._confirmed_activity_session = token
+        if (
+            self._connection_mode is ConnectionMode.ON_DEMAND
+            and self._ble_control_enabled
+            and not self._suspension_requested
+            and not self._terminal_stopped
+            and not self._unload_quiescing
+            and self.is_connection_active
+            and self._active_lease_count == 0
+        ):
+            self._cancel_idle_disconnect_locked()
+            self._schedule_idle_disconnect_locked()
+
     async def _persist_policy_options(self, updates: dict[str, Any]) -> None:
         if self._persist_options is None:
             return
@@ -877,6 +940,7 @@ class TuyaBLEDevice:
         *,
         connection_mode: str | None = None,
         ble_control_enabled: bool | None = None,
+        on_demand_connection_hold_time: object | None = None,
     ) -> None:
         """Persist and apply one or both connection policy settings."""
         async with self._policy_transition_lock:
@@ -895,22 +959,39 @@ class TuyaBLEDevice:
             else:
                 raise TuyaBLEPolicyTransitionError()
 
+            if on_demand_connection_hold_time is None:
+                new_hold_time = self._on_demand_connection_hold_time
+            else:
+                if not self.supports_on_demand_connection_hold_time:
+                    raise TuyaBLEPolicyTransitionError()
+                try:
+                    new_hold_time = validate_on_demand_connection_hold_time(
+                        on_demand_connection_hold_time
+                    )
+                except (OverflowError, ValueError):
+                    raise TuyaBLEPolicyTransitionError() from None
+
             updates: dict[str, Any] = {}
             if new_mode is not self._connection_mode:
                 updates[CONF_CONNECTION_MODE] = new_mode.value
             if new_enabled != self._ble_control_enabled:
                 updates[CONF_BLE_CONTROL_ENABLED] = new_enabled
+            if new_hold_time != self._on_demand_connection_hold_time:
+                updates[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = new_hold_time
             if updates:
                 await self._persist_policy_options(updates)
 
             policy_changed = (
                 new_mode is not self._connection_mode
                 or new_enabled != self._ble_control_enabled
+                or new_hold_time != self._on_demand_connection_hold_time
             )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
+            self._on_demand_connection_hold_time = new_hold_time
             if policy_changed:
                 async with self._policy_lock:
+                    self._cancel_idle_disconnect_locked()
                     self._advance_policy_revision_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
@@ -928,14 +1009,27 @@ class TuyaBLEDevice:
                 CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
             )
             new_enabled = raw_enabled if isinstance(raw_enabled, bool) else True
+            new_hold_time = (
+                normalize_on_demand_connection_hold_time(
+                    options.get(
+                        CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                        DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
+                    )
+                )
+                if self.supports_on_demand_connection_hold_time
+                else self._on_demand_connection_hold_time
+            )
             policy_changed = (
                 new_mode is not self._connection_mode
                 or new_enabled != self._ble_control_enabled
+                or new_hold_time != self._on_demand_connection_hold_time
             )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
+            self._on_demand_connection_hold_time = new_hold_time
             if policy_changed:
                 async with self._policy_lock:
+                    self._cancel_idle_disconnect_locked()
                     self._advance_policy_revision_locked()
             self._suspension_requested = not new_enabled
             await self._apply_connection_policy()
@@ -1497,9 +1591,100 @@ class TuyaBLEDevice:
     def _schedule_idle_disconnect_locked(self) -> None:
         if self._idle_disconnect_task is not None:
             return
-        self._idle_disconnect_task = self._create_policy_task(
-            self._idle_disconnect_after_delay()
-        )
+        if self.supports_on_demand_connection_hold_time:
+            token = self._connection_token
+            if (
+                token is None
+                or self._confirmed_activity_session is not token
+                or self._last_confirmed_activity_monotonic is None
+                or not self._owns_connection_session(token, require_ready=True)
+            ):
+                return
+            coroutine = self._idle_disconnect_after_deadline(token)
+        else:
+            coroutine = self._idle_disconnect_after_delay()
+        self._idle_disconnect_task = self._create_policy_task(coroutine)
+
+    async def _idle_disconnect_after_deadline(
+        self, token: ConnectionSessionToken
+    ) -> None:
+        """Release one exact idle S1 session after confirmed activity expires."""
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                async with self._policy_lock:
+                    if (
+                        not self._owns_connection_session(token, require_ready=True)
+                        or self._confirmed_activity_session is not token
+                        or self._last_confirmed_activity_monotonic is None
+                        or self._connection_mode is not ConnectionMode.ON_DEMAND
+                        or not self._ble_control_enabled
+                        or self._suspension_requested
+                        or self._terminal_stopped
+                        or self._unload_quiescing
+                    ):
+                        return
+                    observed_activity = self._last_confirmed_activity_monotonic
+                    deadline = observed_activity + self.on_demand_connection_hold_time
+                    lease_active = self._active_lease_count > 0
+                    response_active = self._active_response_drain_count > 0
+
+                if lease_active or response_active:
+                    await asyncio.gather(
+                        self._lease_zero_event.wait(),
+                        self._response_drain_zero_event.wait(),
+                    )
+                    continue
+
+                await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+
+                async with self._policy_lock:
+                    if (
+                        not self._owns_connection_session(token, require_ready=True)
+                        or self._confirmed_activity_session is not token
+                        or self._last_confirmed_activity_monotonic is None
+                        or self._connection_mode is not ConnectionMode.ON_DEMAND
+                        or not self._ble_control_enabled
+                        or self._suspension_requested
+                        or self._terminal_stopped
+                        or self._unload_quiescing
+                    ):
+                        return
+                    if self._last_confirmed_activity_monotonic != observed_activity:
+                        continue
+                    if self._active_lease_count or self._active_response_drain_count:
+                        continue
+                    self._pending_release = PendingRelease(
+                        PendingReleaseReason.ON_DEMAND_IDLE,
+                        self._policy_revision,
+                    )
+                    self._idle_disconnect_in_progress = True
+                await self._complete_pending_release()
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.error(
+                "%s: On-demand hold release failed",
+                self.log_identity,
+            )
+            async with self._policy_lock:
+                if (
+                    self._owns_connection_session(token)
+                    and self._connection_mode is ConnectionMode.ON_DEMAND
+                    and self._ble_control_enabled
+                    and not self._terminal_stopped
+                    and self.is_gatt_connected
+                ):
+                    self._pending_release = PendingRelease(
+                        PendingReleaseReason.ON_DEMAND_IDLE,
+                        self._policy_revision,
+                    )
+                    self._schedule_disconnect_retry_locked()
+        finally:
+            self._idle_disconnect_in_progress = False
+            if self._idle_disconnect_task is current_task:
+                self._idle_disconnect_task = None
 
     async def _idle_disconnect_after_delay(self) -> None:
         current_task = asyncio.current_task()
@@ -2133,6 +2318,10 @@ class TuyaBLEDevice:
         """Publish loss of exact-session datapoint validity once."""
         self._notifications_active = False
         self._state_data_fresh = False
+        if token is not None and self._confirmed_activity_session is token:
+            self._last_confirmed_activity_monotonic = None
+            self._confirmed_activity_session = None
+            self._cancel_idle_disconnect_locked()
         self._datapoints._invalidate_session_receipt_provenance()
         if token is not None:
             self._fail_session_response_futures(token)
@@ -2222,6 +2411,9 @@ class TuyaBLEDevice:
         self._is_paired = False
         self._notifications_active = False
         self._connection_token = None
+        self._last_confirmed_activity_monotonic = None
+        self._confirmed_activity_session = None
+        self._cancel_idle_disconnect_locked()
         if token is None or self._client is token.client:
             self._client = None
         self._invalidate_session_data(token)
@@ -3419,6 +3611,7 @@ class TuyaBLEDevice:
                 if session_token is None:
                     return
                 self._parse_datapoints_v3(session_token, time.time(), 0, data, 0)
+                self._record_confirmed_activity(session_token)
                 self._schedule_response(session_token, code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_DP:
@@ -3427,6 +3620,7 @@ class TuyaBLEDevice:
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
                 self._parse_datapoints_v3(session_token, time.time(), flags, data, 2)
+                self._record_confirmed_activity(session_token)
                 data = pack(">HBB", dp_seq_num, flags, 0)
                 self._schedule_response(session_token, code, data, seq_num)
 
@@ -3437,6 +3631,7 @@ class TuyaBLEDevice:
                 pos: int
                 timestamp, pos = self._parse_timestamp(data, 0)
                 self._parse_datapoints_v3(session_token, timestamp, 0, data, pos)
+                self._record_confirmed_activity(session_token)
                 self._schedule_response(session_token, code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_TIME_DP:
@@ -3448,6 +3643,7 @@ class TuyaBLEDevice:
                 flags = data[2]
                 timestamp, pos = self._parse_timestamp(data, 3)
                 self._parse_datapoints_v3(session_token, time.time(), flags, data, pos)
+                self._record_confirmed_activity(session_token)
                 data = pack(">HBB", dp_seq_num, flags, 0)
                 self._schedule_response(session_token, code, data, seq_num)
 
@@ -3461,6 +3657,7 @@ class TuyaBLEDevice:
                 send_flags = data[5]
                 mode = data[6]
                 self._parse_datapoints_v4(session_token, time.time(), mode, data, 7)
+                self._record_confirmed_activity(session_token)
                 if (send_flags & 0x80) == 0:
                     self._schedule_response(
                         session_token, code, data[:7] + b"\x00", seq_num
@@ -3477,6 +3674,7 @@ class TuyaBLEDevice:
                 mode = data[6]
                 timestamp, pos = self._parse_timestamp(data, 7)
                 self._parse_datapoints_v4(session_token, timestamp, mode, data, pos)
+                self._record_confirmed_activity(session_token)
                 if (send_flags & 0x80) == 0:
                     self._schedule_response(
                         session_token, code, data[:7] + b"\x00", seq_num
@@ -3503,6 +3701,7 @@ class TuyaBLEDevice:
                         result,
                     )
                     if result == 0:
+                        self._record_confirmed_activity(session_token)
                         future.set_result(result)
                     else:
                         future.set_exception(TuyaBLEDeviceError(result))
