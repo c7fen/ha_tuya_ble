@@ -10,10 +10,11 @@ import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.components import number as number_platform
 from homeassistant.components.number.const import ATTR_VALUE
-from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 
+from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.config_flow import TuyaBLEOptionsFlow
 from custom_components.tuya_ble.const import (
     CONF_BLE_CONTROL_ENABLED,
@@ -399,6 +400,93 @@ async def test_number_platform_does_not_register_hold_time_for_non_s1_products(
             for entity in component.entities
         )
         hass.data[DOMAIN].pop(entry.entry_id)
+
+
+async def test_options_update_listener_publishes_reloaded_s1_hold_time(
+    hass: HomeAssistant,
+) -> None:
+    """The production listener keeps the reloaded NumberEntity state current."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Synthetic listener S1",
+        data={"address": SYNTHETIC_ADDRESS},
+        options={
+            CONF_CONNECTION_MODE: ConnectionMode.ON_DEMAND.value,
+            CONF_BLE_CONTROL_ENABLED: True,
+            CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 15,
+        },
+    )
+    entry.add_to_hass(hass)
+    manager = Mock()
+    manager.get_device_credentials = AsyncMock(
+        return_value=TuyaBLEDeviceCredentials(
+            uuid="synthetic-listener-uuid",
+            local_key="synthetic-listener-key",
+            device_id="synthetic-listener-device",
+            category=S1_PRODUCT[0],
+            product_id=S1_PRODUCT[1],
+            device_name="Synthetic listener S1",
+            product_model="SYNTHETIC-LISTENER",
+            product_name="Synthetic listener S1",
+            functions=[],
+            status_range=[],
+        )
+    )
+    await number_platform.async_setup(hass, {})
+    component = hass.data[number_platform.DATA_COMPONENT]
+
+    def add_entities(entities: list[object]) -> None:
+        hass.async_create_task(component.async_add_entities(entities))
+
+    async def forward_entry_setups(
+        config_entry: object, platforms: list[Platform]
+    ) -> None:
+        assert config_entry is entry
+        assert platforms == [Platform.NUMBER]
+        await async_setup_numbers(hass, entry, add_entities)
+
+    with (
+        patch.object(integration, "PLATFORMS", [Platform.NUMBER]),
+        patch.object(integration, "HASSTuyaBLEDeviceManager", return_value=manager),
+        patch.object(
+            integration.bluetooth, "async_ble_device_from_address", return_value=None
+        ),
+        patch.object(
+            integration.bluetooth, "async_register_callback", return_value=Mock()
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=forward_entry_setups,
+        ),
+    ):
+        assert await integration.async_setup_entry(hass, entry) is True
+        await hass.async_block_till_done()
+        entity = next(
+            entity
+            for entity in component.entities
+            if isinstance(entity, TuyaBLEOnDemandConnectionHoldTimeNumber)
+        )
+        device = hass.data[DOMAIN][entry.entry_id].device
+        device._ensure_connected = AsyncMock()
+        device._send_datapoints = AsyncMock()
+
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 100,
+            },
+        )
+        await hass.async_block_till_done()
+
+        assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 100
+        assert device.on_demand_connection_hold_time == 100
+        assert float(hass.states.get(entity.entity_id).state) == 100
+        device._ensure_connected.assert_not_awaited()
+        device._send_datapoints.assert_not_awaited()
 
 
 async def test_number_entity_persists_and_reschedules_current_session(
