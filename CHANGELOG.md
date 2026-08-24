@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Adds the S1-only **On-Demand Connection Hold Time** local configuration
+  number. It defaults to 15 seconds and accepts integral values from 15 through
+  105 seconds without adding a third connection mode or changing V1.
+- Holds an exact S1 On-demand session from its latest confirmed current-session
+  protocol activity, without keep-alive traffic, while preserving command,
+  response-drain, and physical-release ownership.
+
+### Upgrade notes
+
+- Existing entries retain their connection mode, BLE-control permission,
+  credentials, entity identity, and customizations. A missing hold-time option
+  behaves as 15 seconds and is not written merely by loading the entry.
+- Longer hold times retain S1 GATT ownership longer and can delay access from
+  the Tuya app. Battery impact is not quantified; 105 seconds is a tested upper
+  bound, not proof of universal battery safety.
+
 ## [0.9.0](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0) (2026-08-06)
 
 This is the first stable release of the maintained downstream 0.9 line. It

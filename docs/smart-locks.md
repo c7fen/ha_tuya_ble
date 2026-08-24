@@ -98,16 +98,23 @@ ownership safely.
 
 ## Connection policy controls
 
-S1 `jtmspro/xqeob8h6` and V1 `ms/7a4xvbtt` expose three local controls:
+S1 `jtmspro/xqeob8h6` and V1 `ms/7a4xvbtt` expose three shared local controls.
+S1 also exposes one local hold-time setting:
 
 | Entity | Meaning |
 | --- | --- |
 | Connection Mode | Always connected retains paired GATT; On demand starts disconnected and leases one session for an explicit command. |
 | Home Assistant BLE Control | Enabled permits HA control; disabled persists suspension, releases GATT after active work finishes, blocks commands, and suppresses reconnects. |
 | Bluetooth Connection | On only for an authenticated and paired GATT session; it remains available as a diagnostic while off or suspended. |
+| On-Demand Connection Hold Time | S1 only. Keeps the exact session for 15–105 seconds after the latest confirmed activity; default 15 seconds and applicable only to On demand. |
 
-On demand uses a fixed 15-second idle disconnect. It does not reconnect for an
-advertisement alone, and local access events can be missed while disconnected.
+The S1 hold-time setting does not add a third mode. Its timer uses the last
+successfully confirmed current-session protocol activity and sends no
+keep-alive. On demand does not reconnect for an advertisement alone, and local
+access events can be missed while disconnected. Longer values retain GATT for
+longer and may delay Tuya-app access. Battery impact is not quantified. The
+measured S1 peer inactivity deadline is approximately 120.5 seconds; 105
+seconds is the maximum tested bound, not proof of universal battery safety.
 Use On demand for S1 unless continuous access-event monitoring is required.
 Use Always connected for access-event monitoring and any future Passage Mode
 Guard. Existing saved policy choices are not rewritten. Repeated connection and
@@ -115,6 +122,9 @@ pairing work has an energy cost; after three failed S1 sessions, background
 reconnects use a 15-minute cooldown that resets only after a 15-minute stable
 authenticated session. This limits connection pressure but makes no unsupported
 battery-capacity or lifetime claim.
+
+Always-connected keep-alive is not implemented here and remains tracked by
+[Issue #30](https://github.com/c7fen/ha_tuya_ble/issues/30).
 
 To let the Tuya app take the peripheral, turn **Home Assistant BLE Control**
 off. Wait for **Bluetooth Connection** to turn off, use the app, close or

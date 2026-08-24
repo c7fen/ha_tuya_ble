@@ -33,7 +33,8 @@ reconnect.
 ## 2. User-visible entities
 
 Only the S1 product `jtmspro/xqeob8h6` and the V1 product `ms/7a4xvbtt` receive
-the three new entities in this implementation.
+the three shared policy entities in this implementation. S1 additionally
+receives one local hold-time number.
 
 * `Connection Mode` is a config select with `always_connected` and `on_demand`
   values. Its visible states are `Always connected` and `On demand`.
@@ -44,6 +45,9 @@ the three new entities in this implementation.
   physical GATT session. This physical diagnostic remains on if notification
   teardown succeeded but GATT release has not yet completed; such a session is
   not usable for integration traffic.
+* `On-Demand Connection Hold Time` is an S1-only config number in seconds. It
+  accepts integral values from 15 through 105 and defaults to 15. It affects
+  only `On demand`; it is not a third connection mode.
 
 The control entities are local policy entities. They remain available while
 the entry is disconnected or suspended. No address, UUID, device identifier,
@@ -54,7 +58,8 @@ credential, payload, or policy internals are exposed as entity attributes.
 The following keys are merged into the existing config-entry options:
 
 * `connection_mode`: `always_connected` or `on_demand`;
-* `ble_control_enabled`: a boolean.
+* `ble_control_enabled`: a boolean;
+* `on_demand_connection_hold_time`: an S1-only integer from 15 through 105.
 
 Missing values default to `always_connected` and `true`, preserving current
 behavior for existing entries. Invalid values are normalized to those safe
@@ -62,6 +67,11 @@ defaults without changing credentials or other options. Every entity and
 options-flow update starts with a copy of the complete existing options and
 updates only the policy keys. No storage file is edited, and no entry is
 removed or recreated.
+
+A missing S1 hold-time value behaves as 15 seconds and is not silently written
+while loading the entry. An invalid persisted hold time also reads as 15
+seconds without preventing setup or rewriting unrelated options. V1 and all
+unrelated products receive neither this option nor the number entity.
 
 Suspension persists `ble_control_enabled = false` before the runtime begins
 disconnecting. A persistence failure leaves the active policy unchanged and
@@ -158,12 +168,15 @@ the policy checks succeed and is removed before acquisition returns. Release
 decrements the count under the same lock and never permits a negative count.
 
 Nested and concurrent leases are reference-counted. Always-connected release
-leaves GATT active. On-demand release schedules one cancellable idle task only
-when the count reaches zero. The task uses the internal
-`DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS = 15.0` constant and checks policy
-again before disconnecting. A new lease, mode change, suspension, unload, or
-shutdown cancels it. A failed or cancelled setup that has already released GATT
-settles directly in `ON_DEMAND_IDLE` and never creates this timer.
+leaves GATT active. For S1, On-demand release retains one cancellable owner only
+when the count reaches zero and confirmed current-session activity exists. Its
+monotonic deadline is the latest confirmed activity plus the configured hold
+time. Later confirmed activity replaces the deadline; no periodic status or
+other keep-alive is sent. A new lease, mode change, suspension, session
+replacement, unload, or shutdown cancels or safely reconciles the owner. A
+failed or cancelled setup that has already released GATT settles directly in
+`ON_DEMAND_IDLE` and never creates this timer. Unrelated products retain their
+existing fixed idle-delay behavior.
 
 Generic datapoint writes and status updates own a lease. S1 lock and unlock
 operations own one outer lease around their complete operation; nested
@@ -238,9 +251,16 @@ wins while an older write is failing, the older failure cannot overwrite it.
 On-demand setup and restart leave GATT disconnected and perform no background
 status update. A command or configuration write acquires a lease, connects and
 authenticates, performs the complete operation, and waits for its required
-response. The last lease schedules a 15-second idle disconnect. Events that
-occur while disconnected cannot be observed; this limitation is documented in
-the user guide.
+response. For S1, the last lease retains one release owner until the configured
+15–105 second monotonic deadline measured from the latest successfully
+confirmed current-session activity. Correlated Device Info, Pair, Device
+Status, and command responses and accepted device-originated reports qualify;
+connection start, advertisements, write return alone, timeouts, rejected data,
+and old-session callbacks do not. Active leases and response drains postpone
+release and force deadline recalculation. A successful intentional release
+does not reconnect or add reconnect-failure pressure; a failed physical release
+retains mandatory cleanup ownership. Events that occur while disconnected
+cannot be observed; this limitation is documented in the user guide.
 
 ## 10. Suspension and re-enable behavior
 
