@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
-from homeassistant.components import number as number_platform
+from homeassistant.components import (
+    number as number_platform,
+    select as select_platform,
+    switch as switch_platform,
+)
 from homeassistant.components.number.const import ATTR_VALUE
 from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import HomeAssistant
@@ -39,6 +43,8 @@ from custom_components.tuya_ble.number import (
 from custom_components.tuya_ble.number import (
     async_setup_entry as async_setup_numbers,
 )
+from custom_components.tuya_ble.select import async_setup_entry as async_setup_selects
+from custom_components.tuya_ble.switch import async_setup_entry as async_setup_switches
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import TuyaBLEPolicyTransitionError
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
@@ -435,20 +441,44 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
         )
     )
     await number_platform.async_setup(hass, {})
-    component = hass.data[number_platform.DATA_COMPONENT]
+    await select_platform.async_setup(hass, {})
+    await switch_platform.async_setup(hass, {})
+    components = {
+        Platform.NUMBER: hass.data[number_platform.DATA_COMPONENT],
+        Platform.SELECT: hass.data[select_platform.DATA_COMPONENT],
+        Platform.SWITCH: hass.data[switch_platform.DATA_COMPONENT],
+    }
 
-    def add_entities(entities: list[object]) -> None:
-        hass.async_create_task(component.async_add_entities(entities))
+    def add_entities(platform: Platform, entities: list[object]) -> None:
+        hass.async_create_task(components[platform].async_add_entities(entities))
 
     async def forward_entry_setups(
         config_entry: object, platforms: list[Platform]
     ) -> None:
         assert config_entry is entry
-        assert platforms == [Platform.NUMBER]
-        await async_setup_numbers(hass, entry, add_entities)
+        assert platforms == [Platform.NUMBER, Platform.SELECT, Platform.SWITCH]
+        await async_setup_numbers(
+            hass,
+            entry,
+            lambda entities: add_entities(Platform.NUMBER, entities),
+        )
+        await async_setup_selects(
+            hass,
+            entry,
+            lambda entities: add_entities(Platform.SELECT, entities),
+        )
+        await async_setup_switches(
+            hass,
+            entry,
+            lambda entities: add_entities(Platform.SWITCH, entities),
+        )
 
     with (
-        patch.object(integration, "PLATFORMS", [Platform.NUMBER]),
+        patch.object(
+            integration,
+            "PLATFORMS",
+            [Platform.NUMBER, Platform.SELECT, Platform.SWITCH],
+        ),
         patch.object(integration, "HASSTuyaBLEDeviceManager", return_value=manager),
         patch.object(
             integration.bluetooth, "async_ble_device_from_address", return_value=None
@@ -461,13 +491,24 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
             "async_forward_entry_setups",
             new=forward_entry_setups,
         ),
+        patch.object(hass.config_entries, "async_reload", new=AsyncMock()) as reload,
     ):
         assert await integration.async_setup_entry(hass, entry) is True
         await hass.async_block_till_done()
-        entity = next(
+        number_entity = next(
             entity
-            for entity in component.entities
+            for entity in components[Platform.NUMBER].entities
             if isinstance(entity, TuyaBLEOnDemandConnectionHoldTimeNumber)
+        )
+        select_entity = next(
+            entity
+            for entity in components[Platform.SELECT].entities
+            if entity.entity_description.key == CONF_CONNECTION_MODE
+        )
+        switch_entity = next(
+            entity
+            for entity in components[Platform.SWITCH].entities
+            if entity.entity_description.key == CONF_BLE_CONTROL_ENABLED
         )
         device = hass.data[DOMAIN][entry.entry_id].device
         device._ensure_connected = AsyncMock()
@@ -477,14 +518,70 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
             entry,
             options={
                 **entry.options,
+                CONF_CONNECTION_MODE: ConnectionMode.ALWAYS_CONNECTED.value,
+                CONF_BLE_CONTROL_ENABLED: False,
                 CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 100,
             },
         )
         await hass.async_block_till_done()
 
+        assert entry.title == "Synthetic listener S1"
         assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 100
+        assert (
+            entry.options[CONF_CONNECTION_MODE] == ConnectionMode.ALWAYS_CONNECTED.value
+        )
+        assert entry.options[CONF_BLE_CONTROL_ENABLED] is False
         assert device.on_demand_connection_hold_time == 100
-        assert float(hass.states.get(entity.entity_id).state) == 100
+        assert device.connection_mode is ConnectionMode.ALWAYS_CONNECTED
+        assert device.ble_control_enabled is False
+        assert hass.states.get(select_entity.entity_id).state == "always_connected"
+        assert hass.states.get(switch_entity.entity_id).state == "off"
+        assert float(hass.states.get(number_entity.entity_id).state) == 100
+        reload.assert_not_awaited()
+
+        for hold_time in (105, 15):
+            hass.config_entries.async_update_entry(
+                entry,
+                options={
+                    **entry.options,
+                    CONF_ON_DEMAND_CONNECTION_HOLD_TIME: hold_time,
+                },
+            )
+            await hass.async_block_till_done()
+            assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == hold_time
+            assert device.on_demand_connection_hold_time == hold_time
+            assert float(hass.states.get(number_entity.entity_id).state) == hold_time
+            assert (
+                sum(
+                    isinstance(entity, TuyaBLEOnDemandConnectionHoldTimeNumber)
+                    for entity in components[Platform.NUMBER].entities
+                )
+                == 1
+            )
+        reload.assert_not_awaited()
+        device._ensure_connected.assert_not_awaited()
+        device._send_datapoints.assert_not_awaited()
+
+        flow = TuyaBLEOptionsFlow(entry)
+        flow.hass = hass
+        result = await flow.async_step_connection_settings(
+            {
+                CONF_CONNECTION_MODE: ConnectionMode.ON_DEMAND.value,
+                CONF_BLE_CONTROL_ENABLED: True,
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 105,
+            }
+        )
+        assert result["type"] == "create_entry"
+        hass.config_entries.async_update_entry(entry, options=result["data"])
+        await hass.async_block_till_done()
+
+        assert device.connection_mode is ConnectionMode.ON_DEMAND
+        assert device.ble_control_enabled is True
+        assert device.on_demand_connection_hold_time == 105
+        assert hass.states.get(select_entity.entity_id).state == "on_demand"
+        assert hass.states.get(switch_entity.entity_id).state == "on"
+        assert float(hass.states.get(number_entity.entity_id).state) == 105
+        reload.assert_not_awaited()
         device._ensure_connected.assert_not_awaited()
         device._send_datapoints.assert_not_awaited()
 

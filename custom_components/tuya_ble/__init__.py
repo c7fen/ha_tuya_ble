@@ -784,6 +784,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options update."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     await data.device.async_apply_persisted_options(dict(entry.options))
+    data.coordinator.async_update_listeners()
     if entry.title != data.title:
         await hass.config_entries.async_reload(entry.entry_id)
 
