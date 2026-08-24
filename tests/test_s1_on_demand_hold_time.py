@@ -545,6 +545,7 @@ async def test_later_confirmed_activity_replaces_one_hold_owner() -> None:
 async def test_deadline_waits_for_protected_work_to_drain(protected: str) -> None:
     device = _make_device()
     token, _ = _install_ready_session(device)
+    real_sleep = asyncio.sleep
     device._execute_disconnect = AsyncMock()
     device._last_confirmed_activity_monotonic = 100.0
     device._confirmed_activity_session = token
@@ -571,7 +572,9 @@ async def test_deadline_waits_for_protected_work_to_drain(protected: str) -> Non
         ),
     ):
         owner = asyncio.create_task(device._idle_disconnect_after_deadline(token))
-        await asyncio.sleep(0)
+        await real_sleep(0)
+        await real_sleep(0)
+        assert not owner.done()
         device._execute_disconnect.assert_not_awaited()
         if protected == "lease":
             device._active_lease_count = 0
