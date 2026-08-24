@@ -236,10 +236,10 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
             else:
                 try:
                     if entry_data:
-                        policy_updates: dict[str, Any] = dict(
-                            connection_mode=mode.value,
-                            ble_control_enabled=raw_enabled,
-                        )
+                        policy_updates: dict[str, Any] = {
+                            "connection_mode": mode.value,
+                            "ble_control_enabled": raw_enabled,
+                        }
                         if hold_time is not None:
                             policy_updates[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = (
                                 hold_time

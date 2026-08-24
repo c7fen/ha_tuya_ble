@@ -6,9 +6,8 @@ import asyncio
 import math
 from unittest.mock import AsyncMock, Mock, patch
 
-from bleak.backends.device import BLEDevice
 import pytest
-from homeassistant.config_entries import ConfigEntry
+from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 
@@ -32,6 +31,8 @@ from custom_components.tuya_ble.devices import (
 )
 from custom_components.tuya_ble.number import (
     TuyaBLEOnDemandConnectionHoldTimeNumber,
+)
+from custom_components.tuya_ble.number import (
     async_setup_entry as async_setup_numbers,
 )
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode

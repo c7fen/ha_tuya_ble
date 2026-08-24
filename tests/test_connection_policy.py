@@ -1026,7 +1026,7 @@ async def test_pending_disconnect_retries_after_a_live_client_failure() -> None:
     """A failed policy release stays pending until one later real disconnect."""
     device = _make_device()
     client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
-    token = _install_connected_session(device, client)
+    _install_connected_session(device, client)
 
     with pytest.raises(ServiceValidationError):
         await device.async_update_connection_policy(ble_control_enabled=False)

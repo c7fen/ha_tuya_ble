@@ -968,7 +968,7 @@ class TuyaBLEDevice:
                     new_hold_time = validate_on_demand_connection_hold_time(
                         on_demand_connection_hold_time
                     )
-                except (OverflowError, ValueError):
+                except (OverflowError, TypeError, ValueError):
                     raise TuyaBLEPolicyTransitionError() from None
 
             updates: dict[str, Any] = {}
@@ -1663,7 +1663,7 @@ class TuyaBLEDevice:
                 return
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception:  # noqa: BLE001 - release ownership must survive all failures
             _LOGGER.error(
                 "%s: On-demand hold release failed",
                 self.log_identity,

@@ -31,9 +31,9 @@ S1_RECONNECT_STABLE_RESET_SECONDS: Final = 15 * 60.0
 
 
 def validate_on_demand_connection_hold_time(value: object) -> int:
-    """Return one valid integral On-Demand hold time or raise ValueError."""
+    """Return one valid integral On-Demand hold time or reject the input."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError
+        raise TypeError
     if not float(value).is_integer():
         raise ValueError
     normalized = int(value)
@@ -50,7 +50,7 @@ def normalize_on_demand_connection_hold_time(value: object) -> int:
     """Read persisted hold time fail-safely without changing stored options."""
     try:
         return validate_on_demand_connection_hold_time(value)
-    except (OverflowError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
 
 
