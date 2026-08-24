@@ -1144,6 +1144,7 @@ class TuyaBLEOnDemandConnectionHoldTimeNumber(TuyaBLEEntity, NumberEntity):
         await self._device.async_update_connection_policy(
             on_demand_connection_hold_time=normalized
         )
+        self.async_write_ha_state()
 
     def set_native_value(self, value: float) -> None:
         """Schedule the asynchronous policy-safe setter for older HA cores."""

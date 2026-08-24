@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
+from homeassistant.components import number as number_platform
+from homeassistant.components.number.const import ATTR_VALUE
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 
@@ -36,6 +39,7 @@ from custom_components.tuya_ble.number import (
     async_setup_entry as async_setup_numbers,
 )
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
+from custom_components.tuya_ble.tuya_ble.exceptions import TuyaBLEPolicyTransitionError
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
 from custom_components.tuya_ble.tuya_ble.security import TuyaBLESecurityMaterial
 from custom_components.tuya_ble.tuya_ble.tuya_ble import (
@@ -110,6 +114,54 @@ def _make_data(hass: HomeAssistant, device: TuyaBLEDevice) -> TuyaBLEData:
         manager=Mock(),
         coordinator=TuyaBLECoordinator(hass, device),
     )
+
+
+async def _setup_hold_time_number_platform(
+    hass: HomeAssistant,
+    *,
+    enabled: bool = True,
+    hold_time: int = DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
+    product: tuple[str, str] = S1_PRODUCT,
+) -> tuple[object, TuyaBLEDevice, TuyaBLEOnDemandConnectionHoldTimeNumber | None]:
+    """Set up the real HA number platform around one synthetic S1 device."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"address": SYNTHETIC_ADDRESS},
+        options={
+            CONF_CONNECTION_MODE: ConnectionMode.ON_DEMAND.value,
+            CONF_BLE_CONTROL_ENABLED: enabled,
+            CONF_ON_DEMAND_CONNECTION_HOLD_TIME: hold_time,
+        },
+    )
+    entry.add_to_hass(hass)
+    device = _make_device(enabled=enabled, hold_time=hold_time, product=product)
+
+    async def persist_options(updates: dict[str, object]) -> None:
+        options = dict(entry.options)
+        options.update(updates)
+        hass.config_entries.async_update_entry(entry, options=options)
+
+    device._persist_options = persist_options
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = _make_data(hass, device)
+    await number_platform.async_setup(hass, {})
+    component = hass.data[number_platform.DATA_COMPONENT]
+
+    def add_entities(entities: list[object]) -> None:
+        hass.async_create_task(component.async_add_entities(entities))
+
+    await async_setup_numbers(hass, entry, add_entities)
+    await hass.async_block_till_done()
+    entity = next(
+        (
+            entity
+            for entity in component.entities
+            if isinstance(entity, TuyaBLEOnDemandConnectionHoldTimeNumber)
+        ),
+        None,
+    )
+    return entry, device, entity
 
 
 def _install_ready_session(
@@ -228,6 +280,127 @@ async def test_number_entity_is_local_available_and_has_stable_identity(
     assert first.entity_description.native_unit_of_measurement == "s"
 
 
+@pytest.mark.parametrize("enabled", (True, False), ids=("ble-on", "ble-off"))
+async def test_number_service_publishes_persisted_hold_time_without_ble(
+    hass: HomeAssistant,
+    enabled: bool,
+) -> None:
+    """The real HA service publishes a local S1 policy update immediately."""
+    entry, device, entity = await _setup_hold_time_number_platform(
+        hass, enabled=enabled
+    )
+    assert entity is not None
+    device._ensure_connected = AsyncMock()
+    device._send_datapoints = AsyncMock()
+
+    assert entity.should_poll is False
+    assert float(hass.states.get(entity.entity_id).state) == 15
+    component = hass.data[number_platform.DATA_COMPONENT]
+    assert (
+        sum(
+            isinstance(candidate, TuyaBLEOnDemandConnectionHoldTimeNumber)
+            for candidate in component.entities
+        )
+        == 1
+    )
+
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {ATTR_ENTITY_ID: entity.entity_id, ATTR_VALUE: 16},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 16
+    assert device.on_demand_connection_hold_time == 16
+    assert float(hass.states.get(entity.entity_id).state) == 16
+    assert device._idle_disconnect_task is None
+    device._ensure_connected.assert_not_awaited()
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_number_service_repeated_values_keep_persisted_and_published_state_equal(
+    hass: HomeAssistant,
+) -> None:
+    """Every local service update keeps the UI and ConfigEntry in agreement."""
+    entry, device, entity = await _setup_hold_time_number_platform(hass)
+    assert entity is not None
+    device._ensure_connected = AsyncMock()
+    device._send_datapoints = AsyncMock()
+
+    for value in (100, 105, 15):
+        await hass.services.async_call(
+            "number",
+            "set_value",
+            {ATTR_ENTITY_ID: entity.entity_id, ATTR_VALUE: value},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+        assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == value
+        assert device.on_demand_connection_hold_time == value
+        assert float(hass.states.get(entity.entity_id).state) == value
+
+    assert device._idle_disconnect_task is None
+    device._ensure_connected.assert_not_awaited()
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_number_service_persistence_failure_keeps_existing_published_state(
+    hass: HomeAssistant,
+) -> None:
+    """A failed policy write cannot publish an unpersisted hold time."""
+    entry, device, entity = await _setup_hold_time_number_platform(hass)
+    assert entity is not None
+    device._persist_options = AsyncMock(side_effect=RuntimeError("synthetic failure"))
+    device._ensure_connected = AsyncMock()
+    device._send_datapoints = AsyncMock()
+
+    with pytest.raises(TuyaBLEPolicyTransitionError):
+        await hass.services.async_call(
+            "number",
+            "set_value",
+            {ATTR_ENTITY_ID: entity.entity_id, ATTR_VALUE: 16},
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 15
+    assert device.on_demand_connection_hold_time == 15
+    assert float(hass.states.get(entity.entity_id).state) == 15
+    assert device._idle_disconnect_task is None
+    device._ensure_connected.assert_not_awaited()
+    device._send_datapoints.assert_not_awaited()
+
+
+async def test_number_platform_reconstruction_publishes_persisted_hold_time(
+    hass: HomeAssistant,
+) -> None:
+    """A reconstructed platform publishes the ConfigEntry's local value."""
+    entry, device, entity = await _setup_hold_time_number_platform(hass, hold_time=100)
+    assert entity is not None
+
+    assert entry.options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] == 100
+    assert device.on_demand_connection_hold_time == 100
+    assert float(hass.states.get(entity.entity_id).state) == 100
+    assert device._idle_disconnect_task is None
+
+
+async def test_number_platform_does_not_register_hold_time_for_non_s1_products(
+    hass: HomeAssistant,
+) -> None:
+    """Only S1 receives the local hold-time NumberEntity."""
+    for product in (V1_PRODUCT, GENERIC_PRODUCT):
+        entry, _, _ = await _setup_hold_time_number_platform(hass, product=product)
+        component = hass.data[number_platform.DATA_COMPONENT]
+        assert not any(
+            isinstance(entity, TuyaBLEOnDemandConnectionHoldTimeNumber)
+            for entity in component.entities
+        )
+        hass.data[DOMAIN].pop(entry.entry_id)
+
+
 async def test_number_entity_persists_and_reschedules_current_session(
     hass: HomeAssistant,
 ) -> None:
@@ -242,11 +415,13 @@ async def test_number_entity_persists_and_reschedules_current_session(
         device,
         TuyaBLEProductInfo("Synthetic hold-time device"),
     )
+    entity.async_write_ha_state = Mock()
 
     await entity.async_set_native_value(100)
 
     assert device.on_demand_connection_hold_time == 100
     persist.assert_awaited_once_with({CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 100})
+    entity.async_write_ha_state.assert_called_once()
     assert device._idle_disconnect_task is not original_owner
     if device._idle_disconnect_task is not None:
         device._idle_disconnect_task.cancel()
