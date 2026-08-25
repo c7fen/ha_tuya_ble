@@ -16,6 +16,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers import entity_registry as er
 
 from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.config_flow import TuyaBLEOptionsFlow
@@ -42,8 +43,14 @@ from custom_components.tuya_ble.number import (
 from custom_components.tuya_ble.number import (
     async_setup_entry as async_setup_numbers,
 )
-from custom_components.tuya_ble.select import async_setup_entry as async_setup_selects
-from custom_components.tuya_ble.switch import async_setup_entry as async_setup_switches
+from custom_components.tuya_ble.select import (
+    TuyaBLEConnectionModeSelect,
+    async_setup_entry as async_setup_selects,
+)
+from custom_components.tuya_ble.switch import (
+    TuyaBLEControlSwitch,
+    async_setup_entry as async_setup_switches,
+)
 from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
 from custom_components.tuya_ble.tuya_ble.exceptions import TuyaBLEPolicyTransitionError
 from custom_components.tuya_ble.tuya_ble.manager import TuyaBLEDeviceCredentials
@@ -185,6 +192,24 @@ def _install_ready_session(
 
 def _schema_keys(result: dict) -> set[str]:
     return {str(marker.schema) for marker in result["data_schema"].schema}
+
+
+def _live_policy_entities(
+    hass: HomeAssistant,
+    entry_id: str,
+    platform: Platform,
+    entity_type: type[object],
+) -> list[object]:
+    """Return live entities from one real forwarded entity platform."""
+    component = hass.data.get(platform.value)
+    entity_platform = getattr(component, "_platforms", {}).get(entry_id)
+    if entity_platform is None:
+        return []
+    return [
+        entity
+        for entity in entity_platform.entities.values()
+        if isinstance(entity, entity_type)
+    ]
 
 
 @pytest.mark.parametrize("value", (15, 100, 105))
@@ -784,6 +809,188 @@ async def test_options_update_listener_publishes_reloaded_s1_hold_time(
         reload.assert_awaited_once_with(entry.entry_id)
         reconstructed_device._ensure_connected.assert_not_awaited()
         reconstructed_device._send_datapoints.assert_not_awaited()
+
+
+async def test_real_config_entry_policy_entities_reconstruct_without_duplicates(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+) -> None:
+    """Exercise three real S1 policy entities through HA unload/setup cycles."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Synthetic lifecycle S1",
+        data={"address": SYNTHETIC_ADDRESS},
+        options={
+            CONF_CONNECTION_MODE: ConnectionMode.ON_DEMAND.value,
+            CONF_BLE_CONTROL_ENABLED: True,
+            CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 15,
+        },
+    )
+    entry.add_to_hass(hass)
+    entry.supports_unload = True
+    entry.supports_remove_device = False
+    object.__setattr__(
+        entry,
+        "_integration_for_domain",
+        Mock(
+            domain=DOMAIN,
+            async_get_component=AsyncMock(return_value=integration),
+            async_get_platform=AsyncMock(),
+        ),
+    )
+    hass.config.components.add(DOMAIN)
+    manager = Mock()
+    manager.get_device_credentials = AsyncMock(
+        return_value=TuyaBLEDeviceCredentials(
+            uuid="synthetic-lifecycle-uuid",
+            local_key="synthetic-lifecycle-key",
+            device_id="synthetic-lifecycle-device",
+            category=S1_PRODUCT[0],
+            product_id=S1_PRODUCT[1],
+            device_name="Synthetic lifecycle S1",
+            product_model="SYNTHETIC-LIFECYCLE",
+            product_name="Synthetic lifecycle S1",
+            functions=[],
+            status_range=[],
+        )
+    )
+    registry = er.async_get(hass)
+    entity_types = (
+        (Platform.NUMBER, TuyaBLEOnDemandConnectionHoldTimeNumber),
+        (Platform.SELECT, TuyaBLEConnectionModeSelect),
+        (Platform.SWITCH, TuyaBLEControlSwitch),
+    )
+
+    def assert_loaded(hold_time: int) -> tuple[
+        TuyaBLEOnDemandConnectionHoldTimeNumber,
+        TuyaBLEConnectionModeSelect,
+        TuyaBLEControlSwitch,
+    ]:
+        assert entry.state is ConfigEntryState.LOADED
+        data = hass.data[DOMAIN][entry.entry_id]
+        assert data.device.on_demand_connection_hold_time == hold_time
+        live_entities = [
+            _live_policy_entities(hass, entry.entry_id, platform, entity_type)
+            for platform, entity_type in entity_types
+        ]
+        assert [len(entities) for entities in live_entities] == [1, 1, 1]
+        number_entity, select_entity, switch_entity = (
+            entities[0] for entities in live_entities
+        )
+        assert float(hass.states.get(number_entity.entity_id).state) == hold_time
+        assert hass.states.get(select_entity.entity_id).state == "on_demand"
+        assert hass.states.get(switch_entity.entity_id).state == "on"
+        policy_rows = [
+            row
+            for row in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if row.platform == DOMAIN
+            and row.unique_id
+            in {
+                number_entity.unique_id,
+                select_entity.unique_id,
+                switch_entity.unique_id,
+            }
+        ]
+        assert len(policy_rows) == 3
+        assert len({row.unique_id for row in policy_rows}) == 3
+        assert len(entry.update_listeners) == 1
+        assert len(data.coordinator._unsub_device_callbacks) == 4
+        return number_entity, select_entity, switch_entity
+
+    with (
+        patch.object(integration, "HASSTuyaBLEDeviceManager", return_value=manager),
+        patch.object(
+            integration.bluetooth, "async_ble_device_from_address", return_value=None
+        ),
+        patch.object(
+            integration.bluetooth, "async_register_callback", return_value=Mock()
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id) is True
+        await hass.async_block_till_done()
+        number_entity, _, _ = assert_loaded(15)
+        data = hass.data[DOMAIN][entry.entry_id]
+        data.device._ensure_connected = AsyncMock()
+        data.device._send_datapoints = AsyncMock()
+
+        await hass.services.async_call(
+            number_platform.DOMAIN,
+            number_platform.SERVICE_SET_VALUE,
+            {ATTR_ENTITY_ID: number_entity.entity_id, ATTR_VALUE: 100},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+        data.device._ensure_connected.assert_not_awaited()
+        data.device._send_datapoints.assert_not_awaited()
+        assert_loaded(100)
+
+        original_reload = hass.config_entries.async_reload
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            wraps=original_reload,
+        ) as reload:
+            hass.config_entries.async_update_entry(
+                entry,
+                title="Synthetic lifecycle S1 renamed",
+                options={
+                    **entry.options,
+                    CONF_ON_DEMAND_CONNECTION_HOLD_TIME: 105,
+                },
+            )
+            await hass.async_block_till_done()
+            reload.assert_awaited_once_with(entry.entry_id)
+        initial_number, _, _ = assert_loaded(105)
+
+        for cycle in range(3):
+            old_data = hass.data[DOMAIN][entry.entry_id]
+            old_number = _live_policy_entities(
+                hass,
+                entry.entry_id,
+                Platform.NUMBER,
+                TuyaBLEOnDemandConnectionHoldTimeNumber,
+            )[0]
+            assert await hass.config_entries.async_unload(entry.entry_id) is True
+            await hass.async_block_till_done()
+
+            assert entry.state is ConfigEntryState.NOT_LOADED
+            assert entry.entry_id not in hass.data[DOMAIN]
+            assert not entry.update_listeners
+            assert all(
+                not _live_policy_entities(hass, entry.entry_id, platform, entity_type)
+                for platform, entity_type in entity_types
+            )
+            assert old_data.coordinator._unsub_device_callbacks == []
+            assert old_data.coordinator._unsub_disconnect is None
+            assert old_data.device._connected_callbacks == []
+            assert old_data.device._callbacks == []
+            assert old_data.device._session_invalidated_callbacks == []
+            assert old_data.device._disconnected_callbacks == []
+            assert old_data.device._reconnect_task is None
+            assert old_data.device._scheduled_reconnect_delay is None
+            assert old_data.device._pending_reconnect_delay is None
+            assert old_data.device._active_reconnect_task is None
+            assert old_data.device._idle_disconnect_task is None
+            assert old_data.device._disconnect_retry_task is None
+            assert old_data.device._startup_task is None
+            assert not old_data.device._response_tasks
+            assert not old_data.device._response_drain_tasks
+            assert not old_data.device._response_cleanup_tasks
+            assert hass.states.get(old_number.entity_id).state == "unavailable"
+
+            assert await hass.config_entries.async_setup(entry.entry_id) is True
+            await hass.async_block_till_done()
+            reconstructed_number, _, _ = assert_loaded(105)
+            assert reconstructed_number is not old_number
+            if cycle == 0:
+                assert reconstructed_number is not initial_number
+            reconstructed_data = hass.data[DOMAIN][entry.entry_id]
+            reconstructed_data.device._ensure_connected = AsyncMock()
+            reconstructed_data.device._send_datapoints = AsyncMock()
+            reconstructed_data.device._ensure_connected.assert_not_awaited()
+            reconstructed_data.device._send_datapoints.assert_not_awaited()
 
 
 async def test_number_entity_persists_and_reschedules_current_session(
