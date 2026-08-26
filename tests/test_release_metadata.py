@@ -1,10 +1,13 @@
 """Validate downstream release metadata and repository links."""
 
+# ruff: noqa: S101
+
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -63,7 +66,7 @@ def test_release_manifest_is_exact() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
     assert manifest["version"] == EXPECTED_RELEASE_VERSION
-    assert EXPECTED_RELEASE_TAG == f"v{manifest['version']}"
+    assert f"v{manifest['version']}" == EXPECTED_RELEASE_TAG
     assert re.fullmatch(r"0\.10\.0b[1-9][0-9]*", manifest["version"])
     assert manifest["codeowners"] == [
         "@c7fen",
@@ -118,8 +121,10 @@ def test_release_links_are_downstream_and_versioned() -> None:
 
 def test_release_archive_path_inventory_is_exact_and_safe() -> None:
     """Bind the release to its reviewed tracked and integration inventories."""
-    result = subprocess.run(
-        ["git", "ls-files", "-z"],
+    git = shutil.which("git")
+    assert git is not None
+    result = subprocess.run(  # noqa: S603
+        [git, "ls-files", "-z"],
         cwd=ROOT,
         check=True,
         capture_output=True,
