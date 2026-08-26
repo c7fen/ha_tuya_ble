@@ -74,9 +74,10 @@ devices and do not publish it.
 A synthetic ordering test reproduced a preconnection template-selection race
 in the prior implementation. The root cause of the originally observed
 physical On-demand Unlock failure remains indeterminate; a transient BLE,
-proxy-routing, GATT-session, or transport failure remains plausible. The local
-candidate has not been installed or tested on hardware, so it makes no hardware
-success claim.
+proxy-routing, GATT-session, or transport failure remains plausible. On the
+reviewed runtime, one selected S1 passed one owner-operated cold Lock and one
+warm same-session Unlock with exactly one physical action each. This does not
+claim that all S1 devices or every command path were physically exercised.
 
 For both products, the Motor State binary sensor mirrors the Boolean DP47 report:
 off corresponds to secure/uncoupled and on corresponds to access-enabled/coupled.
