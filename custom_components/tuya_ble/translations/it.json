@@ -117,6 +117,9 @@
             "hold_time": {
                 "name": "Tempo di mantenimento"
             },
+            "on_demand_connection_hold_time": {
+                "name": "On-Demand Connection Hold Time"
+            },
             "humidity_calibration": {
                 "name": "Calibrazione dell'umidità"
             },
@@ -458,7 +461,11 @@
             "connection_settings": {
                 "data": {
                     "connection_mode": "Modalità di connessione",
-                    "ble_control_enabled": "Controllo BLE di Home Assistant"
+                    "ble_control_enabled": "Controllo BLE di Home Assistant",
+                    "on_demand_connection_hold_time": "On-Demand Connection Hold Time"
+                },
+                "data_description": {
+                    "on_demand_connection_hold_time": "Applies only to On Demand. The S1 connection is retained for this many seconds after the last confirmed activity."
                 },
                 "description": "Scegli come Home Assistant utilizza la connessione Bluetooth."
             },

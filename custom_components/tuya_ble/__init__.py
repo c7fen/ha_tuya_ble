@@ -25,6 +25,7 @@ from .cloud import HASSTuyaBLEDeviceManager, normalize_app_type_data
 from .const import (
     CONF_BLE_CONTROL_ENABLED,
     CONF_CONNECTION_MODE,
+    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
     CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS,
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
@@ -679,12 +680,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ble_device = None
 
     manager = HASSTuyaBLEDeviceManager(hass, manager_data)
+    device_kwargs: dict[str, Any] = {}
+    if CONF_ON_DEMAND_CONNECTION_HOLD_TIME in entry.options:
+        device_kwargs["on_demand_connection_hold_time"] = entry.options[
+            CONF_ON_DEMAND_CONNECTION_HOLD_TIME
+        ]
     device = TuyaBLEDevice(
         manager,
         ble_device,
         address=address,
         connection_mode=connection_mode.value,
         ble_control_enabled=ble_control_enabled,
+        **device_kwargs,
     )
 
     async def _async_persist_policy_options(updates: dict[str, Any]) -> None:
@@ -777,6 +784,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options update."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     await data.device.async_apply_persisted_options(dict(entry.options))
+    data.coordinator.async_update_listeners()
     if entry.title != data.title:
         await hass.config_entries.async_reload(entry.entry_id)
 

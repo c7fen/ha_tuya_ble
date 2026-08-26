@@ -37,9 +37,11 @@ from .tuya_ble import SERVICE_UUIDS, TuyaBLEDeviceCredentials
 from .const import (
     CONF_BLE_CONTROL_ENABLED,
     CONF_CONNECTION_MODE,
+    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
     ConnectionMode,
     DEFAULT_BLE_CONTROL_ENABLED,
     DEFAULT_CONNECTION_MODE,
+    DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
     TUYA_COUNTRIES,
     TUYA_SMART_APP,
     SMARTLIFE_APP,
@@ -53,6 +55,8 @@ from .const import (
     CONF_ENDPOINT,
     CONF_SEC_KEY,
     DOMAIN,
+    normalize_on_demand_connection_hold_time,
+    validate_on_demand_connection_hold_time,
 )
 from .devices import TuyaBLEData, get_device_readable_name
 from .cloud import HASSTuyaBLEDeviceManager
@@ -199,25 +203,49 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
     ) -> FlowResult:
         """Manage connection mode and Home Assistant BLE control."""
         errors: dict[str, str] = {}
+        domain_data = self.hass.data.get(DOMAIN, {})
+        entry_data: TuyaBLEData | None = domain_data.get(self._entry.entry_id)
+        supports_hold_time = bool(
+            entry_data and entry_data.device.supports_on_demand_connection_hold_time
+        )
         if user_input is not None:
+            hold_time_supplied = CONF_ON_DEMAND_CONNECTION_HOLD_TIME in user_input
             raw_mode = user_input.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
             raw_enabled = user_input.get(
                 CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+            )
+            raw_hold_time = user_input.get(
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                (
+                    entry_data.device.on_demand_connection_hold_time
+                    if supports_hold_time and entry_data
+                    else DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
+                ),
             )
             try:
                 mode = ConnectionMode(raw_mode)
                 if not isinstance(raw_enabled, bool):
                     raise ValueError
-            except (TypeError, ValueError):
+                hold_time = (
+                    validate_on_demand_connection_hold_time(raw_hold_time)
+                    if supports_hold_time and hold_time_supplied
+                    else None
+                )
+            except (OverflowError, TypeError, ValueError):
                 errors["base"] = "ble_policy_transition_failed"
             else:
-                domain_data = self.hass.data.get(DOMAIN, {})
-                entry_data: TuyaBLEData | None = domain_data.get(self._entry.entry_id)
                 try:
                     if entry_data:
+                        policy_updates: dict[str, Any] = {
+                            "connection_mode": mode.value,
+                            "ble_control_enabled": raw_enabled,
+                        }
+                        if hold_time is not None:
+                            policy_updates[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = (
+                                hold_time
+                            )
                         await entry_data.device.async_update_connection_policy(
-                            connection_mode=mode.value,
-                            ble_control_enabled=raw_enabled,
+                            **policy_updates
                         )
                 except Exception:  # noqa: BLE001
                     errors["base"] = "ble_policy_transition_failed"
@@ -229,6 +257,8 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
                             CONF_BLE_CONTROL_ENABLED: raw_enabled,
                         }
                     )
+                    if hold_time is not None:
+                        options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = hold_time
                     return self.async_create_entry(
                         title=self._entry.title,
                         data=options,
@@ -246,20 +276,38 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
         )
         if not isinstance(default_enabled, bool):
             default_enabled = DEFAULT_BLE_CONTROL_ENABLED
+        default_hold_time = normalize_on_demand_connection_hold_time(
+            options.get(
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
+            )
+        )
+        schema: dict[vol.Marker, object] = {
+            vol.Required(
+                CONF_CONNECTION_MODE,
+                default=default_mode,
+            ): vol.In([mode.value for mode in ConnectionMode]),
+            vol.Required(
+                CONF_BLE_CONTROL_ENABLED,
+                default=default_enabled,
+            ): bool,
+        }
+        if supports_hold_time:
+            schema[
+                vol.Required(
+                    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                    default=default_hold_time,
+                )
+            ] = vol.All(
+                int,
+                vol.Range(
+                    min=15,
+                    max=105,
+                ),
+            )
         return self.async_show_form(
             step_id="connection_settings",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_CONNECTION_MODE,
-                        default=default_mode,
-                    ): vol.In([mode.value for mode in ConnectionMode]),
-                    vol.Required(
-                        CONF_BLE_CONTROL_ENABLED,
-                        default=default_enabled,
-                    ): bool,
-                }
-            ),
+            data_schema=vol.Schema(schema),
             errors=errors,
         )
 

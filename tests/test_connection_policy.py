@@ -269,7 +269,7 @@ async def test_config_entry_setup_without_advertisement_stays_loaded(
 
 async def test_overlapping_leases_do_not_disconnect_early() -> None:
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
-    _install_connected_session(device, _SyntheticConnectedClient())
+    token = _install_connected_session(device, _SyntheticConnectedClient())
     device._ensure_connected = AsyncMock()
     device._execute_disconnect = AsyncMock()
 
@@ -281,6 +281,7 @@ async def test_overlapping_leases_do_not_disconnect_early() -> None:
         second = device.connection_lease("second")
         await first.__aenter__()
         await second.__aenter__()
+        device._record_confirmed_activity(token)
         await first.__aexit__(None, None, None)
         await asyncio.sleep(0.02)
         device._execute_disconnect.assert_not_awaited()
@@ -316,10 +317,7 @@ async def test_idle_disconnect_failure_stays_pending_for_retry() -> None:
     """A live client remains owned and retryable after an idle release failure."""
     device = _make_device(mode=ConnectionMode.ON_DEMAND)
     client = _SyntheticConnectedClient(disconnect_error=RuntimeError("synthetic"))
-    device._client = client
-    device._is_paired = True
-    device._physical_connection_active = True
-    device._notifications_active = True
+    token = _install_connected_session(device, client)
     lease = device.connection_lease("idle operation", defer_connection=True)
 
     with patch(
@@ -327,6 +325,7 @@ async def test_idle_disconnect_failure_stays_pending_for_retry() -> None:
         0.01,
     ):
         await lease.__aenter__()
+        device._record_confirmed_activity(token)
         await lease.__aexit__(None, None, None)
         await asyncio.sleep(0.02)
 
@@ -1729,12 +1728,13 @@ async def test_unload_waits_for_in_progress_on_demand_release_ownership() -> Non
         raise RuntimeError("synthetic")
 
     client.disconnect.side_effect = disconnect
-    _install_connected_session(device, client)
+    token = _install_connected_session(device, client)
 
     with patch(
         "custom_components.tuya_ble.tuya_ble.tuya_ble.DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS",
         0,
     ):
+        device._record_confirmed_activity(token)
         async with device._policy_lock:
             device._schedule_idle_disconnect_locked()
         idle_owner = device._idle_disconnect_task

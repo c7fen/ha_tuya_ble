@@ -28,7 +28,13 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import (
+    DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
+    DOMAIN,
+    MAX_ON_DEMAND_CONNECTION_HOLD_TIME,
+    MIN_ON_DEMAND_CONNECTION_HOLD_TIME,
+    validate_on_demand_connection_hold_time,
+)
 from .devices import (
     TuyaBLEData,
     TuyaBLEEntity,
@@ -1094,6 +1100,57 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
         return result
 
 
+class TuyaBLEOnDemandConnectionHoldTimeNumber(TuyaBLEEntity, NumberEntity):
+    """Local S1 On-Demand connection hold-time configuration."""
+
+    platform = Platform.NUMBER
+    _is_connection_policy_entity = True
+    _attr_mode = NumberMode.BOX
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: DataUpdateCoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+    ) -> None:
+        super().__init__(
+            hass,
+            coordinator,
+            device,
+            product,
+            NumberEntityDescription(
+                key="on_demand_connection_hold_time",
+                translation_key="on_demand_connection_hold_time",
+                native_min_value=MIN_ON_DEMAND_CONNECTION_HOLD_TIME,
+                native_max_value=MAX_ON_DEMAND_CONNECTION_HOLD_TIME,
+                native_step=1,
+                native_unit_of_measurement=UnitOfTime.SECONDS,
+                entity_category=EntityCategory.CONFIG,
+            ),
+        )
+
+    @property
+    def native_value(self) -> float:
+        """Return the persisted local hold time without requiring BLE."""
+        return float(
+            self._device.on_demand_connection_hold_time
+            or DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Persist and reconcile one integral local hold time."""
+        normalized = validate_on_demand_connection_hold_time(value)
+        await self._device.async_update_connection_policy(
+            on_demand_connection_hold_time=normalized
+        )
+        self.async_write_ha_state()
+
+    def set_native_value(self, value: float) -> None:
+        """Schedule the asynchronous policy-safe setter for older HA cores."""
+        self._hass.create_task(self.async_set_native_value(value))
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1116,4 +1173,13 @@ async def async_setup_entry(
                     mapping,
                 )
             )
+    if data.device.supports_on_demand_connection_hold_time:
+        entities.append(
+            TuyaBLEOnDemandConnectionHoldTimeNumber(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+            )
+        )
     async_add_entities(entities)

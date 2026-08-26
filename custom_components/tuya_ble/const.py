@@ -12,9 +12,13 @@ DOMAIN: Final = "tuya_ble"
 
 CONF_CONNECTION_MODE: Final = "connection_mode"
 CONF_BLE_CONTROL_ENABLED: Final = "ble_control_enabled"
+CONF_ON_DEMAND_CONNECTION_HOLD_TIME: Final = "on_demand_connection_hold_time"
 
 DEFAULT_CONNECTION_MODE: Final = "always_connected"
 DEFAULT_BLE_CONTROL_ENABLED: Final = True
+MIN_ON_DEMAND_CONNECTION_HOLD_TIME: Final = 15
+MAX_ON_DEMAND_CONNECTION_HOLD_TIME: Final = 105
+DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME: Final = 15
 DEFAULT_ON_DEMAND_IDLE_DISCONNECT_SECONDS: Final = 15.0
 CONNECTION_POLICY_TRANSITION_TIMEOUT_SECONDS: Final = 30.0
 BLE_TARGET_WAIT_TIMEOUT_SECONDS: Final = 10.0
@@ -24,6 +28,30 @@ RECONNECT_STABLE_RESET_SECONDS: Final = 30.0
 S1_RECONNECT_FAILURES_BEFORE_COOLDOWN: Final = 3
 S1_RECONNECT_COOLDOWN_SECONDS: Final = 15 * 60.0
 S1_RECONNECT_STABLE_RESET_SECONDS: Final = 15 * 60.0
+
+
+def validate_on_demand_connection_hold_time(value: object) -> int:
+    """Return one valid integral On-Demand hold time or reject the input."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError
+    if not float(value).is_integer():
+        raise ValueError
+    normalized = int(value)
+    if not (
+        MIN_ON_DEMAND_CONNECTION_HOLD_TIME
+        <= normalized
+        <= MAX_ON_DEMAND_CONNECTION_HOLD_TIME
+    ):
+        raise ValueError
+    return normalized
+
+
+def normalize_on_demand_connection_hold_time(value: object) -> int:
+    """Read persisted hold time fail-safely without changing stored options."""
+    try:
+        return validate_on_demand_connection_hold_time(value)
+    except (OverflowError, TypeError, ValueError):
+        return DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
 
 
 class ConnectionMode(StrEnum):
