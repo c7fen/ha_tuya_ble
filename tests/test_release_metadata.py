@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import stat
+import subprocess
 from pathlib import Path
 
 from custom_components.tuya_ble import (
@@ -26,13 +29,42 @@ MANIFEST = ROOT / "custom_components" / "tuya_ble" / "manifest.json"
 README = ROOT / "README.md"
 CHANGELOG = ROOT / "CHANGELOG.md"
 RELEASE_POLICY = ROOT / "docs" / "releasing.md"
+INTEGRATION = ROOT / "custom_components" / "tuya_ble"
+EXPECTED_RELEASE_VERSION = "0.10.0b1"
+EXPECTED_RELEASE_TAG = "v0.10.0b1"
+EXPECTED_TRACKED_PATH_COUNT = 92
+EXPECTED_TRACKED_PATH_DIGEST = (
+    "3d6d7f432942482ae5186d11877d31418d2e9d213b8acba36ecd88ffd32eb201"
+)
+EXPECTED_INTEGRATION_PATH_COUNT = 36
+EXPECTED_INTEGRATION_PATH_DIGEST = (
+    "246440f7c64b14c66e9ce62f150bcebf6d700b0ea04a1841c6b104d721c5532b"
+)
+EXPECTED_RUNTIME_PYTHON_PATH_COUNT = 27
+EXPECTED_RUNTIME_PATH_BLOB_DIGEST = (
+    "d66f63107bde813dfdecae565edfe508c362ccbfb73ac7987b898f34c2f2f6bc"
+)
+
+
+def _path_digest(paths: list[str]) -> str:
+    """Return the deterministic newline-delimited path inventory digest."""
+    return hashlib.sha256("".join(f"{path}\n" for path in paths).encode()).hexdigest()
+
+
+def _git_blob_id(path: Path) -> str:
+    """Return the Git blob ID for one regular file without requiring Git."""
+    contents = path.read_bytes()
+    header = f"blob {len(contents)}\0".encode()
+    return hashlib.sha1(header + contents, usedforsecurity=False).hexdigest()
 
 
 def test_release_manifest_is_exact() -> None:
-    """Require the reviewed stable version, owner order, and downstream URLs."""
+    """Require the reviewed prerelease version, owner order, and URLs."""
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.9.0"
+    assert manifest["version"] == EXPECTED_RELEASE_VERSION
+    assert EXPECTED_RELEASE_TAG == f"v{manifest['version']}"
+    assert re.fullmatch(r"0\.10\.0b[1-9][0-9]*", manifest["version"])
     assert manifest["codeowners"] == [
         "@c7fen",
         "@PlusPlus-ua",
@@ -61,6 +93,15 @@ def test_release_links_are_downstream_and_versioned() -> None:
 
     assert "c7fen/ha_tuya_ble-s1" not in readme
     assert (
+        "## [0.10.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b1)"
+        in changelog
+    )
+    assert "complete delta from stable `v0.9.0`" in changelog
+    assert "This is a prerelease" in changelog
+    assert "Stable `v0.9.0` remains available" in changelog
+    assert "final confirmed-activity timestamp" in changelog
+    assert "all four S1 devices" in changelog
+    assert (
         "## [0.9.0](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0)"
         in changelog
     )
@@ -73,6 +114,48 @@ def test_release_links_are_downstream_and_versioned() -> None:
     )
     assert "supersedes `v0.9.0b1` and `v0.9.0b2` for installation" in changelog
     assert "Although it was not the literal BLE address" in changelog
+
+
+def test_release_archive_path_inventory_is_exact_and_safe() -> None:
+    """Bind the release to its reviewed tracked and integration inventories."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    tracked = sorted(
+        path.decode() for path in result.stdout.split(b"\0") if path
+    )
+    integration = [
+        path for path in tracked if path.startswith("custom_components/tuya_ble/")
+    ]
+
+    assert len(tracked) == EXPECTED_TRACKED_PATH_COUNT
+    assert _path_digest(tracked) == EXPECTED_TRACKED_PATH_DIGEST
+    assert len(integration) == EXPECTED_INTEGRATION_PATH_COUNT
+    assert _path_digest(integration) == EXPECTED_INTEGRATION_PATH_DIGEST
+    for relative in tracked:
+        path = ROOT / relative
+        assert ".." not in Path(relative).parts
+        assert not Path(relative).is_absolute()
+        mode = path.lstat().st_mode
+        assert not stat.S_ISLNK(mode)
+        assert stat.S_ISREG(mode)
+
+
+def test_release_runtime_python_path_blob_digest_is_exact() -> None:
+    """Keep every production Python path and blob identical to reviewed next."""
+    paths = sorted(INTEGRATION.rglob("*.py"))
+    inventory = "".join(
+        f"{path.relative_to(ROOT).as_posix()}\t{_git_blob_id(path)}\n"
+        for path in paths
+    )
+
+    assert len(paths) == EXPECTED_RUNTIME_PYTHON_PATH_COUNT
+    assert hashlib.sha256(inventory.encode()).hexdigest() == (
+        EXPECTED_RUNTIME_PATH_BLOB_DIGEST
+    )
 
 
 def test_release_automation_is_manually_gated() -> None:

@@ -8,23 +8,115 @@ and this project adheres to
 
 ## Unreleased
 
+## [0.10.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b1) (2026-08-26)
+
+This prerelease contains the complete delta from stable `v0.9.0` through the
+reviewed `next` state, not only the S1 hold-time work in PR #34. Stable
+`v0.9.0` remains available while this beta receives owner-directed soak
+testing.
+
 ### Added
 
-- Adds the S1-only **On-Demand Connection Hold Time** local configuration
-  number. It defaults to 15 seconds and accepts integral values from 15 through
-  105 seconds without adding a third connection mode or changing V1.
-- Holds an exact S1 On-demand session from its latest confirmed current-session
-  protocol activity, without keep-alive traffic, while preserving command,
-  response-drain, and physical-release ownership.
+- Adds per-device **Always Connected** and **On Demand** connection modes for
+  the reviewed S1 and V1 smart-lock products, a persistent **Home Assistant BLE
+  Control** switch, and an authenticated **Bluetooth Connection** diagnostic.
+- Adds the S1-only **On-Demand Connection Hold Time** configuration number. It
+  applies only in On Demand mode, defaults to 15 seconds, and accepts integral
+  values from 15 through 105 seconds without adding a third connection mode.
+- Adds exact-session ownership for connection, state, command, response,
+  release, reconnect, unload, and shutdown work. On Demand sends no periodic
+  keep-alive and does not reconnect merely because an advertisement arrived.
+
+### Changed
+
+- Holds an exact S1 On-Demand session from its latest successfully confirmed
+  current-session activity. Active connection leases and protocol-response
+  drains protect the deadline, including the complete DP70, required delay,
+  and DP71 Unlock operation.
+- Makes successful intentional On-Demand release terminal for that session:
+  it schedules no reconnect and does not increase reconnect-failure pressure.
+  Failed physical release remains owned until cleanup is verified.
+- Uses the S1 product's protocol hint during Device-Info bootstrap, selects
+  Unlock templates only after the authenticated session is established, and
+  preserves atomic same-device template ownership without exposing Store
+  contents.
+- Bounds repeated S1 setup and session failure pressure with short initial
+  backoff followed by a 15-minute cooldown. No periodic keep-alive is added to
+  S1 Always Connected mode.
+- Normalizes integral battery-percentage presentation to whole percentages
+  while retaining precise scaled values and explicit user display precision.
+
+### Fixed
+
+- Prevents command, packet, and protected S1 Unlock replay after ambiguous
+  transport failure; stale callbacks and timers cannot mutate a replacement
+  physical session.
+- Retains truthful release ownership through setup, write, cancellation,
+  policy transition, unload, and shutdown failures, including bounded cleanup
+  after a physically connected client becomes unusable.
+- Preserves legitimate cross-cutting Home Assistant option namespaces during
+  the V1 registry migration while keeping ownership-, collision-, and
+  idempotency-safe entity migration behavior.
+- Publishes successful NumberEntity and Options Flow connection-policy updates
+  immediately without starting Bluetooth work.
+
+### Security and privacy
+
+- Physical-control paths remain fail closed: unavailable or ambiguous S1
+  template material performs no command write, and V1/S1 commands remain
+  serialized and at most once.
+- Credentials, complete identifiers, packet contents, lock values, S1 template
+  material, Store records, and private logs are not included. Production logs
+  retain their nonpersistent process-local opaque-label boundary.
+- Unrelated Tuya BLE product registrations, platform mappings, transport, and
+  command behavior are retained. V1 does not use the S1 hold-time path, and
+  Open remains unsupported where it was already unsupported.
+
+### Compatibility and migrations
+
+- Existing entries retain credentials, device and entity ownership,
+  customizations, connection-policy choices, and valid unrelated options. A
+  missing or invalid S1 hold-time option reads safely as 15 seconds without a
+  load-time write.
+- V1 Lock/Unlock transport and command semantics remain the reviewed behavior
+  from `v0.9.0`; PR #34 adds no V1 command change. Unaffected upstream products
+  remain registered and mapped.
+- This metadata-only release preparation changes manifest, changelog,
+  release-facing documentation, and release assertions. All integration Python
+  runtime paths and blobs are byte-identical to reviewed
+  `next@6f9f55b646069e2ddf96fce4acd2d4c5db0d25a7`.
+
+### Hardware scope and limitations
+
+- One selected S1 supplied the Issue #29 physical evidence; no claim is made
+  that all four S1 devices exercised every command path. W15, W100, and W105
+  each passed three non-actuating runs, and dynamic 105-to-15 and 15-to-100
+  hold-time changes passed.
+- One owner-operated cold Lock and one warm Unlock passed with exactly one
+  physical action each and same-session reuse. No peer disconnect, command
+  replay, duplicate action, or reconnect was observed.
+- The final confirmed-activity timestamp in that physical run was not
+  independently exposed. The 105-second production timer contract was
+  established separately by the non-actuating W105 runs against the same
+  reviewed runtime.
+- No S1 battery-saving percentage or battery-life improvement is claimed. On
+  Demand can reduce persistent GATT and proxy use, but repeated connection and
+  pairing also consume energy and local access or alarm events can be missed
+  while Home Assistant is disconnected.
+- The S1 peer/application inactivity behavior remains relevant, and no stable
+  Always-Connected battery profile or vendor-firmware-internal behavior is
+  claimed.
 
 ### Upgrade notes
 
-- Existing entries retain their connection mode, BLE-control permission,
-  credentials, entity identity, and customizations. A missing hold-time option
-  behaves as 15 seconds and is not written merely by loading the entry.
-- Longer hold times retain S1 GATT ownership longer and can delay access from
-  the Tuya app. Battery impact is not quantified; 105 seconds is a tested upper
-  bound, not proof of universal battery safety.
+- This is a prerelease. In HACS, explicitly show/select beta versions and
+  verify `v0.10.0b1` before downloading. Create a full Home Assistant backup
+  first; do not edit HACS or Home Assistant `.storage` files.
+- Use S1 On Demand when continuous event capture is unnecessary. Longer hold
+  times retain GATT ownership longer and can delay Tuya-app access. Use Always
+  Connected when continuous access-event monitoring is required.
+- Stable `v0.9.0` remains available. Promotion to stable `v0.10.0` requires a
+  separate future decision after beta soak evidence.
 
 ## [0.9.0](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.9.0) (2026-08-06)
 

@@ -457,8 +457,13 @@ template-selection race: Pair A was selected before Session 2 connected and
 remained outgoing after Session 2 supplied complete Pair B during setup. The
 root cause of the original physical On-demand Unlock failure remains
 indeterminate, and transient BLE, proxy-routing, GATT-session, or transport
-failure remains plausible. This local candidate has not been installed or
-hardware-tested and therefore makes no physical-success claim.
+failure remains plausible. The reviewed runtime was installed and
+owner-operated on one selected S1 for one cold Lock and one warm same-session
+Unlock, with exactly one physical action each. This is not an all-S1 or
+all-command-path claim. The final confirmed-activity timestamp of that physical
+run was not independently exposed; the 105-second production timer contract
+was established by separate non-actuating W105 runs. No broader physical-success
+claim is made.
 
 ## 15. V1 safety
 

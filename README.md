@@ -29,10 +29,11 @@ of these values as credentials.
 [![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=c7fen&repository=ha_tuya_ble&category=integration)
 
 HACS normally favors stable releases. During the beta programme, explicitly
-select the required prerelease in HACS's version selector and verify the shown
-version before downloading. Do not remove the integration to switch release
-channels. See [Upgrading to 0.9](docs/upgrading-to-0.9.md) before installing a
-0.9 prerelease.
+show and select beta versions in HACS's version selector and verify the shown
+version before downloading. Create a full Home Assistant backup first. Do not
+remove the integration to switch release channels, and do not edit HACS or Home
+Assistant `.storage` files. Stable `v0.9.0` remains available while
+`v0.10.0b1` is tested as a prerelease.
 
 ### Manual installation
 
@@ -74,14 +75,16 @@ S1-TY-BLE-PRO and V1 / Lock P1 devices expose local connection controls:
 - **Bluetooth Connection**: this diagnostic is on only while an authenticated
    and paired GATT session is active. A raw or unpaired link is reported off.
 
-On-demand sessions disconnect after a fixed 15-second idle interval. The delay
-is not configurable in this release. On-demand mode can reduce persistent GATT
-ownership and may help rarely used devices, but repeated connections and
-pairing also consume energy; no battery percentage is promised. Events received
-while Home Assistant is disconnected can be missed, so Always connected is the
-recommended mode for access-event monitoring. The Tuya app and Home Assistant
-normally cannot use the same peripheral simultaneously, and on-demand mode does
-not guarantee simultaneous app and HA access.
+S1 On-Demand sessions retain the exact authenticated session for a configurable
+15–105 seconds after the latest confirmed current-session activity; the default
+is 15 seconds. No periodic keep-alive is sent. V1 and unrelated products do not
+use this S1 timer. On-demand mode can reduce persistent GATT ownership and may
+help rarely used devices, but repeated connections and pairing also consume
+energy; no battery-life percentage is promised. Events received while Home
+Assistant is disconnected can be missed, so Always connected is the recommended
+mode for access-event monitoring. The Tuya app and Home Assistant normally
+cannot use the same peripheral simultaneously, and on-demand mode does not
+guarantee simultaneous app and HA access.
 
 Use the integration's **Configure** action and choose **Connection settings**
 to change these options without re-entering Tuya credentials. The settings do
