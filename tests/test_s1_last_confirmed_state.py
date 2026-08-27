@@ -23,13 +23,23 @@ from custom_components.tuya_ble.devices import (
     TuyaBLEProductInfo,
 )
 from custom_components.tuya_ble.last_confirmed import TuyaBLES1LastConfirmedEntity
-from custom_components.tuya_ble.number import TuyaBLENumber
-from custom_components.tuya_ble.select import TuyaBLESelect
+from custom_components.tuya_ble.number import (
+    TuyaBLENumber,
+    TuyaBLES1LastConfirmedNumber,
+)
+from custom_components.tuya_ble.select import (
+    TuyaBLES1LastConfirmedSelect,
+    TuyaBLESelect,
+)
 from custom_components.tuya_ble.sensor import (
     TuyaBLELastStatusUpdateSensor,
+    TuyaBLES1LastConfirmedSensor,
     TuyaBLESensor,
 )
-from custom_components.tuya_ble.switch import TuyaBLESwitch
+from custom_components.tuya_ble.switch import (
+    TuyaBLES1LastConfirmedSwitch,
+    TuyaBLESwitch,
+)
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLECommandUnconfirmedError,
@@ -129,28 +139,28 @@ def _make_entities(hass: HomeAssistant):
     coordinator = TuyaBLECoordinator(hass, device)
     product = TuyaBLEProductInfo("S1-TY-BLE-PRO")
     entities = {
-        "auto_lock": TuyaBLESwitch(
+        "auto_lock": TuyaBLES1LastConfirmedSwitch(
             hass,
             coordinator,
             device,
             product,
             _mapping_for(switch.get_mapping_by_device(device), 33),
         ),
-        "authentication": TuyaBLESelect(
+        "authentication": TuyaBLES1LastConfirmedSelect(
             hass,
             coordinator,
             device,
             product,
             _mapping_for(select.get_mapping_by_device(device), 34),
         ),
-        "auto_lock_delay": TuyaBLENumber(
+        "auto_lock_delay": TuyaBLES1LastConfirmedNumber(
             hass,
             coordinator,
             device,
             product,
             _mapping_for(number.get_mapping_by_device(device), 36),
         ),
-        "battery": TuyaBLESensor(
+        "battery": TuyaBLES1LastConfirmedSensor(
             hass,
             coordinator,
             device,
@@ -340,9 +350,8 @@ async def test_restore_lifecycle_lookup_and_setup_participation_are_scoped(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only the S1 restore subset consumes HA restore lifecycle work or callbacks."""
-    coordinator, entities = await _factory_entities(
-        hass, _make_s1_device(), "restore-lifecycle"
-    )
+    device = _make_s1_device()
+    coordinator, entities = await _factory_entities(hass, device, "restore-lifecycle")
     scoped = {
         _entity_for_mapping(entities, 33, TuyaBLESwitch),
         _entity_for_mapping(entities, 34, TuyaBLESelect),
@@ -380,20 +389,20 @@ async def test_restore_lifecycle_lookup_and_setup_participation_are_scoped(
     assert set(setup_participants) == scoped
     assert set(lookups) == scoped
     reload_entry.assert_not_awaited()
-    assert len(coordinator.device.last_confirmed_s1_state._callbacks) == 1
+    assert len(device.last_confirmed_s1_state._callbacks) == 1
 
     status = next(
         entity for entity in scoped if isinstance(entity, TuyaBLELastStatusUpdateSensor)
     )
     for _ in range(3):
         await status.async_will_remove_from_hass()
-        assert coordinator.device.last_confirmed_s1_state._callbacks == []
+        assert device.last_confirmed_s1_state._callbacks == []
         await status.async_added_to_hass()
-        assert len(coordinator.device.last_confirmed_s1_state._callbacks) == 1
+        assert len(device.last_confirmed_s1_state._callbacks) == 1
 
     for entity in entities:
         await entity.async_will_remove_from_hass()
-    assert coordinator.device.last_confirmed_s1_state._callbacks == []
+    assert device.last_confirmed_s1_state._callbacks == []
     coordinator.shutdown()
 
 

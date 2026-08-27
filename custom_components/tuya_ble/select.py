@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
-import logging
-
 from homeassistant.components.select import (
-    SelectEntityDescription,
     SelectEntity,
+    SelectEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature, Platform
+from homeassistant.const import Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -21,11 +20,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_CONNECTION_MODE,
-    ConnectionMode,
     DOMAIN,
     FINGERBOT_MODE_PROGRAM,
     FINGERBOT_MODE_PUSH,
     FINGERBOT_MODE_SWITCH,
+    ConnectionMode,
 )
 from .devices import (
     TuyaBLEData,
@@ -836,9 +835,7 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategorySelectMa
     return []
 
 
-class TuyaBLESelect(
-    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, SelectEntity, RestoreEntity
-):
+class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
     """Representation of a Tuya BLE select."""
 
     platform = Platform.SELECT
@@ -859,11 +856,6 @@ class TuyaBLESelect(
     @property
     def current_option(self) -> str | None:
         """Return the selected entity option to represent the entity state."""
-        retained = self._last_confirmed_value
-        if self._last_confirmed_enabled:
-            if retained is None:
-                return None
-            return self._attr_options[retained.value]
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
             datapoint and datapoint.received_in_current_session
@@ -899,12 +891,24 @@ class TuyaBLESelect(
                 if datapoint:
                     self._hass.create_task(datapoint.set_value(int_value))
 
+
+class TuyaBLES1LastConfirmedSelect(
+    TuyaBLESelect, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Authentication Mode only."""
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the safely retained S1 selection."""
+        retained = self._last_confirmed_value
+        if retained is None:
+            return None
+        return self._attr_options[retained.value]
+
     @property
     def available(self) -> bool:
-        """Keep a validated retained S1 value visible independently of BLE."""
-        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
-            return True
-        return super().available
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
 
 
 class TuyaBLEConnectionModeSelect(TuyaBLEEntity, SelectEntity):
@@ -984,8 +988,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSelect
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 34
+                else TuyaBLESelect
+            )
             entities.append(
-                TuyaBLESelect(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

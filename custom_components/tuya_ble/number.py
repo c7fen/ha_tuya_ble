@@ -2,26 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 from typing import Callable
 
 from homeassistant.components.number import (
-    NumberEntityDescription,
     NumberEntity,
+    NumberEntityDescription,
 )
 from homeassistant.components.number.const import NumberDeviceClass, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
+    Platform,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfTime,
     UnitOfVolume,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    Platform,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -1046,9 +1045,7 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategoryNumberMa
     return []
 
 
-class TuyaBLENumber(
-    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, NumberEntity, RestoreEntity
-):
+class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     """Representation of a Tuya BLE Number."""
 
     platform = Platform.NUMBER
@@ -1069,9 +1066,6 @@ class TuyaBLENumber(
     @property
     def native_value(self) -> float | None:
         """Return the entity value to represent the entity state."""
-        retained = self._last_confirmed_value
-        if self._last_confirmed_enabled:
-            return float(retained.value) if retained is not None else None
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
             datapoint and datapoint.received_in_current_session
@@ -1103,12 +1097,27 @@ class TuyaBLENumber(
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
-            return True
         result = super().available
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result
+
+
+class TuyaBLES1LastConfirmedNumber(
+    TuyaBLENumber, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Auto-Lock Delay only."""
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the safely retained S1 configuration value."""
+        retained = self._last_confirmed_value
+        return float(retained.value) if retained is not None else None
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
 
 
 class TuyaBLEOnDemandConnectionHoldTimeNumber(TuyaBLEEntity, NumberEntity):
@@ -1175,8 +1184,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedNumber
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 36
+                else TuyaBLENumber
+            )
             entities.append(
-                TuyaBLENumber(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

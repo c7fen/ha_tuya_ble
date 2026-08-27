@@ -51,12 +51,14 @@ from custom_components.tuya_ble.devices import (
 from custom_components.tuya_ble.lock import TuyaBLES1Lock, TuyaBLEV1Lock
 from custom_components.tuya_ble.number import (
     TuyaBLENumber,
+    TuyaBLES1LastConfirmedNumber,
 )
 from custom_components.tuya_ble.number import (
     get_mapping_by_device as get_number_mapping_by_device,
 )
 from custom_components.tuya_ble.select import (
     TuyaBLEConnectionModeSelect,
+    TuyaBLES1LastConfirmedSelect,
     TuyaBLESelect,
 )
 from custom_components.tuya_ble.select import (
@@ -64,6 +66,7 @@ from custom_components.tuya_ble.select import (
 )
 from custom_components.tuya_ble.sensor import (
     TuyaBLEBatteryMapping,
+    TuyaBLES1LastConfirmedSensor,
     TuyaBLESensor,
 )
 from custom_components.tuya_ble.sensor import (
@@ -71,6 +74,7 @@ from custom_components.tuya_ble.sensor import (
 )
 from custom_components.tuya_ble.switch import (
     TuyaBLEControlSwitch,
+    TuyaBLES1LastConfirmedSwitch,
     TuyaBLESwitch,
 )
 from custom_components.tuya_ble.switch import (
@@ -4244,7 +4248,9 @@ async def test_s1_read_only_entities_require_their_current_session_datapoints(
         for mapping in get_binary_sensor_mapping_by_device(device)
         if mapping.dp_id == 47
     )
-    battery = TuyaBLESensor(hass, coordinator, device, product, battery_mapping)
+    battery = TuyaBLES1LastConfirmedSensor(
+        hass, coordinator, device, product, battery_mapping
+    )
     battery.async_write_ha_state = Mock()
     motor = TuyaBLEBinarySensor(hass, coordinator, device, product, motor_mapping)
     motor.async_write_ha_state = Mock()
@@ -4333,14 +4339,18 @@ async def test_s1_session_invalidation_immediately_publishes_all_current_state(
         item for item in get_number_mapping_by_device(device) if item.dp_id == 36
     )
 
-    battery = TuyaBLESensor(hass, coordinator, device, product, battery_mapping)
+    battery = TuyaBLES1LastConfirmedSensor(
+        hass, coordinator, device, product, battery_mapping
+    )
     door = TuyaBLESensor(hass, coordinator, device, product, door_mapping)
     motor = TuyaBLEBinarySensor(hass, coordinator, device, product, motor_mapping)
-    authentication = TuyaBLESelect(
+    authentication = TuyaBLES1LastConfirmedSelect(
         hass, coordinator, device, product, authentication_mapping
     )
-    auto_lock = TuyaBLESwitch(hass, coordinator, device, product, auto_lock_mapping)
-    auto_lock_delay = TuyaBLENumber(
+    auto_lock = TuyaBLES1LastConfirmedSwitch(
+        hass, coordinator, device, product, auto_lock_mapping
+    )
+    auto_lock_delay = TuyaBLES1LastConfirmedNumber(
         hass, coordinator, device, product, auto_lock_delay_mapping
     )
     entities = (

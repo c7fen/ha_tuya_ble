@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-import logging
 from typing import Callable
+
 from homeassistant.components.sensor import (
     RestoreSensor,
     SensorDeviceClass,
@@ -18,24 +19,25 @@ from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    Platform,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfTime,
     UnitOfVolume,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    Platform,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
 from .const import (
-    BATTERY_STATE_HIGH,
-    BATTERY_STATE_LOW,
-    BATTERY_STATE_NORMAL,
     BATTERY_CHARGED,
     BATTERY_CHARGING,
     BATTERY_NOT_CHARGING,
+    BATTERY_STATE_HIGH,
+    BATTERY_STATE_LOW,
+    BATTERY_STATE_NORMAL,
     CO2_LEVEL_ALARM,
     CO2_LEVEL_NORMAL,
     DOMAIN,
@@ -2050,7 +2052,7 @@ def get_mapping_by_device(
     return []
 
 
-class TuyaBLESensor(TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, RestoreSensor):
+class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
     """Representation of a Tuya BLE sensor."""
 
     platform = Platform.SENSOR
@@ -2066,22 +2068,9 @@ class TuyaBLESensor(TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, RestoreSensor):
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
 
-    @property
-    def native_value(self):
-        """Return retained S1 Battery directly after HA restoration."""
-        if getattr(self._mapping, "last_confirmed", False):
-            retained = self._last_confirmed_value
-            return retained.value if retained is not None else None
-        return self._attr_native_value
-
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        if getattr(self._mapping, "last_confirmed", False):
-            retained = self._last_confirmed_value
-            self._attr_native_value = retained.value if retained is not None else None
-            self.async_write_ha_state()
-            return
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
             datapoint and datapoint.received_in_current_session
@@ -2129,8 +2118,6 @@ class TuyaBLESensor(TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, RestoreSensor):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        if getattr(self._mapping, "last_confirmed", False):
-            return self._last_confirmed_value is not None
         result = super().available
         if result and self._mapping.requires_current_session:
             datapoint = self._device.datapoints[self._mapping.dp_id]
@@ -2138,6 +2125,30 @@ class TuyaBLESensor(TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, RestoreSensor):
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result
+
+
+class TuyaBLES1LastConfirmedSensor(
+    TuyaBLESensor, TuyaBLES1LastConfirmedEntity, RestoreSensor
+):
+    """Restore the exact S1 Battery sensor only."""
+
+    @property
+    def native_value(self):
+        """Return the safely retained S1 Battery value."""
+        retained = self._last_confirmed_value
+        return retained.value if retained is not None else None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Publish retained S1 Battery state without generic sensor updates."""
+        retained = self._last_confirmed_value
+        self._attr_native_value = retained.value if retained is not None else None
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
 
 
 def _select_last_unlock_datapoint(
@@ -2307,8 +2318,16 @@ async def async_setup_entry(
         elif mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSensor
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 8
+                else TuyaBLESensor
+            )
             entities.append(
-                TuyaBLESensor(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

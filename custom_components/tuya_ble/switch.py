@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from homeassistant.components.switch import (
-    SwitchEntityDescription,
-    SwitchEntity,
     SwitchDeviceClass,
+    SwitchEntity,
+    SwitchEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -908,9 +907,7 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategorySwitchMa
     return []
 
 
-class TuyaBLESwitch(
-    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, SwitchEntity, RestoreEntity
-):
+class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
     """Representation of a Tuya BLE Switch."""
 
     platform = Platform.SWITCH
@@ -930,10 +927,6 @@ class TuyaBLESwitch(
     @property
     def is_on(self) -> bool | None:
         """Return true if switch is on."""
-
-        retained = self._last_confirmed_value
-        if self._last_confirmed_enabled:
-            return retained.value if retained is not None else None
 
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
@@ -1018,12 +1011,27 @@ class TuyaBLESwitch(
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
-            return True
         result = super().available
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)
         return result
+
+
+class TuyaBLES1LastConfirmedSwitch(
+    TuyaBLESwitch, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Auto-Lock switch only."""
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the safely retained S1 configuration value."""
+        retained = self._last_confirmed_value
+        return retained.value if retained is not None else None
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
 
 
 class TuyaBLEControlSwitch(TuyaBLEEntity, SwitchEntity):
@@ -1107,8 +1115,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSwitch
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 33
+                else TuyaBLESwitch
+            )
             entities.append(
-                TuyaBLESwitch(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,
