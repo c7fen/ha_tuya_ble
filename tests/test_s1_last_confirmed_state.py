@@ -5,11 +5,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.restore_state import RestoreEntity, StoredState
 from homeassistant.helpers.restore_state import async_get as async_get_restore
-import pytest
 
 from custom_components.tuya_ble import number, select, sensor, switch
 from custom_components.tuya_ble.const import ConnectionMode
@@ -387,7 +387,7 @@ async def test_s1_old_session_report_cannot_replace_retained_state(
     hass: HomeAssistant,
 ) -> None:
     """A retired exact session cannot promote a stale callback as confirmation."""
-    device, coordinator, entities, listeners = _make_entities(hass)
+    device, coordinator, _entities, listeners = _make_entities(hass)
     old_client = _begin_authenticated_session(device)
     old_token = device._connection_token
     assert old_token is not None
@@ -444,7 +444,7 @@ async def test_s1_retention_excludes_alarm_door_and_motor_without_ble_work(
     hass: HomeAssistant,
 ) -> None:
     """Excluded reports and retained-state publication perform no transport work."""
-    device, coordinator, entities, listeners = _make_entities(hass)
+    device, coordinator, _entities, listeners = _make_entities(hass)
     device._send_datapoints = Mock()
     client = _begin_authenticated_session(device)
     for dp_id, dp_type, value in (
