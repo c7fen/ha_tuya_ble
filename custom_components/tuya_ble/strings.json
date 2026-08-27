@@ -294,6 +294,9 @@
                     "phone_remote": "Phone remote"
                 }
             },
+            "last_status_update": {
+                "name": "Last Status Update"
+            },
             "s1_alarm_lock": {
                 "name": "Alarm",
                 "state": {

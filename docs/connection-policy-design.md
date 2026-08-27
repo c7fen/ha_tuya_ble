@@ -393,13 +393,36 @@ The compatibility `received_from_device` property is derived from this
 comparison. Cached values need not be erased on disconnect, and an unrelated
 datapoint in a replacement session cannot make an old value current.
 
-For S1, Battery DP8, Motor State DP47, Authentication Mode DP34, Auto-Lock DP33,
-Auto-Lock Delay DP36, and Door State DP40 require their own current-session
-receipt. After reconnect, a DP8-only report can restore Battery but none of the
-other five values. Configuration entities remain callable when policy permits
-even while their displayed value is unknown. Alarm DP21 and the Last Unlock
-Method datapoints retain their historical/event semantics; they are not proof
-of current configuration and are not cleared merely because a session ended.
+The exact S1 product `jtmspro/xqeob8h6` has a deliberately narrow
+last-confirmed exception for Battery DP8, Auto-Lock DP33, Authentication Mode
+DP34, and Auto-Lock Delay DP36. Only a valid device-originated report accepted
+for the active authenticated session may set one of these values. A locally
+requested write, optimistic datapoint mutation, stale callback, or another
+datapoint's report never upgrades confirmation provenance.
+
+Each retained S1 value exposes `data_fresh`, `last_confirmed_at`, and
+`value_source`. It is fresh only in the exact session that confirmed it. On
+intentional or unexpected session invalidation, the value and confirmation time
+remain available but are marked stale (`data_fresh=false`,
+`value_source=retained`); reconnection alone does not make them fresh. Standard
+Home Assistant state restoration validates each scoped entity independently.
+A valid restored value remains stale (`value_source=restored`) until a new
+current-session report supersedes it. Invalid, incompatible, incomplete, or
+timestamp-less restoration is discarded without blocking setup. A value that
+has never been confirmed or restored remains unknown or unavailable.
+
+`Last Status Update` is a read-only diagnostic timestamp entity for this exact
+S1 product. It is the latest `last_confirmed_at` across DP8, DP33, DP34, and
+DP36 only; it remains visible across session invalidation and restart when a
+valid timestamp exists, otherwise it is unknown. It has no BLE side effect.
+
+S1 Motor State DP47 and Door State DP40 continue to require their own
+current-session receipt and remain current-session-only. Alarm DP21 and Last
+Unlock Method retain their historical/event semantics unchanged; they are not
+confirmation sources and cannot move `Last Status Update`. After reconnect, a
+DP8-only report can update Battery but not the other scoped confirmations.
+Configuration entities remain callable when policy permits even while their
+displayed value is unknown.
 
 The exact reviewed V1 lock exposes read-only Motor State DP47 only when DP47
 itself was received in the active epoch. V1 Auto-Lock DP33 and Auto-Lock Delay
@@ -414,7 +437,19 @@ Other read-only entities are unavailable when aggregate current-session data
 is absent. On-demand command entities remain callable while control is enabled.
 Suspended ordinary entities are unavailable and their write paths reject before
 connecting or writing. Historical Home Assistant state is not treated as a
-current physical state.
+current physical state. A retained or restored S1 value is an explicit
+exception for the four scoped datapoints above, never a claim about current
+physical state.
+
+This retention model adds no polling, background BLE activity, keep-alive,
+scheduler, or manual status refresh. Tuya-app or local changes made while Home
+Assistant is disconnected remain unknown to Home Assistant until a qualifying
+new report arrives. Recorder and long-term statistics can retain the stale DP8
+Battery measurement; consumers must use `data_fresh` and `last_confirmed_at`
+to distinguish a last observation from a current reading. Explicit refresh is
+tracked separately in [Issue #37](https://github.com/c7fen/ha_tuya_ble/issues/37)
+and optional maximum-age scheduling in
+[Issue #38](https://github.com/c7fen/ha_tuya_ble/issues/38).
 
 ## 13. Config-entry Options Flow
 

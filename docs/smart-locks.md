@@ -89,6 +89,76 @@ precision of zero. Home Assistant still honors an explicit user-configured
 sensor precision. Invalid percentages are unavailable rather than displayed,
 and fractional values from products with scaling coefficients remain precise.
 
+## S1 last-confirmed configuration and battery state
+
+For the exact S1 product `jtmspro/xqeob8h6`, Home Assistant retains the last
+device-confirmed value of these four entities:
+
+| Entity | Datapoint | Retained after session end |
+| --- | --- | --- |
+| Battery | DP8 | Yes |
+| Auto-Lock | DP33 | Yes |
+| Authentication Mode | DP34 | Yes |
+| Auto-Lock Delay | DP36 | Yes |
+
+"Last confirmed" is deliberately not the same as current device state. A
+value becomes last-confirmed only after a valid, device-originated report in
+the exact authenticated BLE session. A requested write, an optimistic local
+datapoint change, an old callback, or a report for another datapoint does not
+confirm the value. Once confirmed, Auto-Lock retains a normal known on/off
+state after an On-demand disconnect instead of inventing a default.
+
+Each retained entity provides these machine-readable state attributes for
+automations:
+
+| Attribute | Meaning |
+| --- | --- |
+| `data_fresh` | `true` only while the value was confirmed in the currently authenticated session. |
+| `last_confirmed_at` | Timezone-aware UTC timestamp of that value's most recent valid confirmation. |
+| `value_source` | `current_session`, `retained`, or `restored`. |
+
+On an intentional or unexpected disconnect, a confirmed value remains visible
+but becomes stale: `data_fresh` is `false` and `value_source` is `retained`.
+After an HA restart, standard Home Assistant state restoration may restore a
+separately validated value, but it is always stale with `value_source` set to
+`restored`. Invalid or incomplete restored state is discarded per entity; a
+value that has never been confirmed or safely restored remains unknown or
+unavailable. The next valid report in the new exact session supersedes a
+retained or restored value.
+
+The diagnostic **Last Status Update** timestamp is added once per exact S1
+product. It is the newest `last_confirmed_at` across only DP8, DP33, DP34, and
+DP36. It remains visible across disconnect and restart when a valid timestamp
+exists, is unknown otherwise, and never initiates Bluetooth activity.
+
+Use the freshness attributes in every safety- or state-sensitive automation;
+do not use a visible retained value by itself as proof of the lock's present
+physical configuration. In particular, a Tuya-app change or a local device
+change made while Home Assistant is disconnected is invisible until Home
+Assistant receives a new qualifying report. The model deliberately does not
+retain S1 Alarm DP21, Door State DP40, or Motor State DP47: those remain
+current-session/event behavior and are not inputs to **Last Status Update**.
+V1 (`ms/7a4xvbtt`) is unchanged.
+
+Battery remains a measurement sensor, so Home Assistant Recorder/history and
+long-term statistics can retain a stale battery value after disconnect or
+restart. Treat the recorded value as the last observation, not a new reading
+at the time it was stored or displayed; use `data_fresh` and
+`last_confirmed_at` when analyzing or automating on it.
+
+This feature introduces neither polling nor a background BLE connection,
+keep-alive, scheduler, or manual refresh. A future explicit refresh belongs to
+[Issue #37](https://github.com/c7fen/ha_tuya_ble/issues/37), and optional
+maximum-age scheduling belongs separately to
+[Issue #38](https://github.com/c7fen/ha_tuya_ble/issues/38).
+
+For a safe upgrade, allow Home Assistant to restore only its standard retained
+entity state and regard it as stale until a new device confirmation arrives.
+Do not copy state between devices or treat an upgrade as device verification.
+Release remains gated on the normal documentation, CI, security, exact-head
+review, and any separately authorized hardware checks; this state model does
+not authorize deployment or physical lock operation.
+
 ## Bluetooth ownership
 
 A Tuya BLE peripheral normally accepts one active GATT client. The Tuya app can

@@ -29,6 +29,17 @@ Product category, public Product ID, Home Assistant version, integration
 version, module name, operation name, and a sanitized error class are normally
 sufficient for a first report.
 
+## Retained S1 entity state
+
+The S1 last-confirmed feature relies only on standard Home Assistant entity
+state restoration for the scoped configuration and battery values. Its visible
+metadata is limited to the retained value, a timezone-aware confirmation time,
+and the non-sensitive freshness/source markers. It does not store or expose
+Bluetooth addresses, device identifiers, packet material, raw datapoint
+payloads, S1 unlock templates, credentials, or a stable device-derived label.
+Do not paste entity history or attributes into a public report without the same
+review and sanitization required for logs.
+
 ## Safe issue excerpt
 
 Use a short, manually written summary rather than copied log output:
