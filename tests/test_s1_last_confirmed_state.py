@@ -7,17 +7,22 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from bleak.backends.device import BLEDevice
+from homeassistant.components.number import NumberEntity
+from homeassistant.components.select import SelectEntity
+from homeassistant.components.sensor import RestoreSensor, SensorEntity
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.restore_state import RestoreEntity, StoredState
 from homeassistant.helpers.restore_state import async_get as async_get_restore
 
-from custom_components.tuya_ble import number, select, sensor, switch
-from custom_components.tuya_ble.const import ConnectionMode
+from custom_components.tuya_ble import binary_sensor, number, select, sensor, switch
+from custom_components.tuya_ble.const import DOMAIN, ConnectionMode
 from custom_components.tuya_ble.devices import (
     TuyaBLECoordinator,
     TuyaBLEEntity,
     TuyaBLEProductInfo,
 )
+from custom_components.tuya_ble.last_confirmed import TuyaBLES1LastConfirmedEntity
 from custom_components.tuya_ble.number import TuyaBLENumber
 from custom_components.tuya_ble.select import TuyaBLESelect
 from custom_components.tuya_ble.sensor import (
@@ -58,6 +63,60 @@ def _make_s1_device() -> TuyaBLEDevice:
         product_model="SYNTHETIC-S1",
     )
     return device
+
+
+def _make_product_device(category: str, product_id: str) -> TuyaBLEDevice:
+    """Construct one synthetic mapped product without BLE or persisted state."""
+    device = _make_s1_device()
+    device._device_info.category = category
+    device._device_info.product_id = product_id
+    return device
+
+
+async def _factory_entities(
+    hass: HomeAssistant, device: TuyaBLEDevice, suffix: str
+) -> tuple[TuyaBLECoordinator, list[object]]:
+    """Collect instances from the real platform factories for one synthetic device."""
+    coordinator = TuyaBLECoordinator(hass, device)
+    entry = SimpleNamespace(entry_id=f"synthetic-issue-36-{suffix}")
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = SimpleNamespace(
+        coordinator=coordinator,
+        device=device,
+        product=TuyaBLEProductInfo(f"Synthetic {suffix}"),
+    )
+    entities: list[object] = []
+    for factory in (
+        binary_sensor.async_setup_entry,
+        number.async_setup_entry,
+        select.async_setup_entry,
+        sensor.async_setup_entry,
+        switch.async_setup_entry,
+    ):
+        await factory(hass, entry, entities.extend)
+    return coordinator, entities
+
+
+def _entity_for_mapping(entities: list[object], dp_id: int, entity_type: type):
+    """Return one factory-created entity associated with an exact mapped DP."""
+    return next(
+        entity
+        for entity in entities
+        if isinstance(entity, entity_type)
+        and getattr(getattr(entity, "_mapping", None), "dp_id", None) == dp_id
+    )
+
+
+def _non_scoped_state(entity: object) -> object:
+    """Read the native platform state without relying on restore internals."""
+    if isinstance(entity, TuyaBLESwitch):
+        return entity.is_on
+    if isinstance(entity, TuyaBLESelect):
+        return entity.current_option
+    if isinstance(entity, TuyaBLENumber):
+        return entity.native_value
+    assert isinstance(entity, TuyaBLESensor)
+    entity._attr_native_value = "base-platform-state"
+    return entity.native_value
 
 
 def _mapping_for(mapping, dp_id: int):
@@ -178,17 +237,237 @@ async def _restore_entity(
     await entity.async_added_to_hass()
 
 
-def test_s1_restoration_mro_keeps_platform_base_before_restore() -> None:
-    """RestoreEntity follows the integration base in every scoped platform MRO."""
-    for entity_class in (
-        TuyaBLESwitch,
-        TuyaBLESelect,
-        TuyaBLENumber,
-        TuyaBLESensor,
-        TuyaBLELastStatusUpdateSensor,
+def test_generic_platform_mros_are_the_exact_non_restore_platform_bases() -> None:
+    """Restore support is opt-in concrete behavior, never a generic platform trait."""
+    for entity_class, platform_class, restore_class in (
+        (TuyaBLESwitch, SwitchEntity, RestoreEntity),
+        (TuyaBLESelect, SelectEntity, RestoreEntity),
+        (TuyaBLENumber, NumberEntity, RestoreEntity),
+        (TuyaBLESensor, SensorEntity, RestoreSensor),
     ):
-        mro = entity_class.__mro__
-        assert mro.index(TuyaBLEEntity) < mro.index(RestoreEntity)
+        assert TuyaBLES1LastConfirmedEntity not in entity_class.__mro__
+        assert restore_class not in entity_class.__mro__
+        expected_mro = type(
+            f"Expected{entity_class.__name__}",
+            (TuyaBLEEntity, platform_class),
+            {},
+        ).__mro__[1:]
+        assert entity_class.__mro__[1:] == expected_mro
+
+
+async def test_factory_selects_restore_only_for_exact_s1_confirmed_entities(
+    hass: HomeAssistant,
+) -> None:
+    """Real factory output limits restore behavior to the five reviewed S1 entities."""
+    s1_coordinator, s1_entities = await _factory_entities(
+        hass, _make_s1_device(), "s1-census"
+    )
+    s1_restore_entities = [
+        entity for entity in s1_entities if isinstance(entity, RestoreEntity)
+    ]
+    s1_scoped = (
+        _entity_for_mapping(s1_entities, 33, TuyaBLESwitch),
+        _entity_for_mapping(s1_entities, 34, TuyaBLESelect),
+        _entity_for_mapping(s1_entities, 36, TuyaBLENumber),
+        _entity_for_mapping(s1_entities, 8, TuyaBLESensor),
+    )
+    status = next(
+        entity
+        for entity in s1_entities
+        if isinstance(entity, TuyaBLELastStatusUpdateSensor)
+    )
+
+    assert all(
+        type(entity) is not type_base
+        for entity, type_base in zip(
+            s1_scoped,
+            (TuyaBLESwitch, TuyaBLESelect, TuyaBLENumber, TuyaBLESensor),
+            strict=True,
+        )
+    )
+    assert set(s1_restore_entities) == {*s1_scoped, status}
+    assert isinstance(status, RestoreSensor)
+
+    excluded_s1_dp_ids = {21, 40, 47}
+    for entity in s1_entities:
+        mapping = getattr(entity, "_mapping", None)
+        if getattr(mapping, "dp_id", None) in excluded_s1_dp_ids:
+            assert not isinstance(entity, RestoreEntity)
+    assert not isinstance(
+        next(
+            entity
+            for entity in s1_entities
+            if type(entity).__name__ == "TuyaBLELastUnlockSensor"
+        ),
+        RestoreEntity,
+    )
+    assert not isinstance(
+        _entity_for_mapping(s1_entities, -1, TuyaBLESensor), RestoreEntity
+    )
+
+    v1_coordinator, v1_entities = await _factory_entities(
+        hass, _make_product_device("ms", "7a4xvbtt"), "v1-census"
+    )
+    for entity in v1_entities:
+        mapping = getattr(entity, "_mapping", None)
+        if getattr(mapping, "dp_id", None) in {8, 21, 33, 36, 47}:
+            assert not isinstance(entity, RestoreEntity)
+
+    foreign_s1_coordinator, foreign_s1_entities = await _factory_entities(
+        hass, _make_product_device("jtmspro", "y2yaegze"), "foreign-s1-census"
+    )
+    for entity in foreign_s1_entities:
+        mapping = getattr(entity, "_mapping", None)
+        if getattr(mapping, "dp_id", None) in {8, 33}:
+            assert not isinstance(entity, RestoreEntity)
+
+    unrelated_coordinator, unrelated_entities = await _factory_entities(
+        hass, _make_product_device("dcb", "z5ztlw3k"), "unrelated-census"
+    )
+    for entity_type in (TuyaBLESensor, TuyaBLESwitch, TuyaBLESelect, TuyaBLENumber):
+        entity = next(
+            entity for entity in unrelated_entities if type(entity) is entity_type
+        )
+        assert not isinstance(entity, RestoreEntity)
+
+    s1_coordinator.shutdown()
+    v1_coordinator.shutdown()
+    foreign_s1_coordinator.shutdown()
+    unrelated_coordinator.shutdown()
+
+
+async def test_restore_lifecycle_lookup_and_setup_participation_are_scoped(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the S1 restore subset consumes HA restore lifecycle work or callbacks."""
+    coordinator, entities = await _factory_entities(
+        hass, _make_s1_device(), "restore-lifecycle"
+    )
+    scoped = {
+        _entity_for_mapping(entities, 33, TuyaBLESwitch),
+        _entity_for_mapping(entities, 34, TuyaBLESelect),
+        _entity_for_mapping(entities, 36, TuyaBLENumber),
+        _entity_for_mapping(entities, 8, TuyaBLESensor),
+        next(
+            entity
+            for entity in entities
+            if isinstance(entity, TuyaBLELastStatusUpdateSensor)
+        ),
+    }
+    setup_participants: list[object] = []
+    lookups: list[object] = []
+    reload_entry = AsyncMock()
+    original_added = RestoreEntity.async_added_to_hass
+    original_lookup = RestoreEntity.async_get_last_state
+
+    async def tracked_added(entity) -> None:
+        setup_participants.append(entity)
+        await original_added(entity)
+
+    async def tracked_lookup(entity):
+        lookups.append(entity)
+        return await original_lookup(entity)
+
+    monkeypatch.setattr(RestoreEntity, "async_added_to_hass", tracked_added)
+    monkeypatch.setattr(RestoreEntity, "async_get_last_state", tracked_lookup)
+    monkeypatch.setattr(hass.config_entries, "async_reload", reload_entry)
+
+    for entity in entities:
+        entity.hass = hass
+        entity.async_write_ha_state = Mock()
+        await entity.async_added_to_hass()
+
+    assert set(setup_participants) == scoped
+    assert set(lookups) == scoped
+    reload_entry.assert_not_awaited()
+    assert len(coordinator.device.last_confirmed_s1_state._callbacks) == 1
+
+    status = next(
+        entity for entity in scoped if isinstance(entity, TuyaBLELastStatusUpdateSensor)
+    )
+    for _ in range(3):
+        await status.async_will_remove_from_hass()
+        assert coordinator.device.last_confirmed_s1_state._callbacks == []
+        await status.async_added_to_hass()
+        assert len(coordinator.device.last_confirmed_s1_state._callbacks) == 1
+
+    for entity in entities:
+        await entity.async_will_remove_from_hass()
+    assert coordinator.device.last_confirmed_s1_state._callbacks == []
+    coordinator.shutdown()
+
+
+async def test_non_scoped_factory_entities_preserve_base_presentation_contract(
+    hass: HomeAssistant,
+) -> None:
+    """Non-scoped S1, V1, and unrelated entities expose no restore provenance."""
+    coordinators: list[TuyaBLECoordinator] = []
+    all_entities: list[object] = []
+    for category, product_id, suffix in (
+        ("jtmspro", "xqeob8h6", "s1-base-presentation"),
+        ("ms", "7a4xvbtt", "v1-base-presentation"),
+        ("dcb", "z5ztlw3k", "unrelated-base-presentation"),
+    ):
+        coordinator, entities = await _factory_entities(
+            hass, _make_product_device(category, product_id), suffix
+        )
+        coordinators.append(coordinator)
+        all_entities.extend(entities)
+
+    scoped_s1_dp_ids = {8, 33, 34, 36}
+    checked = 0
+    for entity in all_entities:
+        mapping = getattr(entity, "_mapping", None)
+        if (
+            isinstance(entity, TuyaBLELastStatusUpdateSensor)
+            or getattr(mapping, "dp_id", None) in scoped_s1_dp_ids
+            and entity.device.category == "jtmspro"
+            and entity.device.product_id == "xqeob8h6"
+        ):
+            continue
+        if not isinstance(
+            entity, (TuyaBLESensor, TuyaBLESwitch, TuyaBLESelect, TuyaBLENumber)
+        ):
+            continue
+        checked += 1
+        before = (
+            _non_scoped_state(entity),
+            entity.available,
+            entity.extra_state_attributes,
+            entity.unique_id,
+            entity.entity_description.entity_category,
+            entity.translation_key,
+        )
+        entity.hass = hass
+        entity.async_write_ha_state = Mock()
+        await entity.async_added_to_hass()
+        after = (
+            _non_scoped_state(entity),
+            entity.available,
+            entity.extra_state_attributes,
+            entity.unique_id,
+            entity.entity_description.entity_category,
+            entity.translation_key,
+        )
+        assert type(entity) in {
+            TuyaBLESensor,
+            TuyaBLESwitch,
+            TuyaBLESelect,
+            TuyaBLENumber,
+        }
+        assert not isinstance(entity, RestoreEntity)
+        assert before == after
+        assert entity.extra_state_attributes is None
+        assert not {
+            "last_confirmed_at",
+            "data_fresh",
+            "value_source",
+        }.intersection(entity.extra_state_attributes or {})
+        await entity.async_will_remove_from_hass()
+
+    assert checked >= 10
+    for coordinator in coordinators:
+        coordinator.shutdown()
 
 
 async def test_s1_auto_lock_keeps_both_confirmed_boolean_states_after_disconnect(
