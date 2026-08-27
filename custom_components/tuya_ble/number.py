@@ -26,6 +26,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -41,6 +42,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +74,7 @@ class TuyaBLENumberMapping:
     setter: TuyaBLENumberSetter = None
     mode: NumberMode = NumberMode.BOX
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -940,6 +943,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             **dict.fromkeys(
@@ -1042,7 +1046,9 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategoryNumberMa
     return []
 
 
-class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
+class TuyaBLENumber(
+    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, NumberEntity, RestoreEntity
+):
     """Representation of a Tuya BLE Number."""
 
     platform = Platform.NUMBER
@@ -1063,6 +1069,9 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the entity value to represent the entity state."""
+        retained = self._last_confirmed_value
+        if self._last_confirmed_enabled:
+            return float(retained.value) if retained is not None else None
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
             datapoint and datapoint.received_in_current_session
@@ -1094,6 +1103,8 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
+        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
+            return True
         result = super().available
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)

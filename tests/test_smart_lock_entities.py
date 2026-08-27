@@ -142,6 +142,7 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
         "battery",
         "closed_opened",
         "last_unlock_method",
+        "last_status_update",
     }
 
     alarm = mappings["alarm_lock"]
@@ -160,6 +161,11 @@ def test_s1_sensor_contract_preserves_exact_product_semantics() -> None:
     assert battery.description.suggested_display_precision == 0
     assert battery.description.entity_category is EntityCategory.DIAGNOSTIC
     assert battery.requires_current_session is True
+    assert battery.last_confirmed is True
+
+    last_status_update = mappings["last_status_update"]
+    assert last_status_update.description.device_class is SensorDeviceClass.TIMESTAMP
+    assert last_status_update.description.entity_category is EntityCategory.DIAGNOSTIC
 
     last_unlock = mappings["last_unlock_method"]
     assert last_unlock.unlock_methods == S1_LAST_UNLOCK_METHODS

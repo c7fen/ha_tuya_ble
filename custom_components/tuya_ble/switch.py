@@ -17,6 +17,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import CONF_BLE_CONTROL_ENABLED, DOMAIN
@@ -26,6 +27,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +57,7 @@ class TuyaBLESwitchMapping:
     getter: TuyaBLESwitchGetter = None
     setter: TuyaBLESwitchSetter = None
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -560,6 +563,7 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=smart_lock_automatic_lock_getter,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             "y2yaegze": [
@@ -904,7 +908,9 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategorySwitchMa
     return []
 
 
-class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
+class TuyaBLESwitch(
+    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, SwitchEntity, RestoreEntity
+):
     """Representation of a Tuya BLE Switch."""
 
     platform = Platform.SWITCH
@@ -924,6 +930,10 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
     @property
     def is_on(self) -> bool | None:
         """Return true if switch is on."""
+
+        retained = self._last_confirmed_value
+        if self._last_confirmed_enabled:
+            return retained.value if retained is not None else None
 
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
@@ -1008,6 +1018,8 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
+        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
+            return True
         result = super().available
         if result and self._mapping.is_available:
             result = self._mapping.is_available(self, self._product)

@@ -16,6 +16,7 @@ from homeassistant.const import UnitOfTemperature, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -32,6 +33,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class TuyaBLESelectMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 @dataclass
@@ -503,6 +506,7 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_ENUM,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             "hc7n0urm": [  # A1 Ultra-JM
@@ -832,7 +836,9 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategorySelectMa
     return []
 
 
-class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
+class TuyaBLESelect(
+    TuyaBLEEntity, TuyaBLES1LastConfirmedEntity, SelectEntity, RestoreEntity
+):
     """Representation of a Tuya BLE select."""
 
     platform = Platform.SELECT
@@ -853,6 +859,11 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
     @property
     def current_option(self) -> str | None:
         """Return the selected entity option to represent the entity state."""
+        retained = self._last_confirmed_value
+        if self._last_confirmed_enabled:
+            if retained is None:
+                return None
+            return self._attr_options[retained.value]
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if self._mapping.requires_current_session and not (
             datapoint and datapoint.received_in_current_session
@@ -887,6 +898,13 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
                 )
                 if datapoint:
                     self._hass.create_task(datapoint.set_value(int_value))
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible independently of BLE."""
+        if self._last_confirmed_enabled and self._last_confirmed_value is not None:
+            return True
+        return super().available
 
 
 class TuyaBLEConnectionModeSelect(TuyaBLEEntity, SelectEntity):

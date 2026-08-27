@@ -4259,6 +4259,7 @@ async def test_s1_read_only_entities_require_their_current_session_datapoints(
     device.datapoints._update_from_device(
         47, 0, 0, TuyaBLEDataPointType.DT_BOOL, True, first_token
     )
+    device._fire_callbacks([device.datapoints[8], device.datapoints[47]])
     assert battery.available is True
 
     device._schedule_reconnect_locked = Mock()
@@ -4274,7 +4275,7 @@ async def test_s1_read_only_entities_require_their_current_session_datapoints(
     )
 
     assert device.state_data_fresh is True
-    assert battery.available is False
+    assert battery.available is True
     assert motor.available is False
 
     device.datapoints._update_from_device(
@@ -4283,6 +4284,7 @@ async def test_s1_read_only_entities_require_their_current_session_datapoints(
     device.datapoints._update_from_device(
         47, 0, 0, TuyaBLEDataPointType.DT_BOOL, False, second_token
     )
+    device._fire_callbacks([device.datapoints[8], device.datapoints[47]])
     assert battery.available is True
     assert motor.available is True
     if coordinator._unsub_disconnect is not None:
@@ -4393,18 +4395,18 @@ async def test_s1_session_invalidation_immediately_publishes_all_current_state(
 
     assert coordinator.connected is True
     assert coordinator._unsub_disconnect is not None
-    assert battery.available is False
-    assert battery.native_value is None
+    assert battery.available is True
+    assert battery.native_value == 73
     assert motor.available is False
     assert motor.is_on is None
     assert door.available is False
     assert door.native_value is None
     assert authentication.available is True
-    assert authentication.current_option is None
+    assert authentication.current_option == "single_unlock"
     assert auto_lock.available is True
-    assert auto_lock.is_on is None
+    assert auto_lock.is_on is True
     assert auto_lock_delay.available is True
-    assert auto_lock_delay.native_value is None
+    assert auto_lock_delay.native_value == 10.0
     for entity in entities:
         entity.async_write_ha_state.assert_called()
 
@@ -4428,13 +4430,13 @@ async def test_s1_session_invalidation_immediately_publishes_all_current_state(
         assert motor.available is False
         assert motor.is_on is None
     else:
-        assert battery.available is False
-        assert battery.native_value is None
+        assert battery.available is True
+        assert battery.native_value == 73
         assert motor.available is True
         assert motor.is_on is False
-    assert authentication.current_option is None
-    assert auto_lock.is_on is None
-    assert auto_lock_delay.native_value is None
+    assert authentication.current_option == "single_unlock"
+    assert auto_lock.is_on is True
+    assert auto_lock_delay.native_value == 10.0
     assert door.native_value is None
     assert device.datapoints[21].value == 2
     assert device.datapoints[12].value == 7
