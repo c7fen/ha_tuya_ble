@@ -59,7 +59,6 @@ from custom_components.tuya_ble.number import (
 from custom_components.tuya_ble.select import (
     TuyaBLEConnectionModeSelect,
     TuyaBLES1LastConfirmedSelect,
-    TuyaBLESelect,
 )
 from custom_components.tuya_ble.select import (
     get_mapping_by_device as get_select_mapping_by_device,
