@@ -504,23 +504,27 @@ class S1LastConfirmedState:
             return
         confirmed_at = _normalize_s1_confirmation_timestamp(datetime.now(timezone.utc))
         assert confirmed_at is not None
-        changed = False
-        for datapoint in datapoints:
-            dp_id = datapoint.id
-            if (
-                dp_id not in S1_LAST_CONFIRMED_DP_IDS
-                or datapoint.received_session_epoch != epoch
-                or datapoint.type != S1_LAST_CONFIRMED_DP_TYPES[dp_id]
-                or not self._is_valid(dp_id, datapoint.value)
-            ):
-                continue
-            previous = self._values.get(dp_id)
-            value_confirmed_at = confirmed_at
+        accepted = [
+            datapoint
+            for datapoint in datapoints
+            if datapoint.id in S1_LAST_CONFIRMED_DP_IDS
+            and datapoint.received_session_epoch == epoch
+            and datapoint.type == S1_LAST_CONFIRMED_DP_TYPES[datapoint.id]
+            and self._is_valid(datapoint.id, datapoint.value)
+        ]
+        if not accepted:
+            return
+        batch_confirmed_at = confirmed_at
+        for datapoint in accepted:
+            previous = self._values.get(datapoint.id)
             if previous is not None:
-                value_confirmed_at = max(value_confirmed_at, previous.confirmed_at)
+                batch_confirmed_at = max(batch_confirmed_at, previous.confirmed_at)
+        changed = False
+        for datapoint in accepted:
+            dp_id = datapoint.id
             self._values[dp_id] = S1LastConfirmedValue(
                 datapoint.value,
-                value_confirmed_at,
+                batch_confirmed_at,
                 True,
                 "current_session",
             )

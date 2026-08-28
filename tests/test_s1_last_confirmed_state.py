@@ -1178,7 +1178,7 @@ async def test_s1_confirmation_batch_uses_one_normalized_utc_second(
     """One accepted callback batch gives all valid scoped reports one timestamp."""
     fixed = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
     _freeze_confirmation_time(monkeypatch, {"value": fixed})
-    device, coordinator, entities, listeners = _make_entities(hass)
+    device, coordinator, _entities, listeners = _make_entities(hass)
     _begin_authenticated_session(device)
 
     _report_batch(
@@ -1221,14 +1221,10 @@ async def test_s1_restore_normalizes_legacy_precision_and_rejects_bad_timestamps
         for dp_id in (8, 33, 34, 36)
     } == {expected}
     assert entities["last_status"].native_value == expected
-    assert (
-        device.last_confirmed_s1_state.restore(
-            33, True, datetime(2026, 8, 28, 12, 34, 56)
-        )
-        is False
-    )
+    naive = datetime(2026, 8, 28, 12, 34, 56)  # noqa: DTZ001 - deliberate input
+    assert device.last_confirmed_s1_state.restore(33, True, naive) is False
     assert _parse_restored_timestamp("invalid") is None
-    assert _parse_restored_timestamp(datetime(2026, 8, 28, 12, 34, 56)) is None
+    assert _parse_restored_timestamp(naive) is None
     _cleanup(coordinator, listeners)
 
 
@@ -1266,6 +1262,35 @@ async def test_s1_same_second_value_changes_publish_without_moving_time_backward
     assert monotonic is not None
     assert monotonic.value == 75
     assert monotonic.confirmed_at == expected
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_backward_clock_keeps_one_timestamp_for_a_mixed_batch(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior DP clamps the one canonical timestamp for every valid batch DP."""
+    first = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
+    clock = {"value": first}
+    _freeze_confirmation_time(monkeypatch, clock)
+    device, coordinator, _entities, listeners = _make_entities(hass)
+    _begin_authenticated_session(device)
+    _report(device, 8, TuyaBLEDataPointType.DT_VALUE, 73)
+
+    clock["value"] = first - timedelta(seconds=1)
+    _report_batch(
+        device,
+        [
+            (8, TuyaBLEDataPointType.DT_VALUE, 74),
+            (33, TuyaBLEDataPointType.DT_BOOL, True),
+        ],
+    )
+
+    expected = first.replace(microsecond=0)
+    assert {
+        device.last_confirmed_s1_state.get(dp_id).confirmed_at for dp_id in (8, 33)
+    } == {expected}
+    assert device.last_confirmed_s1_state.get(8).value == 74
+    assert device.last_confirmed_s1_state.get(33).value is True
     _cleanup(coordinator, listeners)
 
 
