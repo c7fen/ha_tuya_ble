@@ -450,6 +450,13 @@ S1_LAST_CONFIRMED_DP_TYPES = {
 }
 
 
+def _normalize_s1_confirmation_timestamp(value: datetime) -> datetime | None:
+    """Return the canonical aware UTC timestamp used by retained S1 state."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
 @dataclass(frozen=True)
 class S1LastConfirmedValue:
     """One safe S1 value confirmed by the exact active BLE session."""
@@ -495,6 +502,8 @@ class S1LastConfirmedState:
         epoch = self._owner.current_session_epoch
         if epoch is None:
             return
+        confirmed_at = _normalize_s1_confirmation_timestamp(datetime.now(timezone.utc))
+        assert confirmed_at is not None
         changed = False
         for datapoint in datapoints:
             dp_id = datapoint.id
@@ -505,13 +514,13 @@ class S1LastConfirmedState:
                 or not self._is_valid(dp_id, datapoint.value)
             ):
                 continue
-            confirmed_at = datetime.now(timezone.utc)
             previous = self._values.get(dp_id)
+            value_confirmed_at = confirmed_at
             if previous is not None:
-                confirmed_at = max(confirmed_at, previous.confirmed_at)
+                value_confirmed_at = max(value_confirmed_at, previous.confirmed_at)
             self._values[dp_id] = S1LastConfirmedValue(
                 datapoint.value,
-                confirmed_at,
+                value_confirmed_at,
                 True,
                 "current_session",
             )
@@ -541,18 +550,18 @@ class S1LastConfirmedState:
 
     def restore(self, dp_id: int, value: object, confirmed_at: datetime) -> bool:
         """Restore one independently validated HA state as stale data."""
+        normalized = _normalize_s1_confirmation_timestamp(confirmed_at)
         if (
             not self.enabled
             or dp_id not in S1_LAST_CONFIRMED_DP_IDS
             or dp_id in self._values
             or not self._is_valid(dp_id, value)
-            or confirmed_at.tzinfo is None
-            or confirmed_at.utcoffset() is None
+            or normalized is None
         ):
             return False
         self._values[dp_id] = S1LastConfirmedValue(
             value,
-            confirmed_at.astimezone(timezone.utc),
+            normalized,
             False,
             "restored",
         )

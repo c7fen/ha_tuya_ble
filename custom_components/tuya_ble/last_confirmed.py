@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from .tuya_ble.tuya_ble import _normalize_s1_confirmation_timestamp
 
 
 def _parse_restored_timestamp(value: object) -> datetime | None:
@@ -17,7 +19,7 @@ def _parse_restored_timestamp(value: object) -> datetime | None:
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
-    return parsed.astimezone(timezone.utc)
+    return _normalize_s1_confirmation_timestamp(parsed)
 
 
 class TuyaBLES1LastConfirmedEntity:
