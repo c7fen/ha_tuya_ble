@@ -2588,7 +2588,9 @@ class TuyaBLEDevice:
     def _invalidate_session_data(self, token: ConnectionSessionToken | None) -> None:
         """Publish loss of exact-session datapoint validity once."""
         generation = self._status_observation
-        if generation is not None and generation.session_token is token:
+        if generation is not None and (
+            token is None or generation.session_token is token
+        ):
             self._emit_status_observation("SESSION_INVALIDATED")
             self._emit_status_observation("OBSERVATION_ENDED")
             self._status_observation = None
