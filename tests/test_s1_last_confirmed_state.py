@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -12,6 +14,7 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.components.sensor import RestoreSensor, SensorEntity
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.restore_state import RestoreEntity, StoredState
 from homeassistant.helpers.restore_state import async_get as async_get_restore
 
@@ -22,7 +25,10 @@ from custom_components.tuya_ble.devices import (
     TuyaBLEEntity,
     TuyaBLEProductInfo,
 )
-from custom_components.tuya_ble.last_confirmed import TuyaBLES1LastConfirmedEntity
+from custom_components.tuya_ble.last_confirmed import (
+    TuyaBLES1LastConfirmedEntity,
+    _parse_restored_timestamp,
+)
 from custom_components.tuya_ble.number import (
     TuyaBLENumber,
     TuyaBLES1LastConfirmedNumber,
@@ -41,6 +47,7 @@ from custom_components.tuya_ble.switch import (
     TuyaBLESwitch,
 )
 from custom_components.tuya_ble.tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
+from custom_components.tuya_ble.tuya_ble import tuya_ble as tuya_ble_protocol
 from custom_components.tuya_ble.tuya_ble.exceptions import (
     TuyaBLECommandUnconfirmedError,
     TuyaBLEControlSuspendedError,
@@ -212,6 +219,61 @@ def _report(
     datapoint = device.datapoints[dp_id]
     assert datapoint is not None
     device._fire_callbacks([datapoint])
+
+
+def _report_batch(
+    device: TuyaBLEDevice,
+    reports: list[tuple[int, TuyaBLEDataPointType, bool | int]],
+) -> None:
+    """Deliver one accepted callback batch through the exact current session."""
+    token = device._connection_token
+    assert token is not None
+    datapoints = []
+    for dp_id, dp_type, value in reports:
+        device.datapoints._update_from_device(dp_id, 0, 0, dp_type, value, token)
+        datapoint = device.datapoints[dp_id]
+        assert datapoint is not None
+        datapoints.append(datapoint)
+    device._fire_callbacks(datapoints)
+
+
+def _freeze_confirmation_time(
+    monkeypatch: pytest.MonkeyPatch, clock: dict[str, datetime]
+) -> None:
+    """Freeze only the local confirmation clock used by the retained S1 model."""
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = clock["value"]
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(tuya_ble_protocol, "datetime", _FrozenDateTime)
+
+
+async def _add_entities_to_real_ha_state_machine(
+    hass: HomeAssistant, entities: dict[str, object]
+) -> list[EntityComponent]:
+    """Attach the reviewed entities to actual Home Assistant entity components."""
+    components: list[EntityComponent] = []
+    for domain, selected in (
+        ("switch", [entities["auto_lock"]]),
+        ("select", [entities["authentication"]]),
+        ("number", [entities["auto_lock_delay"]]),
+        ("sensor", [entities["battery"], entities["last_status"]]),
+    ):
+        for entity in selected:
+            del entity.async_write_ha_state
+        component = EntityComponent(logging.getLogger(__name__), domain, hass)
+        await component.async_add_entities(selected)
+        components.append(component)
+    await hass.async_block_till_done()
+    return components
+
+
+def _state_timestamp(value: object) -> datetime:
+    """Read Home Assistant's in-memory datetime attribute representation."""
+    return value if isinstance(value, datetime) else datetime.fromisoformat(value)
 
 
 def _intentional_disconnect(
@@ -1066,4 +1128,164 @@ async def test_s1_last_status_never_moves_backward_and_listener_cycles_cleanup(
         await status.async_will_remove_from_hass()
         assert device.last_confirmed_s1_state._callbacks == []
     assert len(unique_ids) == 1
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_timestamp_precision_contract_uses_real_ha_state_machine(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Public HA state and every scoped attribute use one exact UTC second."""
+    fixed = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
+    _freeze_confirmation_time(monkeypatch, {"value": fixed})
+    device, coordinator, entities, listeners = _make_entities(hass)
+    await _add_entities_to_real_ha_state_machine(hass, entities)
+    _begin_authenticated_session(device)
+    _report_batch(
+        device,
+        [
+            (33, TuyaBLEDataPointType.DT_BOOL, True),
+            (34, TuyaBLEDataPointType.DT_ENUM, 1),
+            (36, TuyaBLEDataPointType.DT_VALUE, 45),
+            (8, TuyaBLEDataPointType.DT_VALUE, 73),
+        ],
+    )
+    await hass.async_block_till_done()
+
+    scoped = [
+        _state_timestamp(
+            hass.states.get(entities[key].entity_id).attributes["last_confirmed_at"]
+        )
+        for key in ("auto_lock", "authentication", "auto_lock_delay", "battery")
+    ]
+    status = hass.states.get(entities["last_status"].entity_id)
+    assert status is not None
+    public_timestamp = datetime.fromisoformat(status.state)
+    expected = fixed.replace(microsecond=0)
+
+    assert max(scoped) - public_timestamp == timedelta(0), (
+        "S1 scoped confirmation attributes and Home Assistant's public timestamp "
+        "sensor state must compare exactly"
+    )
+    assert scoped == [expected] * 4
+    assert entities["last_status"].native_value == expected
+    assert public_timestamp == expected
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_confirmation_batch_uses_one_normalized_utc_second(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One accepted callback batch gives all valid scoped reports one timestamp."""
+    fixed = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
+    _freeze_confirmation_time(monkeypatch, {"value": fixed})
+    device, coordinator, entities, listeners = _make_entities(hass)
+    _begin_authenticated_session(device)
+
+    _report_batch(
+        device,
+        [
+            (33, TuyaBLEDataPointType.DT_BOOL, True),
+            (34, TuyaBLEDataPointType.DT_ENUM, 1),
+            (36, TuyaBLEDataPointType.DT_VALUE, 45),
+            (8, TuyaBLEDataPointType.DT_VALUE, 73),
+        ],
+    )
+
+    expected = fixed.replace(microsecond=0)
+    assert {
+        device.last_confirmed_s1_state.get(dp_id).confirmed_at
+        for dp_id in (8, 33, 34, 36)
+    } == {expected}
+    assert device.last_confirmed_s1_state.latest_confirmed_at == expected
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_restore_normalizes_legacy_precision_and_rejects_bad_timestamps(
+    hass: HomeAssistant,
+) -> None:
+    """Restoration accepts aware legacy values, but retains only UTC seconds."""
+    device, coordinator, entities, listeners = _make_entities(hass)
+    legacy = "2026-08-28T14:34:56.543896+02:00"
+    expected = datetime(2026, 8, 28, 12, 34, 56, tzinfo=timezone.utc)
+    for key, state in (
+        ("auto_lock", "on"),
+        ("authentication", "finger_card"),
+        ("auto_lock_delay", "45.0"),
+        ("battery", "73.0"),
+    ):
+        await _restore_entity(hass, entities[key], state, {"last_confirmed_at": legacy})
+    await _restore_entity(hass, entities["last_status"], legacy, {})
+
+    assert {
+        device.last_confirmed_s1_state.get(dp_id).confirmed_at
+        for dp_id in (8, 33, 34, 36)
+    } == {expected}
+    assert entities["last_status"].native_value == expected
+    assert (
+        device.last_confirmed_s1_state.restore(
+            33, True, datetime(2026, 8, 28, 12, 34, 56)
+        )
+        is False
+    )
+    assert _parse_restored_timestamp("invalid") is None
+    assert _parse_restored_timestamp(datetime(2026, 8, 28, 12, 34, 56)) is None
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_same_second_value_changes_publish_without_moving_time_backward(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Value changes within a second publish, while a backward clock stays monotonic."""
+    first = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
+    clock = {"value": first}
+    _freeze_confirmation_time(monkeypatch, clock)
+    device, coordinator, entities, listeners = _make_entities(hass)
+    _begin_authenticated_session(device)
+    _report(device, 8, TuyaBLEDataPointType.DT_VALUE, 73)
+    confirmed = device.last_confirmed_s1_state.get(8)
+    assert confirmed is not None
+    expected = first.replace(microsecond=0)
+    assert confirmed.confirmed_at == expected
+
+    entities["battery"].async_write_ha_state.reset_mock()
+    entities["last_status"].async_write_ha_state.reset_mock()
+    clock["value"] = first.replace(microsecond=999999)
+    _report(device, 8, TuyaBLEDataPointType.DT_VALUE, 74)
+    updated = device.last_confirmed_s1_state.get(8)
+    assert updated is not None
+    assert updated.value == 74
+    assert updated.data_fresh is True
+    assert updated.value_source == "current_session"
+    assert updated.confirmed_at == expected
+    entities["battery"].async_write_ha_state.assert_called()
+    entities["last_status"].async_write_ha_state.assert_called()
+
+    clock["value"] = first - timedelta(seconds=1)
+    _report(device, 8, TuyaBLEDataPointType.DT_VALUE, 75)
+    monotonic = device.last_confirmed_s1_state.get(8)
+    assert monotonic is not None
+    assert monotonic.value == 75
+    assert monotonic.confirmed_at == expected
+    _cleanup(coordinator, listeners)
+
+
+async def test_s1_timestamp_normalization_never_uses_ble_transport(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timestamp presentation is local and never creates a transport side effect."""
+    fixed = datetime(2026, 8, 28, 12, 34, 56, 543896, tzinfo=timezone.utc)
+    _freeze_confirmation_time(monkeypatch, {"value": fixed})
+    device, coordinator, _entities, listeners = _make_entities(hass)
+    device._ensure_connected = AsyncMock()
+    device._send_datapoints = AsyncMock()
+    device._send_datapoints_once = AsyncMock()
+    device._send_datapoints_no_replay = AsyncMock()
+    _begin_authenticated_session(device)
+
+    _report(device, 8, TuyaBLEDataPointType.DT_VALUE, 73)
+
+    device._ensure_connected.assert_not_awaited()
+    device._send_datapoints.assert_not_awaited()
+    device._send_datapoints_once.assert_not_awaited()
+    device._send_datapoints_no_replay.assert_not_awaited()
     _cleanup(coordinator, listeners)
