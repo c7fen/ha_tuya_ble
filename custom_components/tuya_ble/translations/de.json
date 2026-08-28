@@ -297,6 +297,9 @@
             "residual_electricity": {
                 "name": "Batterie"
             },
+            "last_status_update": {
+                "name": "Letzte Statusaktualisierung"
+            },
             "signal_strength": {
                 "name": "Signalstärke"
             },

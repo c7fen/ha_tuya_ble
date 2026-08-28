@@ -2,30 +2,30 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 from typing import Callable
 
 from homeassistant.components.number import (
-    NumberEntityDescription,
     NumberEntity,
+    NumberEntityDescription,
 )
 from homeassistant.components.number.const import NumberDeviceClass, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
+    Platform,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfTime,
     UnitOfVolume,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    Platform,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -41,6 +41,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class TuyaBLENumberMapping:
     setter: TuyaBLENumberSetter = None
     mode: NumberMode = NumberMode.BOX
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -940,6 +942,7 @@ mapping: dict[str, TuyaBLECategoryNumberMapping] = {
                     getter=get_smart_lock_auto_lock_time,
                     mode=NumberMode.BOX,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             **dict.fromkeys(
@@ -1100,6 +1103,23 @@ class TuyaBLENumber(TuyaBLEEntity, NumberEntity):
         return result
 
 
+class TuyaBLES1LastConfirmedNumber(
+    TuyaBLENumber, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Auto-Lock Delay only."""
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the safely retained S1 configuration value."""
+        retained = self._last_confirmed_value
+        return float(retained.value) if retained is not None else None
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
+
+
 class TuyaBLEOnDemandConnectionHoldTimeNumber(TuyaBLEEntity, NumberEntity):
     """Local S1 On-Demand connection hold-time configuration."""
 
@@ -1164,8 +1184,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedNumber
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 36
+                else TuyaBLENumber
+            )
             entities.append(
-                TuyaBLENumber(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

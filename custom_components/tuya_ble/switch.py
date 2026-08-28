@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from homeassistant.components.switch import (
-    SwitchEntityDescription,
-    SwitchEntity,
     SwitchDeviceClass,
+    SwitchEntity,
+    SwitchEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import CONF_BLE_CONTROL_ENABLED, DOMAIN
@@ -26,6 +26,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class TuyaBLESwitchMapping:
     getter: TuyaBLESwitchGetter = None
     setter: TuyaBLESwitchSetter = None
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 def is_fingerbot_in_program_mode(
@@ -560,6 +562,7 @@ mapping: dict[str, TuyaBLECategorySwitchMapping] = {
                     dp_type=TuyaBLEDataPointType.DT_BOOL,
                     getter=smart_lock_automatic_lock_getter,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             "y2yaegze": [
@@ -1014,6 +1017,23 @@ class TuyaBLESwitch(TuyaBLEEntity, SwitchEntity):
         return result
 
 
+class TuyaBLES1LastConfirmedSwitch(
+    TuyaBLESwitch, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Auto-Lock switch only."""
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the safely retained S1 configuration value."""
+        retained = self._last_confirmed_value
+        return retained.value if retained is not None else None
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
+
+
 class TuyaBLEControlSwitch(TuyaBLEEntity, SwitchEntity):
     """Persistently permit or suspend Home Assistant BLE control."""
 
@@ -1095,8 +1115,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSwitch
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 33
+                else TuyaBLESwitch
+            )
             entities.append(
-                TuyaBLESwitch(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

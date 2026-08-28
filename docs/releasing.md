@@ -27,6 +27,21 @@ For each release:
 Version changes must never cause a duplicate release or a downgrade. Published
 tag history is immutable.
 
+## Release attestation mode
+
+Ordinary feature pull requests run the always-on repository safety checks.
+Immutable published-release snapshot assertions run only in release-attestation
+mode. For local release preparation, run:
+
+```bash
+TUYA_BLE_RELEASE_ATTESTATION=1 pytest -q tests/test_release_metadata.py
+```
+
+GitHub pull requests whose head branch starts with `release/` and GitHub
+contexts whose ref starts with `refs/tags/v` activate the same assertions
+automatically. A feature branch must never update the last published release
+digest merely to make ordinary development pass.
+
 ## Future automation
 
 Release automation may return only in a dedicated, reviewed pull request after

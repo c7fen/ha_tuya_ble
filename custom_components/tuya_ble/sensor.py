@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-import logging
 from typing import Callable
+
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -17,24 +19,25 @@ from homeassistant.const import (
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    Platform,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfTime,
     UnitOfVolume,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    Platform,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
 from .const import (
-    BATTERY_STATE_HIGH,
-    BATTERY_STATE_LOW,
-    BATTERY_STATE_NORMAL,
     BATTERY_CHARGED,
     BATTERY_CHARGING,
     BATTERY_NOT_CHARGING,
+    BATTERY_STATE_HIGH,
+    BATTERY_STATE_LOW,
+    BATTERY_STATE_NORMAL,
     CO2_LEVEL_ALARM,
     CO2_LEVEL_NORMAL,
     DOMAIN,
@@ -45,6 +48,7 @@ from .devices import (
     TuyaBLEEntity,
     TuyaBLEProductInfo,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity, _parse_restored_timestamp
 from .tuya_ble import TuyaBLEDataPoint, TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +69,7 @@ class TuyaBLESensorMapping:
     icons: list[str] | None = None
     is_available: TuyaBLESensorIsAvailable = None
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 @dataclass
@@ -80,6 +85,20 @@ class TuyaBLELastUnlockSensorMapping:
             entity_category=EntityCategory.DIAGNOSTIC,
         )
     )
+
+
+@dataclass
+class TuyaBLELastStatusUpdateMapping:
+    """Describe the S1 aggregate confirmation timestamp diagnostic."""
+
+    description: SensorEntityDescription = field(
+        default_factory=lambda: SensorEntityDescription(
+            key="last_status_update",
+            device_class=SensorDeviceClass.TIMESTAMP,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+    )
+    force_add: bool = True
 
 
 @dataclass
@@ -549,6 +568,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                     dp_id=8,
                     dp_type=TuyaBLEDataPointType.DT_VALUE,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
                 TuyaBLELastUnlockSensorMapping(
                     unlock_methods={
@@ -575,6 +595,7 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                         ],
                     ),
                 ),
+                TuyaBLELastStatusUpdateMapping(),
                 TuyaBLESensorMapping(
                     dp_id=40,
                     description=SensorEntityDescription(
@@ -2106,6 +2127,30 @@ class TuyaBLESensor(TuyaBLEEntity, SensorEntity):
         return result
 
 
+class TuyaBLES1LastConfirmedSensor(
+    TuyaBLESensor, TuyaBLES1LastConfirmedEntity, RestoreSensor
+):
+    """Restore the exact S1 Battery sensor only."""
+
+    @property
+    def native_value(self):
+        """Return the safely retained S1 Battery value."""
+        retained = self._last_confirmed_value
+        return retained.value if retained is not None else None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Publish retained S1 Battery state without generic sensor updates."""
+        retained = self._last_confirmed_value
+        self._attr_native_value = retained.value if retained is not None else None
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
+
+
 def _select_last_unlock_datapoint(
     unlock_methods: Mapping[int, str],
     update_batch: Sequence[TuyaBLEDataPoint],
@@ -2175,6 +2220,60 @@ class TuyaBLELastUnlockSensor(TuyaBLEEntity, SensorEntity):
         self.async_write_ha_state()
 
 
+class TuyaBLELastStatusUpdateSensor(TuyaBLEEntity, RestoreSensor):
+    """Expose the latest scoped S1 confirmation without any BLE work."""
+
+    platform = Platform.SENSOR
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: TuyaBLECoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+        mapping: TuyaBLELastStatusUpdateMapping,
+    ) -> None:
+        super().__init__(hass, coordinator, device, product, mapping.description)
+        self._restored_timestamp = None
+        self._unsub_last_confirmed = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the aggregate timestamp without initiating BLE work."""
+        await super().async_added_to_hass()
+        previous = await self.async_get_last_state()
+        if previous is not None:
+            self._restored_timestamp = _parse_restored_timestamp(previous.state)
+        self._unsub_last_confirmed = (
+            self._device.last_confirmed_s1_state.register_callback(
+                self.async_write_ha_state
+            )
+        )
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Release the local presentation listener on unload."""
+        unsubscribe = self._unsub_last_confirmed
+        self._unsub_last_confirmed = None
+        if unsubscribe is not None:
+            unsubscribe()
+        await super().async_will_remove_from_hass()
+
+    @property
+    def native_value(self):
+        """Return the latest retained timestamp, if any."""
+        latest = self._device.last_confirmed_s1_state.latest_confirmed_at
+        if latest is None:
+            return self._restored_timestamp
+        if self._restored_timestamp is None:
+            return latest
+        return max(latest, self._restored_timestamp)
+
+    @property
+    def available(self) -> bool:
+        """Stay visible after disconnect once a safe timestamp exists."""
+        return self.native_value is not None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -2183,7 +2282,9 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLESensor | TuyaBLELastUnlockSensor] = [
+    entities: list[
+        TuyaBLESensor | TuyaBLELastUnlockSensor | TuyaBLELastStatusUpdateSensor
+    ] = [
         TuyaBLESensor(
             hass,
             data.coordinator,
@@ -2193,6 +2294,17 @@ async def async_setup_entry(
         )
     ]
     for mapping in mappings:
+        if isinstance(mapping, TuyaBLELastStatusUpdateMapping):
+            entities.append(
+                TuyaBLELastStatusUpdateSensor(
+                    hass,
+                    data.coordinator,
+                    data.device,
+                    data.product,
+                    mapping,
+                )
+            )
+            continue
         if isinstance(mapping, TuyaBLELastUnlockSensorMapping):
             entities.append(
                 TuyaBLELastUnlockSensor(
@@ -2206,8 +2318,16 @@ async def async_setup_entry(
         elif mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSensor
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 8
+                else TuyaBLESensor
+            )
             entities.append(
-                TuyaBLESensor(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

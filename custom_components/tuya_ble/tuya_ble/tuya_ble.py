@@ -441,6 +441,164 @@ class TuyaBLEDataPoints:
         await self._owner._send_datapoints_no_replay([dp_id])
 
 
+S1_LAST_CONFIRMED_DP_IDS = frozenset({8, 33, 34, 36})
+S1_LAST_CONFIRMED_DP_TYPES = {
+    8: TuyaBLEDataPointType.DT_VALUE,
+    33: TuyaBLEDataPointType.DT_BOOL,
+    34: TuyaBLEDataPointType.DT_ENUM,
+    36: TuyaBLEDataPointType.DT_VALUE,
+}
+
+
+def _normalize_s1_confirmation_timestamp(value: datetime) -> datetime | None:
+    """Return the canonical aware UTC timestamp used by retained S1 state."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+@dataclass(frozen=True)
+class S1LastConfirmedValue:
+    """One safe S1 value confirmed by the exact active BLE session."""
+
+    value: bool | int
+    confirmed_at: datetime
+    data_fresh: bool
+    value_source: str
+
+
+class S1LastConfirmedState:
+    """Device-owned, product-scoped state retained across session invalidation."""
+
+    def __init__(self, owner: TuyaBLEDevice) -> None:
+        self._owner = owner
+        self._values: dict[int, S1LastConfirmedValue] = {}
+        self._callbacks: list[Callable[[], None]] = []
+
+    @property
+    def enabled(self) -> bool:
+        return (self._owner.category, self._owner.product_id) == (
+            "jtmspro",
+            "xqeob8h6",
+        )
+
+    def get(self, dp_id: int) -> S1LastConfirmedValue | None:
+        """Return one retained value, only for the exact S1 scope."""
+        if not self.enabled or dp_id not in S1_LAST_CONFIRMED_DP_IDS:
+            return None
+        return self._values.get(dp_id)
+
+    @property
+    def latest_confirmed_at(self) -> datetime | None:
+        """Return the latest safe confirmation time across the scoped DPs."""
+        if not self.enabled or not self._values:
+            return None
+        return max(value.confirmed_at for value in self._values.values())
+
+    def promote(self, datapoints: list[TuyaBLEDataPoint]) -> None:
+        """Accept only validated inbound data owned by the active exact session."""
+        if not self.enabled:
+            return
+        epoch = self._owner.current_session_epoch
+        if epoch is None:
+            return
+        confirmed_at = _normalize_s1_confirmation_timestamp(datetime.now(timezone.utc))
+        assert confirmed_at is not None
+        accepted = [
+            datapoint
+            for datapoint in datapoints
+            if datapoint.id in S1_LAST_CONFIRMED_DP_IDS
+            and datapoint.received_session_epoch == epoch
+            and datapoint.type == S1_LAST_CONFIRMED_DP_TYPES[datapoint.id]
+            and self._is_valid(datapoint.id, datapoint.value)
+        ]
+        if not accepted:
+            return
+        batch_confirmed_at = confirmed_at
+        for datapoint in accepted:
+            previous = self._values.get(datapoint.id)
+            if previous is not None:
+                batch_confirmed_at = max(batch_confirmed_at, previous.confirmed_at)
+        changed = False
+        for datapoint in accepted:
+            dp_id = datapoint.id
+            self._values[dp_id] = S1LastConfirmedValue(
+                datapoint.value,
+                batch_confirmed_at,
+                True,
+                "current_session",
+            )
+            changed = True
+        if changed:
+            self._notify()
+
+    def invalidate(self) -> None:
+        """Downgrade prior confirmations without changing their value or time."""
+        if not self.enabled:
+            return
+        changed = False
+        values: dict[int, S1LastConfirmedValue] = {}
+        for dp_id, value in self._values.items():
+            if value.data_fresh:
+                value = S1LastConfirmedValue(
+                    value.value,
+                    value.confirmed_at,
+                    False,
+                    "retained",
+                )
+                changed = True
+            values[dp_id] = value
+        self._values = values
+        if changed:
+            self._notify()
+
+    def restore(self, dp_id: int, value: object, confirmed_at: datetime) -> bool:
+        """Restore one independently validated HA state as stale data."""
+        normalized = _normalize_s1_confirmation_timestamp(confirmed_at)
+        if (
+            not self.enabled
+            or dp_id not in S1_LAST_CONFIRMED_DP_IDS
+            or dp_id in self._values
+            or not self._is_valid(dp_id, value)
+            or normalized is None
+        ):
+            return False
+        self._values[dp_id] = S1LastConfirmedValue(
+            value,
+            normalized,
+            False,
+            "restored",
+        )
+        self._notify()
+        return True
+
+    def register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Register a presentation-only callback for retained-state changes."""
+        self._callbacks.append(callback)
+
+        def unregister_callback() -> None:
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+
+        return unregister_callback
+
+    def _notify(self) -> None:
+        for callback in tuple(self._callbacks):
+            callback()
+
+    @staticmethod
+    def _is_valid(dp_id: int, value: object) -> bool:
+        if dp_id == 33:
+            return isinstance(value, bool)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        if dp_id == 8:
+            return 0 <= value <= 100
+        if dp_id == 34:
+            return value in (0, 1)
+        return 1 <= value <= 1800
+
+
 class TuyaBLEConnectionLease(AbstractAsyncContextManager):
     """Reference-counted permission to use one device connection."""
 
@@ -645,6 +803,7 @@ class TuyaBLEDevice:
         # self._input_future: asyncio.Future[int] | None = None
 
         self._datapoints = TuyaBLEDataPoints(self)
+        self._last_confirmed_s1_state = S1LastConfirmedState(self)
 
         self._function = {}
         self._status_range = {}
@@ -2143,6 +2302,11 @@ class TuyaBLEDevice:
         return self._datapoints
 
     @property
+    def last_confirmed_s1_state(self) -> S1LastConfirmedState:
+        """Return the product-scoped retained S1 state model."""
+        return self._last_confirmed_s1_state
+
+    @property
     def status(self) -> dict[str, Any]:
         """Get current datapoints values."""
 
@@ -2203,6 +2367,7 @@ class TuyaBLEDevice:
 
     def _fire_callbacks(self, datapoints: list[TuyaBLEDataPoint]) -> None:
         """Fire the callbacks."""
+        self._last_confirmed_s1_state.promote(datapoints)
         for callback in tuple(self._callbacks):
             callback(datapoints)
 
@@ -2318,6 +2483,7 @@ class TuyaBLEDevice:
         """Publish loss of exact-session datapoint validity once."""
         self._notifications_active = False
         self._state_data_fresh = False
+        self._last_confirmed_s1_state.invalidate()
         if token is not None and self._confirmed_activity_session is token:
             self._last_confirmed_activity_monotonic = None
             self._confirmed_activity_session = None

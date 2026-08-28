@@ -2,29 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
-import logging
-
 from homeassistant.components.select import (
-    SelectEntityDescription,
     SelectEntity,
+    SelectEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature, Platform
+from homeassistant.const import Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_CONNECTION_MODE,
-    ConnectionMode,
     DOMAIN,
     FINGERBOT_MODE_PROGRAM,
     FINGERBOT_MODE_PUSH,
     FINGERBOT_MODE_SWITCH,
+    ConnectionMode,
 )
 from .devices import (
     TuyaBLEData,
@@ -32,6 +32,7 @@ from .devices import (
     TuyaBLEProductInfo,
     ensure_control_available,
 )
+from .last_confirmed import TuyaBLES1LastConfirmedEntity
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class TuyaBLESelectMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     requires_current_session: bool = False
+    last_confirmed: bool = False
 
 
 @dataclass
@@ -503,6 +505,7 @@ mapping: dict[str, TuyaBLECategorySelectMapping] = {
                     ),
                     dp_type=TuyaBLEDataPointType.DT_ENUM,
                     requires_current_session=True,
+                    last_confirmed=True,
                 ),
             ],
             "hc7n0urm": [  # A1 Ultra-JM
@@ -889,6 +892,25 @@ class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
                     self._hass.create_task(datapoint.set_value(int_value))
 
 
+class TuyaBLES1LastConfirmedSelect(
+    TuyaBLESelect, TuyaBLES1LastConfirmedEntity, RestoreEntity
+):
+    """Restore the exact S1 Authentication Mode only."""
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the safely retained S1 selection."""
+        retained = self._last_confirmed_value
+        if retained is None:
+            return None
+        return self._attr_options[retained.value]
+
+    @property
+    def available(self) -> bool:
+        """Keep a validated retained S1 value visible after disconnect."""
+        return self._last_confirmed_value is not None
+
+
 class TuyaBLEConnectionModeSelect(TuyaBLEEntity, SelectEntity):
     """Select the per-device BLE connection mode."""
 
@@ -966,8 +988,16 @@ async def async_setup_entry(
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
         ):
+            entity_class = (
+                TuyaBLES1LastConfirmedSelect
+                if (data.device.category, data.device.product_id)
+                == ("jtmspro", "xqeob8h6")
+                and mapping.last_confirmed
+                and mapping.dp_id == 34
+                else TuyaBLESelect
+            )
             entities.append(
-                TuyaBLESelect(
+                entity_class(
                     hass,
                     data.coordinator,
                     data.device,

@@ -12,6 +12,9 @@ quiet-level = 3
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "release_freeze: exact immutable published-release snapshot assertion",
+]
 
 [tool.coverage.run]
 source = ["tests"]
