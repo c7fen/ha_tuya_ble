@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
+import pytest
 from bleak.backends.device import BLEDevice
 
 from custom_components.tuya_ble.const import ConnectionMode
+from custom_components.tuya_ble.tuya_ble.const import TuyaBLECode
+from custom_components.tuya_ble.tuya_ble.exceptions import TuyaBLEDeviceError
 from custom_components.tuya_ble.tuya_ble.tuya_ble import (
     ConnectionSessionToken,
     TuyaBLEDataPointType,
@@ -19,11 +23,13 @@ class _SyntheticClient:
     is_connected = True
 
 
-def _device() -> tuple[TuyaBLEDevice, ConnectionSessionToken]:
+def _device(
+    *, mode: ConnectionMode = ConnectionMode.ON_DEMAND
+) -> tuple[TuyaBLEDevice, ConnectionSessionToken]:
     device = TuyaBLEDevice(
         Mock(),
         BLEDevice("synthetic-s1", "00:00:00:00:00:37", {}),
-        connection_mode=ConnectionMode.ON_DEMAND.value,
+        connection_mode=mode.value,
     )
     device._device_info = SimpleNamespace(category="jtmspro", product_id="xqeob8h6")
     client = _SyntheticClient()
@@ -33,7 +39,36 @@ def _device() -> tuple[TuyaBLEDevice, ConnectionSessionToken]:
     device._connection_epoch = token.epoch
     device._notifications_active = True
     device._is_paired = True
+    device._schedule_idle_disconnect_locked = Mock()
     return device, token
+
+
+def _install_status_response_transport(
+    device: TuyaBLEDevice,
+    token: ConnectionSessionToken,
+) -> AsyncMock:
+    """Answer each synthetic status write with its matching status response."""
+    device._build_packets = Mock(return_value=[b"synthetic-status-request"])
+    status_calls: list[TuyaBLECode] = []
+
+    async def respond(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        assert session_token is token
+        response_key = next(iter(device._input_expected_responses))
+        status_calls.append(TuyaBLECode.FUN_SENDER_DEVICE_STATUS)
+        device._handle_command_or_response(
+            1,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=token,
+        )
+
+    transport = AsyncMock(side_effect=respond)
+    device._int_send_packet_while_connected = transport
+    transport.status_calls = status_calls
+    return transport
 
 
 def test_status_request_has_private_exact_session_observation_generation():
@@ -176,3 +211,181 @@ def test_session_invalidation_ends_generation_and_stale_batch_is_ignored():
         "OBSERVATION_ENDED",
     ]
     assert device._status_observation is None
+
+
+async def test_explicit_status_waiter_rejects_wrong_response_code() -> None:
+    """A matching sequence alone must not complete the public update request."""
+    device, token = _device()
+    events = []
+    device.register_status_observer(events.append)
+    device._build_packets = Mock(return_value=[b"synthetic-status-request"])
+
+    async def respond_with_wrong_then_correct(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        assert session_token is token
+        response_key, future = next(iter(device._input_expected_responses.items()))
+        device._handle_command_or_response(
+            1,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DPS,
+            b"\x00",
+            session_token=token,
+        )
+        assert future.done() is False
+        assert not [event for event in events if event.kind == "ACK_SUCCESS"]
+        device._handle_command_or_response(
+            2,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=token,
+        )
+
+    device._int_send_packet_while_connected = AsyncMock(
+        side_effect=respond_with_wrong_then_correct
+    )
+
+    await device.update()
+
+    assert [event.kind for event in events] == [
+        "REQUEST_CREATED",
+        "REQUEST_HANDED_TO_TRANSPORT",
+        "ACK_SUCCESS",
+    ]
+
+
+async def test_automatic_status_waiter_rejects_wrong_response_code() -> None:
+    """The once-per-session automatic request has the same response contract."""
+    device, token = _device(mode=ConnectionMode.ALWAYS_CONNECTED)
+    events = []
+    device.register_status_observer(events.append)
+    device._build_packets = Mock(return_value=[b"synthetic-status-request"])
+
+    async def respond_with_wrong_then_correct(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        assert session_token is token
+        response_key, future = next(iter(device._input_expected_responses.items()))
+        device._handle_command_or_response(
+            1,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DPS,
+            b"\x00",
+            session_token=token,
+        )
+        assert future.done() is False
+        assert not [event for event in events if event.kind == "ACK_SUCCESS"]
+        device._handle_command_or_response(
+            2,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=token,
+        )
+
+    device._int_send_packet_while_connected = AsyncMock(
+        side_effect=respond_with_wrong_then_correct
+    )
+
+    assert await device._request_status_while_connected(token) is True
+    assert device._status_attempted_token is token
+    assert [event.kind for event in events] == [
+        "REQUEST_CREATED",
+        "REQUEST_HANDED_TO_TRANSPORT",
+        "ACK_SUCCESS",
+    ]
+
+
+async def test_overlapping_explicit_status_terminal_events_keep_request_owner() -> None:
+    """A superseded request still owns its later transport terminal outcome."""
+    device, token = _device()
+    events = []
+    writes_started = 0
+    both_writes_started = asyncio.Event()
+    device.register_status_observer(events.append)
+    device._build_packets = Mock(return_value=[b"synthetic-status-request"])
+
+    async def hold_response_waits(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        nonlocal writes_started
+        assert session_token is token
+        writes_started += 1
+        if writes_started == 2:
+            both_writes_started.set()
+
+    device._int_send_packet_while_connected = AsyncMock(side_effect=hold_response_waits)
+    request_a = asyncio.create_task(device.update())
+    request_b = asyncio.create_task(device.update())
+    await both_writes_started.wait()
+
+    response_keys = sorted(device._input_expected_responses, key=lambda key: key[1])
+    assert [key[1] for key in response_keys] == [1, 2]
+    device._input_expected_responses[response_keys[0]].set_exception(
+        TuyaBLEDeviceError(1)
+    )
+    await asyncio.sleep(0)
+    device._handle_command_or_response(
+        2,
+        response_keys[1][1],
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+        b"\x00",
+        session_token=token,
+    )
+
+    with pytest.raises(TuyaBLEDeviceError):
+        await request_a
+    await request_b
+
+    terminal_events = [
+        event for event in events if event.kind in {"ACK_SUCCESS", "ACK_FAILURE"}
+    ]
+    assert [(event.observation_ordinal, event.kind) for event in terminal_events] == [
+        (1, "ACK_FAILURE"),
+        (2, "ACK_SUCCESS"),
+    ]
+    assert [event.batch_ordinal for event in terminal_events] == [None, None]
+
+
+async def test_automatic_marker_survives_real_explicit_update_without_extra_request() -> (
+    None
+):
+    """Automatic/explicit interaction never resets the automatic request marker."""
+    device, token = _device(mode=ConnectionMode.ALWAYS_CONNECTED)
+    transport = _install_status_response_transport(device, token)
+
+    assert await device._request_status_while_connected(token) is True
+    assert device._status_attempted_token is token
+    await device.update()
+    assert await device._request_status_while_connected(token) is False
+
+    assert transport.await_count == 2
+    assert transport.status_calls == [
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+        TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+    ]
+    assert device._status_attempted_token is token
+
+
+async def test_real_status_paths_add_no_observation_transport_traffic() -> None:
+    """One explicit and one automatic path each write exactly one status request."""
+    explicit_device, explicit_token = _device()
+    explicit_transport = _install_status_response_transport(
+        explicit_device, explicit_token
+    )
+    await explicit_device.update()
+
+    automatic_device, automatic_token = _device(mode=ConnectionMode.ALWAYS_CONNECTED)
+    automatic_transport = _install_status_response_transport(
+        automatic_device, automatic_token
+    )
+    assert await automatic_device._request_status_while_connected(automatic_token)
+    assert (
+        await automatic_device._request_status_while_connected(automatic_token)
+    ) is False
+
+    assert explicit_transport.await_count == 1
+    assert explicit_transport.status_calls == [TuyaBLECode.FUN_SENDER_DEVICE_STATUS]
+    assert automatic_transport.await_count == 1
+    assert automatic_transport.status_calls == [TuyaBLECode.FUN_SENDER_DEVICE_STATUS]
