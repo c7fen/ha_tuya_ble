@@ -70,3 +70,44 @@ def test_one_inbound_message_is_one_metadata_only_dp_batch():
     assert batch.encoded_value_lengths == (2,)
     assert batch.exact_session is True
     assert "7ac3" not in repr(batch).lower()
+
+
+def test_retained_second_request_supersedes_only_the_previous_generation():
+    device, token = _device()
+    events = []
+    device.register_status_observer(events.append)
+
+    first = device._start_status_observation(token, "explicit", 7)
+    second = device._start_status_observation(token, "explicit", 8)
+
+    assert first.ordinal == 1
+    assert second.ordinal == 2
+    assert [event.kind for event in events] == [
+        "REQUEST_CREATED",
+        "OBSERVATION_SUPERSEDED",
+        "OBSERVATION_ENDED",
+        "REQUEST_CREATED",
+    ]
+    assert device._status_attempted_token is None
+
+
+def test_session_invalidation_ends_generation_and_stale_batch_is_ignored():
+    device, token = _device()
+    events = []
+    device.register_status_observer(events.append)
+    device._start_status_observation(token, "explicit", 7)
+
+    device._invalidate_session_data(token)
+    device._parse_datapoints_v3(
+        token,
+        1.0,
+        0,
+        bytes((8, TuyaBLEDataPointType.DT_VALUE.value, 1, 1)),
+        0,
+    )
+
+    assert [event.kind for event in events] == [
+        "REQUEST_CREATED",
+        "SESSION_INVALIDATED",
+        "OBSERVATION_ENDED",
+    ]
