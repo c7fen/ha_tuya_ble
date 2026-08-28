@@ -3335,13 +3335,18 @@ class TuyaBLEDevice:
     ) -> None:
         """Send packet to device and optional read response."""
         async with self.connection_lease("datapoint"):
-            await self._send_packet_while_connected(
-                code,
-                data,
-                0,
-                wait_for_response,
-                status_origin=status_origin,
-            )
+            if status_origin is None:
+                await self._send_packet_while_connected(
+                    code, data, 0, wait_for_response
+                )
+            else:
+                await self._send_packet_while_connected(
+                    code,
+                    data,
+                    0,
+                    wait_for_response,
+                    status_origin=status_origin,
+                )
 
     async def _send_packet_once_confirmed(
         self,
