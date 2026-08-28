@@ -7,9 +7,15 @@ reconnect, polling task, entity, service, or `Refresh Status` button.
 
 The request generation is owned by the exact BLE session and the actual
 outgoing request sequence. Device Status ACK correlation is exact when the
-inbound response has the matching session and `response_to` sequence. Inbound
-DP batches are observed at the parser boundary, so one decoded protocol
-message remains one batch. Their order relative to the ACK is recorded.
+inbound response has the matching session, `response_to` sequence, and Device
+Status response code. Inbound DP batches are observed at the parser boundary,
+so one decoded protocol message remains one batch. Their order relative to the
+ACK is recorded.
+
+A later retained-session request supersedes the prior generation only for
+subsequent DP-batch chronology. Each request retains ownership of its own
+terminal ACK success, failure, or timeout event until its response wait ends;
+the terminal event is never reassigned to a newer generation.
 
 Chronological association is not causal attribution. An observed DP batch is
 not reported as a proven Device Status response by this instrumentation alone;
