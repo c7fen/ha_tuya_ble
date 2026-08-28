@@ -834,6 +834,9 @@ class TuyaBLEDevice:
         self._input_expected_response_codes: dict[
             tuple[ConnectionSessionToken, int], TuyaBLECode
         ] = {}
+        self._input_status_observations: dict[
+            tuple[ConnectionSessionToken, int], _StatusObservationGeneration
+        ] = {}
         # self._input_future: asyncio.Future[int] | None = None
 
         self._datapoints = TuyaBLEDataPoints(self)
@@ -1084,13 +1087,14 @@ class TuyaBLEDevice:
         self,
         kind: str,
         *,
+        generation: _StatusObservationGeneration | None = None,
         batch_ordinal: int | None = None,
         dp_ids: tuple[int, ...] = (),
         dp_types: tuple[str, ...] = (),
         encoded_value_lengths: tuple[int, ...] = (),
         ack_result: str | None = None,
     ) -> None:
-        generation = self._status_observation
+        generation = generation or self._status_observation
         if generation is None:
             return
         self._status_observation_event_ordinal += 1
@@ -1135,7 +1139,7 @@ class TuyaBLEDevice:
             time.monotonic(),
         )
         self._status_observation = generation
-        self._emit_status_observation("REQUEST_CREATED")
+        self._emit_status_observation("REQUEST_CREATED", generation=generation)
         return generation
 
     def _fire_connection_state_callbacks(self, connected: bool) -> None:
@@ -2555,6 +2559,7 @@ class TuyaBLEDevice:
                 continue
             self._input_expected_responses.pop(key, None)
             self._input_expected_response_codes.pop(key, None)
+            self._input_status_observations.pop(key, None)
             if future is not None and not future.done():
                 future.set_exception(TuyaBLEConnectionUnavailableError())
 
@@ -3432,6 +3437,8 @@ class TuyaBLEDevice:
             require_always_connected=require_always_connected,
         ):
             raise TuyaBLEConnectionUnavailableError()
+        if code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS and wait_for_response:
+            expected_response_code = TuyaBLECode.FUN_SENDER_DEVICE_STATUS
         result = True
         future: asyncio.Future | None = None
         generation: _StatusObservationGeneration | None = None
@@ -3447,7 +3454,9 @@ class TuyaBLEDevice:
             generation = self._start_status_observation(
                 token, status_origin or inferred_origin, seq_num
             )
-            self._emit_status_observation("REQUEST_HANDED_TO_TRANSPORT")
+            self._emit_status_observation(
+                "REQUEST_HANDED_TO_TRANSPORT", generation=generation
+            )
         if not self._owns_transport_work(
             token,
             require_always_connected=require_always_connected,
@@ -3461,6 +3470,8 @@ class TuyaBLEDevice:
                 self._input_expected_response_codes[response_key] = (
                     expected_response_code
                 )
+            if generation is not None:
+                self._input_status_observations[response_key] = generation
 
         if response_to > 0:
             _LOGGER.debug(
@@ -3504,7 +3515,9 @@ class TuyaBLEDevice:
                     result = False
                     if generation is not None and not generation.ack_observed:
                         self._emit_status_observation(
-                            "ACK_TIMEOUT", ack_result="timeout"
+                            "ACK_TIMEOUT",
+                            generation=generation,
+                            ack_result="timeout",
                         )
                 if not self._owns_transport_work(
                     token,
@@ -3515,7 +3528,9 @@ class TuyaBLEDevice:
             raise
         except Exception:
             if generation is not None and not generation.ack_observed:
-                self._emit_status_observation("ACK_FAILURE", ack_result="failure")
+                self._emit_status_observation(
+                    "ACK_FAILURE", generation=generation, ack_result="failure"
+                )
             raise
         finally:
             if future:
@@ -3523,6 +3538,7 @@ class TuyaBLEDevice:
                     future.exception()
                 self._input_expected_responses.pop(response_key, None)
                 self._input_expected_response_codes.pop(response_key, None)
+                self._input_status_observations.pop(response_key, None)
 
         return result
 
@@ -4024,7 +4040,7 @@ class TuyaBLEDevice:
             else:
                 future = self._input_expected_responses.pop(response_key, None)
                 self._input_expected_response_codes.pop(response_key, None)
-                generation = self._status_observation
+                generation = self._input_status_observations.pop(response_key, None)
                 if (
                     code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS
                     and generation is not None
@@ -4034,6 +4050,7 @@ class TuyaBLEDevice:
                     generation.ack_observed = True
                     self._emit_status_observation(
                         "ACK_SUCCESS" if result == 0 else "ACK_FAILURE",
+                        generation=generation,
                         ack_result="success" if result == 0 else "failure",
                     )
                 if future:
