@@ -131,6 +131,16 @@ product. It is the newest `last_confirmed_at` across only DP8, DP33, DP34, and
 DP36. It remains visible across disconnect and restart when a valid timestamp
 exists, is unknown otherwise, and never initiates Bluetooth activity.
 
+Issue #36 confirmation timestamps use timezone-aware UTC second precision.
+Home Assistant publishes timestamp-sensor states at second precision, so each
+scoped `last_confirmed_at` and **Last Status Update** compare exactly. Older
+restored attributes with microseconds remain accepted, but are normalized to a
+UTC whole second during restore. This precision does not reduce freshness: a
+valid report still confirms the current exact session, and multiple valid
+reports in one second may intentionally share the same timestamp while their
+values continue to update. **Last Status Update** is diagnostic only; it is not
+proof of the current physical lock state.
+
 Use the freshness attributes in every safety- or state-sensitive automation;
 do not use a visible retained value by itself as proof of the lock's present
 physical configuration. In particular, a Tuya-app change or a local device
