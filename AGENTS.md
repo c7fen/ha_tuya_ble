@@ -51,6 +51,9 @@ and outside the parent directory containing canonical project roots.
   is not sufficient evidence that Supervisor context is unavailable.
 - Do not invent a replacement alias, browser fallback, or alternate route
   merely because the current linked worktree lacks the private local file.
+- Do not invoke or invent a wrapper bootstrap merely because an untracked
+  private file is absent from a linked worktree. First use the established
+  private wrapper and canonical-checkout rules above.
 - A separately authorized local-only wrapper bootstrap MAY consume a
   literal-only private recipe through the repository-owned
   `tools/home_assistant_live_access.py` helper. It must not echo its input,

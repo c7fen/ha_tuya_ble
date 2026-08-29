@@ -15,6 +15,16 @@ from tools import home_assistant_live_access as access
 
 SYNTHETIC_PRIVATE_ROUTE_SENTINEL = "synthetic-private-route-sentinel.invalid"
 SYNTHETIC_PRIVATE_INSTRUCTION_SENTINEL = "synthetic-private-instruction-sentinel"
+SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS = (
+    "synthetic-config-entry-id-sentinel",
+    "synthetic-device-id-sentinel",
+    "synthetic-entity-id-sentinel",
+    "synthetic-supervisor-token-sentinel",
+    "synthetic-authorization-header-sentinel",
+    "synthetic-ssh-agent-environment-sentinel",
+    "synthetic-private-key-sentinel",
+    "/synthetic/private/absolute/evidence/path-sentinel",
+)
 
 
 def _relevant(issue: object) -> bool:
@@ -73,7 +83,7 @@ def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
         ("R-M4", "{}"),
         ("R-M5", '{"issues": null}'),
         ("R-M6", '{"issues": {}}'),
-        ("R-M7", '"not-an-object"'),
+        ("R-M7", '{"issues": "not-a-list"}'),
         ("R-M8", "{"),
     ],
 )
@@ -239,6 +249,28 @@ def test_o_m10_public_results_do_not_retain_private_host_or_path(
     rendered = repr(result)
     assert SYNTHETIC_PRIVATE_ROUTE_SENTINEL not in rendered
     assert str(wrapper) not in rendered
+
+
+def test_transcript_privacy_regression_excludes_all_forbidden_categories() -> None:
+    """Public aggregate evidence excludes every synthetic private category."""
+    response = json.dumps(
+        {
+            "issues": [
+                {
+                    "scope": "integration",
+                    "severity": "critical",
+                    "synthetic_private_values": SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS,
+                }
+            ]
+        }
+    )
+
+    rendered = repr(_collect(response))
+
+    assert all(
+        sentinel not in rendered
+        for sentinel in SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS
+    )
 
 
 def test_wrapper_validation_rejects_shell_metacharacters_and_symlinks(

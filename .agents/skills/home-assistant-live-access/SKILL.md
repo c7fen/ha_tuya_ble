@@ -206,8 +206,15 @@ operation merely to recover from orchestration problems.
 - Avoid `set -x` for live access work.
 - Do not print private evidence/run paths unless a task explicitly requires a
   private local diagnostic and its disclosure is authorized.
+- Do not retain ConfigEntry IDs, device IDs, entity IDs, private absolute
+  evidence paths, or any synthetic sentinels standing in for those values.
 - Do not retain raw Repairs issue objects when aggregate admission counts are
   sufficient.
+- Keep the synthetic transcript-privacy regression in
+  `tests/test_home_assistant_live_access.py` passing. It covers private route
+  and instruction content, ConfigEntry/device/entity identifiers, Supervisor
+  token/header material, SSH-agent environment, private keys, and private
+  absolute evidence paths without using real private data.
 - Public reports should describe the route only as the verified private
   interactive SSH route.
 
