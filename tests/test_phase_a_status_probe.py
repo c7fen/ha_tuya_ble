@@ -18,6 +18,8 @@ from custom_components.tuya_ble.const import (
     ConnectionMode,
     ConnectionPolicyState,
     DOMAIN,
+    PendingRelease,
+    PendingReleaseReason,
 )
 from custom_components.tuya_ble.phase_a_probe import (
     ATTR_CONFIG_ENTRY_ID,
@@ -43,6 +45,19 @@ class _SyntheticClient:
     """Minimal synthetic paired client; never contacts Bluetooth."""
 
     is_connected = True
+
+
+class _DisconnectingSyntheticClient:
+    """Synthetic client that completes one ordinary physical disconnect."""
+
+    def __init__(self) -> None:
+        self.is_connected = True
+        self.stop_notify = AsyncMock()
+
+        async def disconnect() -> None:
+            self.is_connected = False
+
+        self.disconnect = AsyncMock(side_effect=disconnect)
 
 
 def _device(
@@ -464,6 +479,28 @@ async def test_only_the_final_exact_normal_release_completes_the_probe():
 
     assert result["normal_release_observed"] is True
     assert result["result"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_device_reports_only_the_completed_normal_release_with_its_token():
+    """The lifecycle observer is not a generic invalidation notification."""
+    device = _device()
+    client = _DisconnectingSyntheticClient()
+    token = ConnectionSessionToken(client, 1)
+    device._client = client
+    device._connection_token = token
+    device._connection_epoch = token.epoch
+    device._is_paired = True
+    device._notifications_active = True
+    device._pending_release = PendingRelease(PendingReleaseReason.ON_DEMAND_IDLE, 0)
+    observed = []
+    unregister = device.register_on_demand_idle_release_callback(observed.append)
+
+    await device._complete_pending_release()
+    unregister()
+
+    assert observed == [token]
+    assert device._connection_token is None
 
 
 @pytest.mark.asyncio
