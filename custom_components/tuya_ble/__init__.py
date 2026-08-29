@@ -39,6 +39,7 @@ from .phase_a_probe import (
     async_unblock_phase_a_status_probe,
     async_unregister_phase_a_status_probe_if_unused,
 )
+from .phase_a_io_audit import async_register_phase_a_io_audit
 from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [
@@ -654,6 +655,10 @@ def _async_migrate_v1_manual_lock_entity(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tuya BLE from a config entry."""
+
+    # The audit singleton was created at module import. Register its read-only
+    # service before this entry can schedule startup connection work.
+    async_register_phase_a_io_audit(hass)
 
     try:
         manager_data = normalize_app_type_data(dict(entry.options))

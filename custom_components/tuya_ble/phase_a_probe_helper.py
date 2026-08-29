@@ -31,6 +31,7 @@ class HelperOperation(str, Enum):
     PREFLIGHT = "preflight"
     PROBE = "probe"
     RECEIPT = "receipt"
+    AUDIT = "audit"
 
 
 class HelperExit(IntEnum):
@@ -277,6 +278,91 @@ def _clean_receipt_response(value: object) -> dict[str, Any]:
     }
 
 
+def _clean_audit_event(value: object) -> dict[str, Any]:
+    expected = {"event_ordinal", "kind", "monotonic_ms", "protocol_category"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("audit_event_shape")
+    _nonnegative_int(value["event_ordinal"])
+    _nonnegative_int(value["monotonic_ms"])
+    if value["kind"] not in {
+        "CONNECT_ATTEMPT",
+        "GATT_SESSION_CLAIMED",
+        "AUTHENTICATED_SESSION",
+        "PACKET_SENT",
+        "DATAPOINT_WRITE",
+        "RECONNECT_SCHEDULED",
+        "DISCONNECT",
+    }:
+        raise ValueError("audit_event_kind")
+    if value["protocol_category"] not in {
+        None,
+        "DEVICE_STATUS",
+        "DEVICE_INFO",
+        "PAIR",
+        "DATAPOINT",
+        "OTHER",
+    }:
+        raise ValueError("audit_event_category")
+    return {key: value[key] for key in sorted(expected)}
+
+
+def _clean_audit_response(value: object) -> dict[str, Any]:
+    required = {
+        "result",
+        "protocol_version",
+        "audit_instance_token",
+        "event_ordinal",
+        "history_overflow",
+        "runtime_ms",
+        "counters",
+        "events",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        required,
+        required | {"nonce"},
+    ):
+        raise ValueError("audit_shape")
+    if value["result"] != "audit_snapshot" or value["protocol_version"] != 1:
+        raise ValueError("audit_result")
+    if not isinstance(value["audit_instance_token"], str) or not _NONCE_RE.fullmatch(
+        value["audit_instance_token"]
+    ):
+        raise ValueError("audit_instance_token")
+    _nonnegative_int(value["event_ordinal"])
+    _nonnegative_int(value["runtime_ms"])
+    if not isinstance(value["history_overflow"], bool):
+        raise ValueError("audit_overflow")
+    counter_keys = {
+        "connect_attempts",
+        "gatt_sessions_claimed",
+        "authenticated_sessions",
+        "packets_sent_total",
+        "device_status_requests",
+        "device_info_requests",
+        "pair_requests",
+        "datapoint_write_operations",
+        "datapoint_protocol_packets",
+        "other_packets",
+        "reconnect_schedules",
+        "disconnects",
+    }
+    if (
+        not isinstance(value["counters"], dict)
+        or set(value["counters"]) != counter_keys
+    ):
+        raise ValueError("audit_counters")
+    if not all(_nonnegative_int(item) == item for item in value["counters"].values()):
+        raise ValueError("audit_counter_value")
+    if not isinstance(value["events"], list) or len(value["events"]) > 128:
+        raise ValueError("audit_events")
+    response = {key: value[key] for key in required - {"events", "counters"}}
+    response["counters"] = dict(value["counters"])
+    response["events"] = [_clean_audit_event(item) for item in value["events"]]
+    if "nonce" in value:
+        response["nonce"] = _nonce(value["nonce"])
+    return response
+
+
 def sanitize_service_response(
     operation: HelperOperation, response: object
 ) -> dict[str, Any]:
@@ -285,6 +371,8 @@ def sanitize_service_response(
         return _clean_preflight_response(response)
     if operation is HelperOperation.PROBE:
         return _clean_probe_response(response)
+    if operation is HelperOperation.AUDIT:
+        return _clean_audit_response(response)
     return _clean_receipt_response(response)
 
 
@@ -315,6 +403,8 @@ def _path_for(operation: HelperOperation) -> str:
         return "phase_a_status_probe_preflight"
     if operation is HelperOperation.PROBE:
         return "phase_a_status_probe"
+    if operation is HelperOperation.AUDIT:
+        return "phase_a_status_probe_audit"
     return "phase_a_status_probe_receipt"
 
 
@@ -323,6 +413,8 @@ def _service_exit(operation: HelperOperation, response: dict[str, Any]) -> Helpe
         return HelperExit.SUCCESS
     if operation is HelperOperation.RECEIPT:
         return HelperExit.SUCCESS if response["known"] else HelperExit.SERVICE_REJECTED
+    if operation is HelperOperation.AUDIT:
+        return HelperExit.SUCCESS
     if response["result"] == "completed":
         return HelperExit.SUCCESS
     return HelperExit.SERVICE_REJECTED
@@ -352,7 +444,7 @@ def invoke_service(
     """
     submitted_nonce: str | None = None
     try:
-        if operation is HelperOperation.PREFLIGHT:
+        if operation in {HelperOperation.PREFLIGHT, HelperOperation.AUDIT}:
             payload = {"nonce": _nonce(payload.get("nonce", generate_nonce()))}
         elif operation is HelperOperation.RECEIPT:
             payload = {"nonce": _nonce(payload["nonce"])}

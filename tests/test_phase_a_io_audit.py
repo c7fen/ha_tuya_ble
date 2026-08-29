@@ -220,16 +220,18 @@ def test_audit_service_and_startup_order_are_snapshot_only_and_early() -> None:
 
     setup_source = inspect.getsource(integration.async_setup_entry)
     assert "async_register_phase_a_io_audit(hass)" in setup_source
-    assert setup_source.index("async_register_phase_a_io_audit(hass)") < setup_source.index(
-        "device._startup_task"
-    )
+    assert setup_source.index(
+        "async_register_phase_a_io_audit(hass)"
+    ) < setup_source.index("device._startup_task")
     handler_source = inspect.getsource(audit_module._async_handle_phase_a_io_audit)
     assert "snapshot(" in handler_source
     assert "hass.data" not in handler_source
     assert "TuyaBLEDevice" not in handler_source
 
 
-def test_helper_accepts_only_the_audit_schema_and_never_persists_wrapper_fields() -> None:
+def test_helper_accepts_only_the_audit_schema_and_never_persists_wrapper_fields() -> (
+    None
+):
     from custom_components.tuya_ble.phase_a_probe_helper import (
         HelperOperation,
         sanitize_service_response,
