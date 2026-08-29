@@ -15,20 +15,20 @@ from homeassistant.core import SupportsResponse
 from voluptuous import Invalid
 
 from custom_components.tuya_ble.const import (
+    DOMAIN,
     ConnectionMode,
     ConnectionPolicyState,
-    DOMAIN,
     PendingRelease,
     PendingReleaseReason,
 )
 from custom_components.tuya_ble.phase_a_probe import (
+    _LOCKS_DATA_KEY,
     ATTR_CONFIG_ENTRY_ID,
     ATTR_MODE,
     MODE_COLD,
     MODE_COLD_THEN_RETAINED,
     SERVICE_PHASE_A_STATUS_PROBE,
     SERVICE_SCHEMA,
-    _LOCKS_DATA_KEY,
     _async_handle_phase_a_status_probe,
     async_register_phase_a_status_probe,
     async_run_phase_a_status_probe,

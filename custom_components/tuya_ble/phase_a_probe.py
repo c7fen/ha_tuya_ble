@@ -16,9 +16,9 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .const import (
+    DOMAIN,
     ConnectionMode,
     ConnectionPolicyState,
-    DOMAIN,
     EffectiveConnectionPolicy,
 )
 from .tuya_ble.tuya_ble import StatusObservationEvent, TuyaBLEDevice
@@ -227,7 +227,7 @@ async def async_run_phase_a_status_probe(
             await device.update()
         except asyncio.CancelledError:
             raise
-        except Exception:  # Deliberately do not surface transport details.
+        except Exception:  # noqa: BLE001 - deliberately sanitize transport details
             if 1 in collector.created_trials:
                 requests.append(_request_record(1, "update_failed", started))
         else:
@@ -262,7 +262,7 @@ async def async_run_phase_a_status_probe(
                 await device.update()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - deliberately sanitize transport details
                 if 2 in collector.created_trials:
                     requests.append(_request_record(2, "update_failed", started))
             else:
