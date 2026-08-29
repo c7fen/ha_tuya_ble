@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 import urllib.error
 from copy import deepcopy
 from pathlib import Path
@@ -18,6 +20,32 @@ from custom_components.tuya_ble.phase_a_probe_helper import (
     service_response_from_wrapper,
     write_sanitized_evidence,
 )
+
+
+def test_standalone_cli_rejects_invalid_nonce_without_runtime_import() -> None:
+    """P0 must be classified before any HA-package import or HTTP handoff."""
+    script = Path(__file__).parents[1] / "scripts" / "phase_a_status_probe_helper.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(script),
+            "preflight",
+            "--endpoint",
+            "http://invalid.example",
+            "--nonce",
+            "not-a-valid-nonce",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"SUPERVISOR_TOKEN": "synthetic-token"},
+    )
+
+    assert completed.returncode == HelperExit.DEFINITELY_NOT_SUBMITTED
+    assert completed.stdout == '{"outcome":"not_submitted"}\n'
+    assert completed.stderr == ""
 
 
 def _real_probe_response() -> dict[str, object]:
