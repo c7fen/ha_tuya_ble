@@ -756,6 +756,9 @@ class TuyaBLEDevice:
         self._status_observation_event_ordinal = 0
         self._status_observation: _StatusObservationGeneration | None = None
         self._status_observers: list[Callable[[StatusObservationEvent], None]] = []
+        self._on_demand_idle_release_callbacks: list[
+            Callable[[ConnectionSessionToken], None]
+        ] = []
         self._connected_notified_token: ConnectionSessionToken | None = None
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
@@ -1082,6 +1085,30 @@ class TuyaBLEDevice:
                 self._status_observers.remove(callback)
 
         return unregister_callback
+
+    def register_on_demand_idle_release_callback(
+        self, callback: Callable[[ConnectionSessionToken], None]
+    ) -> Callable[[], None]:
+        """Observe a completed normal On-Demand idle release without I/O."""
+        self._on_demand_idle_release_callbacks.append(callback)
+
+        def unregister_callback() -> None:
+            if callback in self._on_demand_idle_release_callbacks:
+                self._on_demand_idle_release_callbacks.remove(callback)
+
+        return unregister_callback
+
+    def _fire_on_demand_idle_release_callbacks(
+        self, session_token: ConnectionSessionToken
+    ) -> None:
+        """Publish only a completed normal idle release to private observers."""
+        for callback in tuple(self._on_demand_idle_release_callbacks):
+            try:
+                callback(session_token)
+            except Exception:  # noqa: BLE001 - passive observer must not alter I/O
+                _LOGGER.debug(
+                    "%s: On-demand idle release callback failed", self.log_identity
+                )
 
     def _emit_status_observation(
         self,
@@ -1473,6 +1500,7 @@ class TuyaBLEDevice:
 
     async def _complete_pending_release(self, *, raise_on_error: bool = False) -> None:
         """Complete one owned physical release after protected work drains."""
+        normal_idle_release_session: ConnectionSessionToken | None = None
         async with self._policy_lock:
             pending = self._pending_release
             if (
@@ -1485,11 +1513,14 @@ class TuyaBLEDevice:
             self._disconnect_in_progress = True
             self._disconnect_idle_event.clear()
             self._policy_state = ConnectionPolicyState.DISCONNECTING
+            if pending.reason is PendingReleaseReason.ON_DEMAND_IDLE:
+                normal_idle_release_session = self._connection_token
 
         disconnect_failed = False
         reconcile_policy = False
         failure_reconnect_delay: float | None = None
         complete_newer_release = False
+        normal_idle_release_completed = False
         try:
             await self._execute_disconnect(terminal=pending.terminal)
         except asyncio.CancelledError:
@@ -1549,6 +1580,7 @@ class TuyaBLEDevice:
                         else:
                             self._suspension_requested = False
                             self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+                            normal_idle_release_completed = True
                     elif pending.reason is PendingReleaseReason.SUSPEND:
                         if (
                             pending.revision != self._policy_revision
@@ -1573,6 +1605,8 @@ class TuyaBLEDevice:
             self._reconcile_after_verified_transport_loss(failure_reconnect_delay)
         elif reconcile_policy:
             await self._apply_connection_policy()
+        elif normal_idle_release_completed and normal_idle_release_session is not None:
+            self._fire_on_demand_idle_release_callbacks(normal_idle_release_session)
 
         if disconnect_failed and raise_on_error:
             raise TuyaBLEPolicyTransitionError() from None

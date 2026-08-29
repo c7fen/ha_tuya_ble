@@ -33,6 +33,12 @@ from .const import (
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .phase_a_probe import (
+    async_cancel_and_drain_phase_a_status_probe,
+    async_register_phase_a_status_probe,
+    async_unblock_phase_a_status_probe,
+    async_unregister_phase_a_status_probe_if_unused,
+)
 from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [
@@ -766,6 +772,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         manager,
         coordinator,
     )
+    async_register_phase_a_status_probe(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -939,6 +946,8 @@ async def _async_bounded_unload_entry_transaction(
         _LOGGER.error("Tuya BLE entry unload transaction reached its time limit")
         data.device.abort_unload_transaction()
         return _EntryUnloadOutcome.RESTORATION_FAILED
+    finally:
+        async_unblock_phase_a_status_probe(hass, data.device)
 
 
 async def _async_unload_entry_transaction(
@@ -947,6 +956,8 @@ async def _async_unload_entry_transaction(
 ) -> _EntryUnloadOutcome:
     """Unload a config entry."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    if not await async_cancel_and_drain_phase_a_status_probe(hass, data.device):
+        return _EntryUnloadOutcome.RESTORED
     if not await data.device.async_prepare_unload():
         return _EntryUnloadOutcome.RESTORED
     platform_outcome = await _async_unload_platforms_transactional(hass, entry)
@@ -958,6 +969,7 @@ async def _async_unload_entry_transaction(
     await data.device.stop()
     data.coordinator.shutdown()
     hass.data[DOMAIN].pop(entry.entry_id)
+    async_unregister_phase_a_status_probe_if_unused(hass)
     return _EntryUnloadOutcome.UNLOADED
 
 
