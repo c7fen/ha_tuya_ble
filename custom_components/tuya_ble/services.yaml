@@ -1,0 +1,18 @@
+phase_a_status_probe:
+  name: TEMPORARY RESEARCH HARNESS — DO NOT MERGE
+  description: >-
+    Temporary S1 Phase-A Device Status research probe. This service is not a
+    product feature and this branch must be closed without merge after the
+    authorized hardware inventory is complete.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    mode:
+      required: true
+      selector:
+        select:
+          options:
+            - cold
+            - cold_then_retained
