@@ -319,6 +319,10 @@ async def _async_handle_phase_a_status_probe(
 
 def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
     """Register the temporary response-only service once per integration domain."""
+    # Narrow synthetic setup tests intentionally use an incomplete hass shape;
+    # real Home Assistant always exposes the service registry.
+    if not hasattr(hass, "services"):
+        return
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get(_SERVICE_DATA_KEY):
         return
@@ -338,6 +342,8 @@ def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
 
 def async_unregister_phase_a_status_probe_if_unused(hass: HomeAssistant) -> None:
     """Remove the temporary service after the final Tuya BLE entry unloads."""
+    if not hasattr(hass, "services"):
+        return
     domain_data = hass.data.get(DOMAIN, {})
     loaded_entries = [key for key in domain_data if not key.startswith("_")]
     if loaded_entries or not domain_data.get(_SERVICE_DATA_KEY):
