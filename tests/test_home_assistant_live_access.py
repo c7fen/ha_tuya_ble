@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,7 @@ def test_r_m1_valid_empty_repairs_are_shape_valid() -> None:
     assert result.shape_valid is True
     assert result.classification == access.ADMISSION_VALID
     assert result.aggregate == access.RepairsAggregate(0, 0)
+    assert asdict(result.aggregate) == {"relevant_count": 0, "critical_count": 0}
 
 
 def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
