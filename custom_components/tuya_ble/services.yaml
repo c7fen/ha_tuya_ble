@@ -40,3 +40,13 @@ phase_a_status_probe_receipt:
       required: true
       selector:
         text:
+phase_a_status_probe_audit:
+  name: TEMPORARY PROCESS-LOCAL I/O AUDIT — DO NOT MERGE
+  description: >-
+    Temporary response-only Phase-A integration I/O snapshot. It performs no
+    device lookup, Bluetooth work, reset, or persistence.
+  fields:
+    nonce:
+      required: false
+      selector:
+        text:

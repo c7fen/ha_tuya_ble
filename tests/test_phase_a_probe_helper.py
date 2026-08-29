@@ -55,6 +55,33 @@ def _real_probe_response() -> dict[str, object]:
     }
 
 
+def _audit_response(nonce: str) -> dict[str, object]:
+    return {
+        "result": "audit_snapshot",
+        "protocol_version": 1,
+        "audit_instance_token": "a" * 32,
+        "event_ordinal": 0,
+        "history_overflow": False,
+        "runtime_ms": 0,
+        "counters": {
+            "connect_attempts": 0,
+            "gatt_sessions_claimed": 0,
+            "authenticated_sessions": 0,
+            "packets_sent_total": 0,
+            "device_status_requests": 0,
+            "device_info_requests": 0,
+            "pair_requests": 0,
+            "datapoint_write_operations": 0,
+            "datapoint_protocol_packets": 0,
+            "other_packets": 0,
+            "reconnect_schedules": 0,
+            "disconnects": 0,
+        },
+        "events": [],
+        "nonce": nonce,
+    }
+
+
 def test_real_response_with_optional_none_event_fields_is_not_ambiguous():
     """The C01 optional-field shape is schema-valid, not exit-78 ambiguity."""
     response = sanitize_service_response(HelperOperation.PROBE, _real_probe_response())
@@ -82,6 +109,52 @@ def test_wrapper_discards_changed_states_before_evidence_is_written(tmp_path):
     rendered = evidence.read_text(encoding="utf-8")
     assert json.loads(rendered) == response
     assert stat.S_IMODE(evidence.stat().st_mode) == 0o600
+    assert "changed_states" not in rendered
+    assert "private.entity" not in rendered
+
+
+def test_audit_helper_invocation_correlates_nonce_and_discards_wrapper_before_evidence(
+    tmp_path,
+):
+    """Audit uses the shared helper transport and cannot retain wrapper state."""
+    nonce = "c" * 16
+    seen = []
+    wrapper = {
+        "service_response": _audit_response(nonce),
+        "changed_states": [{"entity_id": "private.entity", "state": "private"}],
+    }
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(wrapper).encode()
+
+    def opener(request, **_kwargs):
+        seen.append(request)
+        return _Response()
+
+    result = invoke_service(
+        HelperOperation.AUDIT,
+        "http://supervisor/core",
+        {"nonce": nonce},
+        {"Authorization": "Bearer private-token"},
+        opener=opener,
+    )
+    assert result.exit_code is HelperExit.SUCCESS
+    assert result.nonce == nonce
+    assert result.response == _audit_response(nonce)
+    assert seen[0].full_url.endswith(
+        "/tuya_ble/phase_a_status_probe_audit?return_response"
+    )
+
+    evidence = tmp_path / "audit.json"
+    write_sanitized_evidence(evidence, result.response)
+    rendered = evidence.read_text(encoding="utf-8")
     assert "changed_states" not in rendered
     assert "private.entity" not in rendered
 

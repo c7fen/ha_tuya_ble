@@ -54,6 +54,15 @@ from ..const import (
     normalize_on_demand_connection_hold_time,
     validate_on_demand_connection_hold_time,
 )
+from ..phase_a_io_audit import (
+    record_authenticated_session,
+    record_connect_attempt,
+    record_datapoint_write,
+    record_disconnect,
+    record_gatt_session_claimed,
+    record_packet_sent,
+    record_reconnect_scheduled,
+)
 from .const import (
     CHARACTERISTIC_NOTIFY,
     CHARACTERISTIC_NOTIFY_FD50,
@@ -92,6 +101,9 @@ _HOLD_TIME_UNSET = object()
 _ConnectionLeaseContext = dict[int, int]
 _CONNECTION_LEASE_CONTEXT: ContextVar[_ConnectionLeaseContext] = ContextVar(
     "tuya_ble_connection_lease", default={}
+)
+_OUTGOING_PACKET_AUDIT_CODE: ContextVar[TuyaBLECode | None] = ContextVar(
+    "tuya_ble_outgoing_packet_audit_code", default=None
 )
 
 
@@ -962,6 +974,7 @@ class TuyaBLEDevice:
         token = ConnectionSessionToken(client, self._connection_epoch)
         self._client = client
         self._connection_token = token
+        record_gatt_session_claimed()
         self._operation_lock = token.operation_lock
         self._physical_connection_active = True
         self._notifications_active = False
@@ -2049,6 +2062,7 @@ class TuyaBLEDevice:
                 self._reconnect_task.cancel()
                 self._reconnect_task = None
                 self._scheduled_reconnect_delay = delay
+                record_reconnect_scheduled()
                 self._reconnect_task = self._create_policy_task(
                     self._reconnect_after_delay(delay)
                 )
@@ -2060,6 +2074,7 @@ class TuyaBLEDevice:
         ):
             return
         self._scheduled_reconnect_delay = delay
+        record_reconnect_scheduled()
         self._reconnect_task = self._create_policy_task(
             self._reconnect_after_delay(delay)
         )
@@ -2725,6 +2740,8 @@ class TuyaBLEDevice:
             self._next_unexpected_reconnect_delay() if unexpected else None
         )
         was_connected = self._physical_connection_active or self._is_paired
+        if was_connected:
+            record_disconnect()
         self._physical_connection_active = False
         self._is_paired = False
         self._notifications_active = False
@@ -3025,6 +3042,7 @@ class TuyaBLEDevice:
                         self.log_identity,
                         self.rssi,
                     )
+                    record_connect_attempt()
                     client = await establish_connection(
                         BleakClientWithServiceCache,
                         self._ble_device,
@@ -3524,14 +3542,18 @@ class TuyaBLEDevice:
             )
         try:
             packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-            if require_always_connected:
-                await self._int_send_packet_while_connected(
-                    token,
-                    packets,
-                    require_always_connected=True,
-                )
-            else:
-                await self._int_send_packet_while_connected(token, packets)
+            audit_code_token = _OUTGOING_PACKET_AUDIT_CODE.set(code)
+            try:
+                if require_always_connected:
+                    await self._int_send_packet_while_connected(
+                        token,
+                        packets,
+                        require_always_connected=True,
+                    )
+                else:
+                    await self._int_send_packet_while_connected(token, packets)
+            finally:
+                _OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
             if not self._owns_transport_work(
                 token,
                 require_always_connected=require_always_connected,
@@ -3705,6 +3727,7 @@ class TuyaBLEDevice:
     ) -> None:
         """Execute command and read response."""
         client = session_token.client
+        first_write = True
         for packet in packets:
             if (
                 self._owns_transport_work(
@@ -3714,6 +3737,12 @@ class TuyaBLEDevice:
                 and client.is_connected
             ):
                 try:
+                    if first_write:
+                        # One logical Tuya message can occupy multiple GATT
+                        # fragments. Record the actual message once, directly
+                        # before its first physical write attempt.
+                        record_packet_sent(_OUTGOING_PACKET_AUDIT_CODE.get())
+                        first_write = False
                     await client.write_gatt_char(
                         self._characteristic_write,
                         packet,
@@ -3939,7 +3968,10 @@ class TuyaBLEDevice:
                         self.log_identity,
                     )
                     result = 0
+                was_paired = self._is_paired
                 self._is_paired = result == 0
+                if self._is_paired and not was_paired:
+                    record_authenticated_session()
 
             case TuyaBLECode.FUN_SENDER_DEVICE_STATUS:
                 if len(data) != 1:
@@ -4291,6 +4323,7 @@ class TuyaBLEDevice:
 
     async def _send_datapoints_no_replay(self, datapoint_ids: list[int]) -> None:
         """Send one datapoint update without retaining packet bytes for replay."""
+        record_datapoint_write()
         if self._protocol_version == 3:
             await self._send_datapoints_v3(datapoint_ids)
         elif self._protocol_version >= 4:
@@ -4300,6 +4333,7 @@ class TuyaBLEDevice:
 
     async def _send_datapoints_once(self, datapoint_ids: list[int]) -> None:
         """Send one protocol-v3 DP command without replay and require success."""
+        record_datapoint_write()
         if self._protocol_version != 3:
             raise TuyaBLECommandUnconfirmedError()
         data = self._encode_datapoints(datapoint_ids, 1)
@@ -4314,6 +4348,7 @@ class TuyaBLEDevice:
 
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
+        record_datapoint_write()
         if self._protocol_version == 3:
             await self._send_datapoints_v3(datapoint_ids)
         elif self._protocol_version >= 4:
