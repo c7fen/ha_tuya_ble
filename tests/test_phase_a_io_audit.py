@@ -293,6 +293,7 @@ async def test_each_logical_datapoint_entry_point_records_once(method_name) -> N
     device._protocol_version = 3
     device._send_datapoints_v3 = AsyncMock()
     device._send_packet_once_confirmed = AsyncMock()
+    device._encode_datapoints = Mock(return_value=b"synthetic-datapoint")
     with patch.object(transport, "record_datapoint_write") as datapoint:
         await getattr(device, method_name)([77])
     datapoint.assert_called_once_with()
