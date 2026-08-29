@@ -3,6 +3,5 @@
 
 from phase_a_status_probe_lib import main
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

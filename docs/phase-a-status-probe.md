@@ -78,33 +78,64 @@ process-local fence rejects reuse until that unload; once full it fails closed
 before device lookup or BLE. A duplicate real-probe nonce returns a local
 `duplicate_nonce` response and can never invoke BLE a second time.
 
-The repository-owned `scripts/phase_a_status_probe_helper.py` uses the same
-HTTP request, REST-wrapper extraction, response allowlist, outcome mapping,
-and sanitized evidence writer for preflight, real probe, and receipt lookup.
-It drops `changed_states` before validation or persistence. Its exit classes
-are non-overlapping: 0 valid response, 65 definitely not submitted, 66 known
-service rejection, 67 local schema/privacy failure after a response, and 78 a
-potentially submitted HTTP transport ambiguity. A received valid service
+The repository-owned `scripts/phase_a_status_probe_helper.py` is a tiny
+standalone entry point. It imports only its sibling
+`scripts/phase_a_status_probe_lib.py`, which uses Python's standard library
+only and owns the HTTP request, REST-wrapper extraction, response allowlist,
+outcome mapping, and sanitized evidence writer for preflight, real probe, audit,
+and receipt lookup. It never imports the integration package, Home Assistant,
+Bleak, or any other integration runtime dependency.
+
+The helper drops `changed_states` before validation or persistence. Its exit
+classes are non-overlapping: 0 valid response, 65 definitely not submitted, 66
+known service rejection, 67 local schema/privacy failure after a response, and
+78 a potentially submitted HTTP transport ambiguity. A received valid service
 response never maps to 78. The CLI reads a real-probe Config Entry ID only from
-a private process environment variable, never command-line arguments, and
-reports the non-sensitive generated nonce even for ambiguity. A nonce proves
-only response identity; receipt lookup, not retry, is the permitted follow-up
-to a lost real probe response.
+the protected `PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID` process environment
+variable, never command-line arguments, and reports the non-sensitive generated
+nonce even for ambiguity. A nonce proves only response identity; receipt lookup,
+not retry, is the permitted follow-up to a lost real probe response.
+
+The supported CLI has no endpoint, arbitrary evidence-path, ConfigEntry-ID, or
+token argument. It uses the fixed Supervisor Core proxy internally and accepts
+only an operation, optional nonce/mode, and an optional strict evidence label
+such as `A0`. The label is limited to a short uppercase safe alphabet; it is not
+a path. Evidence is derived beneath the helper's fixed private research root.
+The root is created or repaired to mode 0700 and evidence files are atomically
+replaced at mode 0600. The root path is never printed or included in evidence.
+CLI stdout is a single minimal JSON projection containing only the outcome,
+opaque nonce where applicable, and whether evidence was written. Expected input
+or local-storage failures are sanitized JSON outcomes without a traceback.
 
 ## Intended later invocation
 
 From an authorized Home Assistant OS administration environment with Home
-Assistant API access enabled, the intended route is:
-
-```text
-POST http://supervisor/core/api/services/tuya_ble/phase_a_status_probe?return_response
-```
-
-Use the Supervisor proxy only when that environment supplies its normal
-Supervisor authentication material. Never print, persist, paste, or include a
-Supervisor token in a transcript, issue, pull request, or response. This
+Assistant API access enabled, the helper uses the fixed internal Supervisor Core
+proxy. Use it only when that environment supplies its normal Supervisor
+authentication material. Never print, persist, paste, or include a Supervisor
+token in a transcript, issue, pull request, command argument, or response. This
 repository branch neither authorizes nor performs a deployment, reload, service
 call, Bluetooth connection, Device Status request, or physical action.
+
+## Temporary orchestration privacy contract
+
+This temporary research tooling is not permission to record operational access
+details. Future authorized workers must not use `set -x`, print environment
+variables, print a working directory that reveals an operational path, print an
+SSH host or IP route, or place an evidence root in a command argument. Use an
+existing opaque SSH configuration alias where one exists; use sanitized labels
+only; and do not stage source through an echoing interactive TTY or retained
+heredoc.
+
+When a worker explicitly creates local orchestration evidence, it must set
+`umask 077` before creation, verify the resulting file mode is 0600, and retain
+only the minimal sanitized outcome. A platform-owned session transcript whose
+permissions cannot be controlled is not authoritative evidence and must contain
+neither an operational route nor a private path. Existing forensic evidence is
+not to be deleted or copied: an ordinary worker-owned artifact may have its mode
+repaired from 0644 to 0600 only after its unchanged content is verified; a
+platform-managed artifact must be reported as permission remediation unavailable
+only when its mode cannot be controlled by the responsible platform.
 
 The future hardware worker must make the separately authorized calls for five
 `cold_then_retained` trials followed by five `cold` trials. That permits at

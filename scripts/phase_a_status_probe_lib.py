@@ -394,19 +394,24 @@ def service_response_from_wrapper(
 def write_sanitized_evidence(path: Path, response: dict[str, Any]) -> None:
     """Atomically write an already-sanitized response; raw wrappers are never stored."""
     encoded = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as pending:
-        os.chmod(pending.name, 0o600)
-        pending.write(encoded)
-        pending.flush()
-        pending_name = Path(pending.name)
-    pending_name.replace(path)
-    os.chmod(path, 0o600)
+    pending_name: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as pending:
+            os.chmod(pending.name, 0o600)
+            pending.write(encoded)
+            pending.flush()
+            pending_name = Path(pending.name)
+        pending_name.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if pending_name is not None:
+            pending_name.unlink(missing_ok=True)
 
 
 def _private_evidence_root(root: Path) -> Path:
     """Create or repair the one private evidence directory before a write."""
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         raise OSError("evidence_root")
     if stat.S_IMODE(root.stat().st_mode) != 0o700:
         os.chmod(root, 0o700)
@@ -566,7 +571,9 @@ def main(
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> int:
     """Run the production CLI without exposing endpoint or evidence paths."""
-    parser = _SanitizedArgumentParser()
+    result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
+    evidence_written = False
+    parser = _SanitizedArgumentParser(add_help=False)
     parser.add_argument("operation", choices=[item.value for item in HelperOperation])
     parser.add_argument("--nonce")
     parser.add_argument(
@@ -581,7 +588,7 @@ def main(
         ):
             raise ValueError("evidence_label")
         payload: dict[str, str] = {}
-        if args.nonce:
+        if args.nonce is not None:
             payload[
                 (
                     "nonce"
@@ -589,14 +596,13 @@ def main(
                     else "invocation_nonce"
                 )
             ] = args.nonce
+        environment = os.environ if environ is None else environ
         if operation is HelperOperation.PROBE:
-            config_entry_id = (environ or os.environ).get(
-                "PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID"
-            )
+            config_entry_id = environment.get("PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID")
             if config_entry_id:
                 payload["config_entry_id"] = config_entry_id
             payload["mode"] = args.mode
-        token = (environ or os.environ).get("SUPERVISOR_TOKEN")
+        token = environment.get("SUPERVISOR_TOKEN")
         if not token:
             result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
         else:
@@ -607,14 +613,20 @@ def main(
                 {"Authorization": f"Bearer {token}"},
                 opener=opener,
             )
-        evidence_written = False
         if result.response is not None and args.evidence_label is not None:
             write_labeled_evidence(
                 evidence_root, operation, args.evidence_label, result.response
             )
             evidence_written = True
-    except (ValueError, OSError, TypeError):
+    except (TypeError, ValueError):
         result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
+        evidence_written = False
+    except OSError:
+        result = HelperResult(
+            HelperExit.SCHEMA_PRIVACY_FAILURE,
+            "evidence_write_failed",
+            nonce=result.nonce,
+        )
         evidence_written = False
     print(_result_json(result, evidence_written=evidence_written))
     return int(result.exit_code)
