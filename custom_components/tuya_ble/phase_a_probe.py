@@ -33,6 +33,8 @@ _MODES = frozenset({MODE_COLD, MODE_COLD_THEN_RETAINED})
 _MAX_EVENTS = 64
 _RELEASE_CLEANUP_MARGIN_SECONDS = 5.0
 _LOCKS_DATA_KEY = "_temporary_phase_a_status_probe_locks"
+_ACTIVE_PROBES_DATA_KEY = "_temporary_phase_a_status_probe_tasks"
+_UNLOADING_DEVICES_DATA_KEY = "_temporary_phase_a_status_probe_unloading"
 _SERVICE_DATA_KEY = "_temporary_phase_a_status_probe_service_registered"
 
 SERVICE_SCHEMA = vol.Schema(
@@ -339,18 +341,107 @@ async def _async_handle_phase_a_status_probe(
     device = _device_for_service_call(hass, call.data[ATTR_CONFIG_ENTRY_ID])
     if device is None:
         return _empty_response(mode, started, "precondition_failed")
+    domain_data = hass.data[DOMAIN]
+    unloading: set[TuyaBLEDevice] = domain_data.setdefault(
+        _UNLOADING_DEVICES_DATA_KEY, set()
+    )
+    if device in unloading:
+        return _empty_response(mode, started, "precondition_failed")
+    task = asyncio.current_task()
+    if task is None:
+        return _empty_response(mode, started, "precondition_failed")
+    active_probes: dict[TuyaBLEDevice, asyncio.Task[Any]] = domain_data.setdefault(
+        _ACTIVE_PROBES_DATA_KEY, {}
+    )
+    existing = active_probes.get(device)
+    if existing is not None and not existing.done():
+        return _empty_response(mode, started, "probe_already_active")
+    if existing is not None:
+        active_probes.pop(device, None)
     locks: dict[TuyaBLEDevice, asyncio.Lock] = hass.data[DOMAIN].setdefault(
         _LOCKS_DATA_KEY, {}
     )
     lock = locks.setdefault(device, asyncio.Lock())
     if lock.locked():
         return _empty_response(mode, started, "probe_already_active")
+    active_probes[device] = task
     try:
         async with lock:
             return await async_run_phase_a_status_probe(device, mode)
     finally:
+        if active_probes.get(device) is task:
+            active_probes.pop(device, None)
+        if not active_probes:
+            domain_data.pop(_ACTIVE_PROBES_DATA_KEY, None)
         if not lock.locked() and locks.get(device) is lock:
             locks.pop(device, None)
+        if not locks:
+            domain_data.pop(_LOCKS_DATA_KEY, None)
+
+
+async def async_cancel_and_drain_phase_a_status_probe(
+    hass: HomeAssistant, device: TuyaBLEDevice
+) -> bool:
+    """Block, cancel, and drain one device-owned service task before unload."""
+    domain_data = hass.data.get(DOMAIN, {})
+    unloading: set[TuyaBLEDevice] = domain_data.setdefault(
+        _UNLOADING_DEVICES_DATA_KEY, set()
+    )
+    unloading.add(device)
+    active_probes: dict[TuyaBLEDevice, asyncio.Task[Any]] = domain_data.setdefault(
+        _ACTIVE_PROBES_DATA_KEY, {}
+    )
+    task = active_probes.get(device)
+    if task is None:
+        locks: dict[TuyaBLEDevice, asyncio.Lock] = domain_data.get(_LOCKS_DATA_KEY, {})
+        locks.pop(device, None)
+        if not locks:
+            domain_data.pop(_LOCKS_DATA_KEY, None)
+        if not active_probes:
+            domain_data.pop(_ACTIVE_PROBES_DATA_KEY, None)
+        return True
+    if task is asyncio.current_task():
+        return False
+    task.cancel()
+    cancelled_while_draining = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+            cancelled_while_draining = True
+        except Exception:  # noqa: BLE001 - task result is consumed below
+            break
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001,S110 - drained task errors are already sanitized
+        pass
+    finally:
+        if active_probes.get(device) is task:
+            active_probes.pop(device, None)
+        if not active_probes:
+            domain_data.pop(_ACTIVE_PROBES_DATA_KEY, None)
+        locks = domain_data.get(_LOCKS_DATA_KEY, {})
+        locks.pop(device, None)
+        if not locks:
+            domain_data.pop(_LOCKS_DATA_KEY, None)
+    if cancelled_while_draining:
+        raise asyncio.CancelledError
+    return True
+
+
+def async_unblock_phase_a_status_probe(
+    hass: HomeAssistant, device: TuyaBLEDevice
+) -> None:
+    """Allow new temporary probes after a failed entry-unload rollback."""
+    domain_data = hass.data.get(DOMAIN, {})
+    unloading: set[TuyaBLEDevice] = domain_data.get(_UNLOADING_DEVICES_DATA_KEY, set())
+    unloading.discard(device)
+    if not unloading:
+        domain_data.pop(_UNLOADING_DEVICES_DATA_KEY, None)
 
 
 def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:

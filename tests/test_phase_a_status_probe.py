@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
@@ -14,6 +14,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import SupportsResponse
 from voluptuous import Invalid
 
+from custom_components import tuya_ble as integration
 from custom_components.tuya_ble.const import (
     DOMAIN,
     ConnectionMode,
@@ -22,6 +23,7 @@ from custom_components.tuya_ble.const import (
     PendingReleaseReason,
 )
 from custom_components.tuya_ble.phase_a_probe import (
+    _ACTIVE_PROBES_DATA_KEY,
     _LOCKS_DATA_KEY,
     ATTR_CONFIG_ENTRY_ID,
     ATTR_MODE,
@@ -30,8 +32,10 @@ from custom_components.tuya_ble.phase_a_probe import (
     SERVICE_PHASE_A_STATUS_PROBE,
     SERVICE_SCHEMA,
     _async_handle_phase_a_status_probe,
+    async_cancel_and_drain_phase_a_status_probe,
     async_register_phase_a_status_probe,
     async_run_phase_a_status_probe,
+    async_unblock_phase_a_status_probe,
     async_unregister_phase_a_status_probe_if_unused,
 )
 from custom_components.tuya_ble.tuya_ble.tuya_ble import (
@@ -288,6 +292,7 @@ def _service_hass(device: TuyaBLEDevice, state=ConfigEntryState.LOADED):
     return SimpleNamespace(
         data={DOMAIN: {"private-entry": SimpleNamespace(device=device)}},
         config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)),
+        services=SimpleNamespace(async_register=Mock(), async_remove=Mock()),
     )
 
 
@@ -523,7 +528,126 @@ async def test_service_concurrency_rejects_second_call_and_cleans_device_lock():
     assert second["result"] == "probe_already_active"
     assert second["request_count"] == 0
     assert first_result["request_count"] == 1
-    assert hass.data[DOMAIN][_LOCKS_DATA_KEY] == {}
+    assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
+    assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
+
+
+@pytest.mark.asyncio
+async def test_final_entry_unload_drains_active_probe_before_service_removal():
+    """Entry teardown owns the active handler until its callback finally runs."""
+    device = _device()
+    entered = asyncio.Event()
+
+    async def stalled_update() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    device.update = AsyncMock(side_effect=stalled_update)
+    hass = _service_hass(device)
+    async_register_phase_a_status_probe(hass)
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await entered.wait()
+
+    assert await async_cancel_and_drain_phase_a_status_probe(hass, device) is True
+    assert task.done() and task.cancelled()
+    assert device._status_observers == []
+    assert device._on_demand_idle_release_callbacks == []
+    assert device._connection_state_callbacks == []
+    assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
+    assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
+    assert device.update.await_count == 1
+
+    hass.data[DOMAIN].pop("private-entry")
+    async_unblock_phase_a_status_probe(hass, device)
+    async_unregister_phase_a_status_probe_if_unused(hass)
+
+    hass.services.async_remove.assert_called_once_with(
+        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
+    )
+
+
+@pytest.mark.asyncio
+async def test_entry_unload_transaction_drains_service_before_stop_and_removal():
+    """The real entry transaction orders probe drain before device stop."""
+    device = _device()
+    entered = asyncio.Event()
+
+    async def stalled_update() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    device.update = AsyncMock(side_effect=stalled_update)
+    device.async_prepare_unload = AsyncMock(return_value=True)
+    device.stop = AsyncMock()
+    entry = SimpleNamespace(entry_id="private-entry", state=ConfigEntryState.LOADED)
+    coordinator = SimpleNamespace(shutdown=Mock())
+    hass = SimpleNamespace(
+        data={
+            DOMAIN: {
+                "private-entry": SimpleNamespace(device=device, coordinator=coordinator)
+            }
+        },
+        config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)),
+        services=SimpleNamespace(async_register=Mock(), async_remove=Mock()),
+    )
+    async_register_phase_a_status_probe(hass)
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await entered.wait()
+
+    with patch.object(
+        integration,
+        "_async_unload_platforms_transactional",
+        AsyncMock(return_value=integration._PlatformUnloadOutcome.UNLOADED),
+    ):
+        outcome = await integration._async_unload_entry_transaction(hass, entry)
+
+    assert outcome is integration._EntryUnloadOutcome.UNLOADED
+    assert task.done() and task.cancelled()
+    device.stop.assert_awaited_once()
+    coordinator.shutdown.assert_called_once()
+    assert device._status_observers == []
+    assert device._on_demand_idle_release_callbacks == []
+    assert device._connection_state_callbacks == []
+    assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
+    assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
+    hass.services.async_remove.assert_called_once_with(
+        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonfinal_entry_unload_drains_only_its_device_and_keeps_service():
+    device = _device()
+    entered = asyncio.Event()
+
+    async def stalled_update() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    device.update = AsyncMock(side_effect=stalled_update)
+    hass = _service_hass(device)
+    hass.data[DOMAIN]["other-loaded-entry"] = SimpleNamespace(device=_device())
+    async_register_phase_a_status_probe(hass)
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await entered.wait()
+
+    assert await async_cancel_and_drain_phase_a_status_probe(hass, device) is True
+    hass.data[DOMAIN].pop("private-entry")
+    async_unblock_phase_a_status_probe(hass, device)
+    async_unregister_phase_a_status_probe_if_unused(hass)
+
+    assert task.done() and task.cancelled()
+    hass.services.async_remove.assert_not_called()
+    assert device.update.await_count == 1
 
 
 @pytest.mark.asyncio

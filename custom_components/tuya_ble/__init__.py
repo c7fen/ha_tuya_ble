@@ -34,7 +34,9 @@ from .const import (
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
 from .phase_a_probe import (
+    async_cancel_and_drain_phase_a_status_probe,
     async_register_phase_a_status_probe,
+    async_unblock_phase_a_status_probe,
     async_unregister_phase_a_status_probe_if_unused,
 )
 from .tuya_ble import TuyaBLEDevice
@@ -952,17 +954,23 @@ async def _async_unload_entry_transaction(
 ) -> _EntryUnloadOutcome:
     """Unload a config entry."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
+    if not await async_cancel_and_drain_phase_a_status_probe(hass, data.device):
+        async_unblock_phase_a_status_probe(hass, data.device)
+        return _EntryUnloadOutcome.RESTORED
     if not await data.device.async_prepare_unload():
+        async_unblock_phase_a_status_probe(hass, data.device)
         return _EntryUnloadOutcome.RESTORED
     platform_outcome = await _async_unload_platforms_transactional(hass, entry)
     if platform_outcome is not _PlatformUnloadOutcome.UNLOADED:
         await data.device.async_cancel_unload()
+        async_unblock_phase_a_status_probe(hass, data.device)
         if platform_outcome is _PlatformUnloadOutcome.RESTORED:
             return _EntryUnloadOutcome.RESTORED
         return _EntryUnloadOutcome.RESTORATION_FAILED
     await data.device.stop()
     data.coordinator.shutdown()
     hass.data[DOMAIN].pop(entry.entry_id)
+    async_unblock_phase_a_status_probe(hass, data.device)
     async_unregister_phase_a_status_probe_if_unused(hass)
     return _EntryUnloadOutcome.UNLOADED
 
