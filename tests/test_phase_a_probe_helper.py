@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import urllib.error
+from copy import deepcopy
 
 import pytest
 
@@ -12,6 +14,7 @@ from custom_components.tuya_ble.phase_a_probe_helper import (
     sanitize_service_response,
     service_response_from_wrapper,
     write_sanitized_evidence,
+    invoke_service,
 )
 
 
@@ -111,3 +114,87 @@ def test_valid_service_outcomes_have_non_overlapping_exit_classes(
         HelperExit.SUCCESS,
         HelperExit.SERVICE_REJECTED,
     }
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("completed", HelperExit.SUCCESS),
+        ("precondition_failed", HelperExit.SERVICE_REJECTED),
+        ("invalid_or_incomplete", HelperExit.SERVICE_REJECTED),
+        ("observation_overflow", HelperExit.SERVICE_REJECTED),
+        ("known_service_error", HelperExit.SERVICE_REJECTED),
+        ("transport_ambiguous", HelperExit.AMBIGUOUS_POST_SUBMISSION),
+    ],
+)
+def test_real_probe_result_classes_are_explicit_and_non_overlapping(result, expected):
+    """Mocked real responses cannot collapse known results into exit 78."""
+    response = deepcopy(_real_probe_response())
+    response["result"] = result
+    wrapper = {"service_response": response}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(wrapper).encode()
+
+    outcome = invoke_service(
+        HelperOperation.PROBE,
+        "http://supervisor/core",
+        {
+            "config_entry_id": "in-memory-only",
+            "mode": "cold",
+            "invocation_nonce": "d" * 16,
+        },
+        {},
+        opener=lambda *_args, **_kwargs: _Response(),
+    )
+
+    assert outcome.exit_code is expected
+    assert outcome.outcome == result
+
+
+def test_helper_distinguishes_not_submitted_ambiguity_and_schema_failure():
+    """Transport and local parser outcomes remain distinct without BLE claims."""
+    not_submitted = invoke_service(
+        HelperOperation.PROBE,
+        "http://supervisor/core",
+        {"mode": "cold", "invocation_nonce": "a" * 16},
+        {},
+    )
+    ambiguous = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "a" * 16},
+        {},
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            urllib.error.URLError("synthetic")
+        ),
+    )
+
+    class _BadResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"changed_states":["not-a-service-response"]}'
+
+    schema_invalid = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "a" * 16},
+        {},
+        opener=lambda *_args, **_kwargs: _BadResponse(),
+    )
+
+    assert not_submitted.exit_code is HelperExit.DEFINITELY_NOT_SUBMITTED
+    assert ambiguous.exit_code is HelperExit.AMBIGUOUS_POST_SUBMISSION
+    assert schema_invalid.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE

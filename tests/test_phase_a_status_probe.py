@@ -369,12 +369,12 @@ async def test_receipt_lookup_and_duplicate_nonce_never_replay_device_update():
         "nonce": nonce,
         "known": True,
         "service_entered": True,
-        "request_handed_to_transport": False,
-        "terminal_class": "precondition_failed",
+        "request_handed_to_transport": True,
+        "terminal_class": "invalid_or_incomplete",
         "response_available": True,
     }
     assert duplicate["result"] == "duplicate_nonce"
-    assert device.update.await_count == 0
+    assert device.update.await_count == 1
     assert nonce in hass.data[DOMAIN][_RECEIPT_LEDGER_DATA_KEY]
 
 
@@ -656,9 +656,11 @@ async def test_final_entry_unload_drains_active_probe_before_service_removal():
     async_unblock_phase_a_status_probe(hass, device)
     async_unregister_phase_a_status_probe_if_unused(hass)
 
-    hass.services.async_remove.assert_called_once_with(
-        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
-    )
+    assert hass.services.async_remove.call_args_list == [
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT),),
+    ]
 
 
 @pytest.mark.asyncio
@@ -708,9 +710,11 @@ async def test_entry_unload_transaction_drains_service_before_stop_and_removal()
     assert device._connection_state_callbacks == []
     assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
     assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
-    hass.services.async_remove.assert_called_once_with(
-        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
-    )
+    assert hass.services.async_remove.call_args_list == [
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT),),
+    ]
 
 
 @pytest.mark.asyncio
