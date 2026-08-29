@@ -33,6 +33,10 @@ from .const import (
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .phase_a_probe import (
+    async_register_phase_a_status_probe,
+    async_unregister_phase_a_status_probe_if_unused,
+)
 from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [
@@ -766,6 +770,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         manager,
         coordinator,
     )
+    async_register_phase_a_status_probe(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -958,6 +963,7 @@ async def _async_unload_entry_transaction(
     await data.device.stop()
     data.coordinator.shutdown()
     hass.data[DOMAIN].pop(entry.entry_id)
+    async_unregister_phase_a_status_probe_if_unused(hass)
     return _EntryUnloadOutcome.UNLOADED
 
 

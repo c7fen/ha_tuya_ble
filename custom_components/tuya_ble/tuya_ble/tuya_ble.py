@@ -756,6 +756,7 @@ class TuyaBLEDevice:
         self._status_observation_event_ordinal = 0
         self._status_observation: _StatusObservationGeneration | None = None
         self._status_observers: list[Callable[[StatusObservationEvent], None]] = []
+        self._on_demand_idle_release_callbacks: list[Callable[[], None]] = []
         self._connected_notified_token: ConnectionSessionToken | None = None
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
@@ -1082,6 +1083,28 @@ class TuyaBLEDevice:
                 self._status_observers.remove(callback)
 
         return unregister_callback
+
+    def register_on_demand_idle_release_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Observe a completed normal On-Demand idle release without I/O."""
+        self._on_demand_idle_release_callbacks.append(callback)
+
+        def unregister_callback() -> None:
+            if callback in self._on_demand_idle_release_callbacks:
+                self._on_demand_idle_release_callbacks.remove(callback)
+
+        return unregister_callback
+
+    def _fire_on_demand_idle_release_callbacks(self) -> None:
+        """Publish only a completed normal idle release to private observers."""
+        for callback in tuple(self._on_demand_idle_release_callbacks):
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - passive observer must not alter I/O
+                _LOGGER.debug(
+                    "%s: On-demand idle release callback failed", self.log_identity
+                )
 
     def _emit_status_observation(
         self,
@@ -1490,6 +1513,7 @@ class TuyaBLEDevice:
         reconcile_policy = False
         failure_reconnect_delay: float | None = None
         complete_newer_release = False
+        normal_idle_release_completed = False
         try:
             await self._execute_disconnect(terminal=pending.terminal)
         except asyncio.CancelledError:
@@ -1549,6 +1573,7 @@ class TuyaBLEDevice:
                         else:
                             self._suspension_requested = False
                             self._policy_state = ConnectionPolicyState.ON_DEMAND_IDLE
+                            normal_idle_release_completed = True
                     elif pending.reason is PendingReleaseReason.SUSPEND:
                         if (
                             pending.revision != self._policy_revision
@@ -1573,6 +1598,8 @@ class TuyaBLEDevice:
             self._reconcile_after_verified_transport_loss(failure_reconnect_delay)
         elif reconcile_policy:
             await self._apply_connection_policy()
+        elif normal_idle_release_completed:
+            self._fire_on_demand_idle_release_callbacks()
 
         if disconnect_failed and raise_on_error:
             raise TuyaBLEPolicyTransitionError() from None

@@ -52,10 +52,12 @@ def _install_successful_update(device: TuyaBLEDevice) -> AsyncMock:
     async def update() -> None:
         nonlocal calls
         calls += 1
-        token = ConnectionSessionToken(_SyntheticClient(), calls)
-        device._client = token.client
-        device._connection_token = token
-        device._connection_epoch = token.epoch
+        token = device._connection_token
+        if token is None:
+            token = ConnectionSessionToken(_SyntheticClient(), 1)
+            device._client = token.client
+            device._connection_token = token
+            device._connection_epoch = token.epoch
         device._is_paired = True
         device._notifications_active = True
         device._policy_state = ConnectionPolicyState.ON_DEMAND_ACTIVE
