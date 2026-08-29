@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakError, BleakNotFoundError
 
 from custom_components.tuya_ble.const import ConnectionMode
 from custom_components.tuya_ble.phase_a_io_audit import (
@@ -40,6 +42,12 @@ def _device() -> TuyaBLEDevice:
         BLEDevice("synthetic audit device", "00:00:00:00:00:37", {}),
         connection_mode=ConnectionMode.ON_DEMAND.value,
     )
+
+
+def _always_connected_device() -> TuyaBLEDevice:
+    device = _device()
+    device._connection_mode = ConnectionMode.ALWAYS_CONNECTED
+    return device
 
 
 def test_new_process_audit_is_zeroed_opaque_and_has_no_reset_path() -> None:
@@ -188,13 +196,52 @@ async def test_exact_claim_and_authentication_hooks_record_once() -> None:
             b"\x00",
             session_token=token,
         )
+        device._handle_command_or_response(
+            2,
+            0,
+            TuyaBLECode.FUN_SENDER_PAIR,
+            b"\x00",
+            session_token=token,
+        )
 
     claim.assert_called_once_with()
     auth.assert_called_once_with()
 
 
-async def test_wire_and_logical_dp_hooks_do_not_need_real_ble() -> None:
+async def test_connect_attempt_failure_records_once_without_claiming_session() -> None:
     import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
+
+    device = _device()
+    with (
+        patch.object(transport, "record_connect_attempt") as attempt,
+        patch.object(transport, "record_gatt_session_claimed") as claim,
+        patch.object(
+            transport,
+            "establish_connection",
+            AsyncMock(side_effect=BleakNotFoundError()),
+        ),
+        pytest.raises(BleakNotFoundError),
+    ):
+        await device._ensure_connected()
+
+    attempt.assert_called_once_with()
+    claim.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("code", "counter"),
+    [
+        (TuyaBLECode.FUN_SENDER_DEVICE_STATUS, "device_status_requests"),
+        (TuyaBLECode.FUN_SENDER_DEVICE_INFO, "device_info_requests"),
+        (TuyaBLECode.FUN_SENDER_PAIR, "pair_requests"),
+        (TuyaBLECode.FUN_SENDER_DPS, "datapoint_protocol_packets"),
+        (TuyaBLECode.FUN_SENDER_OTA_START, "other_packets"),
+    ],
+)
+async def test_wire_hook_records_one_exact_category_per_logical_message(
+    code, counter
+) -> None:
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
 
     device = _device()
     client = Mock(is_connected=True, write_gatt_char=AsyncMock())
@@ -202,15 +249,84 @@ async def test_wire_and_logical_dp_hooks_do_not_need_real_ble() -> None:
     device._is_paired = True
     device._notifications_active = True
     device._characteristic_write = "synthetic-characteristic"
-    with patch.object(transport, "record_packet_sent") as packet:
-        await device._int_send_packets_locked(token, [b"private-local-key"])
-    packet.assert_called_once_with(None)
+    audit = _audit()
+    with patch.object(audit_module, "AUDIT", audit):
+        await device._int_send_packets_locked(
+            token,
+            [b"private-local-key", b"second-private-fragment"],
+            audit_code=code,
+        )
+    assert client.write_gatt_char.await_count == 2
+    snapshot = audit.snapshot()
+    assert snapshot["counters"]["packets_sent_total"] == 1
+    assert snapshot["counters"][counter] == 1
+    assert sum(snapshot["counters"].values()) == 2
 
+
+async def test_wire_hook_does_not_record_when_no_write_is_possible() -> None:
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    device = _device()
+    client = Mock(is_connected=False, write_gatt_char=AsyncMock())
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    audit = _audit()
+    with patch.object(audit_module, "AUDIT", audit), pytest.raises(BleakError):
+        await device._int_send_packets_locked(
+            token,
+            [b"private-local-key"],
+            audit_code=TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+        )
+    client.write_gatt_char.assert_not_awaited()
+    assert audit.snapshot()["counters"]["packets_sent_total"] == 0
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["_send_datapoints", "_send_datapoints_no_replay", "_send_datapoints_once"],
+)
+async def test_each_logical_datapoint_entry_point_records_once(method_name) -> None:
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
+
+    device = _device()
     device._protocol_version = 3
     device._send_datapoints_v3 = AsyncMock()
+    device._send_packet_once_confirmed = AsyncMock()
     with patch.object(transport, "record_datapoint_write") as datapoint:
-        await device._send_datapoints([77])
+        await getattr(device, method_name)([77])
     datapoint.assert_called_once_with()
+
+
+def test_reconnect_audit_counts_initial_and_replacement_tasks_not_guards_or_cancel() -> (
+    None
+):
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    device = _always_connected_device()
+    created: list[Mock] = []
+
+    def create_policy_task(coroutine):
+        coroutine.close()
+        task = Mock()
+        created.append(task)
+        return task
+
+    device._create_policy_task = Mock(side_effect=create_policy_task)
+    audit = _audit()
+    with patch.object(audit_module, "AUDIT", audit):
+        device._schedule_reconnect_locked(1)
+        initial = device._reconnect_task
+        device._schedule_reconnect_locked(2)
+        device._cancel_reconnect_locked()
+        device._schedule_reconnect_locked(0)
+        device._connection_mode = ConnectionMode.ON_DEMAND
+        device._schedule_reconnect_locked(3)
+
+    assert len(created) == 3
+    assert audit.snapshot()["counters"]["reconnect_schedules"] == 3
+    initial.cancel.assert_called_once_with()
+    created[1].cancel.assert_called_once_with()
 
 
 def test_audit_service_and_startup_order_are_snapshot_only_and_early() -> None:
@@ -227,6 +343,84 @@ def test_audit_service_and_startup_order_are_snapshot_only_and_early() -> None:
     assert "snapshot(" in handler_source
     assert "hass.data" not in handler_source
     assert "TuyaBLEDevice" not in handler_source
+
+
+async def test_audit_service_snapshot_is_repeated_read_only_and_never_looks_up_device() -> (
+    None
+):
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    audit = _audit()
+    audit.record_connect_attempt()
+    call = SimpleNamespace(data={"nonce": "c" * 16})
+    with patch.object(audit_module, "AUDIT", audit):
+        first = await audit_module._async_handle_phase_a_io_audit(call)
+        second = await audit_module._async_handle_phase_a_io_audit(call)
+
+    assert first == second
+    assert first["counters"]["connect_attempts"] == 1
+    assert first["event_ordinal"] == 1
+
+
+async def test_preflight_receipt_and_invalid_probe_target_preserve_zero_io_audit() -> (
+    None
+):
+    """A-M10: rejected or local-only research calls cannot fabricate I/O."""
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    from custom_components.tuya_ble.phase_a_probe import (
+        _async_handle_phase_a_status_probe,
+        _async_handle_phase_a_status_probe_preflight,
+        _async_handle_phase_a_status_probe_receipt,
+    )
+
+    audit = _audit()
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(async_get_entry=lambda _entry_id: None),
+    )
+    with patch.object(audit_module, "AUDIT", audit):
+        preflight = await _async_handle_phase_a_status_probe_preflight(
+            hass, SimpleNamespace(data={"nonce": "d" * 16})
+        )
+        receipt = await _async_handle_phase_a_status_probe_receipt(
+            hass, SimpleNamespace(data={"nonce": "d" * 16})
+        )
+        rejected = await _async_handle_phase_a_status_probe(
+            hass,
+            SimpleNamespace(
+                data={
+                    "config_entry_id": "private-config-entry",
+                    "mode": "cold",
+                }
+            ),
+        )
+
+    assert preflight["result"] == "preflight_ok"
+    assert receipt["known"] is False
+    assert rejected["result"] == "precondition_failed"
+    snapshot = audit.snapshot()
+    assert snapshot["event_ordinal"] == 0
+    assert all(value == 0 for value in snapshot["counters"].values())
+
+
+def test_startup_activity_has_an_audit_epoch_before_later_service_registration() -> (
+    None
+):
+    """Model startup work before service registration through the real singleton."""
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    audit = _audit()
+    hass = SimpleNamespace(data={}, services=Mock())
+    with patch.object(audit_module, "AUDIT", audit):
+        # A startup callback can cross an instrumented boundary before the
+        # response service becomes reachable; module state already exists.
+        audit_module.record_connect_attempt()
+        before_registration = audit.snapshot()
+        audit_module.async_register_phase_a_io_audit(hass)
+
+    assert before_registration["counters"]["connect_attempts"] == 1
+    assert before_registration["event_ordinal"] == 1
+    hass.services.async_register.assert_called_once()
 
 
 def test_helper_accepts_only_the_audit_schema_and_never_persists_wrapper_fields() -> (

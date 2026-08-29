@@ -2059,6 +2059,7 @@ class TuyaBLEDevice:
                 self._reconnect_task.cancel()
                 self._reconnect_task = None
                 self._scheduled_reconnect_delay = delay
+                record_reconnect_scheduled()
                 self._reconnect_task = self._create_policy_task(
                     self._reconnect_after_delay(delay)
                 )
@@ -3731,6 +3732,7 @@ class TuyaBLEDevice:
     ) -> None:
         """Execute command and read response."""
         client = session_token.client
+        first_write = True
         for packet in packets:
             if (
                 self._owns_transport_work(
@@ -3740,7 +3742,12 @@ class TuyaBLEDevice:
                 and client.is_connected
             ):
                 try:
-                    record_packet_sent(audit_code)
+                    if first_write:
+                        # One logical Tuya message can occupy multiple GATT
+                        # fragments. Record the actual message once, directly
+                        # before its first physical write attempt.
+                        record_packet_sent(audit_code)
+                        first_write = False
                     await client.write_gatt_char(
                         self._characteristic_write,
                         packet,
