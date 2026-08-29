@@ -20,8 +20,9 @@ Control enabled and Connection Mode set to On Demand. Before any request, it
 atomically requires an idle runtime: no GATT client, authenticated session,
 connection lease, pending release, reconnect, or disconnect transition. A
 failed precondition returns a sanitized result and sends no request. The
-service has a dedicated per-device owner, so a simultaneous probe is rejected
-before BLE I/O.
+service has a dedicated owner keyed to the in-memory device object, so a
+simultaneous probe is rejected before BLE I/O without retaining the supplied
+Config Entry ID in its lock state.
 
 The implementation calls the existing reviewed `TuyaBLEDevice.update()` path
 exactly once for `cold` and at most twice for `cold_then_retained`. It makes no

@@ -10,12 +10,28 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from bleak.backends.device import BLEDevice
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import SupportsResponse
+from voluptuous import Invalid
 
 from custom_components.tuya_ble.const import (
     ConnectionMode,
     ConnectionPolicyState,
+    DOMAIN,
 )
-from custom_components.tuya_ble.phase_a_probe import async_run_phase_a_status_probe
+from custom_components.tuya_ble.phase_a_probe import (
+    ATTR_CONFIG_ENTRY_ID,
+    ATTR_MODE,
+    MODE_COLD,
+    MODE_COLD_THEN_RETAINED,
+    SERVICE_PHASE_A_STATUS_PROBE,
+    SERVICE_SCHEMA,
+    _LOCKS_DATA_KEY,
+    _async_handle_phase_a_status_probe,
+    async_register_phase_a_status_probe,
+    async_run_phase_a_status_probe,
+    async_unregister_phase_a_status_probe_if_unused,
+)
 from custom_components.tuya_ble.tuya_ble.tuya_ble import (
     ConnectionSessionToken,
     StatusObservationEvent,
@@ -86,8 +102,14 @@ def _install_successful_update(device: TuyaBLEDevice) -> AsyncMock:
 
 async def _release_normally(device: TuyaBLEDevice) -> None:
     """Fire the narrow passive normal-release observer after a loop turn."""
-    await asyncio.sleep(0)
-    device._fire_on_demand_idle_release_callbacks()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        token = device._connection_token
+        if token is not None:
+            break
+    else:
+        raise AssertionError("synthetic update did not establish a session")
+    device._fire_on_demand_idle_release_callbacks(token)
 
 
 @pytest.mark.asyncio
@@ -208,5 +230,303 @@ async def test_response_never_leaks_adversarial_private_material(caplog):
         "private-config-entry-and-device-id",
         "private-local-key",
         "private-sec-key",
+        "private-entity-id",
+        "private-raw-bytes",
+        "private-dp-value",
     ):
         assert forbidden not in rendered
+
+
+def test_service_schema_and_response_only_registration_lifecycle():
+    """The temporary action has strict input and disappears with the domain."""
+    services = SimpleNamespace(async_register=Mock(), async_remove=Mock())
+    hass = SimpleNamespace(data={}, services=services)
+
+    assert (
+        SERVICE_SCHEMA(
+            {ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry", ATTR_MODE: MODE_COLD}
+        )[ATTR_MODE]
+        == MODE_COLD
+    )
+    with pytest.raises(Invalid):
+        SERVICE_SCHEMA({ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry"})
+    with pytest.raises(Invalid):
+        SERVICE_SCHEMA(
+            {
+                ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry",
+                ATTR_MODE: "three_requests",
+            }
+        )
+
+    async_register_phase_a_status_probe(hass)
+    _, _, kwargs = services.async_register.mock_calls[0]
+    assert kwargs["supports_response"] is SupportsResponse.ONLY
+    assert kwargs["schema"] is SERVICE_SCHEMA
+
+    async_unregister_phase_a_status_probe_if_unused(hass)
+    services.async_remove.assert_called_once_with(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE)
+
+
+def _service_hass(device: TuyaBLEDevice, state=ConfigEntryState.LOADED):
+    """Return a minimal loaded-entry service environment with no real HA I/O."""
+    entry = SimpleNamespace(state=state)
+    return SimpleNamespace(
+        data={DOMAIN: {"private-entry": SimpleNamespace(device=device)}},
+        config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", (None, ConfigEntryState.SETUP_RETRY))
+async def test_missing_or_unloaded_service_target_rejects_without_io(state):
+    device = _device()
+    device.update = AsyncMock()
+    hass = (
+        _service_hass(device, state)
+        if state is not None
+        else SimpleNamespace(
+            data={DOMAIN: {}},
+            config_entries=SimpleNamespace(async_get_entry=Mock(return_value=None)),
+        )
+    )
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+
+    result = await _async_handle_phase_a_status_probe(hass, call)
+
+    assert result["request_count"] == 0
+    device.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda device: setattr(device, "_client", _SyntheticClient()),
+        lambda device: setattr(device, "_is_paired", True),
+        lambda device: setattr(device, "_active_lease_count", 1),
+        lambda device: setattr(device, "_pending_release", object()),
+        lambda device: setattr(device, "_reconnect_task", object()),
+        lambda device: setattr(device, "_terminal_stopped", True),
+        lambda device: setattr(device, "_unload_quiescing", True),
+    ],
+)
+async def test_every_unsafe_cold_runtime_gate_rejects_before_io(mutate):
+    device = _device()
+    mutate(device)
+    device.update = AsyncMock()
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD)
+
+    assert result["result"] == "precondition_failed"
+    assert result["cold_request_attempted"] is False
+    assert result["request_count"] == 0
+    device.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_connect_or_handshake_failure_is_an_attempt_but_not_a_status_request():
+    device = _device()
+    device.update = AsyncMock(side_effect=RuntimeError("synthetic connect failure"))
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD)
+
+    assert result["cold_request_attempted"] is True
+    assert result["request_count"] == 0
+    assert result["requests"] == []
+    device.update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ack_timeout_after_request_creation_counts_once_without_retry():
+    device = _device()
+
+    async def timeout_update() -> None:
+        token = ConnectionSessionToken(_SyntheticClient(), 1)
+        device._client = token.client
+        device._connection_token = token
+        device._connection_epoch = token.epoch
+        device._is_paired = True
+        device._notifications_active = True
+        for callback in tuple(device._status_observers):
+            callback(StatusObservationEvent(1, "explicit", "REQUEST_CREATED", 1))
+            callback(
+                StatusObservationEvent(
+                    1, "explicit", "ACK_TIMEOUT", 2, ack_result="timeout"
+                )
+            )
+
+    device.update = AsyncMock(side_effect=timeout_update)
+    release = asyncio.create_task(_release_normally(device))
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD_THEN_RETAINED)
+    await release
+
+    assert device.update.await_count == 1
+    assert result["request_count"] == 1
+    assert result["requests"][0]["result"] == "ack_failed"
+    assert result["retained_request_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_replacement_during_first_update_blocks_retained_leg():
+    device = _device()
+    old_tokens = []
+
+    async def replaced_update() -> None:
+        old = ConnectionSessionToken(_SyntheticClient(), 1)
+        old_tokens.append(old)
+        device._client = old.client
+        device._connection_token = old
+        device._connection_epoch = old.epoch
+        device._is_paired = True
+        device._notifications_active = True
+        for callback in tuple(device._status_observers):
+            callback(StatusObservationEvent(1, "explicit", "REQUEST_CREATED", 1))
+            callback(
+                StatusObservationEvent(
+                    1, "explicit", "ACK_SUCCESS", 2, ack_result="success"
+                )
+            )
+        replacement = ConnectionSessionToken(_SyntheticClient(), 2)
+        device._client = replacement.client
+        device._connection_token = replacement
+        device._connection_epoch = replacement.epoch
+
+    device.update = AsyncMock(side_effect=replaced_update)
+
+    async def release_old_session() -> None:
+        while not old_tokens:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        device._fire_on_demand_idle_release_callbacks(old_tokens[0])
+
+    release = asyncio.create_task(release_old_session())
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD_THEN_RETAINED)
+    await release
+
+    assert device.update.await_count == 1
+    assert result["same_session_retained"] is False
+    assert result["automatic_reconnect_observed"] is True
+
+
+@pytest.mark.asyncio
+async def test_collector_overflow_prevents_the_retained_leg():
+    device = _device()
+
+    async def overflowing_update() -> None:
+        token = ConnectionSessionToken(_SyntheticClient(), 1)
+        device._client = token.client
+        device._connection_token = token
+        device._connection_epoch = token.epoch
+        device._is_paired = True
+        device._notifications_active = True
+        for callback in tuple(device._status_observers):
+            callback(StatusObservationEvent(1, "explicit", "REQUEST_CREATED", 1))
+            callback(
+                StatusObservationEvent(
+                    1, "explicit", "ACK_SUCCESS", 2, ack_result="success"
+                )
+            )
+            for ordinal in range(3, 67):
+                callback(StatusObservationEvent(1, "explicit", "DP_BATCH", ordinal))
+
+    device.update = AsyncMock(side_effect=overflowing_update)
+    release = asyncio.create_task(_release_normally(device))
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD_THEN_RETAINED)
+    await release
+
+    assert device.update.await_count == 1
+    assert result["observation_overflow"] is True
+    assert result["retained_request_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_only_the_final_exact_normal_release_completes_the_probe():
+    device = _device()
+    device.update = _install_successful_update(device)
+
+    async def unrelated_then_exact_release() -> None:
+        await asyncio.sleep(0)
+        unrelated = ConnectionSessionToken(_SyntheticClient(), 99)
+        device._fire_on_demand_idle_release_callbacks(unrelated)
+        assert device._on_demand_idle_release_callbacks
+        token = device._connection_token
+        assert token is not None
+        device._fire_on_demand_idle_release_callbacks(token)
+
+    release = asyncio.create_task(unrelated_then_exact_release())
+    result = await async_run_phase_a_status_probe(device, MODE_COLD)
+    await release
+
+    assert result["normal_release_observed"] is True
+    assert result["result"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_service_concurrency_rejects_second_call_and_cleans_device_lock():
+    device = _device()
+    device.update = _install_successful_update(device)
+    hass = _service_hass(device)
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    first = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await asyncio.sleep(0)
+
+    second = await _async_handle_phase_a_status_probe(hass, call)
+    token = device._connection_token
+    assert token is not None
+    device._fire_on_demand_idle_release_callbacks(token)
+    first_result = await first
+
+    assert second["result"] == "probe_already_active"
+    assert second["request_count"] == 0
+    assert first_result["request_count"] == 1
+    assert hass.data[DOMAIN][_LOCKS_DATA_KEY] == {}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_removes_every_probe_callback_and_never_retries():
+    device = _device()
+    entered = asyncio.Event()
+    release_update = asyncio.Event()
+
+    async def stalled_update() -> None:
+        entered.set()
+        await release_update.wait()
+
+    device.update = AsyncMock(side_effect=stalled_update)
+    task = asyncio.create_task(async_run_phase_a_status_probe(device, MODE_COLD))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert device.update.await_count == 1
+    assert device._status_observers == []
+    assert device._on_demand_idle_release_callbacks == []
+    assert device._connection_state_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_write_policy_or_issue_hidden_retained_setup_work():
+    device = _device()
+    device.update = _install_successful_update(device)
+    device.async_update_connection_policy = AsyncMock()
+    device.pair = AsyncMock()
+    device._update_device_info = AsyncMock()
+    device._ensure_connected = AsyncMock()
+    release = asyncio.create_task(_release_normally(device))
+
+    result = await async_run_phase_a_status_probe(device, MODE_COLD_THEN_RETAINED)
+    await release
+
+    assert result["request_count"] == 2
+    device.async_update_connection_policy.assert_not_awaited()
+    device.pair.assert_not_awaited()
+    device._update_device_info.assert_not_awaited()
+    device._ensure_connected.assert_not_awaited()

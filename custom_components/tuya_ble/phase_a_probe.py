@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 
 from .const import (
@@ -46,13 +47,15 @@ SERVICE_SCHEMA = vol.Schema(
 class _Collector:
     """Bounded conversion of private observations into safe response records."""
 
-    def __init__(self, started: float) -> None:
+    def __init__(self, device: TuyaBLEDevice, started: float) -> None:
+        self._device = device
         self._started = started
         self.events: list[dict[str, Any]] = []
         self.overflow = False
         self._generation_trials: dict[int, int] = {}
         self._next_trial: int | None = None
-        self.ack_success_trials: set[int] = set()
+        self.created_trials: set[int] = set()
+        self.ack_success_sessions: dict[int, object] = {}
         self.ack_failure_trials: set[int] = set()
 
     def expect_trial(self, trial: int) -> None:
@@ -65,8 +68,12 @@ class _Collector:
             self._generation_trials[event.observation_ordinal] = self._next_trial
             self._next_trial = None
         trial = self._generation_trials.get(event.observation_ordinal, 0)
-        if event.kind == "ACK_SUCCESS" and trial:
-            self.ack_success_trials.add(trial)
+        if event.kind == "REQUEST_CREATED" and trial:
+            self.created_trials.add(trial)
+        if event.kind == "ACK_SUCCESS" and trial and event.exact_session:
+            session = self._device._connection_token
+            if session is not None:
+                self.ack_success_sessions[trial] = session
         elif event.kind in {"ACK_FAILURE", "ACK_TIMEOUT"} and trial:
             self.ack_failure_trials.add(trial)
         if len(self.events) >= _MAX_EVENTS:
@@ -184,14 +191,17 @@ async def async_run_phase_a_status_probe(
     if not await _is_eligible_cold_idle(device):
         return _empty_response(mode, started, "precondition_failed")
 
-    collector = _Collector(started)
+    collector = _Collector(device, started)
     requests: list[dict[str, Any]] = []
     release_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     first_session: object | None = None
+    final_session: object | None = None
     automatic_reconnect = False
+    cold_update_invoked = False
+    retained_update_invoked = False
 
-    def on_normal_release() -> None:
-        if not release_future.done():
+    def on_normal_release(session: object) -> None:
+        if session is final_session and not release_future.done():
             release_future.set_result(None)
 
     def on_connection_state(connected: bool) -> None:
@@ -212,20 +222,29 @@ async def async_run_phase_a_status_probe(
     )
     try:
         collector.expect_trial(1)
+        cold_update_invoked = True
         try:
             await device.update()
         except asyncio.CancelledError:
             raise
         except Exception:  # Deliberately do not surface transport details.
-            requests.append(_request_record(1, "update_failed", started))
+            if 1 in collector.created_trials:
+                requests.append(_request_record(1, "update_failed", started))
         else:
-            if 1 in collector.ack_success_trials:
-                requests.append(_request_record(1, "ack_success", started))
-                first_session = device._connection_token
-            elif 1 in collector.ack_failure_trials:
-                requests.append(_request_record(1, "ack_failed", started))
-            else:
-                requests.append(_request_record(1, "ack_missing", started))
+            if 1 in collector.created_trials:
+                first_session = collector.ack_success_sessions.get(1)
+                if first_session is not None:
+                    requests.append(_request_record(1, "ack_success", started))
+                    final_session = first_session
+                    if (
+                        device.is_connection_active
+                        and device._connection_token is not first_session
+                    ):
+                        automatic_reconnect = True
+                elif 1 in collector.ack_failure_trials:
+                    requests.append(_request_record(1, "ack_failed", started))
+                else:
+                    requests.append(_request_record(1, "ack_missing", started))
 
         same_session_retained = False
         cold_succeeded = (
@@ -234,29 +253,42 @@ async def async_run_phase_a_status_probe(
             and first_session is not None
             and device.is_connection_active
             and device._connection_token is first_session
+            and not collector.overflow
         )
         if mode == MODE_COLD_THEN_RETAINED and cold_succeeded:
             collector.expect_trial(2)
+            retained_update_invoked = True
             try:
                 await device.update()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                requests.append(_request_record(2, "update_failed", started))
+                if 2 in collector.created_trials:
+                    requests.append(_request_record(2, "update_failed", started))
             else:
-                same_session_retained = (
-                    device.is_connection_active
-                    and device._connection_token is first_session
-                    and 2 in collector.ack_success_trials
-                )
-                if same_session_retained:
-                    requests.append(_request_record(2, "ack_success", started))
-                elif 2 in collector.ack_failure_trials:
-                    requests.append(_request_record(2, "ack_failed", started))
-                else:
-                    requests.append(_request_record(2, "session_not_retained", started))
+                if 2 in collector.created_trials:
+                    second_session = collector.ack_success_sessions.get(2)
+                    same_session_retained = (
+                        not collector.overflow
+                        and second_session is first_session
+                        and device.is_connection_active
+                        and device._connection_token is first_session
+                    )
+                    if same_session_retained:
+                        requests.append(_request_record(2, "ack_success", started))
+                        final_session = second_session
+                    elif 2 in collector.ack_failure_trials:
+                        requests.append(_request_record(2, "ack_failed", started))
+                    else:
+                        requests.append(
+                            _request_record(2, "session_not_retained", started)
+                        )
 
-        normal_release_observed = await _wait_for_normal_release(device, release_future)
+        normal_release_observed = (
+            await _wait_for_normal_release(device, release_future)
+            if final_session is not None
+            else False
+        )
         completed = (
             bool(requests)
             and all(request["result"] == "ack_success" for request in requests)
@@ -268,8 +300,8 @@ async def async_run_phase_a_status_probe(
         return {
             "mode": mode,
             "result": "completed" if completed else "invalid_or_incomplete",
-            "cold_request_attempted": bool(requests),
-            "retained_request_attempted": len(requests) == 2,
+            "cold_request_attempted": cold_update_invoked,
+            "retained_request_attempted": retained_update_invoked,
             "request_count": len(requests),
             "same_session_retained": same_session_retained,
             "normal_release_observed": normal_release_observed,
@@ -289,6 +321,9 @@ def _device_for_service_call(
     hass: HomeAssistant, entry_id: str
 ) -> TuyaBLEDevice | None:
     """Look up one loaded config entry without retaining its private identifier."""
+    entry = hass.config_entries.async_get_entry(entry_id)
+    if entry is None or entry.state is not ConfigEntryState.LOADED:
+        return None
     data = hass.data.get(DOMAIN, {}).get(entry_id)
     device = getattr(data, "device", None)
     return device if isinstance(device, TuyaBLEDevice) else None
@@ -304,17 +339,18 @@ async def _async_handle_phase_a_status_probe(
     device = _device_for_service_call(hass, call.data[ATTR_CONFIG_ENTRY_ID])
     if device is None:
         return _empty_response(mode, started, "precondition_failed")
-    locks: dict[str, asyncio.Lock] = hass.data[DOMAIN].setdefault(_LOCKS_DATA_KEY, {})
-    entry_id: str = call.data[ATTR_CONFIG_ENTRY_ID]
-    lock = locks.setdefault(entry_id, asyncio.Lock())
+    locks: dict[TuyaBLEDevice, asyncio.Lock] = hass.data[DOMAIN].setdefault(
+        _LOCKS_DATA_KEY, {}
+    )
+    lock = locks.setdefault(device, asyncio.Lock())
     if lock.locked():
         return _empty_response(mode, started, "probe_already_active")
     try:
         async with lock:
             return await async_run_phase_a_status_probe(device, mode)
     finally:
-        if not lock.locked() and locks.get(entry_id) is lock:
-            locks.pop(entry_id, None)
+        if not lock.locked() and locks.get(device) is lock:
+            locks.pop(device, None)
 
 
 def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
