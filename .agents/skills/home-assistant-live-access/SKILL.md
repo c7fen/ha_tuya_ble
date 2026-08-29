@@ -1,39 +1,67 @@
 ---
 name: home-assistant-live-access
-description: Required procedure for any live Home Assistant host, Supervisor, deployment, restart, Core-check, or runtime-validation work in this repository. Resolves the private local SSH route safely, establishes the required interactive SSH Key Agent login, and enters a Supervisor-capable login shell without exposing private access data.
+description: Required procedure for any live Home Assistant host, Supervisor, deployment, restart, Core-check, Repairs, or runtime-validation work in this repository. Uses the private local interactive SSH route without rendering it into agent transcripts, establishes the required SSH Key Agent login, enters a Supervisor-capable login shell, and enforces fail-closed structured admission parsing.
 ---
 
 # Home Assistant live access
 
 Use this skill for every task that touches the running Home Assistant host or
 Supervisor, including read-only runtime inspection, deployment, Core checks,
-restarts, integration reloads, service calls, and live validation.
+Repairs checks, restarts, integration reloads, service calls, and live
+validation.
 
-## 1. Load the private local access instructions first
+## 1. Private local access instructions are not transcript input
 
 The exact Home Assistant SSH target is intentionally not committed to this public
 repository.
 
-1. Check for `AGENTS.local.md` in the current checkout.
-2. If it is absent and this is Felix's primary WSL2 workstation, read the private
-   `AGENTS.local.md` from the canonical checkout documented in the repository
-   `AGENTS.md`.
-3. Do not print, quote, copy, summarize, commit, or publish the private target or
-   other access details from that file.
-4. An untracked `AGENTS.local.md` is not inherited by linked Git worktrees. Its
-   absence in a worktree therefore does **not** mean the Home Assistant route is
-   unavailable.
+An untracked `AGENTS.local.md` may exist in the canonical checkout. Linked Git
+worktrees do not inherit that file.
 
-Do not invent a replacement host, alias, route bootstrap, browser fallback, or
-other access method before checking the canonical private local instructions.
+**Critical privacy rule:** never read `AGENTS.local.md` through a file-reading,
+terminal, connector, or agent tool whose response returns the file contents to
+the model/transcript. Do not `cat`, `sed`, `head`, `tail`, or otherwise render
+that private file into retained platform output.
 
-## 2. SSH authentication is interactive
+Do not print, quote, copy, summarize, commit, or publish the private target or
+other access details from that file.
+
+If the current worktree lacks the private file, its absence does **not** mean the
+route is unavailable. The canonical checkout documented in repository
+`AGENTS.md` remains the local private source of truth, but its contents must be
+consumed only through a non-echoing local mechanism.
+
+## 2. Preferred non-echoing route wrapper
+
+For agent/orchestrator live work, prefer an untracked local executable wrapper:
+
+```text
+$HOME/.local/bin/ha-tuya-ble-ssh
+```
+
+The wrapper is private local state, not repository content. It should contain or
+resolve the already verified SSH command and finish with an `exec ssh ...`
+interactive login. Recommended permissions are owner-only executable (`0700`)
+under an owner-only parent directory.
+
+The wrapper itself must never print the resolved target before launching SSH.
+
+If the wrapper is absent, do **not** solve that by rendering `AGENTS.local.md`
+into the transcript. A separately authorized local-only bootstrap may create the
+wrapper from the already established private instructions using a non-echoing
+process. If no such safe local mechanism is available, ask the operator to
+create/update the wrapper rather than exposing the private file.
+
+Do not invent a replacement host, public alias, browser fallback, or alternate
+network route merely because a linked worktree lacks `AGENTS.local.md`.
+
+## 3. SSH authentication is interactive
 
 On the verified primary workstation, SSH authentication is supplied by the
 existing SSH Key Agent and requires an **interactive SSH login**.
 
-Use the exact SSH command/target from `AGENTS.local.md` and allocate an
-interactive terminal/PTY. Keep that SSH session open for the bounded live task.
+Launch the private wrapper with an interactive terminal/PTY and keep that SSH
+session open for the bounded live task.
 
 Do **not** replace it with a one-shot command such as:
 
@@ -47,7 +75,7 @@ verified route is unavailable.
 Do not inspect, export, copy, replace, or print private keys, SSH-agent sockets,
 or SSH-agent environment variables.
 
-## 3. Establish Supervisor context inside the interactive session
+## 4. Establish Supervisor context inside the interactive session
 
 A direct/non-login command environment on this host may lack the Supervisor
 context required by the Home Assistant `ha` CLI.
@@ -76,28 +104,83 @@ If a direct shell invocation lacks Supervisor context, first correct the login
 shell as above. Do not conclude that Supervisor is unavailable and do not create
 an alternate route merely because a non-login environment lacks the token.
 
-## 4. Command execution model for agents
+## 5. Strict structured Repairs admission
+
+Repairs admission is fail-closed. When a supported Home Assistant response is
+used to prove the Repairs gate, the collector must validate the actual response
+shape before filtering or counting anything.
+
+For the currently verified structured response, require:
+
+- top-level value is an object/dictionary;
+- the object contains key `issues`;
+- `issues` is a list.
+
+A missing key, null value, array at the top level, string, malformed JSON, or any
+other response shape is an admission failure/indeterminate observation.
+
+**Forbidden:** silently converting an unexpected response into an empty list,
+for example logic equivalent to:
+
+```text
+issues = payload if isinstance(payload, list) else []
+```
+
+or:
+
+```text
+issues = payload.get("issues", [])
+```
+
+without first proving the key exists and is a list.
+
+A minimal safe shape check is conceptually:
+
+```python
+payload = json.load(stream)
+if not isinstance(payload, dict):
+    raise ValueError("repairs_response_shape")
+if "issues" not in payload or not isinstance(payload["issues"], list):
+    raise ValueError("repairs_issues_shape")
+issues = payload["issues"]
+```
+
+Task-specific filtering of `issues` must happen in-process. Retained/public
+evidence should contain only allowlisted aggregate results such as shape-valid,
+relevant-count, and critical-count. Do not dump issue objects merely to debug a
+collector.
+
+Use the same strict decoder at every admission point in one live run (for
+example D0 and post-activation). Do not use separate permissive parsing logic at
+later gates.
+
+If the structured schema changes, stop with a collector/admission classification
+and correct the decoder before any deployment/restart proceeds. Do not label a
+predecessor admission failure as an invocation/service failure.
+
+## 6. Command execution model for agents
 
 For agent/orchestrator execution:
 
-1. Open one interactive SSH session using the private command from
-   `AGENTS.local.md`.
+1. Open one interactive SSH session using the private local wrapper.
 2. Wait for the Home Assistant command-line prompt/banner before sending remote
    work.
 3. Enter the verified login-shell workflow.
 4. Execute the authorized bounded commands by sending them through that existing
    interactive session.
-5. Keep authorization boundaries from the active task; this skill grants no
+5. Validate structured admission responses strictly before mutation gates.
+6. Keep authorization boundaries from the active task; this skill grants no
    deployment, restart, service-call, BLE, lock, or configuration permission by
    itself.
-6. Close the interactive SSH session when the bounded task is complete.
+7. Close the interactive SSH session when the bounded task is complete.
 
 Do not silently open additional sessions, retry device work, or broaden a live
 operation merely to recover from orchestration problems.
 
-## 5. Privacy and evidence
+## 7. Privacy and evidence
 
 - The exact Home Assistant host/address and private route remain local-only.
+- Never render private instruction-file contents into platform tool output.
 - Do not copy private access details into PRs, issues, committed files, retained
   public logs, or sanitized evidence.
 - Never print `SUPERVISOR_TOKEN`, Authorization headers, SSH-agent data, private
@@ -105,18 +188,24 @@ operation merely to recover from orchestration problems.
 - Avoid `set -x` for live access work.
 - Do not print private evidence/run paths unless a task explicitly requires a
   private local diagnostic and its disclosure is authorized.
+- Do not retain raw Repairs issue objects when aggregate admission counts are
+  sufficient.
 - Public reports should describe the route only as the verified private
   interactive SSH route.
 
-## 6. Fail-closed access decisions
+## 8. Fail-closed access and admission decisions
 
-Stop and request operator input only when the private local access instructions
-are genuinely unavailable from both the current checkout and the documented
-canonical checkout, or when the interactive SSH login itself fails.
+Stop and request operator input only when the private local route cannot be
+launched through the established non-echoing mechanism, or when the interactive
+SSH login itself fails.
+
+Stop with an admission/collector classification when a required structured
+response does not match its proven schema.
 
 The following are **not** valid reasons to declare the route unavailable:
 
 - `AGENTS.local.md` missing only from a linked worktree;
+- refusing to render the private local file into tool output;
 - a non-interactive `ssh <target> "command"` attempt failing;
 - a direct non-login shell lacking Supervisor context;
 - an agent preferring a newly invented privacy-safe alias;
