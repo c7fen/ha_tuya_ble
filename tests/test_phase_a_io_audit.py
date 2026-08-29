@@ -305,6 +305,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     code, counter
 ) -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
     client = Mock(is_connected=True, write_gatt_char=AsyncMock())
@@ -316,6 +317,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
         return_value=[b"synthetic-first-fragment", b"synthetic-second-fragment"]
     )
     audit = _audit()
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
     with patch.object(audit_module, "AUDIT", audit):
         await device._send_packet_while_connected(
             code,
@@ -324,6 +326,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
             False,
             session_token=token,
         )
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
     assert client.write_gatt_char.await_count == 2
     snapshot = audit.snapshot()
     assert snapshot["counters"]["packets_sent_total"] == 1
@@ -333,6 +336,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
 
 async def test_first_write_failure_records_one_exact_message_category() -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
     client = Mock(
@@ -346,6 +350,7 @@ async def test_first_write_failure_records_one_exact_message_category() -> None:
     device._build_packets = Mock(return_value=[b"synthetic-first-fragment"])
     device._record_write_transport_failure = AsyncMock()
     audit = _audit()
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
     with patch.object(audit_module, "AUDIT", audit), pytest.raises(BleakError):
         await device._send_packet_while_connected(
             TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
@@ -354,10 +359,40 @@ async def test_first_write_failure_records_one_exact_message_category() -> None:
             False,
             session_token=token,
         )
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
     client.write_gatt_char.assert_awaited_once()
     snapshot = audit.snapshot()
     assert snapshot["counters"]["packets_sent_total"] == 1
     assert snapshot["counters"]["device_status_requests"] == 1
+
+
+async def test_high_level_empty_packet_list_records_no_transport_activity() -> None:
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
+
+    device = _device()
+    client = Mock(is_connected=True, write_gatt_char=AsyncMock())
+    token = device._claim_connection_session(client)
+    device._is_paired = True
+    device._notifications_active = True
+    device._build_packets = Mock(return_value=[])
+    audit = _audit()
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
+    with patch.object(audit_module, "AUDIT", audit):
+        await device._send_packet_while_connected(
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"synthetic-outbound",
+            0,
+            False,
+            session_token=token,
+        )
+    assert transport._OUTGOING_PACKET_AUDIT_CODE.get() is None
+    client.write_gatt_char.assert_not_awaited()
+    snapshot = audit.snapshot()
+    assert snapshot["event_ordinal"] == 0
+    assert snapshot["events"] == []
+    assert snapshot["counters"]["packets_sent_total"] == 0
+    assert all(value == 0 for value in snapshot["counters"].values())
 
 
 def test_real_connection_loss_records_once_but_stale_or_inactive_state_does_not() -> (
