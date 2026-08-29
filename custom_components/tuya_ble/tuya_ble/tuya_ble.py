@@ -102,6 +102,9 @@ _ConnectionLeaseContext = dict[int, int]
 _CONNECTION_LEASE_CONTEXT: ContextVar[_ConnectionLeaseContext] = ContextVar(
     "tuya_ble_connection_lease", default={}
 )
+_OUTGOING_PACKET_AUDIT_CODE: ContextVar[TuyaBLECode | None] = ContextVar(
+    "tuya_ble_outgoing_packet_audit_code", default=None
+)
 
 
 def _lease_context_depth(device: object) -> int:
@@ -3539,17 +3542,18 @@ class TuyaBLEDevice:
             )
         try:
             packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-            if require_always_connected:
-                await self._int_send_packet_while_connected(
-                    token,
-                    packets,
-                    require_always_connected=True,
-                    audit_code=code,
-                )
-            else:
-                await self._int_send_packet_while_connected(
-                    token, packets, audit_code=code
-                )
+            audit_code_token = _OUTGOING_PACKET_AUDIT_CODE.set(code)
+            try:
+                if require_always_connected:
+                    await self._int_send_packet_while_connected(
+                        token,
+                        packets,
+                        require_always_connected=True,
+                    )
+                else:
+                    await self._int_send_packet_while_connected(token, packets)
+            finally:
+                _OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
             if not self._owns_transport_work(
                 token,
                 require_always_connected=require_always_connected,
@@ -3600,7 +3604,6 @@ class TuyaBLEDevice:
         packets: list[bytes],
         *,
         require_always_connected: bool = False,
-        audit_code: TuyaBLECode | None = None,
     ) -> None:
         operation_lock = session_token.operation_lock
         if operation_lock.locked():
@@ -3622,12 +3625,9 @@ class TuyaBLEDevice:
                         session_token,
                         packets,
                         require_always_connected=True,
-                        audit_code=audit_code,
                     )
                 else:
-                    await self._send_packets_locked(
-                        session_token, packets, audit_code=audit_code
-                    )
+                    await self._send_packets_locked(session_token, packets)
             except BleakNotFoundError:
                 _LOGGER.error(
                     "%s: device not found, no longer in range, or poor RSSI: %s",
@@ -3648,7 +3648,6 @@ class TuyaBLEDevice:
         packets: list[bytes],
         *,
         require_always_connected: bool = False,
-        audit_code: TuyaBLECode | None = None,
     ) -> None:
         """Send command to device and read response."""
         self.ensure_control_available()
@@ -3663,12 +3662,9 @@ class TuyaBLEDevice:
                     session_token,
                     packets,
                     require_always_connected=True,
-                    audit_code=audit_code,
                 )
             else:
-                await self._int_send_packets_locked(
-                    session_token, packets, audit_code=audit_code
-                )
+                await self._int_send_packets_locked(session_token, packets)
         except BleakDBusError as ex:
             if "Bluetooth is already shutdown" in str(ex):
                 _LOGGER.debug("%s: Bluetooth is already shutdown", self.log_identity)
@@ -3728,7 +3724,6 @@ class TuyaBLEDevice:
         packets: list[bytes],
         *,
         require_always_connected: bool = False,
-        audit_code: TuyaBLECode | None = None,
     ) -> None:
         """Execute command and read response."""
         client = session_token.client
@@ -3746,7 +3741,7 @@ class TuyaBLEDevice:
                         # One logical Tuya message can occupy multiple GATT
                         # fragments. Record the actual message once, directly
                         # before its first physical write attempt.
-                        record_packet_sent(audit_code)
+                        record_packet_sent(_OUTGOING_PACKET_AUDIT_CODE.get())
                         first_write = False
                     await client.write_gatt_char(
                         self._characteristic_write,

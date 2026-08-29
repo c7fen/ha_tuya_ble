@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -178,6 +180,38 @@ def test_transport_and_policy_hooks_are_at_the_required_central_boundaries() -> 
     assert "record_reconnect_scheduled()" in sources["reconnect"]
 
 
+def test_audit_singleton_is_constructed_at_module_scope_before_registration() -> None:
+    """A-M8: moving construction into registration is a contract failure."""
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    source = Path(audit_module.__file__).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    singleton = next(
+        statement
+        for statement in module.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "AUDIT"
+            for target in statement.targets
+        )
+    )
+    assert isinstance(singleton.value, ast.Call)
+    assert isinstance(singleton.value.func, ast.Name)
+    assert singleton.value.func.id == "PhaseAIoAudit"
+
+    registration = next(
+        statement
+        for statement in module.body
+        if isinstance(statement, ast.FunctionDef)
+        and statement.name == "async_register_phase_a_io_audit"
+    )
+    registration_source = ast.get_source_segment(source, registration)
+    assert singleton.lineno < registration.lineno
+    assert registration_source is not None
+    assert "PhaseAIoAudit(" not in registration_source
+    assert "AUDIT =" not in registration_source
+
+
 async def test_exact_claim_and_authentication_hooks_record_once() -> None:
     import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
@@ -228,6 +262,35 @@ async def test_connect_attempt_failure_records_once_without_claiming_session() -
     claim.assert_not_called()
 
 
+async def test_connection_attempt_before_service_registration_is_in_later_snapshot() -> (
+    None
+):
+    """The process audit survives startup activity before service availability."""
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
+
+    device = _device()
+    hass = SimpleNamespace(data={}, services=Mock())
+    audit = _audit()
+    with (
+        patch.object(audit_module, "AUDIT", audit),
+        patch.object(
+            transport,
+            "establish_connection",
+            AsyncMock(side_effect=BleakNotFoundError()),
+        ),
+    ):
+        with pytest.raises(BleakNotFoundError):
+            await device._ensure_connected()
+        assert audit.snapshot()["counters"]["connect_attempts"] == 1
+        audit_module.async_register_phase_a_io_audit(hass)
+        handler = hass.services.async_register.call_args.args[2]
+        later_snapshot = await handler(SimpleNamespace(data={"nonce": "e" * 16}))
+
+    assert later_snapshot["counters"]["connect_attempts"] == 1
+    assert later_snapshot["nonce"] == "e" * 16
+
+
 @pytest.mark.parametrize(
     ("code", "counter"),
     [
@@ -242,6 +305,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     code, counter
 ) -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
     client = Mock(is_connected=True, write_gatt_char=AsyncMock())
@@ -251,11 +315,14 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     device._characteristic_write = "synthetic-characteristic"
     audit = _audit()
     with patch.object(audit_module, "AUDIT", audit):
-        await device._int_send_packets_locked(
-            token,
-            [b"private-local-key", b"second-private-fragment"],
-            audit_code=code,
-        )
+        audit_code_token = transport._OUTGOING_PACKET_AUDIT_CODE.set(code)
+        try:
+            await device._int_send_packets_locked(
+                token,
+                [b"private-local-key", b"second-private-fragment"],
+            )
+        finally:
+            transport._OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
     assert client.write_gatt_char.await_count == 2
     snapshot = audit.snapshot()
     assert snapshot["counters"]["packets_sent_total"] == 1
@@ -265,6 +332,7 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
 
 async def test_wire_hook_does_not_record_when_no_write_is_possible() -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
+    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
     client = Mock(is_connected=False, write_gatt_char=AsyncMock())
@@ -273,11 +341,13 @@ async def test_wire_hook_does_not_record_when_no_write_is_possible() -> None:
     device._notifications_active = True
     audit = _audit()
     with patch.object(audit_module, "AUDIT", audit), pytest.raises(BleakError):
-        await device._int_send_packets_locked(
-            token,
-            [b"private-local-key"],
-            audit_code=TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+        audit_code_token = transport._OUTGOING_PACKET_AUDIT_CODE.set(
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS
         )
+        try:
+            await device._int_send_packets_locked(token, [b"private-local-key"])
+        finally:
+            transport._OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
     client.write_gatt_char.assert_not_awaited()
     assert audit.snapshot()["counters"]["packets_sent_total"] == 0
 
