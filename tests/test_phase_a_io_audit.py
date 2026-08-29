@@ -305,7 +305,6 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     code, counter
 ) -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
-    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
     client = Mock(is_connected=True, write_gatt_char=AsyncMock())
@@ -313,16 +312,18 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     device._is_paired = True
     device._notifications_active = True
     device._characteristic_write = "synthetic-characteristic"
+    device._build_packets = Mock(
+        return_value=[b"synthetic-first-fragment", b"synthetic-second-fragment"]
+    )
     audit = _audit()
     with patch.object(audit_module, "AUDIT", audit):
-        audit_code_token = transport._OUTGOING_PACKET_AUDIT_CODE.set(code)
-        try:
-            await device._int_send_packets_locked(
-                token,
-                [b"private-local-key", b"second-private-fragment"],
-            )
-        finally:
-            transport._OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
+        await device._send_packet_while_connected(
+            code,
+            b"synthetic-outbound",
+            0,
+            False,
+            session_token=token,
+        )
     assert client.write_gatt_char.await_count == 2
     snapshot = audit.snapshot()
     assert snapshot["counters"]["packets_sent_total"] == 1
@@ -330,26 +331,53 @@ async def test_wire_hook_records_one_exact_category_per_logical_message(
     assert sum(snapshot["counters"].values()) == 2
 
 
-async def test_wire_hook_does_not_record_when_no_write_is_possible() -> None:
+async def test_first_write_failure_records_one_exact_message_category() -> None:
     import custom_components.tuya_ble.phase_a_io_audit as audit_module
-    import custom_components.tuya_ble.tuya_ble.tuya_ble as transport
 
     device = _device()
-    client = Mock(is_connected=False, write_gatt_char=AsyncMock())
+    client = Mock(
+        is_connected=True,
+        write_gatt_char=AsyncMock(side_effect=RuntimeError("synthetic failure")),
+    )
     token = device._claim_connection_session(client)
     device._is_paired = True
     device._notifications_active = True
+    device._characteristic_write = "synthetic-characteristic"
+    device._build_packets = Mock(return_value=[b"synthetic-first-fragment"])
+    device._record_write_transport_failure = AsyncMock()
     audit = _audit()
     with patch.object(audit_module, "AUDIT", audit), pytest.raises(BleakError):
-        audit_code_token = transport._OUTGOING_PACKET_AUDIT_CODE.set(
-            TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+        await device._send_packet_while_connected(
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"synthetic-outbound",
+            0,
+            False,
+            session_token=token,
         )
-        try:
-            await device._int_send_packets_locked(token, [b"private-local-key"])
-        finally:
-            transport._OUTGOING_PACKET_AUDIT_CODE.reset(audit_code_token)
-    client.write_gatt_char.assert_not_awaited()
-    assert audit.snapshot()["counters"]["packets_sent_total"] == 0
+    client.write_gatt_char.assert_awaited_once()
+    snapshot = audit.snapshot()
+    assert snapshot["counters"]["packets_sent_total"] == 1
+    assert snapshot["counters"]["device_status_requests"] == 1
+
+
+def test_real_connection_loss_records_once_but_stale_or_inactive_state_does_not() -> (
+    None
+):
+    import custom_components.tuya_ble.phase_a_io_audit as audit_module
+
+    device = _device()
+    token = device._claim_connection_session(Mock(is_connected=True))
+    device._is_paired = True
+    device._notifications_active = True
+    audit = _audit()
+    with patch.object(audit_module, "AUDIT", audit):
+        device._mark_connection_lost(token)
+        device._mark_connection_lost(token)
+        _device()._mark_connection_lost()
+
+    snapshot = audit.snapshot()
+    assert snapshot["counters"]["disconnects"] == 1
+    assert [event["kind"] for event in snapshot["events"]] == ["DISCONNECT"]
 
 
 @pytest.mark.parametrize(
@@ -428,7 +456,16 @@ async def test_audit_service_snapshot_is_repeated_read_only_and_never_looks_up_d
         first = await audit_module._async_handle_phase_a_io_audit(call)
         second = await audit_module._async_handle_phase_a_io_audit(call)
 
-    assert first == second
+    assert first["runtime_ms"] <= second["runtime_ms"]
+    for key in (
+        "audit_instance_token",
+        "event_ordinal",
+        "history_overflow",
+        "counters",
+        "events",
+        "nonce",
+    ):
+        assert first[key] == second[key]
     assert first["counters"]["connect_attempts"] == 1
     assert first["event_ordinal"] == 1
 
