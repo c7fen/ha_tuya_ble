@@ -9,15 +9,17 @@ device identifier storage.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 _NONCE_RE = re.compile(r"[0-9a-f]{16,32}\Z")
 _MAX_EVENTS = 64
@@ -48,6 +50,7 @@ class HelperResult:
     exit_code: HelperExit
     outcome: str
     response: dict[str, Any] | None = None
+    nonce: str | None = None
 
 
 def generate_nonce() -> str:
@@ -104,7 +107,7 @@ def _clean_event(value: object) -> dict[str, Any]:
     ):
         raise ValueError("event_text")
     if not isinstance(value["exact_session"], bool):
-        raise ValueError("event_session")
+        raise TypeError("event_session")
     _optional_text(value["ack_result"])
     _optional_text(value["ack_phase"])
     for key in ("dp_ids", "encoded_value_lengths"):
@@ -177,9 +180,9 @@ def _clean_probe_response(value: object) -> dict[str, Any]:
         "precondition_failed",
         "probe_already_active",
         "duplicate_nonce",
+        "nonce_capacity_reached",
         "observation_overflow",
         "known_service_error",
-        "transport_ambiguous",
         "service_error",
     }:
         raise ValueError("probe_result")
@@ -228,16 +231,18 @@ def _clean_probe_response(value: object) -> dict[str, Any]:
 
 
 def _clean_preflight_response(value: object) -> dict[str, Any]:
-    expected = {"result", "protocol_version", "nonce"}
-    if not isinstance(value, dict) or set(value) != expected:
+    required = {"result", "protocol_version"}
+    if not isinstance(value, dict) or set(value) not in (
+        required,
+        required | {"nonce"},
+    ):
         raise ValueError("preflight_shape")
     if value["result"] != "preflight_ok" or value["protocol_version"] != 1:
         raise ValueError("preflight_result")
-    return {
-        "result": "preflight_ok",
-        "protocol_version": 1,
-        "nonce": _nonce(value["nonce"]),
-    }
+    response: dict[str, Any] = {"result": "preflight_ok", "protocol_version": 1}
+    if "nonce" in value:
+        response["nonce"] = _nonce(value["nonce"])
+    return response
 
 
 def _clean_receipt_response(value: object) -> dict[str, Any]:
@@ -290,7 +295,7 @@ def service_response_from_wrapper(
     if not isinstance(wrapper, dict) or not isinstance(
         wrapper.get("service_response"), dict
     ):
-        raise ValueError("service_response")
+        raise TypeError("service_response")
     return sanitize_service_response(operation, wrapper["service_response"])
 
 
@@ -302,6 +307,7 @@ def write_sanitized_evidence(path: Path, response: dict[str, Any]) -> None:
         pending.flush()
         pending_name = Path(pending.name)
     pending_name.replace(path)
+    os.chmod(path, 0o600)
 
 
 def _path_for(operation: HelperOperation) -> str:
@@ -319,9 +325,13 @@ def _service_exit(operation: HelperOperation, response: dict[str, Any]) -> Helpe
         return HelperExit.SUCCESS if response["known"] else HelperExit.SERVICE_REJECTED
     if response["result"] == "completed":
         return HelperExit.SUCCESS
-    if response["result"] == "transport_ambiguous":
-        return HelperExit.AMBIGUOUS_POST_SUBMISSION
     return HelperExit.SERVICE_REJECTED
+
+
+def _response_nonce(operation: HelperOperation, response: dict[str, Any]) -> str | None:
+    """Return the sanitized correlation value from a received service response."""
+    key = "invocation_nonce" if operation is HelperOperation.PROBE else "nonce"
+    return response.get(key)
 
 
 def invoke_service(
@@ -340,6 +350,7 @@ def invoke_service(
     received but malformed wrapper is instead a deterministic local schema
     failure and is never reported as a hardware invocation outcome.
     """
+    submitted_nonce: str | None = None
     try:
         if operation is HelperOperation.PREFLIGHT:
             payload = {"nonce": _nonce(payload.get("nonce", generate_nonce()))}
@@ -357,6 +368,11 @@ def invoke_service(
                 payload["mode"], str
             ):
                 raise ValueError("probe_input")
+        submitted_nonce = (
+            payload["invocation_nonce"]
+            if operation is HelperOperation.PROBE
+            else payload["nonce"]
+        )
         request = urllib.request.Request(
             endpoint.rstrip("/")
             + "/api/services/tuya_ble/"
@@ -372,10 +388,31 @@ def invoke_service(
         with opener(request, timeout=timeout) as http_response:
             wrapper = json.load(http_response)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        return HelperResult(HelperExit.AMBIGUOUS_POST_SUBMISSION, "transport_ambiguous")
+        return HelperResult(
+            HelperExit.AMBIGUOUS_POST_SUBMISSION,
+            "transport_ambiguous",
+            nonce=submitted_nonce,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return HelperResult(
+            HelperExit.SCHEMA_PRIVACY_FAILURE,
+            "schema_invalid",
+            nonce=submitted_nonce,
+        )
     try:
         response = service_response_from_wrapper(operation, wrapper)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return HelperResult(HelperExit.SCHEMA_PRIVACY_FAILURE, "schema_invalid")
+        return HelperResult(
+            HelperExit.SCHEMA_PRIVACY_FAILURE,
+            "schema_invalid",
+            nonce=submitted_nonce,
+        )
+    if _response_nonce(operation, response) != submitted_nonce:
+        return HelperResult(
+            HelperExit.SCHEMA_PRIVACY_FAILURE,
+            "nonce_mismatch",
+            nonce=submitted_nonce,
+        )
     exit_code = _service_exit(operation, response)
-    return HelperResult(exit_code, response.get("result", "receipt"), response)
+    outcome = response.get("result", "receipt")
+    return HelperResult(exit_code, outcome, response, submitted_nonce)

@@ -62,17 +62,21 @@ it does not silently truncate a valid result.
 
 `tuya_ble.phase_a_status_probe_preflight` is a separate, response-only
 temporary service. It accepts an optional opaque `nonce` and returns exactly
-`result: preflight_ok`, `protocol_version: 1`, and that nonce. It performs no
-device lookup, connection, lease, Device Status, Device Info, pair, lock,
+`result: preflight_ok`, `protocol_version: 1`, and the supplied nonce. With no
+nonce it omits that field. The repository helper always generates and submits
+a nonce, then requires an exact echoed match before accepting the response. It
+performs no device lookup, connection, lease, Device Status, Device Info, pair, lock,
 unlock, open, DP write, policy update, reconnect, or keepalive.
 
 `tuya_ble.phase_a_status_probe_receipt` accepts only the opaque nonce. It
 returns a bounded in-memory receipt projection: whether the service was
 entered, whether a Device Status request was handed to transport, a sanitized
 terminal class, and whether a response became available. The ledger is bounded
-to 32 entries, expires after 15 minutes, is never persisted, and clears when
-the last integration entry unloads. A duplicate real-probe nonce returns a
-local `duplicate_nonce` response and can never invoke BLE a second time.
+to 32 details that expire after 15 minutes, is never persisted, and clears when
+the last integration entry unloads. A separate non-evicting 32-nonce
+process-local fence rejects reuse until that unload; once full it fails closed
+before device lookup or BLE. A duplicate real-probe nonce returns a local
+`duplicate_nonce` response and can never invoke BLE a second time.
 
 The repository-owned `scripts/phase_a_status_probe_helper.py` uses the same
 HTTP request, REST-wrapper extraction, response allowlist, outcome mapping,
@@ -80,9 +84,12 @@ and sanitized evidence writer for preflight, real probe, and receipt lookup.
 It drops `changed_states` before validation or persistence. Its exit classes
 are non-overlapping: 0 valid response, 65 definitely not submitted, 66 known
 service rejection, 67 local schema/privacy failure after a response, and 78 a
-potentially submitted transport ambiguity. A nonce proves only response
-identity; receipt lookup, not retry, is the permitted follow-up to a lost real
-probe response.
+potentially submitted HTTP transport ambiguity. A received valid service
+response never maps to 78. The CLI reads a real-probe Config Entry ID only from
+a private process environment variable, never command-line arguments, and
+reports the non-sensitive generated nonce even for ambiguity. A nonce proves
+only response identity; receipt lookup, not retry, is the permitted follow-up
+to a lost real probe response.
 
 ## Intended later invocation
 

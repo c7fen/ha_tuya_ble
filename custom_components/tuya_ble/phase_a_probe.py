@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 import voluptuous as vol
@@ -45,6 +46,7 @@ _ACTIVE_PROBES_DATA_KEY = "_temporary_phase_a_status_probe_tasks"
 _UNLOADING_DEVICES_DATA_KEY = "_temporary_phase_a_status_probe_unloading"
 _SERVICE_DATA_KEY = "_temporary_phase_a_status_probe_service_registered"
 _RECEIPT_LEDGER_DATA_KEY = "_temporary_phase_a_status_probe_receipts"
+_USED_NONCES_DATA_KEY = "_temporary_phase_a_status_probe_used_nonces"
 
 _NONCE_RE = re.compile(r"[0-9a-f]{16,32}\Z")
 
@@ -77,7 +79,12 @@ RECEIPT_SERVICE_SCHEMA = vol.Schema(
 class _Collector:
     """Bounded conversion of private observations into safe response records."""
 
-    def __init__(self, device: TuyaBLEDevice, started: float) -> None:
+    def __init__(
+        self,
+        device: TuyaBLEDevice,
+        started: float,
+        request_handed_to_transport: Callable[[], None] | None = None,
+    ) -> None:
         self._device = device
         self._started = started
         self.events: list[dict[str, Any]] = []
@@ -87,6 +94,7 @@ class _Collector:
         self.created_trials: set[int] = set()
         self.ack_success_sessions: dict[int, object] = {}
         self.ack_failure_trials: set[int] = set()
+        self._request_handed_to_transport = request_handed_to_transport
 
     def expect_trial(self, trial: int) -> None:
         """Associate the next actual status generation with one logical trial."""
@@ -100,6 +108,8 @@ class _Collector:
         trial = self._generation_trials.get(event.observation_ordinal, 0)
         if event.kind == "REQUEST_CREATED" and trial:
             self.created_trials.add(trial)
+            if self._request_handed_to_transport is not None:
+                self._request_handed_to_transport()
         if event.kind == "ACK_SUCCESS" and trial and event.exact_session:
             session = self._device._connection_token
             if session is not None:
@@ -168,9 +178,12 @@ def _receipt_ledger(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
     for nonce, record in list(ledger.items()):
         if now - record["created_at"] > _RECEIPT_TTL_SECONDS:
             ledger.pop(nonce, None)
-    while len(ledger) > _RECEIPT_MAX_ENTRIES:
-        ledger.pop(next(iter(ledger)))
     return ledger
+
+
+def _used_nonces(hass: HomeAssistant) -> set[str]:
+    """Return the non-evicting process-local no-replay fence."""
+    return hass.data.setdefault(DOMAIN, {}).setdefault(_USED_NONCES_DATA_KEY, set())
 
 
 def _receipt_response(nonce: str, record: dict[str, Any] | None) -> dict[str, Any]:
@@ -251,6 +264,7 @@ def _request_record(trial: int, result: str, started: float) -> dict[str, Any]:
 async def async_run_phase_a_status_probe(
     device: TuyaBLEDevice,
     mode: str,
+    request_handed_to_transport: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run exactly one cold trial, optionally followed by one retained trial.
 
@@ -264,7 +278,7 @@ async def async_run_phase_a_status_probe(
     if not await _is_eligible_cold_idle(device):
         return _empty_response(mode, started, "precondition_failed")
 
-    collector = _Collector(device, started)
+    collector = _Collector(device, started, request_handed_to_transport)
     requests: list[dict[str, Any]] = []
     release_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     first_session: object | None = None
@@ -413,12 +427,16 @@ async def _async_handle_phase_a_status_probe(
     ledger: dict[str, dict[str, Any]] | None = None
     if nonce is not None:
         ledger = _receipt_ledger(hass)
-        if nonce in ledger:
+        used_nonces = _used_nonces(hass)
+        if nonce in used_nonces:
             return _response_with_nonce(
                 _empty_response(mode, started, "duplicate_nonce"), nonce
             )
-        while len(ledger) >= _RECEIPT_MAX_ENTRIES:
-            ledger.pop(next(iter(ledger)))
+        if len(used_nonces) >= _RECEIPT_MAX_ENTRIES:
+            return _response_with_nonce(
+                _empty_response(mode, started, "nonce_capacity_reached"), nonce
+            )
+        used_nonces.add(nonce)
         ledger[nonce] = {
             "created_at": time.monotonic(),
             "request_handed_to_transport": False,
@@ -457,9 +475,19 @@ async def _async_handle_phase_a_status_probe(
         response = _empty_response(mode, started, "probe_already_active")
         return _finish_receipted_probe(response, nonce, ledger)
     active_probes[device] = task
+
+    def request_handed_to_transport() -> None:
+        if nonce is None or ledger is None:
+            return
+        record = ledger.get(nonce)
+        if record is not None:
+            record["request_handed_to_transport"] = True
+
     try:
         async with lock:
-            response = await async_run_phase_a_status_probe(device, mode)
+            response = await async_run_phase_a_status_probe(
+                device, mode, request_handed_to_transport
+            )
             return _finish_receipted_probe(response, nonce, ledger)
     except asyncio.CancelledError:
         if nonce is not None and ledger is not None:
@@ -490,10 +518,6 @@ def _finish_receipted_probe(
         return response
     ledger[nonce].update(
         {
-            "request_handed_to_transport": bool(
-                response["cold_request_attempted"]
-                or response["retained_request_attempted"]
-            ),
             "terminal_class": response["result"],
             "response_available": True,
         }
@@ -506,11 +530,13 @@ async def _async_handle_phase_a_status_probe_preflight(
     call: ServiceCall,
 ) -> dict[str, Any]:
     """Exercise the response route with no device lookup or BLE-capable call."""
-    return {
+    response: dict[str, Any] = {
         "result": "preflight_ok",
         "protocol_version": 1,
-        "nonce": call.data.get(ATTR_NONCE, ""),
     }
+    if ATTR_NONCE in call.data:
+        response["nonce"] = call.data[ATTR_NONCE]
+    return response
 
 
 async def _async_handle_phase_a_status_probe_receipt(
@@ -629,3 +655,4 @@ def async_unregister_phase_a_status_probe_if_unused(hass: HomeAssistant) -> None
     hass.services.async_remove(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT)
     domain_data.pop(_SERVICE_DATA_KEY, None)
     domain_data.pop(_RECEIPT_LEDGER_DATA_KEY, None)
+    domain_data.pop(_USED_NONCES_DATA_KEY, None)

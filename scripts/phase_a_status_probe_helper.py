@@ -21,7 +21,6 @@ def main() -> int:
     parser.add_argument("operation", choices=[item.value for item in HelperOperation])
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--nonce")
-    parser.add_argument("--config-entry-id")
     parser.add_argument(
         "--mode", choices=("cold", "cold_then_retained"), default="cold"
     )
@@ -34,8 +33,9 @@ def main() -> int:
             "nonce" if operation is not HelperOperation.PROBE else "invocation_nonce"
         ] = args.nonce
     if operation is HelperOperation.PROBE:
-        if args.config_entry_id:
-            payload["config_entry_id"] = args.config_entry_id
+        config_entry_id = os.environ.get("PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID")
+        if config_entry_id:
+            payload["config_entry_id"] = config_entry_id
         payload["mode"] = args.mode
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
@@ -47,8 +47,22 @@ def main() -> int:
         {"Authorization": f"Bearer {token}"},
     )
     if result.response is not None and args.evidence is not None:
-        write_sanitized_evidence(args.evidence, result.response)
-    print(json.dumps({"outcome": result.outcome}, separators=(",", ":")))
+        try:
+            write_sanitized_evidence(args.evidence, result.response)
+        except OSError:
+            print(
+                json.dumps(
+                    {"outcome": "evidence_write_failed", "nonce": result.nonce},
+                    separators=(",", ":"),
+                )
+            )
+            return 67
+    print(
+        json.dumps(
+            {"outcome": result.outcome, "nonce": result.nonce},
+            separators=(",", ":"),
+        )
+    )
     return int(result.exit_code)
 
 

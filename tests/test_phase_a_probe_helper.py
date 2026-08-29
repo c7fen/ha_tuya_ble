@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import json
+import stat
 import urllib.error
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
 from custom_components.tuya_ble.phase_a_probe_helper import (
     HelperExit,
     HelperOperation,
+    invoke_service,
     sanitize_service_response,
     service_response_from_wrapper,
     write_sanitized_evidence,
-    invoke_service,
 )
 
 
@@ -79,8 +81,17 @@ def test_wrapper_discards_changed_states_before_evidence_is_written(tmp_path):
 
     rendered = evidence.read_text(encoding="utf-8")
     assert json.loads(rendered) == response
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o600
     assert "changed_states" not in rendered
     assert "private.entity" not in rendered
+
+
+def test_no_input_preflight_response_is_valid_but_not_helper_acceptable():
+    """A direct no-input service call is valid; helper calls always correlate it."""
+    assert sanitize_service_response(
+        HelperOperation.PREFLIGHT,
+        {"result": "preflight_ok", "protocol_version": 1},
+    ) == {"result": "preflight_ok", "protocol_version": 1}
 
 
 @pytest.mark.parametrize(
@@ -124,7 +135,7 @@ def test_valid_service_outcomes_have_non_overlapping_exit_classes(
         ("invalid_or_incomplete", HelperExit.SERVICE_REJECTED),
         ("observation_overflow", HelperExit.SERVICE_REJECTED),
         ("known_service_error", HelperExit.SERVICE_REJECTED),
-        ("transport_ambiguous", HelperExit.AMBIGUOUS_POST_SUBMISSION),
+        ("nonce_capacity_reached", HelperExit.SERVICE_REJECTED),
     ],
 )
 def test_real_probe_result_classes_are_explicit_and_non_overlapping(result, expected):
@@ -157,6 +168,118 @@ def test_real_probe_result_classes_are_explicit_and_non_overlapping(result, expe
 
     assert outcome.exit_code is expected
     assert outcome.outcome == result
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload", "response"),
+    [
+        (
+            HelperOperation.PREFLIGHT,
+            {"nonce": "a" * 16},
+            {"result": "preflight_ok", "protocol_version": 1, "nonce": "b" * 16},
+        ),
+        (
+            HelperOperation.PROBE,
+            {
+                "config_entry_id": "in-memory-only",
+                "mode": "cold",
+                "invocation_nonce": "a" * 16,
+            },
+            {**_real_probe_response(), "invocation_nonce": "b" * 16},
+        ),
+        (
+            HelperOperation.RECEIPT,
+            {"nonce": "a" * 16},
+            {
+                "nonce": "b" * 16,
+                "known": False,
+                "service_entered": False,
+                "request_handed_to_transport": False,
+                "terminal_class": None,
+                "response_available": False,
+            },
+        ),
+    ],
+)
+def test_received_nonce_mismatch_is_local_schema_failure(operation, payload, response):
+    """A response is accepted only when it exactly echoes the submitted nonce."""
+    wrapper = {"service_response": response}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(wrapper).encode()
+
+    outcome = invoke_service(
+        operation,
+        "http://supervisor/core",
+        payload,
+        {},
+        opener=lambda *_args, **_kwargs: _Response(),
+    )
+
+    assert outcome.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
+    assert outcome.outcome == "nonce_mismatch"
+
+
+def test_malformed_json_is_deterministic_schema_failure():
+    """Malformed received JSON cannot escape or become transport ambiguity."""
+
+    class _MalformedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    outcome = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "a" * 16},
+        {},
+        opener=lambda *_args, **_kwargs: _MalformedResponse(),
+    )
+
+    assert outcome.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
+
+
+def test_received_transport_ambiguous_result_is_schema_failure_not_exit_78():
+    """Exit 78 belongs only to an HTTP transport exception after handoff."""
+    response = deepcopy(_real_probe_response())
+    response["result"] = "transport_ambiguous"
+    wrapper = {"service_response": response}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(wrapper).encode()
+
+    outcome = invoke_service(
+        HelperOperation.PROBE,
+        "http://supervisor/core",
+        {
+            "config_entry_id": "in-memory-only",
+            "mode": "cold",
+            "invocation_nonce": "d" * 16,
+        },
+        {},
+        opener=lambda *_args, **_kwargs: _Response(),
+    )
+
+    assert outcome.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
 
 
 def test_helper_distinguishes_not_submitted_ambiguity_and_schema_failure():
@@ -197,4 +320,33 @@ def test_helper_distinguishes_not_submitted_ambiguity_and_schema_failure():
 
     assert not_submitted.exit_code is HelperExit.DEFINITELY_NOT_SUBMITTED
     assert ambiguous.exit_code is HelperExit.AMBIGUOUS_POST_SUBMISSION
+    assert ambiguous.nonce == "a" * 16
     assert schema_invalid.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
+
+
+def test_ambiguous_omitted_nonce_is_generated_before_http_handoff():
+    """An operator can perform receipt lookup without an automatic retry."""
+    outcome = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {},
+        {},
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            urllib.error.URLError("synthetic")
+        ),
+    )
+
+    assert outcome.exit_code is HelperExit.AMBIGUOUS_POST_SUBMISSION
+    assert outcome.nonce is not None
+    assert len(outcome.nonce) == 32
+    assert set(outcome.nonce) <= set("0123456789abcdef")
+
+
+def test_cli_does_not_accept_private_config_entry_id_in_argv():
+    """The temporary CLI receives a probe target only through private process env."""
+    script = (
+        Path(__file__).parents[1] / "scripts" / "phase_a_status_probe_helper.py"
+    ).read_text(encoding="utf-8")
+
+    assert "--config-entry-id" not in script
+    assert "PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID" in script
