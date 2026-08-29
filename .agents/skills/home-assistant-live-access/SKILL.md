@@ -47,10 +47,21 @@ under an owner-only parent directory.
 The wrapper itself must never print the resolved target before launching SSH.
 
 If the wrapper is absent, do **not** solve that by rendering `AGENTS.local.md`
-into the transcript. A separately authorized local-only bootstrap may create the
-wrapper from the already established private instructions using a non-echoing
-process. If no such safe local mechanism is available, ask the operator to
-create/update the wrapper rather than exposing the private file.
+into the transcript. A separately authorized local-only bootstrap may create
+the wrapper from a literal-only private recipe using the repository-owned
+`tools/home_assistant_live_access.py` helper. It must consume the recipe without
+rendering it, create only an owner-only regular non-symlink `0700` file, accept
+only the allowlisted private interactive SSH command shape, and statically
+validate both the recipe AST and wrapper command. The helper is local-only: it
+must not open a network connection or report a private target. If no such safe
+local mechanism is available, ask the operator to create/update the wrapper
+rather than exposing the private file.
+
+The bootstrap recipe is deliberately separate from `AGENTS.local.md`; the
+helper never parses that instruction file. Its generated/accepted wrapper is
+only a direct `exec ssh <safe-private-alias>` command (an absolute SSH executable
+and `-tt` are also permitted). No shell metacharacters, remote command, proxy,
+or alternate route are allowed.
 
 Do not invent a replacement host, public alias, browser fallback, or alternate
 network route merely because a linked worktree lacks `AGENTS.local.md`.
@@ -150,13 +161,20 @@ evidence should contain only allowlisted aggregate results such as shape-valid,
 relevant-count, and critical-count. Do not dump issue objects merely to debug a
 collector.
 
-Use the same strict decoder at every admission point in one live run (for
-example D0 and post-activation). Do not use separate permissive parsing logic at
-later gates.
+Use the same strict decoder at every admission point in one live run: initial,
+post-activation, and post-rollback. Its only retained result is sanitized
+aggregate evidence (total, relevant, and critical counts). Do not use separate
+permissive parsing logic or an empty-list fallback at later gates.
 
-If the structured schema changes, stop with a collector/admission classification
-and correct the decoder before any deployment/restart proceeds. Do not label a
-predecessor admission failure as an invocation/service failure.
+Repository tooling represents the strict internal decode as `shape_valid` plus
+the proven `issues` sequence. Invalid shapes set `shape_valid` false and retain
+no substitute empty sequence. Only the aggregate-only gate result may cross the
+collector boundary.
+
+If the structured schema changes, stop with the distinct
+`REPAIRS_RESPONSE_SHAPE_INVALID` collector/admission classification and correct
+the decoder before any deployment/restart proceeds. Do not label a predecessor
+admission failure as an invocation/service failure.
 
 ## 6. Command execution model for agents
 

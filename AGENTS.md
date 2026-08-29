@@ -49,9 +49,19 @@ and outside the parent directory containing canonical project roots.
 - After interactive login, use the verified login-shell workflow from the skill
   for Supervisor-backed `ha` commands. A direct non-login command environment
   is not sufficient evidence that Supervisor context is unavailable.
-- Do not invent a replacement alias, privacy bootstrap, browser fallback, or
-  alternate route merely because the current linked worktree lacks the private
-  local file.
+- Do not invent a replacement alias, browser fallback, or alternate route
+  merely because the current linked worktree lacks the private local file.
+- A separately authorized local-only wrapper bootstrap MAY consume a
+  literal-only private recipe through the repository-owned
+  `tools/home_assistant_live_access.py` helper. It must not echo its input,
+  target, or wrapper text; it must require an owner-only directory, a regular
+  non-symlink `0700` wrapper, the allowlisted private interactive SSH route,
+  and static command validation. The bootstrap recipe is a separate local-only
+  format; it does not parse or render `AGENTS.local.md`. This helper is not a
+  live-access authority and must never make a network connection.
+- Validate the private wrapper structurally before a live task. Treat an
+  invalid wrapper, an invalid Repairs response, or an unavailable private route
+  as an access/admission or collector outcome, never as an invocation result.
 
 ## Device and behavior changes
 
