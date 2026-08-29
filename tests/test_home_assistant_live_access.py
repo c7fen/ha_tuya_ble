@@ -63,7 +63,11 @@ def test_r_m1_valid_empty_repairs_are_shape_valid() -> None:
     assert result.shape_valid is True
     assert result.classification == access.ADMISSION_VALID
     assert result.aggregate == access.RepairsAggregate(0, 0)
-    assert asdict(result.aggregate) == {"relevant_count": 0, "critical_count": 0}
+    assert asdict(access.repairs_evidence(result)) == {
+        "shape_valid": True,
+        "relevant_count": 0,
+        "critical_count": 0,
+    }
 
 
 def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
@@ -75,7 +79,7 @@ def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
 
     assert decoded == access.DecodedRepairs(shape_valid=True, issues=(issue,))
     assert result.aggregate == access.RepairsAggregate(1, 1)
-    assert "scope" not in repr(result)
+    assert "scope" not in repr(access.repairs_evidence(result))
 
 
 @pytest.mark.parametrize(
@@ -103,6 +107,11 @@ def test_repairs_invalid_shapes_fail_closed_without_empty_issue_fallback(
     assert result.classification == access.ADMISSION_COLLECTOR
     assert result.code == access.REPAIRS_RESPONSE_SHAPE_INVALID
     assert result.aggregate is None
+    assert asdict(access.repairs_evidence(result)) == {
+        "shape_valid": False,
+        "relevant_count": None,
+        "critical_count": None,
+    }
 
 
 def test_r_m9_extra_object_fields_are_accepted() -> None:
@@ -267,7 +276,7 @@ def test_transcript_privacy_regression_excludes_all_forbidden_categories() -> No
         }
     )
 
-    rendered = repr(_collect(response))
+    rendered = repr(access.repairs_evidence(_collect(response)))
 
     assert all(
         sentinel not in rendered

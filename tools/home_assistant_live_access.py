@@ -58,13 +58,22 @@ class RepairsAggregate:
 
 @dataclass(frozen=True)
 class RepairsGateResult:
-    """A fail-closed, aggregate-only collector result for one represented gate."""
+    """Internal fail-closed decision for one represented collector gate."""
 
     gate: RepairsGate
     shape_valid: bool
     classification: str
     code: str
     aggregate: RepairsAggregate | None
+
+
+@dataclass(frozen=True)
+class RepairsEvidence:
+    """The exact retained/public Repairs evidence allowlist."""
+
+    shape_valid: bool
+    relevant_count: int | None
+    critical_count: int | None
 
 
 @dataclass(frozen=True)
@@ -155,6 +164,21 @@ def collect_represented_repairs_gates(
     return tuple(
         collect_repairs_gate(gate, responses[gate], is_relevant, is_critical)
         for gate in RepairsGate
+    )
+
+
+def repairs_evidence(result: RepairsGateResult) -> RepairsEvidence:
+    """Cross the collector boundary with only the exact evidence allowlist."""
+    if result.aggregate is None:
+        return RepairsEvidence(
+            shape_valid=result.shape_valid,
+            relevant_count=None,
+            critical_count=None,
+        )
+    return RepairsEvidence(
+        shape_valid=result.shape_valid,
+        relevant_count=result.aggregate.relevant_count,
+        critical_count=result.aggregate.critical_count,
     )
 
 

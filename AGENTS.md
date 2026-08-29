@@ -65,6 +65,9 @@ and outside the parent directory containing canonical project roots.
 - Validate the private wrapper structurally before a live task. Treat an
   invalid wrapper, an invalid Repairs response, or an unavailable private route
   as an access/admission or collector outcome, never as an invocation result.
+- Retained/public Repairs evidence is limited to exactly `shape_valid`,
+  `relevant_count`, and `critical_count`; gate and decision metadata stay
+  inside the orchestrator.
 
 ## Device and behavior changes
 

@@ -168,8 +168,10 @@ permissive parsing logic or an empty-list fallback at later gates.
 
 Repository tooling represents the strict internal decode as `shape_valid` plus
 the proven `issues` sequence. Invalid shapes set `shape_valid` false and retain
-no substitute empty sequence. Only the aggregate-only gate result may cross the
-collector boundary.
+no substitute empty sequence. Gate name, classification, and failure code stay
+inside the orchestration decision. Only `RepairsEvidence` may cross the
+collector boundary, with exactly `shape_valid`, `relevant_count`, and
+`critical_count`.
 
 If the structured schema changes, stop with the distinct
 `REPAIRS_RESPONSE_SHAPE_INVALID` collector/admission classification and correct
