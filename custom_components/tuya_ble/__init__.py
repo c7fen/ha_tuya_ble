@@ -33,13 +33,13 @@ from .const import (
     ConnectionMode,
 )
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
+from .phase_a_io_audit import async_register_phase_a_io_audit
 from .phase_a_probe import (
     async_cancel_and_drain_phase_a_status_probe,
     async_register_phase_a_status_probe,
     async_unblock_phase_a_status_probe,
     async_unregister_phase_a_status_probe_if_unused,
 )
-from .phase_a_io_audit import async_register_phase_a_io_audit
 from .tuya_ble import TuyaBLEDevice
 
 PLATFORMS: list[Platform] = [

@@ -29,15 +29,6 @@ from bleak_retry_connector import (
 )
 from Crypto.Cipher import AES
 
-from ..phase_a_io_audit import (
-    record_authenticated_session,
-    record_connect_attempt,
-    record_datapoint_write,
-    record_disconnect,
-    record_gatt_session_claimed,
-    record_packet_sent,
-    record_reconnect_scheduled,
-)
 from ..const import (
     BLE_TARGET_WAIT_TIMEOUT_SECONDS,
     CONF_BLE_CONTROL_ENABLED,
@@ -62,6 +53,15 @@ from ..const import (
     PendingReleaseReason,
     normalize_on_demand_connection_hold_time,
     validate_on_demand_connection_hold_time,
+)
+from ..phase_a_io_audit import (
+    record_authenticated_session,
+    record_connect_attempt,
+    record_datapoint_write,
+    record_disconnect,
+    record_gatt_session_claimed,
+    record_packet_sent,
+    record_reconnect_scheduled,
 )
 from .const import (
     CHARACTERISTIC_NOTIFY,

@@ -331,7 +331,7 @@ def _clean_audit_response(value: object) -> dict[str, Any]:
     _nonnegative_int(value["event_ordinal"])
     _nonnegative_int(value["runtime_ms"])
     if not isinstance(value["history_overflow"], bool):
-        raise ValueError("audit_overflow")
+        raise TypeError("audit_overflow")
     counter_keys = {
         "connect_attempts",
         "gatt_sessions_claimed",
