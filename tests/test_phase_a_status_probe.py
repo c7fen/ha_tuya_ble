@@ -25,6 +25,7 @@ from custom_components.tuya_ble.const import (
 from custom_components.tuya_ble.phase_a_probe import (
     _ACTIVE_PROBES_DATA_KEY,
     _LOCKS_DATA_KEY,
+    _UNLOADING_DEVICES_DATA_KEY,
     ATTR_CONFIG_ENTRY_ID,
     ATTR_MODE,
     MODE_COLD,
@@ -605,7 +606,7 @@ async def test_entry_unload_transaction_drains_service_before_stop_and_removal()
         "_async_unload_platforms_transactional",
         AsyncMock(return_value=integration._PlatformUnloadOutcome.UNLOADED),
     ):
-        outcome = await integration._async_unload_entry_transaction(hass, entry)
+        outcome = await integration._async_bounded_unload_entry_transaction(hass, entry)
 
     assert outcome is integration._EntryUnloadOutcome.UNLOADED
     assert task.done() and task.cancelled()
@@ -648,6 +649,128 @@ async def test_nonfinal_entry_unload_drains_only_its_device_and_keeps_service():
     assert task.done() and task.cancelled()
     hass.services.async_remove.assert_not_called()
     assert device.update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_local_drain_deadline_keeps_cancellation_resistant_probe_owned():
+    """A timed-out drain rolls unload back without orphaning the live handler."""
+    device = _device()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_update() -> None:
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    device.update = AsyncMock(side_effect=cancellation_resistant_update)
+    hass = _service_hass(device)
+    entry = hass.config_entries.async_get_entry.return_value
+    entry.entry_id = "private-entry"
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await entered.wait()
+
+    with patch(
+        "custom_components.tuya_ble.phase_a_probe._LOCAL_DRAIN_TIMEOUT_SECONDS",
+        0.01,
+    ):
+        outcome = await integration._async_bounded_unload_entry_transaction(hass, entry)
+
+    assert outcome is integration._EntryUnloadOutcome.RESTORED
+    assert not task.done()
+    assert hass.data[DOMAIN][_ACTIVE_PROBES_DATA_KEY][device] is task
+    assert hass.data[DOMAIN][_LOCKS_DATA_KEY][device].locked()
+    assert _UNLOADING_DEVICES_DATA_KEY not in hass.data[DOMAIN]
+    busy = await _async_handle_phase_a_status_probe(hass, call)
+    assert busy["result"] == "probe_already_active"
+
+    release.set()
+    await task
+    assert device._status_observers == []
+    assert device._on_demand_idle_release_callbacks == []
+    assert device._connection_state_callbacks == []
+    assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
+    assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
+    assert device.update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_interrupts_drain_without_orphaning_probe():
+    device = _device()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_update() -> None:
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    device.update = AsyncMock(side_effect=cancellation_resistant_update)
+    hass = _service_hass(device)
+    call = SimpleNamespace(
+        data={ATTR_CONFIG_ENTRY_ID: "private-entry", ATTR_MODE: MODE_COLD}
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await entered.wait()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            async_cancel_and_drain_phase_a_status_probe(hass, device), 0.01
+        )
+
+    assert not task.done()
+    assert hass.data[DOMAIN][_ACTIVE_PROBES_DATA_KEY][device] is task
+    async_unblock_phase_a_status_probe(hass, device)
+    release.set()
+    await task
+    assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
+    assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
+
+
+@pytest.mark.asyncio
+async def test_bounded_unload_exception_and_timeout_clear_only_unload_marker():
+    device = _device()
+    entry = SimpleNamespace(entry_id="private-entry", state=ConfigEntryState.LOADED)
+    coordinator = SimpleNamespace(shutdown=Mock())
+    hass = SimpleNamespace(
+        data={
+            DOMAIN: {
+                "private-entry": SimpleNamespace(device=device, coordinator=coordinator)
+            }
+        },
+        config_entries=SimpleNamespace(async_get_entry=Mock(return_value=entry)),
+        services=SimpleNamespace(async_register=Mock(), async_remove=Mock()),
+    )
+
+    with (
+        patch.object(
+            device, "async_prepare_unload", AsyncMock(side_effect=RuntimeError)
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        await integration._async_bounded_unload_entry_transaction(hass, entry)
+    assert _UNLOADING_DEVICES_DATA_KEY not in hass.data[DOMAIN]
+
+    async def never_prepare() -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    device.async_prepare_unload = never_prepare
+    device.abort_unload_transaction = Mock()
+    with patch.object(integration, "ENTRY_UNLOAD_TRANSACTION_TIMEOUT_SECONDS", 0.01):
+        outcome = await integration._async_bounded_unload_entry_transaction(hass, entry)
+    assert outcome is integration._EntryUnloadOutcome.RESTORATION_FAILED
+    assert _UNLOADING_DEVICES_DATA_KEY not in hass.data[DOMAIN]
+    device.abort_unload_transaction.assert_called_once()
 
 
 @pytest.mark.asyncio

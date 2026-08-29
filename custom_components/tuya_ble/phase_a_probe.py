@@ -32,6 +32,7 @@ MODE_COLD_THEN_RETAINED = "cold_then_retained"
 _MODES = frozenset({MODE_COLD, MODE_COLD_THEN_RETAINED})
 _MAX_EVENTS = 64
 _RELEASE_CLEANUP_MARGIN_SECONDS = 5.0
+_LOCAL_DRAIN_TIMEOUT_SECONDS = 5.0
 _LOCKS_DATA_KEY = "_temporary_phase_a_status_probe_locks"
 _ACTIVE_PROBES_DATA_KEY = "_temporary_phase_a_status_probe_tasks"
 _UNLOADING_DEVICES_DATA_KEY = "_temporary_phase_a_status_probe_unloading"
@@ -402,17 +403,11 @@ async def async_cancel_and_drain_phase_a_status_probe(
         return True
     if task is asyncio.current_task():
         return False
-    task.cancel()
-    cancelled_while_draining = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                break
-            cancelled_while_draining = True
-        except Exception:  # noqa: BLE001 - task result is consumed below
-            break
+    if not task.cancelling():
+        task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=_LOCAL_DRAIN_TIMEOUT_SECONDS)
+    if not done:
+        return False
     try:
         task.result()
     except asyncio.CancelledError:
@@ -428,8 +423,6 @@ async def async_cancel_and_drain_phase_a_status_probe(
         locks.pop(device, None)
         if not locks:
             domain_data.pop(_LOCKS_DATA_KEY, None)
-    if cancelled_while_draining:
-        raise asyncio.CancelledError
     return True
 
 
