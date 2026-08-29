@@ -469,9 +469,14 @@ async def test_receipt_marks_transport_handoff_only_at_request_created():
     )
     release.set()
     await task
+    terminal_receipt = await _async_handle_phase_a_status_probe_receipt(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
 
     assert receipt["request_handed_to_transport"] is True
     assert receipt["response_available"] is False
+    assert terminal_receipt["request_handed_to_transport"] is True
+    assert terminal_receipt["response_available"] is True
 
 
 def _service_hass(device: TuyaBLEDevice, state=ConfigEntryState.LOADED):
