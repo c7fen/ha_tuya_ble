@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from custom_components.tuya_ble.phase_a_probe_helper import (
+from scripts.phase_a_status_probe_lib import (
     HelperExit,
     HelperOperation,
     invoke_service,
@@ -32,8 +32,6 @@ def test_standalone_cli_rejects_invalid_nonce_without_runtime_import() -> None:
             "-S",
             str(script),
             "preflight",
-            "--endpoint",
-            "http://invalid.example",
             "--nonce",
             "not-a-valid-nonce",
         ],
@@ -46,6 +44,54 @@ def test_standalone_cli_rejects_invalid_nonce_without_runtime_import() -> None:
     assert completed.returncode == HelperExit.DEFINITELY_NOT_SUBMITTED
     assert completed.stdout == '{"outcome":"not_submitted"}\n'
     assert completed.stderr == ""
+
+
+def test_standalone_library_import_graph_excludes_integration_runtime() -> None:
+    """The administration client remains importable with only stdlib modules."""
+    scripts = Path(__file__).parents[1] / "scripts"
+    program = "".join(
+        (
+            "import sys;sys.path.insert(0,sys.argv[1]);",
+            "import phase_a_status_probe_lib;",
+            "blocked=('custom_components.tuya_ble','homeassistant','bleak','voluptuous','Crypto');",
+            "assert not any(name == prefix or name.startswith(prefix + '.') "
+            "for name in sys.modules for prefix in blocked)",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", program, str(scripts)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={},
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+
+def test_invalid_nonce_does_not_invoke_http_opener() -> None:
+    """Local nonce validation remains ahead of HTTP handoff."""
+    opener_calls = 0
+
+    def opener(*_args, **_kwargs):
+        nonlocal opener_calls
+        opener_calls += 1
+        raise AssertionError("HTTP opener must not run")
+
+    result = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://invalid.example",
+        {"nonce": "not-a-valid-nonce"},
+        {},
+        opener=opener,
+    )
+
+    assert result.exit_code is HelperExit.DEFINITELY_NOT_SUBMITTED
+    assert result.outcome == "not_submitted"
+    assert opener_calls == 0
 
 
 def _real_probe_response() -> dict[str, object]:
@@ -445,9 +491,13 @@ def test_ambiguous_omitted_nonce_is_generated_before_http_handoff():
 
 def test_cli_does_not_accept_private_config_entry_id_in_argv():
     """The temporary CLI receives a probe target only through private process env."""
-    script = (
-        Path(__file__).parents[1] / "scripts" / "phase_a_status_probe_helper.py"
-    ).read_text(encoding="utf-8")
+    scripts = Path(__file__).parents[1] / "scripts"
+    script = (scripts / "phase_a_status_probe_helper.py").read_text(encoding="utf-8")
+    library = (scripts / "phase_a_status_probe_lib.py").read_text(encoding="utf-8")
 
     assert "--config-entry-id" not in script
-    assert "PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID" in script
+    assert "--endpoint" not in script
+    assert "--evidence" not in script
+    assert "--config-entry-id" not in library
+    assert "--endpoint" not in library
+    assert "PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID" in library
