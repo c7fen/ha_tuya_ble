@@ -8,7 +8,9 @@ single, explicitly invoked research service call.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 import voluptuous as vol
@@ -24,8 +26,12 @@ from .const import (
 from .tuya_ble.tuya_ble import StatusObservationEvent, TuyaBLEDevice
 
 SERVICE_PHASE_A_STATUS_PROBE = "phase_a_status_probe"
+SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT = "phase_a_status_probe_preflight"
+SERVICE_PHASE_A_STATUS_PROBE_RECEIPT = "phase_a_status_probe_receipt"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
+ATTR_INVOCATION_NONCE = "invocation_nonce"
 ATTR_MODE = "mode"
+ATTR_NONCE = "nonce"
 MODE_COLD = "cold"
 MODE_COLD_THEN_RETAINED = "cold_then_retained"
 
@@ -33,24 +39,52 @@ _MODES = frozenset({MODE_COLD, MODE_COLD_THEN_RETAINED})
 _MAX_EVENTS = 64
 _RELEASE_CLEANUP_MARGIN_SECONDS = 5.0
 _LOCAL_DRAIN_TIMEOUT_SECONDS = 5.0
+_RECEIPT_MAX_ENTRIES = 32
+_RECEIPT_TTL_SECONDS = 900.0
 _LOCKS_DATA_KEY = "_temporary_phase_a_status_probe_locks"
 _ACTIVE_PROBES_DATA_KEY = "_temporary_phase_a_status_probe_tasks"
 _UNLOADING_DEVICES_DATA_KEY = "_temporary_phase_a_status_probe_unloading"
 _SERVICE_DATA_KEY = "_temporary_phase_a_status_probe_service_registered"
+_RECEIPT_LEDGER_DATA_KEY = "_temporary_phase_a_status_probe_receipts"
+_USED_NONCES_DATA_KEY = "_temporary_phase_a_status_probe_used_nonces"
+
+_NONCE_RE = re.compile(r"[0-9a-f]{16,32}\Z")
+
+
+def _validate_nonce(value: str) -> str:
+    """Accept only an opaque, non-identifying correlation nonce."""
+    if not isinstance(value, str) or not _NONCE_RE.fullmatch(value):
+        raise vol.Invalid("nonce must be 16-32 lowercase hexadecimal characters")
+    return value
+
 
 SERVICE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_CONFIG_ENTRY_ID): str,
         vol.Required(ATTR_MODE): vol.In(_MODES),
+        vol.Required(ATTR_INVOCATION_NONCE): _validate_nonce,
     },
     extra=vol.PREVENT_EXTRA,
+)
+
+
+PREFLIGHT_SERVICE_SCHEMA = vol.Schema(
+    {vol.Optional(ATTR_NONCE): _validate_nonce}, extra=vol.PREVENT_EXTRA
+)
+RECEIPT_SERVICE_SCHEMA = vol.Schema(
+    {vol.Required(ATTR_NONCE): _validate_nonce}, extra=vol.PREVENT_EXTRA
 )
 
 
 class _Collector:
     """Bounded conversion of private observations into safe response records."""
 
-    def __init__(self, device: TuyaBLEDevice, started: float) -> None:
+    def __init__(
+        self,
+        device: TuyaBLEDevice,
+        started: float,
+        request_handed_to_transport: Callable[[], None] | None = None,
+    ) -> None:
         self._device = device
         self._started = started
         self.events: list[dict[str, Any]] = []
@@ -60,6 +94,7 @@ class _Collector:
         self.created_trials: set[int] = set()
         self.ack_success_sessions: dict[int, object] = {}
         self.ack_failure_trials: set[int] = set()
+        self._request_handed_to_transport = request_handed_to_transport
 
     def expect_trial(self, trial: int) -> None:
         """Associate the next actual status generation with one logical trial."""
@@ -73,6 +108,8 @@ class _Collector:
         trial = self._generation_trials.get(event.observation_ordinal, 0)
         if event.kind == "REQUEST_CREATED" and trial:
             self.created_trials.add(trial)
+            if self._request_handed_to_transport is not None:
+                self._request_handed_to_transport()
         if event.kind == "ACK_SUCCESS" and trial and event.exact_session:
             session = self._device._connection_token
             if session is not None:
@@ -121,6 +158,52 @@ def _empty_response(mode: str, started: float, result: str) -> dict[str, Any]:
         "duration_ms": _relative_ms(started),
         "requests": [],
         "events": [],
+    }
+
+
+def _response_with_nonce(response: dict[str, Any], nonce: str | None) -> dict[str, Any]:
+    """Attach an opaque helper correlation value without retaining any target ID."""
+    if nonce is not None:
+        response[ATTR_INVOCATION_NONCE] = nonce
+    return response
+
+
+def _receipt_ledger(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
+    """Return the temporary, process-local receipt ledger and expire old records."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    ledger: dict[str, dict[str, Any]] = domain_data.setdefault(
+        _RECEIPT_LEDGER_DATA_KEY, {}
+    )
+    now = time.monotonic()
+    for nonce, record in list(ledger.items()):
+        if now - record["created_at"] > _RECEIPT_TTL_SECONDS:
+            ledger.pop(nonce, None)
+    return ledger
+
+
+def _used_nonces(hass: HomeAssistant) -> set[str]:
+    """Return the non-evicting process-local no-replay fence."""
+    return hass.data.setdefault(DOMAIN, {}).setdefault(_USED_NONCES_DATA_KEY, set())
+
+
+def _receipt_response(nonce: str, record: dict[str, Any] | None) -> dict[str, Any]:
+    """Expose only a bounded non-identifying receipt projection."""
+    if record is None:
+        return {
+            "nonce": nonce,
+            "known": False,
+            "service_entered": False,
+            "request_handed_to_transport": False,
+            "terminal_class": None,
+            "response_available": False,
+        }
+    return {
+        "nonce": nonce,
+        "known": True,
+        "service_entered": True,
+        "request_handed_to_transport": record["request_handed_to_transport"],
+        "terminal_class": record["terminal_class"],
+        "response_available": record["response_available"],
     }
 
 
@@ -181,6 +264,7 @@ def _request_record(trial: int, result: str, started: float) -> dict[str, Any]:
 async def async_run_phase_a_status_probe(
     device: TuyaBLEDevice,
     mode: str,
+    request_handed_to_transport: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run exactly one cold trial, optionally followed by one retained trial.
 
@@ -194,7 +278,7 @@ async def async_run_phase_a_status_probe(
     if not await _is_eligible_cold_idle(device):
         return _empty_response(mode, started, "precondition_failed")
 
-    collector = _Collector(device, started)
+    collector = _Collector(device, started, request_handed_to_transport)
     requests: list[dict[str, Any]] = []
     release_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     first_session: object | None = None
@@ -339,24 +423,48 @@ async def _async_handle_phase_a_status_probe(
     """Run one isolated service call under its dedicated per-device owner."""
     mode: str = call.data[ATTR_MODE]
     started = time.monotonic()
+    nonce = call.data.get(ATTR_INVOCATION_NONCE)
+    ledger: dict[str, dict[str, Any]] | None = None
+    if nonce is not None:
+        ledger = _receipt_ledger(hass)
+        used_nonces = _used_nonces(hass)
+        if nonce in used_nonces:
+            return _response_with_nonce(
+                _empty_response(mode, started, "duplicate_nonce"), nonce
+            )
+        if len(used_nonces) >= _RECEIPT_MAX_ENTRIES:
+            return _response_with_nonce(
+                _empty_response(mode, started, "nonce_capacity_reached"), nonce
+            )
+        used_nonces.add(nonce)
+        ledger[nonce] = {
+            "created_at": time.monotonic(),
+            "request_handed_to_transport": False,
+            "terminal_class": "entered",
+            "response_available": False,
+        }
     device = _device_for_service_call(hass, call.data[ATTR_CONFIG_ENTRY_ID])
     if device is None:
-        return _empty_response(mode, started, "precondition_failed")
+        response = _empty_response(mode, started, "precondition_failed")
+        return _finish_receipted_probe(response, nonce, ledger)
     domain_data = hass.data[DOMAIN]
     unloading: set[TuyaBLEDevice] = domain_data.setdefault(
         _UNLOADING_DEVICES_DATA_KEY, set()
     )
     if device in unloading:
-        return _empty_response(mode, started, "precondition_failed")
+        response = _empty_response(mode, started, "precondition_failed")
+        return _finish_receipted_probe(response, nonce, ledger)
     task = asyncio.current_task()
     if task is None:
-        return _empty_response(mode, started, "precondition_failed")
+        response = _empty_response(mode, started, "precondition_failed")
+        return _finish_receipted_probe(response, nonce, ledger)
     active_probes: dict[TuyaBLEDevice, asyncio.Task[Any]] = domain_data.setdefault(
         _ACTIVE_PROBES_DATA_KEY, {}
     )
     existing = active_probes.get(device)
     if existing is not None and not existing.done():
-        return _empty_response(mode, started, "probe_already_active")
+        response = _empty_response(mode, started, "probe_already_active")
+        return _finish_receipted_probe(response, nonce, ledger)
     if existing is not None:
         active_probes.pop(device, None)
     locks: dict[TuyaBLEDevice, asyncio.Lock] = hass.data[DOMAIN].setdefault(
@@ -364,11 +472,31 @@ async def _async_handle_phase_a_status_probe(
     )
     lock = locks.setdefault(device, asyncio.Lock())
     if lock.locked():
-        return _empty_response(mode, started, "probe_already_active")
+        response = _empty_response(mode, started, "probe_already_active")
+        return _finish_receipted_probe(response, nonce, ledger)
     active_probes[device] = task
+
+    def request_handed_to_transport() -> None:
+        if nonce is None or ledger is None:
+            return
+        record = ledger.get(nonce)
+        if record is not None:
+            record["request_handed_to_transport"] = True
+
     try:
         async with lock:
-            return await async_run_phase_a_status_probe(device, mode)
+            response = await async_run_phase_a_status_probe(
+                device, mode, request_handed_to_transport
+            )
+            return _finish_receipted_probe(response, nonce, ledger)
+    except asyncio.CancelledError:
+        if nonce is not None and ledger is not None:
+            ledger[nonce]["terminal_class"] = "cancelled"
+        raise
+    except Exception:
+        if nonce is not None and ledger is not None:
+            ledger[nonce]["terminal_class"] = "service_error"
+        raise
     finally:
         if active_probes.get(device) is task:
             active_probes.pop(device, None)
@@ -378,6 +506,46 @@ async def _async_handle_phase_a_status_probe(
             locks.pop(device, None)
         if not locks:
             domain_data.pop(_LOCKS_DATA_KEY, None)
+
+
+def _finish_receipted_probe(
+    response: dict[str, Any],
+    nonce: str | None,
+    ledger: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Record a safe terminal receipt after the one permitted probe execution."""
+    if nonce is None or ledger is None:
+        return response
+    ledger[nonce].update(
+        {
+            "terminal_class": response["result"],
+            "response_available": True,
+        }
+    )
+    return _response_with_nonce(response, nonce)
+
+
+async def _async_handle_phase_a_status_probe_preflight(
+    _hass: HomeAssistant,
+    call: ServiceCall,
+) -> dict[str, Any]:
+    """Exercise the response route with no device lookup or BLE-capable call."""
+    response: dict[str, Any] = {
+        "result": "preflight_ok",
+        "protocol_version": 1,
+    }
+    if ATTR_NONCE in call.data:
+        response["nonce"] = call.data[ATTR_NONCE]
+    return response
+
+
+async def _async_handle_phase_a_status_probe_receipt(
+    hass: HomeAssistant,
+    call: ServiceCall,
+) -> dict[str, Any]:
+    """Read a process-local receipt without resolving a device or doing I/O."""
+    nonce: str = call.data[ATTR_NONCE]
+    return _receipt_response(nonce, _receipt_ledger(hass).get(nonce))
 
 
 async def async_cancel_and_drain_phase_a_status_probe(
@@ -438,7 +606,7 @@ def async_unblock_phase_a_status_probe(
 
 
 def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
-    """Register the temporary response-only service once per integration domain."""
+    """Register the temporary response-only research actions once per domain."""
     # Narrow synthetic setup tests intentionally use an incomplete hass shape;
     # real Home Assistant always exposes the service registry.
     if not hasattr(hass, "services"):
@@ -457,6 +625,20 @@ def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
         schema=SERVICE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT,
+        lambda call: _async_handle_phase_a_status_probe_preflight(hass, call),
+        schema=PREFLIGHT_SERVICE_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PHASE_A_STATUS_PROBE_RECEIPT,
+        lambda call: _async_handle_phase_a_status_probe_receipt(hass, call),
+        schema=RECEIPT_SERVICE_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
     domain_data[_SERVICE_DATA_KEY] = True
 
 
@@ -469,4 +651,8 @@ def async_unregister_phase_a_status_probe_if_unused(hass: HomeAssistant) -> None
     if loaded_entries or not domain_data.get(_SERVICE_DATA_KEY):
         return
     hass.services.async_remove(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE)
+    hass.services.async_remove(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT)
+    hass.services.async_remove(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT)
     domain_data.pop(_SERVICE_DATA_KEY, None)
+    domain_data.pop(_RECEIPT_LEDGER_DATA_KEY, None)
+    domain_data.pop(_USED_NONCES_DATA_KEY, None)

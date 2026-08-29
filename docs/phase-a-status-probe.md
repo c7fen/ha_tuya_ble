@@ -8,7 +8,9 @@ restore Home Assistant to a reviewed non-harness commit.
 
 ## Scope and safeguards
 
-The action accepts exactly one private `config_entry_id` and one `mode`:
+The real action accepts exactly one private `config_entry_id`, one `mode`, and
+an opaque, caller-generated `invocation_nonce` of 16–32 lowercase hexadecimal
+characters. The nonce must contain no device or account information:
 
 - `cold` performs one cold Device Status request.
 - `cold_then_retained` performs one cold request and, only after the first
@@ -55,6 +57,39 @@ Registry IDs, address, UUID, session token or epoch, sequence number, DP value,
 packet bytes, keys, credentials, or wall-clock timestamp. On collector
 overflow it sets `observation_overflow: true` and classifies the probe invalid;
 it does not silently truncate a valid result.
+
+## BLE-free response-path preflight and receipt lookup
+
+`tuya_ble.phase_a_status_probe_preflight` is a separate, response-only
+temporary service. It accepts an optional opaque `nonce` and returns exactly
+`result: preflight_ok`, `protocol_version: 1`, and the supplied nonce. With no
+nonce it omits that field. The repository helper always generates and submits
+a nonce, then requires an exact echoed match before accepting the response. It
+performs no device lookup, connection, lease, Device Status, Device Info, pair, lock,
+unlock, open, DP write, policy update, reconnect, or keepalive.
+
+`tuya_ble.phase_a_status_probe_receipt` accepts only the opaque nonce. It
+returns a bounded in-memory receipt projection: whether the service was
+entered, whether a Device Status request was handed to transport, a sanitized
+terminal class, and whether a response became available. The ledger is bounded
+to 32 details that expire after 15 minutes, is never persisted, and clears when
+the last integration entry unloads. A separate non-evicting 32-nonce
+process-local fence rejects reuse until that unload; once full it fails closed
+before device lookup or BLE. A duplicate real-probe nonce returns a local
+`duplicate_nonce` response and can never invoke BLE a second time.
+
+The repository-owned `scripts/phase_a_status_probe_helper.py` uses the same
+HTTP request, REST-wrapper extraction, response allowlist, outcome mapping,
+and sanitized evidence writer for preflight, real probe, and receipt lookup.
+It drops `changed_states` before validation or persistence. Its exit classes
+are non-overlapping: 0 valid response, 65 definitely not submitted, 66 known
+service rejection, 67 local schema/privacy failure after a response, and 78 a
+potentially submitted HTTP transport ambiguity. A received valid service
+response never maps to 78. The CLI reads a real-probe Config Entry ID only from
+a private process environment variable, never command-line arguments, and
+reports the non-sensitive generated nonce even for ambiguity. A nonce proves
+only response identity; receipt lookup, not retry, is the permitted follow-up
+to a lost real probe response.
 
 ## Intended later invocation
 

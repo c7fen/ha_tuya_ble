@@ -25,14 +25,25 @@ from custom_components.tuya_ble.const import (
 from custom_components.tuya_ble.phase_a_probe import (
     _ACTIVE_PROBES_DATA_KEY,
     _LOCKS_DATA_KEY,
+    _RECEIPT_LEDGER_DATA_KEY,
+    _RECEIPT_MAX_ENTRIES,
     _UNLOADING_DEVICES_DATA_KEY,
+    _USED_NONCES_DATA_KEY,
     ATTR_CONFIG_ENTRY_ID,
+    ATTR_INVOCATION_NONCE,
     ATTR_MODE,
+    ATTR_NONCE,
     MODE_COLD,
     MODE_COLD_THEN_RETAINED,
+    PREFLIGHT_SERVICE_SCHEMA,
+    RECEIPT_SERVICE_SCHEMA,
     SERVICE_PHASE_A_STATUS_PROBE,
+    SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT,
+    SERVICE_PHASE_A_STATUS_PROBE_RECEIPT,
     SERVICE_SCHEMA,
     _async_handle_phase_a_status_probe,
+    _async_handle_phase_a_status_probe_preflight,
+    _async_handle_phase_a_status_probe_receipt,
     async_cancel_and_drain_phase_a_status_probe,
     async_register_phase_a_status_probe,
     async_run_phase_a_status_probe,
@@ -262,9 +273,14 @@ def test_service_schema_and_response_only_registration_lifecycle():
     services = SimpleNamespace(async_register=Mock(), async_remove=Mock())
     hass = SimpleNamespace(data={}, services=services)
 
+    valid_nonce = "a" * 16
     assert (
         SERVICE_SCHEMA(
-            {ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry", ATTR_MODE: MODE_COLD}
+            {
+                ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry",
+                ATTR_MODE: MODE_COLD,
+                ATTR_INVOCATION_NONCE: valid_nonce,
+            }
         )[ATTR_MODE]
         == MODE_COLD
     )
@@ -277,6 +293,20 @@ def test_service_schema_and_response_only_registration_lifecycle():
                 ATTR_MODE: "three_requests",
             }
         )
+    with pytest.raises(Invalid):
+        SERVICE_SCHEMA(
+            {
+                ATTR_CONFIG_ENTRY_ID: "synthetic-private-entry",
+                ATTR_MODE: MODE_COLD,
+                ATTR_INVOCATION_NONCE: "not-a-safe-nonce",
+            }
+        )
+    assert (
+        PREFLIGHT_SERVICE_SCHEMA({ATTR_NONCE: valid_nonce})[ATTR_NONCE] == valid_nonce
+    )
+    with pytest.raises(Invalid):
+        PREFLIGHT_SERVICE_SCHEMA({ATTR_NONCE: "A" * 16})
+    assert RECEIPT_SERVICE_SCHEMA({ATTR_NONCE: valid_nonce})[ATTR_NONCE] == valid_nonce
 
     async_register_phase_a_status_probe(hass)
     _, _, kwargs = services.async_register.mock_calls[0]
@@ -284,7 +314,169 @@ def test_service_schema_and_response_only_registration_lifecycle():
     assert kwargs["schema"] is SERVICE_SCHEMA
 
     async_unregister_phase_a_status_probe_if_unused(hass)
-    services.async_remove.assert_called_once_with(DOMAIN, SERVICE_PHASE_A_STATUS_PROBE)
+    assert services.async_remove.call_args_list == [
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preflight_is_response_only_and_performs_no_device_io():
+    """The plumbing preflight never resolves or touches a device."""
+    nonce = "b" * 16
+    device = _device()
+    device.update = AsyncMock()
+    device.pair = AsyncMock()
+    device._ensure_connected = AsyncMock()
+    hass = _service_hass(device)
+
+    result = await _async_handle_phase_a_status_probe_preflight(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
+
+    assert result == {
+        "result": "preflight_ok",
+        "protocol_version": 1,
+        "nonce": nonce,
+    }
+    device.update.assert_not_awaited()
+    device.pair.assert_not_awaited()
+    device._ensure_connected.assert_not_awaited()
+
+    assert await _async_handle_phase_a_status_probe_preflight(
+        hass, SimpleNamespace(data={})
+    ) == {"result": "preflight_ok", "protocol_version": 1}
+
+
+@pytest.mark.asyncio
+async def test_receipt_lookup_and_duplicate_nonce_never_replay_device_update():
+    """A pre-REQUEST_CREATED failure remains false and is never replayed."""
+    nonce = "c" * 16
+    device = _device()
+    device.update = AsyncMock(side_effect=RuntimeError("synthetic before request"))
+    hass = _service_hass(device)
+    call = SimpleNamespace(
+        data={
+            ATTR_CONFIG_ENTRY_ID: "private-entry",
+            ATTR_MODE: MODE_COLD,
+            ATTR_INVOCATION_NONCE: nonce,
+        }
+    )
+
+    first = await _async_handle_phase_a_status_probe(hass, call)
+    receipt = await _async_handle_phase_a_status_probe_receipt(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
+    duplicate = await _async_handle_phase_a_status_probe(hass, call)
+
+    assert first["invocation_nonce"] == nonce
+    assert receipt == {
+        "nonce": nonce,
+        "known": True,
+        "service_entered": True,
+        "request_handed_to_transport": False,
+        "terminal_class": "invalid_or_incomplete",
+        "response_available": True,
+    }
+    assert duplicate["result"] == "duplicate_nonce"
+    assert device.update.await_count == 1
+    assert nonce in hass.data[DOMAIN][_RECEIPT_LEDGER_DATA_KEY]
+
+
+@pytest.mark.asyncio
+async def test_expired_receipt_never_allows_the_same_nonce_to_replay_ble():
+    """Receipt detail expiry cannot remove a nonce from the process replay fence."""
+    nonce = "d" * 16
+    device = _device()
+    device.update = AsyncMock()
+    hass = _service_hass(device)
+    call = SimpleNamespace(
+        data={
+            ATTR_CONFIG_ENTRY_ID: "private-entry",
+            ATTR_MODE: MODE_COLD,
+            ATTR_INVOCATION_NONCE: nonce,
+        }
+    )
+
+    await _async_handle_phase_a_status_probe(hass, call)
+    hass.data[DOMAIN][_RECEIPT_LEDGER_DATA_KEY][nonce]["created_at"] = -10_000
+    expired = await _async_handle_phase_a_status_probe_receipt(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
+    duplicate = await _async_handle_phase_a_status_probe(hass, call)
+
+    assert expired["known"] is False
+    assert duplicate["result"] == "duplicate_nonce"
+    assert device.update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_nonce_capacity_fails_closed_before_device_lookup_or_ble():
+    """A full no-replay fence rejects a fresh nonce without touching a target."""
+    nonce = "e" * 16
+    device = _device()
+    device.update = AsyncMock()
+    hass = _service_hass(device)
+    hass.data[DOMAIN][_USED_NONCES_DATA_KEY] = {
+        f"{ordinal:016x}" for ordinal in range(_RECEIPT_MAX_ENTRIES)
+    }
+
+    result = await _async_handle_phase_a_status_probe(
+        hass,
+        SimpleNamespace(
+            data={
+                ATTR_CONFIG_ENTRY_ID: "private-entry",
+                ATTR_MODE: MODE_COLD,
+                ATTR_INVOCATION_NONCE: nonce,
+            }
+        ),
+    )
+
+    assert result["result"] == "nonce_capacity_reached"
+    hass.config_entries.async_get_entry.assert_not_called()
+    device.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_receipt_marks_transport_handoff_only_at_request_created():
+    """The receipt becomes true at the authoritative observer milestone."""
+    nonce = "f" * 16
+    device = _device()
+    created = asyncio.Event()
+    release = asyncio.Event()
+
+    async def update() -> None:
+        for callback in tuple(device._status_observers):
+            callback(StatusObservationEvent(1, "explicit", "REQUEST_CREATED", 1))
+        created.set()
+        await release.wait()
+
+    device.update = AsyncMock(side_effect=update)
+    hass = _service_hass(device)
+    call = SimpleNamespace(
+        data={
+            ATTR_CONFIG_ENTRY_ID: "private-entry",
+            ATTR_MODE: MODE_COLD,
+            ATTR_INVOCATION_NONCE: nonce,
+        }
+    )
+    task = asyncio.create_task(_async_handle_phase_a_status_probe(hass, call))
+    await created.wait()
+
+    receipt = await _async_handle_phase_a_status_probe_receipt(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
+    release.set()
+    await task
+    terminal_receipt = await _async_handle_phase_a_status_probe_receipt(
+        hass, SimpleNamespace(data={ATTR_NONCE: nonce})
+    )
+
+    assert receipt["request_handed_to_transport"] is True
+    assert receipt["response_available"] is False
+    assert terminal_receipt["request_handed_to_transport"] is True
+    assert terminal_receipt["response_available"] is True
 
 
 def _service_hass(device: TuyaBLEDevice, state=ConfigEntryState.LOADED):
@@ -565,9 +757,11 @@ async def test_final_entry_unload_drains_active_probe_before_service_removal():
     async_unblock_phase_a_status_probe(hass, device)
     async_unregister_phase_a_status_probe_if_unused(hass)
 
-    hass.services.async_remove.assert_called_once_with(
-        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
-    )
+    assert hass.services.async_remove.call_args_list == [
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT),),
+    ]
 
 
 @pytest.mark.asyncio
@@ -617,9 +811,11 @@ async def test_entry_unload_transaction_drains_service_before_stop_and_removal()
     assert device._connection_state_callbacks == []
     assert _ACTIVE_PROBES_DATA_KEY not in hass.data[DOMAIN]
     assert _LOCKS_DATA_KEY not in hass.data[DOMAIN]
-    hass.services.async_remove.assert_called_once_with(
-        DOMAIN, SERVICE_PHASE_A_STATUS_PROBE
-    )
+    assert hass.services.async_remove.call_args_list == [
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT),),
+        ((DOMAIN, SERVICE_PHASE_A_STATUS_PROBE_RECEIPT),),
+    ]
 
 
 @pytest.mark.asyncio

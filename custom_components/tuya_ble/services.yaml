@@ -16,3 +16,27 @@ phase_a_status_probe:
           options:
             - cold
             - cold_then_retained
+    invocation_nonce:
+      required: true
+      selector:
+        text:
+phase_a_status_probe_preflight:
+  name: TEMPORARY RESEARCH PREFLIGHT — DO NOT MERGE
+  description: >-
+    BLE-free Phase-A response-path preflight. It does not resolve a device,
+    acquire a lease, or issue any Bluetooth request.
+  fields:
+    nonce:
+      required: false
+      selector:
+        text:
+phase_a_status_probe_receipt:
+  name: TEMPORARY RESEARCH RECEIPT LOOKUP — DO NOT MERGE
+  description: >-
+    BLE-free lookup of a bounded, process-local Phase-A probe receipt. A known
+    nonce is never replayed as a Device Status request.
+  fields:
+    nonce:
+      required: true
+      selector:
+        text:
