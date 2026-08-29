@@ -28,6 +28,31 @@ host, use `$WORKTREE_ROOT/ha_tuya_ble/<task>` only when `WORKTREE_ROOT` is
 explicitly configured. That root must remain outside all canonical checkouts
 and outside the parent directory containing canonical project roots.
 
+## Home Assistant live access
+
+- Before ANY live Home Assistant host, Supervisor, deployment, restart, Core
+  check, or live-validation task, read and follow
+  `.agents/skills/home-assistant-live-access/SKILL.md`.
+- On Felix's primary workstation, environment-specific Home Assistant SSH
+  details are stored only in the private, untracked `AGENTS.local.md` in the
+  canonical checkout. Linked worktrees do not inherit that untracked file.
+  Therefore, if `AGENTS.local.md` is absent in the current worktree, agents MUST
+  check the canonical checkout above before claiming that the route is unknown
+  or unavailable.
+- Never commit, publish, or echo the private Home Assistant target, internal
+  address, credentials, SSH-agent material, or Supervisor token from the local
+  instructions.
+- The verified workstation route uses SSH Key Agent authentication that requires
+  an interactive SSH login. Do not substitute a one-shot non-interactive
+  `ssh <target> "<command>"` path for live Home Assistant work when the local
+  instructions specify the interactive route.
+- After interactive login, use the verified login-shell workflow from the skill
+  for Supervisor-backed `ha` commands. A direct non-login command environment
+  is not sufficient evidence that Supervisor context is unavailable.
+- Do not invent a replacement alias, privacy bootstrap, browser fallback, or
+  alternate route merely because the current linked worktree lacks the private
+  local file.
+
 ## Device and behavior changes
 
 - Do not add tests only for a simple device mapping. Add coverage when existing
