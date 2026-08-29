@@ -52,7 +52,6 @@ class DecodedRepairs:
 class RepairsAggregate:
     """Sanitized Repairs evidence; no issue object is retained or emitted."""
 
-    total_count: int
     relevant_count: int
     critical_count: int
 
@@ -121,7 +120,6 @@ def aggregate_decoded_repairs(
                 critical_count += 1
 
     return RepairsAggregate(
-        total_count=len(decoded.issues),
         relevant_count=relevant_count,
         critical_count=critical_count,
     )

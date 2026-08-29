@@ -61,7 +61,7 @@ def test_r_m1_valid_empty_repairs_are_shape_valid() -> None:
     assert decoded == access.DecodedRepairs(shape_valid=True, issues=())
     assert result.shape_valid is True
     assert result.classification == access.ADMISSION_VALID
-    assert result.aggregate == access.RepairsAggregate(0, 0, 0)
+    assert result.aggregate == access.RepairsAggregate(0, 0)
 
 
 def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
@@ -72,7 +72,7 @@ def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
     result = _collect(response)
 
     assert decoded == access.DecodedRepairs(shape_valid=True, issues=(issue,))
-    assert result.aggregate == access.RepairsAggregate(1, 1, 1)
+    assert result.aggregate == access.RepairsAggregate(1, 1)
     assert "scope" not in repr(result)
 
 

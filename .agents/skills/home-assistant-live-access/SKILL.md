@@ -162,8 +162,8 @@ relevant-count, and critical-count. Do not dump issue objects merely to debug a
 collector.
 
 Use the same strict decoder at every admission point in one live run: initial,
-post-activation, and post-rollback. Its only retained result is sanitized
-aggregate evidence (total, relevant, and critical counts). Do not use separate
+post-activation, and post-rollback. Its only retained result is the allowlisted
+shape-valid flag plus relevant and critical counts. Do not use separate
 permissive parsing logic or an empty-list fallback at later gates.
 
 Repository tooling represents the strict internal decode as `shape_valid` plus
