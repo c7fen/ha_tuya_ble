@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -54,10 +55,27 @@ def _collect(response: str) -> access.RepairsGateResult:
     )
 
 
-def test_r_m1_valid_empty_repairs_are_shape_valid() -> None:
-    """R-M1: valid empty is not an invalid response."""
-    decoded = access.decode_repairs_response('{"issues": []}')
-    result = _collect('{"issues": []}')
+def _resolution_response(issues: list[object]) -> str:
+    """Return the complete synthetic Supervisor response used by ``--raw-json``."""
+    return json.dumps(
+        {
+            "result": "ok",
+            "data": {
+                "unsupported": [],
+                "unhealthy": [],
+                "issues": issues,
+                "suggestions": [],
+                "checks": [],
+            },
+        }
+    )
+
+
+def test_s_m1_official_supervisor_envelope_empty_issues_is_shape_valid() -> None:
+    """S-M1: the complete Supervisor wrapper is the canonical transport."""
+    response = _resolution_response([])
+    decoded = access.decode_repairs_response(response)
+    result = _collect(response)
 
     assert decoded == access.DecodedRepairs(shape_valid=True, issues=())
     assert result.shape_valid is True
@@ -70,10 +88,10 @@ def test_r_m1_valid_empty_repairs_are_shape_valid() -> None:
     }
 
 
-def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
-    """R-M2: strict internal decode preserves valid entries, public result does not."""
+def test_s_m2_supervisor_envelope_preserves_issues_for_aggregation() -> None:
+    """S-M2: strict internal decode preserves valid entries, public result does not."""
     issue = {"scope": "integration", "severity": "critical"}
-    response = json.dumps({"issues": [issue]})
+    response = _resolution_response([issue])
     decoded = access.decode_repairs_response(response)
     result = _collect(response)
 
@@ -85,22 +103,26 @@ def test_r_m2_valid_nonempty_repairs_are_preserved_for_aggregation() -> None:
 @pytest.mark.parametrize(
     ("name", "response"),
     [
-        ("R-M3", "[]"),
-        ("R-M4", "{}"),
-        ("R-M5", '{"issues": null}'),
-        ("R-M6", '{"issues": {}}'),
-        ("R-M7", '{"issues": "not-a-list"}'),
-        ("R-M8", "{"),
+        ("S-M3", '{"issues": []}'),
+        ("S-M4", "[]"),
+        ("S-M5", '{"data": {"issues": []}}'),
+        ("S-M6", '{"result": "error", "data": {"issues": []}}'),
+        ("S-M7", '{"result": "ok"}'),
+        ("S-M8", '{"result": "ok", "data": null}'),
+        ("S-M9", '{"result": "ok", "data": {}}'),
+        ("S-M10", '{"result": "ok", "data": {"issues": null}}'),
+        ("S-M11", '{"result": "ok", "data": {"issues": {}}}'),
+        ("S-M12", "{"),
     ],
 )
 def test_repairs_invalid_shapes_fail_closed_without_empty_issue_fallback(
     name: str, response: str
 ) -> None:
-    """R-M3 through R-M8: invalid shapes never become an empty list."""
+    """S-M3 through S-M12: invalid shapes never become an empty list."""
     decoded = access.decode_repairs_response(response)
     result = _collect(response)
 
-    assert name.startswith("R-M")
+    assert name.startswith("S-M")
     assert decoded.shape_valid is False
     assert decoded.issues is None
     assert result.shape_valid is False
@@ -114,15 +136,23 @@ def test_repairs_invalid_shapes_fail_closed_without_empty_issue_fallback(
     }
 
 
-def test_r_m9_extra_object_fields_are_accepted() -> None:
-    """R-M9: only the required shape is constrained."""
-    decoded = access.decode_repairs_response('{"issues": [], "future": {}}')
+def test_s_m13_unknown_wrapper_and_data_fields_are_accepted() -> None:
+    """S-M13: only the mandatory Supervisor envelope shape is constrained."""
+    decoded = access.decode_repairs_response(
+        json.dumps(
+            {
+                "result": "ok",
+                "future_wrapper": {},
+                "data": {"issues": [], "future_data": {}},
+            }
+        )
+    )
 
     assert decoded == access.DecodedRepairs(shape_valid=True, issues=())
 
 
-def test_r_m10_source_rejects_old_permissive_fallback_mutations() -> None:
-    """R-M10: reject both ``get`` and list-or-empty mutation forms."""
+def test_s_m14_and_s_m15_source_rejects_old_shape_and_permissive_fallbacks() -> None:
+    """S-M14/15: reject old top-level parsing and every empty-list fallback."""
     source = Path(access.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     fallback_get_calls = [
@@ -144,7 +174,8 @@ def test_r_m10_source_rejects_old_permissive_fallback_mutations() -> None:
 
     assert not fallback_get_calls
     assert not list_or_empty
-    assert '"issues" not in payload' in source
+    assert '"issues" not in payload' not in source
+    assert '"result" not in payload' in source
 
 
 def test_all_represented_gates_use_the_same_strict_decoder(
@@ -159,12 +190,66 @@ def test_all_represented_gates_use_the_same_strict_decoder(
         return original_decoder(response)
 
     monkeypatch.setattr(access, "decode_repairs_response", traced_decoder)
-    responses = {gate: '{"issues": []}' for gate in access.RepairsGate}
+    responses = {gate: _resolution_response([]) for gate in access.RepairsGate}
     results = access.collect_represented_repairs_gates(responses, _relevant, _critical)
 
     assert [result.gate for result in results] == list(access.RepairsGate)
     assert all(result.shape_valid for result in results)
     assert calls == ["decode", "decode", "decode"]
+
+
+def test_b_m1_to_b_m10_private_pty_broker_hides_banner_and_preserves_session(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Synthetic child proves private startup, login-shell, commands, and close output."""
+    child = r"""
+import os
+import sys
+
+if not os.isatty(0):
+    raise SystemExit("SYNTHETIC_PIPE_REGRESSION")
+print("SYNTHETIC_IPV4_SENTINEL=192.0.2.37", flush=True)
+print("SYNTHETIC_IPV6_SENTINEL=2001:db8::37", flush=True)
+print("SYNTHETIC_PRIVATE_HOST_SENTINEL=private-host.invalid", flush=True)
+print("SYNTHETIC_HOME_ASSISTANT_URL_SENTINEL=http://private-host.invalid:8123", flush=True)
+print("SYNTHETIC_OBSERVER_URL_SENTINEL=http://observer.invalid", flush=True)
+print("REMOTE_PROMPT", flush=True)
+for line in sys.stdin:
+    command = line.strip()
+    if command == "exec bash -li":
+        print("LOGIN_PROMPT", flush=True)
+    elif command == "safe-status":
+        print('{"result": "ok", "data": {"issues": []}}', flush=True)
+    elif command == "exit":
+        print("SYNTHETIC_CLOSE_TARGET_SENTINEL=private-host.invalid", flush=True)
+        break
+"""
+    broker = access.PrivateInteractiveSessionBroker(
+        [sys.executable, "-u", "-c", child],
+        remote_ready_marker=b"REMOTE_PROMPT",
+        login_ready_marker=b"LOGIN_PROMPT",
+        timeout_seconds=1,
+    )
+
+    assert broker.open() == access.BrokerState.SESSION_ACTIVE
+    assert broker.execute(
+        access.ResolutionInfoCommand("safe-status")
+    ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
+    broker.close()
+
+    rendered = capsys.readouterr().out + capsys.readouterr().err + repr(broker)
+    assert "HA_INTERACTIVE_SESSION_READY" in rendered
+    assert all(
+        sentinel not in rendered
+        for sentinel in (
+            "SYNTHETIC_IPV4_SENTINEL",
+            "SYNTHETIC_IPV6_SENTINEL",
+            "SYNTHETIC_PRIVATE_HOST_SENTINEL",
+            "SYNTHETIC_HOME_ASSISTANT_URL_SENTINEL",
+            "SYNTHETIC_OBSERVER_URL_SENTINEL",
+            "SYNTHETIC_CLOSE_TARGET_SENTINEL",
+        )
+    )
 
 
 def test_o_m6_private_instruction_never_reaches_bootstrap_stdout(
