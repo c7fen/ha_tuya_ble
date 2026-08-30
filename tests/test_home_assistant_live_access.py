@@ -2491,6 +2491,156 @@ def _r32_bundles() -> tuple[access.SourceBundle, access.SourceBundle]:
     return candidate, restore
 
 
+_R32_ACTION_PREDECESSORS = {
+    access.LifecycleAction.INITIAL_REPAIRS: frozenset({access.LifecycleState.BASELINE}),
+    access.LifecycleAction.BACKUP: frozenset(
+        {access.LifecycleState.INITIAL_REPAIRS_PASS}
+    ),
+    access.LifecycleAction.CANDIDATE_TRANSFER: frozenset(
+        {access.LifecycleState.BACKUP_VERIFIED}
+    ),
+    access.LifecycleAction.CANDIDATE_INSTALL: frozenset(
+        {access.LifecycleState.CANDIDATE_STAGED}
+    ),
+    access.LifecycleAction.CANDIDATE_INVENTORY: frozenset(
+        {access.LifecycleState.CANDIDATE_INSTALLED}
+    ),
+    access.LifecycleAction.CANDIDATE_CORE_CHECK_1: frozenset(
+        {access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
+    ),
+    access.LifecycleAction.CANDIDATE_CORE_CHECK_2: frozenset(
+        {access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
+    ),
+    access.LifecycleAction.ACTIVATION_RESTART: frozenset(
+        {access.LifecycleState.CANDIDATE_CORE_CHECKED}
+    ),
+    access.LifecycleAction.CANDIDATE_READINESS: frozenset(
+        {access.LifecycleState.ACTIVATION_RESTART_CONSUMED}
+    ),
+    access.LifecycleAction.SERVICES_PRESENT: frozenset(
+        {access.LifecycleState.CANDIDATE_READY}
+    ),
+    access.LifecycleAction.POST_ACTIVATION_REPAIRS: frozenset(
+        {access.LifecycleState.RESEARCH_SERVICES_PRESENT}
+    ),
+    access.LifecycleAction.A0: frozenset(
+        {access.LifecycleState.POST_ACTIVATION_REPAIRS_PASS}
+    ),
+    access.LifecycleAction.P0: frozenset({access.LifecycleState.A0_COLLECTED}),
+    access.LifecycleAction.AP0: frozenset({access.LifecycleState.P0_COMPLETED}),
+    access.LifecycleAction.PREFLIGHT: frozenset({access.LifecycleState.AP0_COLLECTED}),
+    access.LifecycleAction.RECEIPT: frozenset(
+        {access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED}
+    ),
+    access.LifecycleAction.A1: frozenset(
+        {access.LifecycleState.NON_PROBE_RECEIPT_COMPLETED}
+    ),
+    access.LifecycleAction.RESEARCH_FINAL: frozenset(
+        {access.LifecycleState.A1_COLLECTED}
+    ),
+    access.LifecycleAction.A2: frozenset(
+        {access.LifecycleState.RESEARCH_FINAL_VALIDATED}
+    ),
+    access.LifecycleAction.RESTORE_TRANSFER: frozenset(
+        {
+            access.LifecycleState.A2_COLLECTED,
+            access.LifecycleState.ROLLBACK_REQUIRED,
+        }
+    ),
+    access.LifecycleAction.RESTORE_INSTALL: frozenset(
+        {access.LifecycleState.RESTORE_STAGED}
+    ),
+    access.LifecycleAction.RESTORE_INVENTORY: frozenset(
+        {access.LifecycleState.PR41_RESTORED}
+    ),
+    access.LifecycleAction.RESTORE_CORE_CHECK_1: frozenset(
+        {access.LifecycleState.RESTORE_INVENTORY_VERIFIED}
+    ),
+    access.LifecycleAction.RESTORE_CORE_CHECK_2: frozenset(
+        {access.LifecycleState.RESTORE_INVENTORY_VERIFIED}
+    ),
+    access.LifecycleAction.REMOVAL_RESTART: frozenset(
+        {access.LifecycleState.RESTORE_CORE_CHECKED}
+    ),
+    access.LifecycleAction.RESTORE_READINESS: frozenset(
+        {access.LifecycleState.REMOVAL_RESTART_CONSUMED}
+    ),
+    access.LifecycleAction.SERVICES_ABSENT: frozenset(
+        {access.LifecycleState.PR41_READY}
+    ),
+    access.LifecycleAction.POST_RESTORE_REPAIRS: frozenset(
+        {access.LifecycleState.RESEARCH_SERVICES_ABSENT}
+    ),
+    access.LifecycleAction.FINAL_ACCEPTANCE: frozenset(
+        {access.LifecycleState.POST_RESTORE_REPAIRS_PASS}
+    ),
+    access.LifecycleAction.AMBIGUOUS_RECEIPT: frozenset(
+        {access.LifecycleState.ROLLBACK_REQUIRED}
+    ),
+    access.LifecycleAction.BACKUP_FALLBACK: frozenset(
+        {access.LifecycleState.ROLLBACK_REQUIRED}
+    ),
+}
+
+
+def test_r32_action_capability_predecessor_mapping_is_exact_and_immutable() -> None:
+    assert access._LIFECYCLE_ACTION_PREDECESSORS == _R32_ACTION_PREDECESSORS
+    assert set(access._LIFECYCLE_ACTION_PREDECESSORS) == set(access.LifecycleAction)
+    with pytest.raises(TypeError):
+        access._LIFECYCLE_ACTION_PREDECESSORS[access.LifecycleAction.BACKUP] = (
+            frozenset({access.LifecycleState.BASELINE})
+        )
+
+
+@pytest.mark.parametrize("entrypoint", ("_dispatch", "__dispatch_action"))
+@pytest.mark.parametrize("action", tuple(access.LifecycleAction))
+def test_r32_private_dispatch_cannot_mint_capability_from_wrong_state(
+    action: access.LifecycleAction,
+    entrypoint: str,
+) -> None:
+    controller, broker = _r32_controller()
+    allowed = _R32_ACTION_PREDECESSORS[action]
+    wrong_state = next(state for state in access.LifecycleState if state not in allowed)
+    controller._state = wrong_state
+    callbacks: list[object] = []
+
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+        if entrypoint == "_dispatch":
+            controller._dispatch(
+                action,
+                lambda capability: callbacks.append(capability),
+                _dispatch_token=(
+                    controller._FullPreflightLifecycleController__dispatch_token
+                ),
+            )
+        else:
+            controller._FullPreflightLifecycleController__dispatch_action(
+                action, lambda capability: callbacks.append(capability)
+            )
+
+    assert controller.state is wrong_state
+    assert controller._permits[action].consumed is False
+    assert callbacks == []
+    assert broker.calls == []
+
+
+@pytest.mark.parametrize("action", tuple(access.LifecycleAction))
+def test_r32_private_dispatch_mints_only_from_each_exact_predecessor(
+    action: access.LifecycleAction,
+) -> None:
+    for predecessor in _R32_ACTION_PREDECESSORS[action]:
+        controller, broker = _r32_controller()
+        controller._state = predecessor
+
+        capability = controller._FullPreflightLifecycleController__dispatch_action(
+            action, lambda minted: minted
+        )
+
+        assert capability.action is action
+        assert controller._permits[action].consumed is True
+        assert broker.calls == []
+
+
 def _r32_unbound_real_broker() -> access.PrivateInteractiveSessionBroker:
     """Return an active synthetic broker shell without opening a PTY."""
     broker = object.__new__(access.PrivateInteractiveSessionBroker)
