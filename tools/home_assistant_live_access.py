@@ -401,6 +401,17 @@ class PrivateInteractiveSessionBroker:
         self._write_private(self._frame_printf(payload) + "\n")
         self._read_until(frame)
 
+    def _verify_interactive_login_bash(self) -> None:
+        """Prove post-``exec`` Bash, interactive mode, and login-shell mode together."""
+        payload, frame = self._new_frame("LOGIN")
+        command = (
+            'if [ -n "${BASH_VERSION-}" ] && '
+            "case $- in *i*) true ;; *) false ;; esac && "
+            f"shopt -q login_shell; then {self._frame_printf(payload)}; fi\n"
+        )
+        self._write_private(command)
+        self._read_until(frame)
+
     def _drain_and_discard(self, duration_seconds: float) -> None:
         if self._master_fd is None:
             return
@@ -447,7 +458,7 @@ class PrivateInteractiveSessionBroker:
         self._challenge("REMOTE")
         self._state = BrokerState.REMOTE_INTERACTIVE_READY
         self._write_private("exec bash -li\n")
-        self._challenge("LOGIN")
+        self._verify_interactive_login_bash()
         self._state = BrokerState.LOGIN_SHELL_READY
         self._state = BrokerState.SESSION_ACTIVE
         print(HA_INTERACTIVE_SESSION_READY)
