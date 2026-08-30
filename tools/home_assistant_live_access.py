@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import copy
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -24,9 +27,10 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, TextIO
+from typing import Any, NoReturn, Self, TextIO
 
 REPAIRS_RESPONSE_SHAPE_INVALID = "REPAIRS_RESPONSE_SHAPE_INVALID"
 ADMISSION_COLLECTOR = "ADMISSION_COLLECTOR"
@@ -44,6 +48,12 @@ _MAX_SOURCE_FILES = 512
 _TRANSFER_CHUNK_SIZE = 2048
 _FRAME_START = b"\x1e"
 _FRAME_END = b"\x1f"
+_LIFECYCLE_JOURNAL_SCHEMA = 1
+_MAX_LIFECYCLE_JOURNAL_BYTES = 128 * 1024
+_LIFECYCLE_STATE_ROOT: Path | None = None
+_LIFECYCLE_JOURNAL_NAME = "journal.json"
+_LIFECYCLE_LOCK_NAME = "journal.lock"
+_NON_DURABLE_TEST_CONSTRUCTION_TOKEN = object()
 PR45_CANDIDATE_COMMIT = "a382c08cd4e8613dc214505bcb8a6f59f8da3022"
 PR45_CANDIDATE_TREE = "73246ecd71f0953c7bf8a73df78d6506bee29c8e"
 PR41_RESTORE_COMMIT = "4f73a9b008dcb89134bc41001c486f06d6056867"
@@ -123,6 +133,8 @@ class BoundedOperation(StrEnum):
     PHASE_A_HELPER = "phase_a_helper"
     RESTORE = "restore"
     RESTORE_BACKUP = "restore_backup"
+    RECONCILE_BACKUP = "reconcile_backup"
+    RESTORE_TAIL_RECONCILE = "restore_tail_reconcile"
 
 
 class PhaseAOperation(StrEnum):
@@ -179,12 +191,20 @@ class LifecycleState(StrEnum):
     PR41_READY = "PR41_READY"
     RESEARCH_SERVICES_ABSENT = "RESEARCH_SERVICES_ABSENT"
     POST_RESTORE_REPAIRS_PASS = "POST_RESTORE_REPAIRS_PASS"
-    COMPLETE = "COMPLETE"
+    COMPLETE_NORMAL = "COMPLETE_NORMAL"
+    COMPLETE = "COMPLETE_NORMAL"
+    RESTORED_AFTER_ABORT = "RESTORED_AFTER_ABORT"
+    RESTORE_FAILED = "RESTORE_FAILED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     ROLLBACK_REQUIRED = "ROLLBACK_REQUIRED"
 
     @property
     def is_failure(self) -> bool:
-        return self is LifecycleState.ROLLBACK_REQUIRED
+        return self in {
+            LifecycleState.ROLLBACK_REQUIRED,
+            LifecycleState.RESTORE_FAILED,
+            LifecycleState.RECOVERY_REQUIRED,
+        }
 
 
 class LifecycleAction(StrEnum):
@@ -196,7 +216,6 @@ class LifecycleAction(StrEnum):
     CANDIDATE_INSTALL = "candidate_install"
     CANDIDATE_INVENTORY = "candidate_inventory"
     CANDIDATE_CORE_CHECK_1 = "candidate_core_check_1"
-    CANDIDATE_CORE_CHECK_2 = "candidate_core_check_2"
     ACTIVATION_RESTART = "activation_restart"
     CANDIDATE_READINESS = "candidate_readiness"
     SERVICES_PRESENT = "services_present"
@@ -213,14 +232,16 @@ class LifecycleAction(StrEnum):
     RESTORE_INSTALL = "restore_install"
     RESTORE_INVENTORY = "restore_inventory"
     RESTORE_CORE_CHECK_1 = "restore_core_check_1"
-    RESTORE_CORE_CHECK_2 = "restore_core_check_2"
     REMOVAL_RESTART = "removal_restart"
     RESTORE_READINESS = "restore_readiness"
     SERVICES_ABSENT = "services_absent"
     POST_RESTORE_REPAIRS = "post_restore_repairs"
-    FINAL_ACCEPTANCE = "final_acceptance"
+    FINAL_ACCEPTANCE_NORMAL = "final_acceptance_normal"
+    FINAL_ACCEPTANCE_AFTER_ABORT = "final_acceptance_after_abort"
     AMBIGUOUS_RECEIPT = "ambiguous_receipt"
     BACKUP_FALLBACK = "backup_fallback"
+    BACKUP_FALLBACK_RECONCILE = "backup_fallback_reconcile"
+    RESTORE_TAIL_RECONCILE = "restore_tail_reconcile"
 
 
 _LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
@@ -233,9 +254,6 @@ _LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
             {LifecycleState.CANDIDATE_INSTALLED}
         ),
         LifecycleAction.CANDIDATE_CORE_CHECK_1: frozenset(
-            {LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
-        ),
-        LifecycleAction.CANDIDATE_CORE_CHECK_2: frozenset(
             {LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
         ),
         LifecycleAction.ACTIVATION_RESTART: frozenset(
@@ -259,14 +277,15 @@ _LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
         LifecycleAction.RESEARCH_FINAL: frozenset({LifecycleState.A1_COLLECTED}),
         LifecycleAction.A2: frozenset({LifecycleState.RESEARCH_FINAL_VALIDATED}),
         LifecycleAction.RESTORE_TRANSFER: frozenset(
-            {LifecycleState.A2_COLLECTED, LifecycleState.ROLLBACK_REQUIRED}
+            {
+                LifecycleState.A2_COLLECTED,
+                LifecycleState.ROLLBACK_REQUIRED,
+                LifecycleState.RECOVERY_REQUIRED,
+            }
         ),
         LifecycleAction.RESTORE_INSTALL: frozenset({LifecycleState.RESTORE_STAGED}),
         LifecycleAction.RESTORE_INVENTORY: frozenset({LifecycleState.PR41_RESTORED}),
         LifecycleAction.RESTORE_CORE_CHECK_1: frozenset(
-            {LifecycleState.RESTORE_INVENTORY_VERIFIED}
-        ),
-        LifecycleAction.RESTORE_CORE_CHECK_2: frozenset(
             {LifecycleState.RESTORE_INVENTORY_VERIFIED}
         ),
         LifecycleAction.REMOVAL_RESTART: frozenset(
@@ -279,13 +298,171 @@ _LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
         LifecycleAction.POST_RESTORE_REPAIRS: frozenset(
             {LifecycleState.RESEARCH_SERVICES_ABSENT}
         ),
-        LifecycleAction.FINAL_ACCEPTANCE: frozenset(
+        LifecycleAction.FINAL_ACCEPTANCE_NORMAL: frozenset(
+            {LifecycleState.POST_RESTORE_REPAIRS_PASS}
+        ),
+        LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT: frozenset(
             {LifecycleState.POST_RESTORE_REPAIRS_PASS}
         ),
         LifecycleAction.AMBIGUOUS_RECEIPT: frozenset(
-            {LifecycleState.ROLLBACK_REQUIRED}
+            {LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED}
         ),
         LifecycleAction.BACKUP_FALLBACK: frozenset({LifecycleState.ROLLBACK_REQUIRED}),
+        LifecycleAction.BACKUP_FALLBACK_RECONCILE: frozenset(
+            {LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED}
+        ),
+        LifecycleAction.RESTORE_TAIL_RECONCILE: frozenset(
+            {LifecycleState.RECOVERY_REQUIRED}
+        ),
+    }
+)
+
+_LIFECYCLE_ACTION_SUCCESSORS = MappingProxyType(
+    {
+        LifecycleAction.INITIAL_REPAIRS: frozenset(
+            {LifecycleState.INITIAL_REPAIRS_PASS}
+        ),
+        LifecycleAction.BACKUP: frozenset({LifecycleState.BACKUP_VERIFIED}),
+        LifecycleAction.CANDIDATE_TRANSFER: frozenset(
+            {LifecycleState.CANDIDATE_STAGED}
+        ),
+        LifecycleAction.CANDIDATE_INSTALL: frozenset(
+            {LifecycleState.CANDIDATE_INSTALLED}
+        ),
+        LifecycleAction.CANDIDATE_INVENTORY: frozenset(
+            {LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.CANDIDATE_CORE_CHECK_1: frozenset(
+            {LifecycleState.CANDIDATE_CORE_CHECKED}
+        ),
+        LifecycleAction.ACTIVATION_RESTART: frozenset(
+            {LifecycleState.ACTIVATION_RESTART_CONSUMED}
+        ),
+        LifecycleAction.CANDIDATE_READINESS: frozenset(
+            {LifecycleState.CANDIDATE_READY}
+        ),
+        LifecycleAction.SERVICES_PRESENT: frozenset(
+            {LifecycleState.RESEARCH_SERVICES_PRESENT}
+        ),
+        LifecycleAction.POST_ACTIVATION_REPAIRS: frozenset(
+            {LifecycleState.POST_ACTIVATION_REPAIRS_PASS}
+        ),
+        LifecycleAction.A0: frozenset({LifecycleState.A0_COLLECTED}),
+        LifecycleAction.P0: frozenset({LifecycleState.P0_COMPLETED}),
+        LifecycleAction.AP0: frozenset({LifecycleState.AP0_COLLECTED}),
+        LifecycleAction.PREFLIGHT: frozenset(
+            {LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED}
+        ),
+        LifecycleAction.RECEIPT: frozenset(
+            {LifecycleState.NON_PROBE_RECEIPT_COMPLETED}
+        ),
+        LifecycleAction.A1: frozenset({LifecycleState.A1_COLLECTED}),
+        LifecycleAction.RESEARCH_FINAL: frozenset(
+            {LifecycleState.RESEARCH_FINAL_VALIDATED}
+        ),
+        LifecycleAction.A2: frozenset({LifecycleState.A2_COLLECTED}),
+        LifecycleAction.RESTORE_TRANSFER: frozenset({LifecycleState.RESTORE_STAGED}),
+        LifecycleAction.RESTORE_INSTALL: frozenset({LifecycleState.PR41_RESTORED}),
+        LifecycleAction.RESTORE_INVENTORY: frozenset(
+            {LifecycleState.RESTORE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.RESTORE_CORE_CHECK_1: frozenset(
+            {LifecycleState.RESTORE_CORE_CHECKED}
+        ),
+        LifecycleAction.REMOVAL_RESTART: frozenset(
+            {LifecycleState.REMOVAL_RESTART_CONSUMED}
+        ),
+        LifecycleAction.RESTORE_READINESS: frozenset({LifecycleState.PR41_READY}),
+        LifecycleAction.SERVICES_ABSENT: frozenset(
+            {LifecycleState.RESEARCH_SERVICES_ABSENT}
+        ),
+        LifecycleAction.POST_RESTORE_REPAIRS: frozenset(
+            {LifecycleState.POST_RESTORE_REPAIRS_PASS}
+        ),
+        LifecycleAction.FINAL_ACCEPTANCE_NORMAL: frozenset(
+            {LifecycleState.COMPLETE_NORMAL}
+        ),
+        LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT: frozenset(
+            {LifecycleState.RESTORED_AFTER_ABORT}
+        ),
+        LifecycleAction.AMBIGUOUS_RECEIPT: frozenset(
+            {LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED}
+        ),
+        LifecycleAction.BACKUP_FALLBACK: frozenset({LifecycleState.ROLLBACK_REQUIRED}),
+        LifecycleAction.BACKUP_FALLBACK_RECONCILE: frozenset(
+            {LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED}
+        ),
+        LifecycleAction.RESTORE_TAIL_RECONCILE: frozenset(
+            {LifecycleState.RESTORED_AFTER_ABORT}
+        ),
+    }
+)
+
+_NORMAL_LIFECYCLE_HISTORY = (
+    LifecycleState.BASELINE,
+    LifecycleState.INITIAL_REPAIRS_PASS,
+    LifecycleState.BACKUP_VERIFIED,
+    LifecycleState.CANDIDATE_STAGED,
+    LifecycleState.CANDIDATE_INSTALLED,
+    LifecycleState.CANDIDATE_INVENTORY_VERIFIED,
+    LifecycleState.CANDIDATE_CORE_CHECKED,
+    LifecycleState.ACTIVATION_RESTART_CONSUMED,
+    LifecycleState.CANDIDATE_READY,
+    LifecycleState.RESEARCH_SERVICES_PRESENT,
+    LifecycleState.POST_ACTIVATION_REPAIRS_PASS,
+    LifecycleState.A0_COLLECTED,
+    LifecycleState.P0_COMPLETED,
+    LifecycleState.AP0_COLLECTED,
+    LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED,
+    LifecycleState.NON_PROBE_RECEIPT_COMPLETED,
+    LifecycleState.A1_COLLECTED,
+    LifecycleState.RESEARCH_FINAL_VALIDATED,
+    LifecycleState.A2_COLLECTED,
+    LifecycleState.RESTORE_STAGED,
+    LifecycleState.PR41_RESTORED,
+    LifecycleState.RESTORE_INVENTORY_VERIFIED,
+    LifecycleState.RESTORE_CORE_CHECKED,
+    LifecycleState.REMOVAL_RESTART_CONSUMED,
+    LifecycleState.PR41_READY,
+    LifecycleState.RESEARCH_SERVICES_ABSENT,
+    LifecycleState.POST_RESTORE_REPAIRS_PASS,
+)
+
+_CANDIDATE_SOURCE_ACTIONS = frozenset(
+    {
+        LifecycleAction.CANDIDATE_TRANSFER,
+        LifecycleAction.CANDIDATE_INSTALL,
+        LifecycleAction.CANDIDATE_INVENTORY,
+        LifecycleAction.CANDIDATE_CORE_CHECK_1,
+        LifecycleAction.ACTIVATION_RESTART,
+        LifecycleAction.CANDIDATE_READINESS,
+        LifecycleAction.SERVICES_PRESENT,
+        LifecycleAction.POST_ACTIVATION_REPAIRS,
+        LifecycleAction.A0,
+        LifecycleAction.P0,
+        LifecycleAction.AP0,
+        LifecycleAction.PREFLIGHT,
+        LifecycleAction.RECEIPT,
+        LifecycleAction.AMBIGUOUS_RECEIPT,
+        LifecycleAction.A1,
+        LifecycleAction.RESEARCH_FINAL,
+        LifecycleAction.A2,
+    }
+)
+
+_RESTORE_SOURCE_ACTIONS = frozenset(
+    {
+        LifecycleAction.RESTORE_TRANSFER,
+        LifecycleAction.RESTORE_INSTALL,
+        LifecycleAction.RESTORE_INVENTORY,
+        LifecycleAction.RESTORE_CORE_CHECK_1,
+        LifecycleAction.REMOVAL_RESTART,
+        LifecycleAction.RESTORE_READINESS,
+        LifecycleAction.SERVICES_ABSENT,
+        LifecycleAction.POST_RESTORE_REPAIRS,
+        LifecycleAction.FINAL_ACCEPTANCE_NORMAL,
+        LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT,
+        LifecycleAction.RESTORE_TAIL_RECONCILE,
     }
 )
 
@@ -297,14 +474,15 @@ _BOUNDED_OPERATION_ACTIONS = {
     ),
     BoundedOperation.INSTALL: frozenset({LifecycleAction.CANDIDATE_INSTALL}),
     BoundedOperation.SOURCE_INVENTORY: frozenset(
-        {LifecycleAction.CANDIDATE_INVENTORY, LifecycleAction.RESTORE_INVENTORY}
+        {
+            LifecycleAction.CANDIDATE_INVENTORY,
+            LifecycleAction.RESTORE_INVENTORY,
+        }
     ),
     BoundedOperation.CORE_CHECK: frozenset(
         {
             LifecycleAction.CANDIDATE_CORE_CHECK_1,
-            LifecycleAction.CANDIDATE_CORE_CHECK_2,
             LifecycleAction.RESTORE_CORE_CHECK_1,
-            LifecycleAction.RESTORE_CORE_CHECK_2,
         }
     ),
     BoundedOperation.RESTART_CORE: frozenset(
@@ -330,6 +508,12 @@ _BOUNDED_OPERATION_ACTIONS = {
     ),
     BoundedOperation.RESTORE: frozenset({LifecycleAction.RESTORE_INSTALL}),
     BoundedOperation.RESTORE_BACKUP: frozenset({LifecycleAction.BACKUP_FALLBACK}),
+    BoundedOperation.RECONCILE_BACKUP: frozenset(
+        {LifecycleAction.BACKUP_FALLBACK_RECONCILE}
+    ),
+    BoundedOperation.RESTORE_TAIL_RECONCILE: frozenset(
+        {LifecycleAction.RESTORE_TAIL_RECONCILE}
+    ),
 }
 
 
@@ -339,14 +523,16 @@ _ROLLBACK_REBIND_ACTIONS = frozenset(
         LifecycleAction.RESTORE_INSTALL,
         LifecycleAction.RESTORE_INVENTORY,
         LifecycleAction.RESTORE_CORE_CHECK_1,
-        LifecycleAction.RESTORE_CORE_CHECK_2,
         LifecycleAction.REMOVAL_RESTART,
         LifecycleAction.RESTORE_READINESS,
         LifecycleAction.SERVICES_ABSENT,
         LifecycleAction.POST_RESTORE_REPAIRS,
-        LifecycleAction.FINAL_ACCEPTANCE,
+        LifecycleAction.FINAL_ACCEPTANCE_NORMAL,
+        LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT,
         LifecycleAction.AMBIGUOUS_RECEIPT,
         LifecycleAction.BACKUP_FALLBACK,
+        LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+        LifecycleAction.RESTORE_TAIL_RECONCILE,
     }
 )
 
@@ -362,6 +548,8 @@ _ROLLBACK_BROKER_ADAPTERS = (
     "_collect_resolution_info",
     "_invoke_phase_a",
     "_restore_private_backup",
+    "_reconcile_private_backup",
+    "_reconcile_restore_tail",
 )
 
 
@@ -396,16 +584,91 @@ class _ControllerBinding:
     session_generation: object
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
+class _PrivateWirePacket:
+    """One internally issued ASCII packet for the name-mangled PTY sink."""
+
+    payload: bytes = field(repr=False)
+    issuer: object = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _LifecycleCapability:
     """A controller-minted, broker-validated, one-shot action capability."""
 
     controller: object
     issuer: object
     lifecycle_generation: object
+    source_generation: object
     session_generation: object
     action: LifecycleAction
-    consumed: bool = False
+    issuance_identity: object
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceOrigin:
+    """Internal provenance for one sanitized evidence object."""
+
+    evidence: object = field(repr=False)
+    controller: object = field(repr=False)
+    lifecycle_generation: object = field(repr=False)
+    source_generation: object = field(repr=False)
+    action: LifecycleAction
+    session_generation: object = field(repr=False)
+    issuance_identity: object = field(repr=False)
+    audit_instance: str | None = field(default=None, repr=False)
+    nonce: str | None = field(default=None, repr=False)
+
+
+_EVIDENCE_ORIGIN_LEDGER: dict[int, _EvidenceOrigin] = {}
+_CLAIMED_EVIDENCE: set[int] = set()
+
+
+def _bind_evidence_origin(evidence: object, capability: _LifecycleCapability) -> object:
+    """Bind a newly parsed sanitized result to its exact broker capability."""
+    identity = id(evidence)
+    existing = _EVIDENCE_ORIGIN_LEDGER.get(identity)
+    if existing is not None:
+        raise SessionBrokerError(
+            "PRIVATE_INTERACTIVE_SESSION_EVIDENCE_REUSED"
+        ) from None
+    audit = evidence.audit if isinstance(evidence, PhaseAResult) else None
+    _EVIDENCE_ORIGIN_LEDGER[identity] = _EvidenceOrigin(
+        evidence=evidence,
+        controller=capability.controller,
+        lifecycle_generation=capability.lifecycle_generation,
+        source_generation=capability.source_generation,
+        action=capability.action,
+        session_generation=capability.session_generation,
+        issuance_identity=capability.issuance_identity,
+        audit_instance=(
+            audit.audit_instance_token if isinstance(audit, AuditSnapshot) else None
+        ),
+        nonce=evidence.nonce if isinstance(evidence, PhaseAResult) else None,
+    )
+    return evidence
+
+
+def _claim_evidence_origin(
+    evidence: object, capability: _LifecycleCapability
+) -> _EvidenceOrigin | None:
+    """Claim evidence once when every immutable issuance dimension matches."""
+    identity = id(evidence)
+    origin = _EVIDENCE_ORIGIN_LEDGER.get(identity)
+    if (
+        origin is None
+        or origin.evidence is not evidence
+        or identity in _CLAIMED_EVIDENCE
+        or origin.controller is not capability.controller
+        or origin.lifecycle_generation is not capability.lifecycle_generation
+        or origin.source_generation is not capability.source_generation
+        or origin.action is not capability.action
+        or origin.session_generation is not capability.session_generation
+        or origin.issuance_identity is not capability.issuance_identity
+    ):
+        return None
+    _CLAIMED_EVIDENCE.add(identity)
+    return origin
 
 
 @dataclass(frozen=True)
@@ -490,12 +753,48 @@ class InstallResult:
 
 
 @dataclass(frozen=True)
+class FallbackReconciliationResult:
+    phase: str
+    restoration_applied: bool
+    manifest_match: bool
+    file_count: int
+
+
+@dataclass(frozen=True)
 class SourceInventoryResult:
     expected_count: int
     observed_count: int
     manifest_match: bool
     unexpected_count: int
     missing_count: int
+
+
+@dataclass(frozen=True)
+class RestoreTailReconciliationEvidence:
+    """Sanitized complete PR #41 proof for one recovery dispatch."""
+
+    original_operation_id: str
+    reconciliation_operation_id: str
+    expected_count: int
+    observed_count: int
+    manifest_match: bool
+    unexpected_count: int
+    missing_count: int
+    research_files_absent: bool
+    core_http_status: int
+    core_result: str
+    core_check_passed: bool
+    restart_resolved: bool
+    core_reachable: bool
+    core_running: bool
+    integration_loaded: bool
+    timed_out: bool
+    expected_absent_count: int
+    observed_absent_count: int
+    all_expected_absent: bool
+    repairs_shape_valid: bool
+    repairs_relevant_count: int
+    repairs_critical_count: int
 
 
 @dataclass(frozen=True)
@@ -628,23 +927,1314 @@ class FinalRestoreProof:
     @property
     def complete(self) -> bool:
         """Require every named predicate explicitly; no dynamic defaults exist."""
-        return (
-            self.source_manifest_match
-            and self.research_files_absent
-            and self.core_check_passed
-            and self.restart_consumed
-            and self.restart_dispatched
-            and self.restart_submitted
-            and self.restart_accepted
-            and self.core_reachable
-            and self.core_running
-            and self.integration_loaded
-            and self.core_not_timed_out
-            and self.research_services_absent
-            and self.repairs_shape_valid
-            and self.repairs_relevant_zero
-            and self.repairs_critical_zero
+        return all(
+            value is True
+            for value in (
+                self.source_manifest_match,
+                self.research_files_absent,
+                self.core_check_passed,
+                self.restart_consumed,
+                self.restart_dispatched,
+                self.restart_submitted,
+                self.restart_accepted,
+                self.core_reachable,
+                self.core_running,
+                self.integration_loaded,
+                self.core_not_timed_out,
+                self.research_services_absent,
+                self.repairs_shape_valid,
+                self.repairs_relevant_zero,
+                self.repairs_critical_zero,
+            )
         )
+
+
+def _exact_non_bool_int(
+    value: object, *, minimum: int = 0, maximum: int | None = None
+) -> bool:
+    """Accept an integer only when bool-subclass confusion is impossible."""
+    return (
+        type(value) is int
+        and value >= minimum
+        and (maximum is None or value <= maximum)
+    )
+
+
+def _strict_json_object(raw: bytes) -> dict[str, object]:
+    """Decode one bounded JSON object while rejecting duplicate keys."""
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeError, ValueError, TypeError):
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+    if type(decoded) is not dict:
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+    return decoded
+
+
+def _fixed_lifecycle_state_root() -> Path:
+    """Resolve one owner-private location shared by this repository's worktrees."""
+    if _LIFECYCLE_STATE_ROOT is not None:
+        return _LIFECYCLE_STATE_ROOT
+
+    repository = Path(__file__).absolute().parent.parent
+    dot_git = repository / ".git"
+    try:
+        metadata = dot_git.lstat()
+    except OSError:
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
+    if stat.S_ISDIR(metadata.st_mode):
+        common = dot_git
+    elif (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+    ):
+        try:
+            raw = dot_git.read_bytes()
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        if len(raw) > 4096:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        try:
+            line = raw.decode("utf-8").strip()
+        except UnicodeError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        if not line.startswith("gitdir: ") or "\n" in line or "\r" in line:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        candidate = Path(line.removeprefix("gitdir: "))
+        if not candidate.is_absolute():
+            candidate = repository / candidate
+        git_dir = Path(os.path.abspath(candidate))
+        if git_dir.parent.name != "worktrees":
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        common = git_dir.parent.parent
+    else:
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
+    try:
+        common_metadata = common.lstat()
+    except OSError:
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+    if (
+        not stat.S_ISDIR(common_metadata.st_mode)
+        or common_metadata.st_uid != os.getuid()
+    ):
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+    return common / "ha_tuya_ble_issue_37_lifecycle_v1"
+
+
+class _DurableLifecycleJournal:
+    """Fixed-path, locked, atomic continuity record for one Issue-37 lifecycle."""
+
+    _TOP_LEVEL_KEYS = frozenset(
+        {
+            "schema_version",
+            "lifecycle_generation",
+            "active",
+            "terminal",
+            "stage",
+            "research_succeeded",
+            "rollback_mode",
+            "recovery_mode",
+            "pr45_source",
+            "pr41_restore",
+            "source_generation",
+            "consumed_operations",
+            "helper_tombstones",
+            "restart_tombstones",
+            "core_check_attempts",
+            "ambiguous_operation",
+            "known_nonce",
+            "evidence_generation",
+            "evidence_identities",
+            "transitions",
+            "operations",
+            "fallback_phase",
+        }
+    )
+    _RISKY_ACTIONS = frozenset(
+        {
+            LifecycleAction.BACKUP.value,
+            LifecycleAction.CANDIDATE_TRANSFER.value,
+            LifecycleAction.CANDIDATE_INSTALL.value,
+            LifecycleAction.ACTIVATION_RESTART.value,
+            LifecycleAction.P0.value,
+            LifecycleAction.PREFLIGHT.value,
+            LifecycleAction.A0.value,
+            LifecycleAction.AP0.value,
+            LifecycleAction.A1.value,
+            LifecycleAction.A2.value,
+            LifecycleAction.RESTORE_TRANSFER.value,
+            LifecycleAction.RESTORE_INSTALL.value,
+            LifecycleAction.REMOVAL_RESTART.value,
+            LifecycleAction.BACKUP_FALLBACK.value,
+            LifecycleAction.BACKUP_FALLBACK_RECONCILE.value,
+            LifecycleAction.RESTORE_TAIL_RECONCILE.value,
+        }
+    )
+
+    @classmethod
+    def discard_abandoned_preparation(cls) -> bool:
+        """Explicitly discard only an active journal with no risky tombstone."""
+        journal = object.__new__(cls)
+        journal._directory = _fixed_lifecycle_state_root()
+        journal._journal_path = journal._directory / _LIFECYCLE_JOURNAL_NAME
+        journal._lock_path = journal._directory / _LIFECYCLE_LOCK_NAME
+        journal._lock_fd = None
+        journal._closed = False
+        journal._secure_directory()
+        journal._acquire_lock()
+        try:
+            record = journal._read_record()
+            if record is None:
+                return False
+            consumed = set(record["consumed_operations"])
+            if (
+                record["active"] is not True
+                or consumed.intersection(cls._RISKY_ACTIONS)
+                or record["recovery_mode"] is True
+                or record["rollback_mode"] is True
+            ):
+                raise LifecycleControllerError(
+                    "LIFECYCLE_PREPARATION_DISCARD_FORBIDDEN"
+                ) from None
+            journal._journal_path.unlink()
+            directory_fd = os.open(
+                journal._directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return True
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        finally:
+            journal.close()
+
+    def __init__(self) -> None:
+        self._directory = _fixed_lifecycle_state_root()
+        self._journal_path = self._directory / _LIFECYCLE_JOURNAL_NAME
+        self._lock_path = self._directory / _LIFECYCLE_LOCK_NAME
+        self._lock_fd: int | None = None
+        self._closed = False
+        self._secure_directory()
+        self._acquire_lock()
+        try:
+            record = self._read_record()
+            if record is None:
+                record = self._new_record()
+                self._write_record(record)
+            elif record["active"] is True:
+                consumed = set(record["consumed_operations"])
+                if not consumed.intersection(self._RISKY_ACTIONS):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_PREPARATION_ABANDONED"
+                    ) from None
+                record = copy.deepcopy(record)
+                record["recovery_mode"] = True
+                record["rollback_mode"] = True
+                reconciliation = next(
+                    (
+                        operation
+                        for operation in record["operations"]
+                        if operation["action"]
+                        == LifecycleAction.RESTORE_TAIL_RECONCILE.value
+                    ),
+                    None,
+                )
+                if reconciliation is not None and reconciliation["phase"] != (
+                    "transition_committed"
+                ):
+                    record["stage"] = LifecycleState.RESTORE_FAILED.value
+                    record["terminal"] = LifecycleState.RESTORE_FAILED.value
+                    record["active"] = False
+                    record["transitions"].append(
+                        {
+                            "sequence": len(record["transitions"]),
+                            "stage": LifecycleState.RESTORE_FAILED.value,
+                            "action": None,
+                            "source_generation": record["source_generation"],
+                            "evidence_generation": None,
+                            "session_generation": None,
+                            "issuance_identity": None,
+                        }
+                    )
+                elif reconciliation is None:
+                    record["stage"] = LifecycleState.RECOVERY_REQUIRED.value
+                    record["transitions"].append(
+                        {
+                            "sequence": len(record["transitions"]),
+                            "stage": LifecycleState.RECOVERY_REQUIRED.value,
+                            "action": None,
+                            "source_generation": record["source_generation"],
+                            "evidence_generation": None,
+                            "session_generation": None,
+                            "issuance_identity": None,
+                        }
+                    )
+                self._write_record(record)
+            else:
+                raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETAINED") from None
+            self._record = record
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _token() -> str:
+        return secrets.token_hex(16)
+
+    @staticmethod
+    def _safe_stat(value: os.stat_result, *, mode: int, directory: bool) -> bool:
+        expected_type = (
+            stat.S_ISDIR(value.st_mode) if directory else stat.S_ISREG(value.st_mode)
+        )
+        return (
+            expected_type
+            and value.st_uid == os.getuid()
+            and stat.S_IMODE(value.st_mode) == mode
+            and (directory or value.st_nlink == 1)
+        )
+
+    def _secure_directory(self) -> None:
+        try:
+            self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            metadata = self._directory.lstat()
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        if not self._safe_stat(metadata, mode=0o700, directory=True):
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
+    def _open_regular(self, path: Path, flags: int, mode: int = 0o600) -> int:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        close_on_exec = getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags | nofollow | close_on_exec, mode)
+            metadata = os.fstat(descriptor)
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        if not self._safe_stat(metadata, mode=0o600, directory=False):
+            os.close(descriptor)
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        return descriptor
+
+    def _acquire_lock(self) -> None:
+        descriptor = self._open_regular(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(descriptor)
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise LifecycleControllerError("LIFECYCLE_OWNER_ACTIVE") from None
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        self._lock_fd = descriptor
+
+    def _read_record(self) -> dict[str, object] | None:
+        try:
+            metadata = self._journal_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        if not self._safe_stat(metadata, mode=0o600, directory=False):
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        descriptor = self._open_regular(self._journal_path, os.O_RDONLY)
+        try:
+            size = os.fstat(descriptor).st_size
+            if size <= 0 or size > _MAX_LIFECYCLE_JOURNAL_BYTES:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            chunks: list[bytes] = []
+            remaining = size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_JOURNAL_INVALID"
+                    ) from None
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        finally:
+            os.close(descriptor)
+        record = _strict_json_object(b"".join(chunks))
+        self._validate_record(record)
+        return record
+
+    def _new_record(self) -> dict[str, object]:
+        lifecycle = self._token()
+        source = self._token()
+        return {
+            "schema_version": _LIFECYCLE_JOURNAL_SCHEMA,
+            "lifecycle_generation": lifecycle,
+            "active": True,
+            "terminal": None,
+            "stage": LifecycleState.BASELINE.value,
+            "research_succeeded": False,
+            "rollback_mode": False,
+            "recovery_mode": False,
+            "pr45_source": {
+                "commit": PR45_CANDIDATE_COMMIT,
+                "tree": PR45_CANDIDATE_TREE,
+                "generation": self._token(),
+            },
+            "pr41_restore": {
+                "commit": PR41_RESTORE_COMMIT,
+                "tree": PR41_RESTORE_TREE,
+                "generation": self._token(),
+            },
+            "source_generation": source,
+            "consumed_operations": [],
+            "helper_tombstones": [],
+            "restart_tombstones": [],
+            "core_check_attempts": {"candidate": [], "restore": []},
+            "ambiguous_operation": None,
+            "known_nonce": None,
+            "evidence_generation": 0,
+            "evidence_identities": [],
+            "transitions": [
+                {
+                    "sequence": 0,
+                    "stage": LifecycleState.BASELINE.value,
+                    "action": None,
+                    "source_generation": source,
+                    "evidence_generation": None,
+                    "session_generation": None,
+                    "issuance_identity": None,
+                }
+            ],
+            "operations": [],
+            "fallback_phase": "available",
+        }
+
+    @classmethod
+    def _validate_record(cls, record: dict[str, object]) -> None:
+        invalid = set(record) != cls._TOP_LEVEL_KEYS
+        token = re.compile(r"[0-9a-f]{32}\Z")
+        states = {item.value for item in LifecycleState}
+        actions = {item.value for item in LifecycleAction}
+        candidate_actions = {item.value for item in _CANDIDATE_SOURCE_ACTIONS}
+        restore_actions = {item.value for item in _RESTORE_SOURCE_ACTIONS}
+        terminal_values = {
+            LifecycleState.COMPLETE_NORMAL.value,
+            LifecycleState.RESTORED_AFTER_ABORT.value,
+            LifecycleState.RESTORE_FAILED.value,
+        }
+        invalid = invalid or record.get("schema_version") != _LIFECYCLE_JOURNAL_SCHEMA
+        invalid = invalid or not isinstance(record.get("lifecycle_generation"), str)
+        invalid = (
+            invalid or token.fullmatch(record.get("lifecycle_generation", "")) is None
+        )
+        invalid = invalid or type(record.get("active")) is not bool
+        invalid = invalid or record.get("terminal") not in terminal_values | {None}
+        invalid = invalid or record.get("stage") not in states
+        invalid = invalid or type(record.get("research_succeeded")) is not bool
+        invalid = invalid or type(record.get("rollback_mode")) is not bool
+        invalid = invalid or type(record.get("recovery_mode")) is not bool
+        invalid = invalid or not isinstance(record.get("source_generation"), str)
+        invalid = (
+            invalid or token.fullmatch(record.get("source_generation", "")) is None
+        )
+        for key, commit, tree in (
+            ("pr45_source", PR45_CANDIDATE_COMMIT, PR45_CANDIDATE_TREE),
+            ("pr41_restore", PR41_RESTORE_COMMIT, PR41_RESTORE_TREE),
+        ):
+            value = record.get(key)
+            invalid = invalid or type(value) is not dict
+            if type(value) is dict:
+                invalid = invalid or set(value) != {"commit", "tree", "generation"}
+                invalid = invalid or value.get("commit") != commit
+                invalid = invalid or value.get("tree") != tree
+                invalid = invalid or not isinstance(value.get("generation"), str)
+                invalid = (
+                    invalid or token.fullmatch(value.get("generation", "")) is None
+                )
+        candidate_value = record.get("pr45_source")
+        restore_value = record.get("pr41_restore")
+        candidate_generation = (
+            candidate_value.get("generation") if type(candidate_value) is dict else None
+        )
+        restore_generation = (
+            restore_value.get("generation") if type(restore_value) is dict else None
+        )
+        for key in (
+            "consumed_operations",
+            "helper_tombstones",
+            "restart_tombstones",
+        ):
+            value = record.get(key)
+            invalid = invalid or type(value) is not list
+            if type(value) is list:
+                invalid = invalid or len(value) != len(set(value))
+                invalid = invalid or any(item not in actions for item in value)
+        core = record.get("core_check_attempts")
+        invalid = invalid or type(core) is not dict
+        if type(core) is dict:
+            invalid = invalid or set(core) != {"candidate", "restore"}
+            for attempts in core.values():
+                invalid = invalid or type(attempts) is not list
+                if type(attempts) is list:
+                    invalid = invalid or any(
+                        not _exact_non_bool_int(item, minimum=1, maximum=2)
+                        for item in attempts
+                    )
+                    invalid = invalid or attempts not in ([], [1], [1, 2])
+        ambiguous = record.get("ambiguous_operation")
+        invalid = invalid or ambiguous not in actions | {None}
+        nonce = record.get("known_nonce")
+        invalid = invalid or (
+            nonce is not None
+            and (not isinstance(nonce, str) or _NONCE.fullmatch(nonce) is None)
+        )
+        invalid = invalid or not _exact_non_bool_int(
+            record.get("evidence_generation"), maximum=1_000_000
+        )
+        identities = record.get("evidence_identities")
+        transitions = record.get("transitions")
+        operations = record.get("operations")
+        invalid = invalid or type(identities) is not list
+        invalid = invalid or type(transitions) is not list or not transitions
+        invalid = invalid or type(operations) is not list
+        if type(identities) is list:
+            identity_generations: list[int] = []
+            issuance_identities: list[str] = []
+            for identity in identities:
+                invalid = (
+                    invalid
+                    or type(identity) is not dict
+                    or set(identity)
+                    != {
+                        "generation",
+                        "lifecycle_generation",
+                        "action",
+                        "source_generation",
+                        "session_generation",
+                        "issuance_identity",
+                        "audit_instance",
+                        "nonce",
+                    }
+                )
+                if type(identity) is dict:
+                    invalid = invalid or not _exact_non_bool_int(
+                        identity.get("generation"), minimum=1
+                    )
+                    if type(identity.get("generation")) is int:
+                        identity_generations.append(identity["generation"])
+                    invalid = invalid or identity.get("action") not in actions
+                    identity_action = identity.get("action")
+                    if identity_action in candidate_actions:
+                        invalid = (
+                            invalid
+                            or identity.get("source_generation") != candidate_generation
+                        )
+                    elif identity_action in restore_actions:
+                        invalid = (
+                            invalid
+                            or identity.get("source_generation") != restore_generation
+                        )
+                    invalid = invalid or any(
+                        not isinstance(identity.get(name), str)
+                        or token.fullmatch(identity.get(name, "")) is None
+                        for name in (
+                            "lifecycle_generation",
+                            "source_generation",
+                            "session_generation",
+                            "issuance_identity",
+                        )
+                    )
+                    invalid = invalid or identity.get(
+                        "lifecycle_generation"
+                    ) != record.get("lifecycle_generation")
+                    if isinstance(identity.get("issuance_identity"), str):
+                        issuance_identities.append(identity["issuance_identity"])
+                    for name in ("audit_instance", "nonce"):
+                        value = identity.get(name)
+                        invalid = invalid or (
+                            value is not None
+                            and (
+                                not isinstance(value, str)
+                                or _NONCE.fullmatch(value) is None
+                            )
+                        )
+            invalid = invalid or identity_generations != list(
+                range(1, len(identity_generations) + 1)
+            )
+            invalid = invalid or len(issuance_identities) != len(
+                set(issuance_identities)
+            )
+            invalid = invalid or len(identity_generations) != record.get(
+                "evidence_generation"
+            )
+        if type(transitions) is list:
+            for index, transition in enumerate(transitions):
+                invalid = (
+                    invalid
+                    or type(transition) is not dict
+                    or set(transition)
+                    != {
+                        "sequence",
+                        "stage",
+                        "action",
+                        "source_generation",
+                        "evidence_generation",
+                        "session_generation",
+                        "issuance_identity",
+                    }
+                )
+                if type(transition) is dict:
+                    invalid = invalid or transition.get("sequence") != index
+                    invalid = invalid or transition.get("stage") not in states
+                    invalid = invalid or transition.get("action") not in actions | {
+                        None
+                    }
+                    invalid = invalid or not isinstance(
+                        transition.get("source_generation"), str
+                    )
+                    transition_action = transition.get("action")
+                    if transition_action in candidate_actions:
+                        invalid = (
+                            invalid
+                            or transition.get("source_generation")
+                            != candidate_generation
+                        )
+                    elif transition_action in restore_actions:
+                        invalid = (
+                            invalid
+                            or transition.get("source_generation") != restore_generation
+                        )
+                    evidence = transition.get("evidence_generation")
+                    invalid = invalid or (
+                        evidence is not None
+                        and not _exact_non_bool_int(evidence, minimum=1)
+                    )
+                    identity = None
+                    if type(identities) is list and type(evidence) is int:
+                        identity = next(
+                            (
+                                item
+                                for item in identities
+                                if type(item) is dict
+                                and item.get("generation") == evidence
+                            ),
+                            None,
+                        )
+                    evidence_free = transition_action is None
+                    invalid = invalid or (
+                        evidence_free
+                        and (
+                            evidence is not None
+                            or transition.get("session_generation") is not None
+                            or transition.get("issuance_identity") is not None
+                        )
+                    )
+                    if not evidence_free:
+                        invalid = invalid or identity is None
+                        if type(identity) is dict:
+                            invalid = invalid or any(
+                                (
+                                    identity.get("action") != transition_action,
+                                    identity.get("source_generation")
+                                    != transition.get("source_generation"),
+                                    identity.get("session_generation")
+                                    != transition.get("session_generation"),
+                                    identity.get("issuance_identity")
+                                    != transition.get("issuance_identity"),
+                                )
+                            )
+            if transitions:
+                first = transitions[0]
+                invalid = invalid or first.get("sequence") != 0
+                invalid = invalid or first.get("stage") != LifecycleState.BASELINE.value
+                invalid = invalid or first.get("action") is not None
+                for previous, transition in pairwise(transitions):
+                    try:
+                        previous_state = LifecycleState(previous.get("stage"))
+                        next_state = LifecycleState(transition.get("stage"))
+                        action_value = transition.get("action")
+                        action = (
+                            None
+                            if action_value is None
+                            else LifecycleAction(action_value)
+                        )
+                    except (TypeError, ValueError):
+                        invalid = True
+                        continue
+                    if action is None:
+                        invalid = invalid or next_state not in {
+                            LifecycleState.ROLLBACK_REQUIRED,
+                            LifecycleState.RECOVERY_REQUIRED,
+                            LifecycleState.RESTORE_FAILED,
+                        }
+                    else:
+                        invalid = (
+                            invalid
+                            or previous_state
+                            not in _LIFECYCLE_ACTION_PREDECESSORS[action]
+                            or next_state not in _LIFECYCLE_ACTION_SUCCESSORS[action]
+                        )
+        phases = {
+            "intent_durable",
+            "dispatch_started",
+            "result_durable",
+            "transition_committed",
+            "ambiguous",
+            "reconciled",
+        }
+        if type(operations) is list:
+            seen: set[str] = set()
+            for operation in operations:
+                invalid = (
+                    invalid
+                    or type(operation) is not dict
+                    or set(operation)
+                    != {
+                        "action",
+                        "phase",
+                        "source_generation",
+                        "nonce",
+                        "session_generation",
+                        "issuance_identity",
+                        "reconciles_operation_id",
+                    }
+                )
+                if type(operation) is dict:
+                    action = operation.get("action")
+                    invalid = invalid or action not in actions or action in seen
+                    if isinstance(action, str):
+                        seen.add(action)
+                    invalid = invalid or operation.get("phase") not in phases
+                    invalid = invalid or not isinstance(
+                        operation.get("source_generation"), str
+                    )
+                    invalid = (
+                        invalid
+                        or token.fullmatch(operation.get("source_generation", ""))
+                        is None
+                    )
+                    invalid = invalid or any(
+                        not isinstance(operation.get(name), str)
+                        or token.fullmatch(operation.get(name, "")) is None
+                        for name in ("session_generation", "issuance_identity")
+                    )
+                    reconciles = operation.get("reconciles_operation_id")
+                    invalid = invalid or (
+                        action == LifecycleAction.RESTORE_TAIL_RECONCILE.value
+                    ) != isinstance(reconciles, str)
+                    if isinstance(reconciles, str):
+                        invalid = invalid or token.fullmatch(reconciles) is None
+                        prior = [
+                            item
+                            for item in operations
+                            if type(item) is dict
+                            and item is not operation
+                            and item.get("issuance_identity") == reconciles
+                        ]
+                        invalid = invalid or len(prior) != 1
+                        if len(prior) == 1:
+                            invalid = invalid or prior[0].get("action") not in {
+                                LifecycleAction.RESTORE_TRANSFER.value,
+                                LifecycleAction.RESTORE_INSTALL.value,
+                                LifecycleAction.RESTORE_INVENTORY.value,
+                                LifecycleAction.RESTORE_CORE_CHECK_1.value,
+                                LifecycleAction.REMOVAL_RESTART.value,
+                                LifecycleAction.RESTORE_READINESS.value,
+                                LifecycleAction.SERVICES_ABSENT.value,
+                                LifecycleAction.POST_RESTORE_REPAIRS.value,
+                            }
+                    if action in candidate_actions:
+                        invalid = (
+                            invalid
+                            or operation.get("source_generation")
+                            != candidate_generation
+                        )
+                    elif action in restore_actions:
+                        invalid = (
+                            invalid
+                            or operation.get("source_generation") != restore_generation
+                        )
+                    operation_nonce = operation.get("nonce")
+                    invalid = invalid or (
+                        operation_nonce is not None
+                        and (
+                            not isinstance(operation_nonce, str)
+                            or _NONCE.fullmatch(operation_nonce) is None
+                        )
+                    )
+            if type(record.get("consumed_operations")) is list:
+                invalid = invalid or seen != set(record["consumed_operations"])
+            evidence_actions: list[object] = []
+            if type(identities) is list:
+                evidence_actions = [
+                    identity.get("action")
+                    for identity in identities
+                    if type(identity) is dict
+                ]
+            result_actions = [
+                operation.get("action")
+                for operation in operations
+                if type(operation) is dict
+                and operation.get("phase")
+                in {"result_durable", "transition_committed", "reconciled"}
+            ]
+            invalid = invalid or evidence_actions != result_actions
+            operation_issuances = [
+                operation.get("issuance_identity")
+                for operation in operations
+                if type(operation) is dict
+            ]
+            invalid = invalid or len(operation_issuances) != len(
+                set(operation_issuances)
+            )
+        helper_actions = {
+            LifecycleAction.A0.value,
+            LifecycleAction.P0.value,
+            LifecycleAction.AP0.value,
+            LifecycleAction.PREFLIGHT.value,
+            LifecycleAction.RECEIPT.value,
+            LifecycleAction.A1.value,
+            LifecycleAction.A2.value,
+            LifecycleAction.AMBIGUOUS_RECEIPT.value,
+        }
+        restart_actions = {
+            LifecycleAction.ACTIVATION_RESTART.value,
+            LifecycleAction.REMOVAL_RESTART.value,
+            LifecycleAction.RESTORE_TAIL_RECONCILE.value,
+        }
+        consumed_values = record.get("consumed_operations")
+        if type(consumed_values) is list:
+            invalid = invalid or record.get("helper_tombstones") != [
+                value for value in consumed_values if value in helper_actions
+            ]
+            invalid = invalid or record.get("restart_tombstones") != [
+                value for value in consumed_values if value in restart_actions
+            ]
+            expected_candidate_attempts = [
+                1
+                for value in consumed_values
+                if value == LifecycleAction.CANDIDATE_CORE_CHECK_1.value
+            ]
+            expected_restore_attempts = [
+                1
+                for value in consumed_values
+                if value == LifecycleAction.RESTORE_CORE_CHECK_1.value
+            ]
+            if type(core) is dict:
+                invalid = (
+                    invalid or core.get("candidate") != expected_candidate_attempts
+                )
+                invalid = invalid or core.get("restore") != expected_restore_attempts
+            if LifecycleAction.PREFLIGHT.value in consumed_values:
+                invalid = invalid or record.get("known_nonce") is None
+        if (
+            record.get("ambiguous_operation") is not None
+            and type(consumed_values) is list
+        ):
+            invalid = (
+                invalid or record.get("ambiguous_operation") not in consumed_values
+            )
+        invalid = invalid or record.get("fallback_phase") not in {
+            "available",
+            "intent_recorded",
+            "possibly_applied",
+            "reconciled",
+        }
+        if type(operations) is list:
+            fallback_operations = {
+                operation.get("action"): operation.get("phase")
+                for operation in operations
+                if type(operation) is dict
+                and operation.get("action")
+                in {
+                    LifecycleAction.BACKUP_FALLBACK.value,
+                    LifecycleAction.BACKUP_FALLBACK_RECONCILE.value,
+                }
+            }
+            fallback_phase = record.get("fallback_phase")
+            invalid = invalid or (
+                fallback_phase == "available" and bool(fallback_operations)
+            )
+            invalid = invalid or (
+                fallback_phase == "intent_recorded"
+                and fallback_operations
+                != {LifecycleAction.BACKUP_FALLBACK.value: "intent_durable"}
+            )
+            invalid = invalid or (
+                fallback_phase == "possibly_applied"
+                and fallback_operations.get(LifecycleAction.BACKUP_FALLBACK.value)
+                not in {"dispatch_started", "result_durable", "ambiguous"}
+            )
+            invalid = invalid or (
+                fallback_phase == "reconciled"
+                and not any(
+                    phase in {"transition_committed", "reconciled"}
+                    for phase in fallback_operations.values()
+                )
+            )
+        if type(transitions) is list and transitions:
+            invalid = invalid or transitions[-1].get("stage") != record.get("stage")
+            observed_states = [item.get("stage") for item in transitions]
+            invalid = invalid or (
+                record.get("research_succeeded") is True
+                and LifecycleState.A2_COLLECTED.value not in observed_states
+            )
+            invalid = invalid or (
+                record.get("stage") == LifecycleState.BASELINE.value
+                and record.get("research_succeeded") is True
+            )
+        terminal = record.get("terminal")
+        invalid = invalid or ((terminal is None) == (record.get("active") is False))
+        invalid = invalid or (terminal is not None and terminal != record.get("stage"))
+        invalid = invalid or (
+            record.get("rollback_mode") is not record.get("recovery_mode")
+        )
+        recovery_states = {
+            LifecycleState.ROLLBACK_REQUIRED.value,
+            LifecycleState.RECOVERY_REQUIRED.value,
+            LifecycleState.RESTORED_AFTER_ABORT.value,
+            LifecycleState.RESTORE_FAILED.value,
+        }
+        invalid = invalid or (
+            record.get("stage") in recovery_states
+            and record.get("recovery_mode") is not True
+        )
+        if terminal == LifecycleState.RESTORE_FAILED.value:
+            restoration_states = {
+                state.value
+                for state in (
+                    LifecycleState.RESTORE_STAGED,
+                    LifecycleState.PR41_RESTORED,
+                    LifecycleState.RESTORE_INVENTORY_VERIFIED,
+                    LifecycleState.RESTORE_CORE_CHECKED,
+                    LifecycleState.REMOVAL_RESTART_CONSUMED,
+                    LifecycleState.PR41_READY,
+                    LifecycleState.RESEARCH_SERVICES_ABSENT,
+                    LifecycleState.POST_RESTORE_REPAIRS_PASS,
+                )
+            }
+            invalid = (
+                invalid
+                or not any(
+                    item.get("stage") in restoration_states
+                    for item in transitions
+                    if type(item) is dict
+                )
+                and LifecycleAction.RESTORE_TRANSFER.value
+                not in set(record.get("consumed_operations", []))
+            )
+        if terminal == LifecycleState.RESTORED_AFTER_ABORT.value:
+            invalid = invalid or transitions[-1].get("action") not in {
+                LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT.value,
+                LifecycleAction.RESTORE_TAIL_RECONCILE.value,
+            }
+        if terminal == LifecycleState.COMPLETE_NORMAL.value:
+            invalid = (
+                invalid
+                or transitions[-1].get("action")
+                != LifecycleAction.FINAL_ACCEPTANCE_NORMAL.value
+            )
+            invalid = invalid or record.get("research_succeeded") is not True
+            invalid = invalid or record.get("recovery_mode") is not False
+            invalid = invalid or record.get("rollback_mode") is not False
+            if type(transitions) is list:
+                observed = tuple(
+                    LifecycleState(item["stage"])
+                    for item in transitions
+                    if type(item) is dict and item.get("stage") in states
+                )
+                position = 0
+                for state in observed:
+                    if (
+                        position < len(_NORMAL_LIFECYCLE_HISTORY)
+                        and state is _NORMAL_LIFECYCLE_HISTORY[position]
+                    ):
+                        position += 1
+                invalid = invalid or position != len(_NORMAL_LIFECYCLE_HISTORY)
+        if invalid:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
+    def _write_record(self, record: dict[str, object]) -> None:
+        self._validate_record(record)
+        payload = json.dumps(
+            record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        if len(payload) > _MAX_LIFECYCLE_JOURNAL_BYTES:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        temporary = self._directory / f".journal-{self._token()}.tmp"
+        descriptor: int | None = None
+        try:
+            descriptor = self._open_regular(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, self._journal_path)
+            directory_fd = os.open(
+                self._directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
+    def _commit(self, mutate: Callable[[dict[str, object]], None]) -> None:
+        if self._closed or self._lock_fd is None:
+            raise LifecycleControllerError("LIFECYCLE_OWNER_INACTIVE") from None
+        candidate = copy.deepcopy(self._record)
+        mutate(candidate)
+        self._write_record(candidate)
+        self._record = candidate
+
+    @property
+    def lifecycle_generation(self) -> str:
+        return self._record["lifecycle_generation"]
+
+    @property
+    def source_generation(self) -> str:
+        return self._record["source_generation"]
+
+    @property
+    def state(self) -> LifecycleState:
+        return LifecycleState(self._record["stage"])
+
+    @property
+    def recovery_mode(self) -> bool:
+        return self._record["recovery_mode"] is True
+
+    @property
+    def research_succeeded(self) -> bool:
+        return self._record["research_succeeded"] is True
+
+    @property
+    def consumed_actions(self) -> frozenset[LifecycleAction]:
+        return frozenset(
+            LifecycleAction(value) for value in self._record["consumed_operations"]
+        )
+
+    @property
+    def transitions(self) -> tuple[dict[str, object], ...]:
+        return tuple(copy.deepcopy(self._record["transitions"]))
+
+    def restore_tail_original_operation_id(self) -> str:
+        eligible = {
+            LifecycleAction.RESTORE_TRANSFER.value,
+            LifecycleAction.RESTORE_INSTALL.value,
+            LifecycleAction.RESTORE_INVENTORY.value,
+            LifecycleAction.RESTORE_CORE_CHECK_1.value,
+            LifecycleAction.REMOVAL_RESTART.value,
+            LifecycleAction.RESTORE_READINESS.value,
+            LifecycleAction.SERVICES_ABSENT.value,
+            LifecycleAction.POST_RESTORE_REPAIRS.value,
+        }
+        matches = [
+            item for item in self._record["operations"] if item["action"] in eligible
+        ]
+        if not matches:
+            raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
+        return matches[-1]["issuance_identity"]
+
+    def restore_tail_restart_mode(self) -> str:
+        matches = [
+            item
+            for item in self._record["operations"]
+            if item["action"] == LifecycleAction.REMOVAL_RESTART.value
+        ]
+        if not matches:
+            return "submit_once"
+        if matches[0]["phase"] == "intent_durable":
+            return "submit_once"
+        if matches[0]["phase"] == "transition_committed":
+            return "previously_committed"
+        raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
+
+    def record_intent(
+        self,
+        action: LifecycleAction,
+        *,
+        source_generation: str,
+        session_generation: str,
+        issuance_identity: str,
+        reconciles_operation_id: str | None = None,
+        nonce: str | None,
+    ) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            if (
+                LifecycleState(record["stage"])
+                not in _LIFECYCLE_ACTION_PREDECESSORS[action]
+            ):
+                raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
+            expected_source = record["source_generation"]
+            if action in _CANDIDATE_SOURCE_ACTIONS:
+                expected_source = record["pr45_source"]["generation"]
+            elif action in _RESTORE_SOURCE_ACTIONS:
+                expected_source = record["pr41_restore"]["generation"]
+            if source_generation != expected_source:
+                raise LifecycleControllerError(
+                    "LIFECYCLE_SOURCE_GENERATION_INVALID"
+                ) from None
+            if action.value in record["consumed_operations"]:
+                raise LifecycleControllerError("LIFECYCLE_PERMIT_CONSUMED") from None
+            if action is LifecycleAction.RESTORE_TAIL_RECONCILE:
+                if reconciles_operation_id != self.restore_tail_original_operation_id():
+                    raise LifecycleControllerError(
+                        "RESTORE_RECONCILIATION_UNAVAILABLE"
+                    ) from None
+            elif reconciles_operation_id is not None:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            record["consumed_operations"].append(action.value)
+            if action in {
+                LifecycleAction.A0,
+                LifecycleAction.P0,
+                LifecycleAction.AP0,
+                LifecycleAction.PREFLIGHT,
+                LifecycleAction.RECEIPT,
+                LifecycleAction.A1,
+                LifecycleAction.A2,
+                LifecycleAction.AMBIGUOUS_RECEIPT,
+            }:
+                record["helper_tombstones"].append(action.value)
+            if action in {
+                LifecycleAction.ACTIVATION_RESTART,
+                LifecycleAction.REMOVAL_RESTART,
+                LifecycleAction.RESTORE_TAIL_RECONCILE,
+            }:
+                record["restart_tombstones"].append(action.value)
+            if action is LifecycleAction.CANDIDATE_CORE_CHECK_1:
+                record["core_check_attempts"]["candidate"].append(1)
+            if action is LifecycleAction.RESTORE_CORE_CHECK_1:
+                record["core_check_attempts"]["restore"].append(1)
+            if action is LifecycleAction.PREFLIGHT:
+                record["known_nonce"] = nonce
+            if action is LifecycleAction.BACKUP_FALLBACK:
+                record["fallback_phase"] = "intent_recorded"
+            record["operations"].append(
+                {
+                    "action": action.value,
+                    "phase": "intent_durable",
+                    "source_generation": source_generation,
+                    "nonce": nonce,
+                    "session_generation": session_generation,
+                    "issuance_identity": issuance_identity,
+                    "reconciles_operation_id": reconciles_operation_id,
+                }
+            )
+
+        self._commit(mutate)
+
+    def _set_operation_phase(self, action: LifecycleAction, phase: str) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            matches = [
+                operation
+                for operation in record["operations"]
+                if operation["action"] == action.value
+            ]
+            if len(matches) != 1:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            matches[0]["phase"] = phase
+            if action in {
+                LifecycleAction.BACKUP_FALLBACK,
+                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+            }:
+                record["fallback_phase"] = {
+                    "dispatch_started": "possibly_applied",
+                    "result_durable": "possibly_applied",
+                    "transition_committed": "reconciled",
+                    "reconciled": "reconciled",
+                }.get(phase, record["fallback_phase"])
+
+        self._commit(mutate)
+
+    def record_dispatch_started(self, action: LifecycleAction) -> None:
+        self._set_operation_phase(action, "dispatch_started")
+
+    def record_ambiguous(self, action: LifecycleAction) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            matches = [
+                operation
+                for operation in record["operations"]
+                if operation["action"] == action.value
+            ]
+            if len(matches) != 1:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            matches[0]["phase"] = "ambiguous"
+            record["ambiguous_operation"] = action.value
+            record["recovery_mode"] = True
+            record["rollback_mode"] = True
+
+        self._commit(mutate)
+
+    def record_application_ambiguity(self, action: LifecycleAction, nonce: str) -> None:
+        """Retain a typed ambiguous result without erasing its durable evidence."""
+
+        def mutate(record: dict[str, object]) -> None:
+            if (
+                action.value not in record["consumed_operations"]
+                or not isinstance(nonce, str)
+                or _NONCE.fullmatch(nonce) is None
+            ):
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            record["ambiguous_operation"] = action.value
+            record["known_nonce"] = nonce
+            record["recovery_mode"] = True
+            record["rollback_mode"] = True
+
+        self._commit(mutate)
+
+    def record_fallback_reconciled(self) -> None:
+        self._set_operation_phase(
+            LifecycleAction.BACKUP_FALLBACK_RECONCILE, "reconciled"
+        )
+
+    def record_result(
+        self,
+        action: LifecycleAction,
+        *,
+        lifecycle_generation: str,
+        source_generation: str,
+        session_generation: str,
+        issuance_identity: str,
+        audit_instance: str | None,
+        nonce: str | None,
+    ) -> int:
+        generation = self._record["evidence_generation"] + 1
+
+        def mutate(record: dict[str, object]) -> None:
+            matches = [
+                operation
+                for operation in record["operations"]
+                if operation["action"] == action.value
+            ]
+            if len(matches) != 1:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            matches[0]["phase"] = "result_durable"
+            if (
+                matches[0]["session_generation"] != session_generation
+                or matches[0]["issuance_identity"] != issuance_identity
+            ):
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+            record["evidence_generation"] = generation
+            record["evidence_identities"].append(
+                {
+                    "generation": generation,
+                    "lifecycle_generation": lifecycle_generation,
+                    "action": action.value,
+                    "source_generation": source_generation,
+                    "session_generation": session_generation,
+                    "issuance_identity": issuance_identity,
+                    "audit_instance": audit_instance,
+                    "nonce": nonce,
+                }
+            )
+
+        self._commit(mutate)
+        return generation
+
+    def transition(
+        self,
+        state: LifecycleState,
+        *,
+        action: LifecycleAction | None,
+        source_generation: str,
+        evidence_generation: int | None,
+        recovery: bool = False,
+        terminal: bool = False,
+    ) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            session_generation = None
+            issuance_identity = None
+            if action is not None:
+                matches = [
+                    operation
+                    for operation in record["operations"]
+                    if operation["action"] == action.value
+                ]
+                if len(matches) != 1:
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_JOURNAL_INVALID"
+                    ) from None
+                matches[0]["phase"] = "transition_committed"
+                if evidence_generation is not None:
+                    identities = [
+                        identity
+                        for identity in record["evidence_identities"]
+                        if identity["generation"] == evidence_generation
+                    ]
+                    if len(identities) != 1:
+                        raise LifecycleControllerError(
+                            "LIFECYCLE_JOURNAL_INVALID"
+                        ) from None
+                    session_generation = identities[0]["session_generation"]
+                    issuance_identity = identities[0]["issuance_identity"]
+            record["stage"] = state.value
+            record["source_generation"] = source_generation
+            record["recovery_mode"] = record["recovery_mode"] is True or recovery
+            record["rollback_mode"] = record["rollback_mode"] is True or recovery
+            if state is LifecycleState.A2_COLLECTED and not record["recovery_mode"]:
+                record["research_succeeded"] = True
+            record["transitions"].append(
+                {
+                    "sequence": len(record["transitions"]),
+                    "stage": state.value,
+                    "action": None if action is None else action.value,
+                    "source_generation": source_generation,
+                    "evidence_generation": evidence_generation,
+                    "session_generation": session_generation,
+                    "issuance_identity": issuance_identity,
+                }
+            )
+            if terminal:
+                record["terminal"] = state.value
+                record["active"] = False
+
+        self._commit(mutate)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        descriptor = self._lock_fd
+        self._lock_fd = None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _source_path_allowed(path: object, state: SourceState) -> bool:
@@ -1215,6 +2805,15 @@ def repairs_evidence(result: RepairsGateResult) -> RepairsEvidence:
     )
 
 
+def _fixed_repairs_evidence(response: str) -> RepairsEvidence:
+    """Project Repairs internally; any issue is conservatively blocking."""
+    decoded = decode_repairs_response(response)
+    if decoded.shape_valid is not True or decoded.issues is None:
+        return RepairsEvidence(False, None, None)
+    count = len(decoded.issues)
+    return RepairsEvidence(True, count, count)
+
+
 def _extract_exact_framed_json_object(private_output: bytes) -> str | None:
     """Decode exactly one JSON object from a broker-bounded private payload."""
     try:
@@ -1236,6 +2835,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 import urllib.error
@@ -1248,6 +2848,8 @@ HELPER = INTEGRATION / '.phase_a_tools'
 STAGE = ROOT / '.ha_tuya_ble_r30_stage'
 BACKUP = ROOT / '.ha_tuya_ble_r30_backup'
 BACKUP_CONSUMED = ROOT / '.ha_tuya_ble_r30_backup.consumed'
+BACKUP_IDENTITY = ROOT / '.ha_tuya_ble_r30_backup.identity'
+RESTORE_CONSUMED = ROOT / '.ha_tuya_ble_r30_restore.consumed'
 EVIDENCE = Path('/var/lib/phase-a-status-probe')
 SERVICES = {'preflight', 'probe', 'receipt', 'audit'}
 COUNTERS = {
@@ -1386,6 +2988,124 @@ def inventory_result(expected, observed):
         'missing_count': len(set(expected) - set(observed)),
     }
 
+def inventory_identity(observed):
+    canonical = ''.join(
+        path + '\0' + str(size) + '\0' + digest + '\n'
+        for path, (size, digest) in sorted(observed.items())
+    ).encode()
+    return {
+        'file_count': len(observed),
+        'manifest_identity': hashlib.sha256(canonical).hexdigest(),
+    }
+
+def sync_root():
+    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def write_private_json(path, value):
+    pending = path.with_name(path.name + '.pending')
+    pending.unlink(missing_ok=True)
+    payload = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
+    if len(payload) > 4096:
+        raise ValueError('private_state')
+    descriptor = os.open(
+        pending,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(pending, path)
+    sync_root()
+
+def read_private_json(path, keys):
+    root_descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=root_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o777 != 0o600
+            or metadata.st_size < 2
+            or metadata.st_size > 4096
+        ):
+            raise ValueError('private_state')
+        payload = b''
+        while len(payload) < metadata.st_size:
+            chunk = os.read(descriptor, metadata.st_size - len(payload))
+            if not chunk:
+                raise ValueError('private_state')
+            payload += chunk
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(root_descriptor)
+    def strict_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('private_state')
+            value[key] = item
+        return value
+    value = json.loads(payload, object_pairs_hook=strict_object)
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise ValueError('private_state')
+    return value
+
+def read_backup_identity():
+    value = read_private_json(BACKUP_IDENTITY, {'file_count', 'manifest_identity'})
+    if (
+        not isinstance(value['file_count'], int)
+        or isinstance(value['file_count'], bool)
+        or value['file_count'] < 1
+        or not isinstance(value['manifest_identity'], str)
+        or len(value['manifest_identity']) != 64
+    ):
+        raise ValueError('backup_identity')
+    return value
+
+def write_fallback_phase(phase, identity):
+    if phase not in {'intent_recorded', 'possibly_applied', 'reconciled'}:
+        raise ValueError('fallback_phase')
+    write_private_json(
+        BACKUP_CONSUMED,
+        {
+            'phase': phase,
+            'file_count': identity['file_count'],
+            'manifest_identity': identity['manifest_identity'],
+        },
+    )
+
+def read_fallback_phase():
+    value = read_private_json(
+        BACKUP_CONSUMED, {'phase', 'file_count', 'manifest_identity'}
+    )
+    if value['phase'] not in {'intent_recorded', 'possibly_applied', 'reconciled'}:
+        raise ValueError('fallback_phase')
+    identity = {
+        'file_count': value['file_count'],
+        'manifest_identity': value['manifest_identity'],
+    }
+    if BACKUP_IDENTITY.exists() and identity != read_backup_identity():
+        raise ValueError('backup_identity')
+    return value['phase'], identity
+
 def backup():
     before = inventory_targets()
     if not before:
@@ -1403,7 +3123,10 @@ def backup():
         remove(pending)
     else:
         os.replace(pending, BACKUP)
+    write_private_json(BACKUP_IDENTITY, inventory_identity(after))
     BACKUP_CONSUMED.unlink(missing_ok=True)
+    RESTORE_CONSUMED.unlink(missing_ok=True)
+    sync_root()
     return {
         'success': before == after,
         'file_count': len(after),
@@ -1466,9 +3189,9 @@ def exchange(left, right):
         code = ctypes.get_errno()
         raise OSError(code, 'atomic_exchange')
 
-def mark_backup_consumed():
+def mark_restore_consumed():
     descriptor = os.open(
-        BACKUP_CONSUMED,
+        RESTORE_CONSUMED,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
         0o600,
     )
@@ -1485,7 +3208,7 @@ def activate(value, restoring=False):
         raise ValueError('assembled')
     backup_marked = False
     if restoring:
-        mark_backup_consumed()
+        mark_restore_consumed()
         backup_marked = True
     exchanged = INTEGRATION.exists()
     mutated = False
@@ -1504,12 +3227,13 @@ def activate(value, restoring=False):
         elif mutated:
             os.replace(INTEGRATION, staged)
         if backup_marked:
-            BACKUP_CONSUMED.unlink(missing_ok=True)
+            RESTORE_CONSUMED.unlink(missing_ok=True)
         raise
     remove(STAGE)
     if restoring:
         try:
             remove(BACKUP)
+            BACKUP_IDENTITY.unlink(missing_ok=True)
         except OSError:
             pass
     return {
@@ -1683,31 +3407,36 @@ def invoke_helper(value):
     return result
 
 def restore_backup():
-    mark_backup_consumed()
+    if BACKUP_CONSUMED.exists():
+        raise ValueError('backup_consumed')
+    identity = read_backup_identity()
     source = BACKUP / 'integration'
+    expected = inventory_deployment(source)
+    if inventory_identity(expected) != identity:
+        raise ValueError('backup')
+    write_fallback_phase('intent_recorded', identity)
     integration_existed = INTEGRATION.exists()
     mutated = False
     try:
-        expected = inventory_deployment(source)
-        if not expected:
-            raise ValueError('backup')
+        write_fallback_phase('possibly_applied', identity)
         if integration_existed:
             exchange(source, INTEGRATION)
         else:
             os.replace(source, INTEGRATION)
         mutated = True
         installed = inventory_targets()
-        if installed != expected:
+        if inventory_identity(installed) != identity:
             raise ValueError('backup_restore')
+        write_fallback_phase('reconciled', identity)
     except Exception:
         if mutated and integration_existed:
             exchange(source, INTEGRATION)
         elif mutated:
             os.replace(INTEGRATION, source)
-        BACKUP_CONSUMED.unlink(missing_ok=True)
         raise
     try:
         remove(BACKUP)
+        BACKUP_IDENTITY.unlink(missing_ok=True)
     except OSError:
         pass
     return {
@@ -1715,6 +3444,133 @@ def restore_backup():
         'expected_file_count': len(expected),
         'installed_file_count': len(installed),
         'manifest_match': True,
+    }
+
+def reconcile_backup():
+    phase, identity = read_fallback_phase()
+    source = BACKUP / 'integration'
+    live = inventory_targets()
+    live_matches = inventory_identity(live) == identity
+    source_matches = source.exists() and inventory_identity(
+        inventory_deployment(source)
+    ) == identity
+    if not live_matches:
+        if phase not in {'intent_recorded', 'possibly_applied'} or not source_matches:
+            raise ValueError('backup_reconciliation')
+        write_fallback_phase('possibly_applied', identity)
+        if INTEGRATION.exists():
+            exchange(source, INTEGRATION)
+        else:
+            os.replace(source, INTEGRATION)
+        live = inventory_targets()
+        live_matches = inventory_identity(live) == identity
+    if not live_matches:
+        raise ValueError('backup_reconciliation')
+    write_fallback_phase('reconciled', identity)
+    try:
+        remove(BACKUP)
+        BACKUP_IDENTITY.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {
+        'phase': 'reconciled',
+        'restoration_applied': True,
+        'manifest_match': True,
+        'file_count': identity['file_count'],
+    }
+
+def restore_tail_reconcile(value):
+    _, expected = expected_manifest(value)
+    original = value.get('original_operation_id')
+    reconciliation = value.get('reconciliation_operation_id')
+    restart_mode = value.get('restart_mode')
+    if not all(
+        isinstance(item, str)
+        and len(item) == 32
+        and all(character in '0123456789abcdef' for character in item)
+        for item in (original, reconciliation)
+    ):
+        raise ValueError('operation_identity')
+    if restart_mode not in {'submit_once', 'previously_committed'}:
+        raise ValueError('restart_mode')
+    inventory = inventory_result(expected, inventory_targets())
+    if not (
+        inventory['manifest_match'] is True
+        and inventory['expected_count'] == inventory['observed_count']
+        and inventory['unexpected_count'] == 0
+        and inventory['missing_count'] == 0
+    ):
+        raise ValueError('restore_inventory')
+    core = core_check()
+    if not (
+        isinstance(core.get('http_status'), int)
+        and not isinstance(core.get('http_status'), bool)
+        and 200 <= core['http_status'] <= 299
+        and core.get('result') == 'ok'
+        and core.get('check_passed') is True
+        and core.get('error_class') is None
+    ):
+        raise ValueError('restore_core_check')
+    restart = (
+        restart_core()
+        if restart_mode == 'submit_once'
+        else {'submitted': True, 'accepted': True}
+    )
+    ready = readiness()
+    services = service_inventory('expected_absent')
+    runner = __import__('sub' + 'process')
+    completed = runner.run(
+        ['ha', 'resolution', 'info', '--raw-json'],
+        capture_output=True,
+        check=False,
+        timeout=40,
+    )
+    repairs_shape_valid = False
+    issues = []
+    if completed.returncode == 0 and not completed.stderr:
+        try:
+            repairs = json.loads(completed.stdout)
+            data = repairs.get('data') if isinstance(repairs, dict) else None
+            issues = data.get('issues') if isinstance(data, dict) else None
+            repairs_shape_valid = (
+                isinstance(repairs, dict)
+                and repairs.get('result') == 'ok'
+                and isinstance(issues, list)
+            )
+        except Exception:
+            repairs_shape_valid = False
+    count = len(issues) if repairs_shape_valid else -1
+    research_files_absent = (
+        inventory['manifest_match'] is True
+        and inventory['unexpected_count'] == 0
+        and inventory['missing_count'] == 0
+    )
+    restart_resolved = (
+        restart['submitted'] is True
+        and restart['accepted'] is True
+        and
+        core.get('check_passed') is True
+        and ready['core_reachable'] is True
+        and ready['core_running'] is True
+        and ready['integration_loaded'] is True
+        and ready['timed_out'] is False
+    )
+    return {
+        'original_operation_id': original,
+        'reconciliation_operation_id': reconciliation,
+        **inventory,
+        'research_files_absent': research_files_absent,
+        'core_http_status': core.get('http_status'),
+        'core_result': core.get('result'),
+        'core_check_passed': core.get('check_passed') is True,
+        'restart_resolved': restart_resolved,
+        **ready,
+        'expected_absent_count': services['expected_absent_count'],
+        'observed_absent_count': services['observed_absent_count'],
+        'all_expected_absent': services['all_expected_absent'],
+        'repairs_shape_valid': repairs_shape_valid,
+        'repairs_relevant_count': count,
+        'repairs_critical_count': count,
     }
 
 value = receive()
@@ -1743,6 +3599,10 @@ try:
         result = activate(value, restoring=True)
     elif operation == 'restore_backup':
         result = restore_backup()
+    elif operation == 'reconcile_backup':
+        result = reconcile_backup()
+    elif operation == 'restore_tail_reconcile':
+        result = restore_tail_reconcile(value)
     else:
         raise ValueError('operation')
 except Exception:
@@ -1799,7 +3659,7 @@ class PrivateInteractiveSessionBroker:
         self._restarted_states: set[SourceState] = set()
         self._backup_restore_attempted = False
         self._controller_binding: _ControllerBinding | None = None
-        self.__write_token = object()
+        self.__wire_issuer = object()
 
     def __repr__(self) -> str:
         """Never render the wrapper path, target, argv, or captured output."""
@@ -1812,6 +3672,18 @@ class PrivateInteractiveSessionBroker:
 
     @staticmethod
     def _new_frame(phase: str) -> tuple[str, bytes]:
+        if phase not in {
+            "REMOTE",
+            "LOGIN",
+            "RESULT_START",
+            "RESULT_END",
+            "ECHO_OFF",
+            "OPERATION_START",
+            "OPERATION_END",
+        }:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
+            ) from None
         payload = f"HA_BROKER_{phase}:{secrets.token_hex(16)}"
         return payload, _FRAME_START + payload.encode("ascii") + _FRAME_END
 
@@ -1898,6 +3770,8 @@ class PrivateInteractiveSessionBroker:
             or capability.issuer is not binding.issuer.identity
             or capability.lifecycle_generation is not binding.lifecycle_generation
             or capability.session_generation is not binding.session_generation
+            or capability.source_generation is None
+            or capability.issuance_identity is None
             or capability.action not in expected_actions
             or not any(capability is issued for issued in binding.issuer.issued)
             or any(capability is consumed for consumed in binding.issuer.consumed)
@@ -1907,20 +3781,23 @@ class PrivateInteractiveSessionBroker:
             ) from None
         if consume:
             binding.issuer.consumed.append(capability)
-            capability.consumed = True
         return capability
 
-    def _require_write_token(self, write_token: object) -> None:
-        if write_token is not self.__write_token:
+    def __write_wire(self, packet: _PrivateWirePacket) -> None:
+        if (
+            type(packet) is not _PrivateWirePacket
+            or packet.issuer is not self.__wire_issuer
+        ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_WRITE_SCOPE_INVALID"
             ) from None
-
-    def _write_private(self, value: str, *, _write_token: object = None) -> None:
-        self._require_write_token(_write_token)
         if self._master_fd is None:
             self._fail(BrokerFailure.PROTOCOL)
-        encoded = value.encode("ascii")
+        encoded = packet.payload
+        if not encoded or not isinstance(encoded, bytes):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_WRITE_SCOPE_INVALID"
+            ) from None
         offset = 0
         try:
             while offset < len(encoded):
@@ -1976,24 +3853,27 @@ class PrivateInteractiveSessionBroker:
                 self._fail(BrokerFailure.CHILD_EXITED)
             captured.extend(chunk)
 
-    def _challenge(self, phase: str, *, _write_token: object = None) -> None:
-        self._require_write_token(_write_token)
+    def _challenge(self, phase: str) -> None:
         payload, frame = self._new_frame(phase)
-        self._write_private(
-            self._frame_printf(payload) + "\n", _write_token=self.__write_token
+        self.__write_wire(
+            _PrivateWirePacket(
+                (self._frame_printf(payload) + "\n").encode("ascii"),
+                self.__wire_issuer,
+            )
         )
         self._read_until(frame)
 
-    def _verify_interactive_login_bash(self, *, _write_token: object = None) -> None:
+    def _verify_interactive_login_bash(self) -> None:
         """Prove post-``exec`` Bash, interactive mode, and login-shell mode together."""
-        self._require_write_token(_write_token)
         payload, frame = self._new_frame("LOGIN")
         command = (
             'if [ -n "${BASH_VERSION-}" ] && '
             "case $- in *i*) true ;; *) false ;; esac && "
             f"shopt -q login_shell; then {self._frame_printf(payload)}; fi\n"
         )
-        self._write_private(command, _write_token=self.__write_token)
+        self.__write_wire(
+            _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
+        )
         self._read_until(frame)
 
     def _drain_and_discard(self, duration_seconds: float) -> None:
@@ -2039,10 +3919,10 @@ class PrivateInteractiveSessionBroker:
                 "PRIVATE_INTERACTIVE_SESSION_START_FAILED"
             ) from None
         self._state = BrokerState.SSH_CHILD_STARTED
-        self._challenge("REMOTE", _write_token=self.__write_token)
+        self._challenge("REMOTE")
         self._state = BrokerState.REMOTE_INTERACTIVE_READY
-        self._write_private("exec bash -li\n", _write_token=self.__write_token)
-        self._verify_interactive_login_bash(_write_token=self.__write_token)
+        self.__write_wire(_PrivateWirePacket(b"exec bash -li\n", self.__wire_issuer))
+        self._verify_interactive_login_bash()
         self._state = BrokerState.LOGIN_SHELL_READY
         self._session_generation = object()
         self._state = BrokerState.SESSION_ACTIVE
@@ -2052,8 +3932,6 @@ class PrivateInteractiveSessionBroker:
     def _collect_resolution_info(
         self,
         gate: RepairsGate,
-        is_relevant: Callable[[object], bool],
-        is_critical: Callable[[object], bool],
         *,
         _capability: object = None,
     ) -> RepairsEvidence:
@@ -2067,7 +3945,9 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        self._require_capability(_capability, frozenset({actions[gate]}), consume=True)
+        capability = self._require_capability(
+            _capability, frozenset({actions[gate]}), consume=True
+        )
         if self._state is not BrokerState.SESSION_ACTIVE:
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE") from None
         start_payload, start_frame = self._new_frame("RESULT_START")
@@ -2076,31 +3956,29 @@ class PrivateInteractiveSessionBroker:
             f"{self._frame_printf(start_payload)}; ha resolution info --raw-json; "
             f"{self._frame_printf(end_payload)}\n"
         )
-        self._write_private(command, _write_token=self.__write_token)
+        self.__write_wire(
+            _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
+        )
         self._read_until(start_frame)
         private_output = self._read_until(end_frame)
         response = _extract_exact_framed_json_object(private_output)
-        result = collect_repairs_gate(
-            gate,
-            response if response is not None else "",
-            is_relevant,
-            is_critical,
-        )
-        return repairs_evidence(result)
+        evidence = _fixed_repairs_evidence(response if response is not None else "")
+        return _bind_evidence_origin(evidence, capability)
 
-    def _ensure_echo_disabled(self, *, _write_token: object = None) -> None:
-        self._require_write_token(_write_token)
+    def _ensure_echo_disabled(self) -> None:
         if self._echo_disabled:
             return
         payload, frame = self._new_frame("ECHO_OFF")
-        self._write_private(
-            f"stty -echo && {self._frame_printf(payload)}\n",
-            _write_token=self.__write_token,
+        self.__write_wire(
+            _PrivateWirePacket(
+                f"stty -echo && {self._frame_printf(payload)}\n".encode("ascii"),
+                self.__wire_issuer,
+            )
         )
         self._read_until(frame)
         self._echo_disabled = True
 
-    def _execute_bounded_operation(
+    def __execute_bounded_operation(
         self,
         operation: BoundedOperation,
         value: dict[str, object],
@@ -2133,7 +4011,7 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        self._ensure_echo_disabled(_write_token=self.__write_token)
+        self._ensure_echo_disabled()
         start_payload, start_frame = self._new_frame("OPERATION_START")
         end_payload, end_frame = self._new_frame("OPERATION_END")
         encoded_program = base64.b64encode(
@@ -2159,16 +4037,29 @@ class PrivateInteractiveSessionBroker:
             f"python3 -c {shlex.quote(bootstrap)} {operation.value}; "
             f"{self._frame_printf(end_payload)}\n"
         )
-        self._write_private(command, _write_token=self.__write_token)
+        self.__write_wire(
+            _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
+        )
         self._read_until(start_frame)
-        self._write_private(
-            str(len(program_chunks)) + "\n", _write_token=self.__write_token
+        self.__write_wire(
+            _PrivateWirePacket(
+                (str(len(program_chunks)) + "\n").encode("ascii"),
+                self.__wire_issuer,
+            )
         )
         for chunk in program_chunks:
-            self._write_private(chunk + "\n", _write_token=self.__write_token)
-        self._write_private(str(len(chunks)) + "\n", _write_token=self.__write_token)
+            self.__write_wire(
+                _PrivateWirePacket((chunk + "\n").encode("ascii"), self.__wire_issuer)
+            )
+        self.__write_wire(
+            _PrivateWirePacket(
+                (str(len(chunks)) + "\n").encode("ascii"), self.__wire_issuer
+            )
+        )
         for chunk in chunks:
-            self._write_private(chunk + "\n", _write_token=self.__write_token)
+            self.__write_wire(
+                _PrivateWirePacket((chunk + "\n").encode("ascii"), self.__wire_issuer)
+            )
         deadlines = {
             BoundedOperation.TRANSFER: 90.0,
             BoundedOperation.INSTALL: 90.0,
@@ -2213,15 +4104,18 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
 
     def _create_private_backup(self, *, _capability: object = None) -> BackupResult:
-        self._require_capability(_capability, frozenset({LifecycleAction.BACKUP}))
-        output = self._execute_bounded_operation(
+        capability = self._require_capability(
+            _capability, frozenset({LifecycleAction.BACKUP})
+        )
+        output = self.__execute_bounded_operation(
             BoundedOperation.BACKUP, {}, _capability=_capability
         )
-        return self._simple_result(
+        result = self._simple_result(
             output,
             BackupResult,
             ("success", "file_count", "manifest_match", "regular_files_only"),
         )
+        return _bind_evidence_origin(result, capability)
 
     def _transfer_source_bundle(
         self, bundle: SourceBundle, *, _capability: object = None
@@ -2232,24 +4126,25 @@ class PrivateInteractiveSessionBroker:
             and bundle.state is SourceState.CANDIDATE
             else LifecycleAction.RESTORE_TRANSFER
         )
-        self._require_capability(_capability, frozenset({action}))
+        capability = self._require_capability(_capability, frozenset({action}))
         validate_source_bundle(bundle)
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.TRANSFER,
             _bundle_payload(bundle),
             detail=bundle.state.value,
             _capability=_capability,
         )
-        return self._simple_result(
+        result = self._simple_result(
             output,
             TransferResult,
             ("success", "file_count", "manifest_match", "regular_files_only"),
         )
+        return _bind_evidence_origin(result, capability)
 
     def _install_staged_source(
         self, manifest: SourceManifest, *, _capability: object = None
     ) -> InstallResult:
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({LifecycleAction.CANDIDATE_INSTALL})
         )
         if (
@@ -2257,7 +4152,7 @@ class PrivateInteractiveSessionBroker:
             or manifest.state is not SourceState.CANDIDATE
         ):
             raise SourceBundleError("CANDIDATE_MANIFEST_REQUIRED") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.INSTALL,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
@@ -2275,7 +4170,7 @@ class PrivateInteractiveSessionBroker:
         )
         if result.installation_success and result.manifest_match:
             self._active_source_state = SourceState.CANDIDATE
-        return result
+        return _bind_evidence_origin(result, capability)
 
     def _verify_source_inventory(
         self, manifest: SourceManifest, *, _capability: object = None
@@ -2286,42 +4181,82 @@ class PrivateInteractiveSessionBroker:
             and manifest.state is SourceState.CANDIDATE
             else LifecycleAction.RESTORE_INVENTORY
         )
-        self._require_capability(_capability, frozenset({action}))
+        capability = self._require_capability(_capability, frozenset({action}))
         if not isinstance(manifest, SourceManifest):
             raise SourceBundleError("SOURCE_MANIFEST_INVALID") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.SOURCE_INVENTORY,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
             _capability=_capability,
         )
-        return _parse_source_inventory_result(_exact_payload(output))
+        result = _parse_source_inventory_result(_exact_payload(output))
+        return _bind_evidence_origin(result, capability)
+
+    def _reconcile_restore_tail(
+        self,
+        manifest: SourceManifest,
+        original_operation_id: str,
+        restart_mode: str,
+        *,
+        _capability: object = None,
+    ) -> RestoreTailReconciliationEvidence:
+        """Re-observe the complete PR #41 tail without replaying its action."""
+        capability = self._require_capability(
+            _capability, frozenset({LifecycleAction.RESTORE_TAIL_RECONCILE})
+        )
+        if (
+            not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
+        ):
+            raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+        if (
+            not isinstance(original_operation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", original_operation_id) is None
+        ):
+            raise SourceBundleError("RESTORE_OPERATION_ID_INVALID") from None
+        if restart_mode not in {"submit_once", "previously_committed"}:
+            raise SourceBundleError("RESTORE_RESTART_MODE_INVALID") from None
+        output = self.__execute_bounded_operation(
+            BoundedOperation.RESTORE_TAIL_RECONCILE,
+            {
+                "manifest": _manifest_payload(manifest),
+                "original_operation_id": original_operation_id,
+                "reconciliation_operation_id": str(capability.issuance_identity),
+                "restart_mode": restart_mode,
+            },
+            detail=manifest.state.value,
+            _capability=_capability,
+        )
+        value = _exact_payload(output)
+        fields = tuple(RestoreTailReconciliationEvidence.__dataclass_fields__)
+        if set(value) != set(fields):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        result = RestoreTailReconciliationEvidence(*(value[field] for field in fields))
+        if result.manifest_match is True:
+            self._active_source_state = SourceState.RESTORE
+        return _bind_evidence_origin(result, capability)
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
     ) -> CoreCheckResult:
         action_by_state = {
-            SourceState.CANDIDATE: {
-                1: LifecycleAction.CANDIDATE_CORE_CHECK_1,
-                2: LifecycleAction.CANDIDATE_CORE_CHECK_2,
-            },
-            SourceState.RESTORE: {
-                1: LifecycleAction.RESTORE_CORE_CHECK_1,
-                2: LifecycleAction.RESTORE_CORE_CHECK_2,
-            },
+            SourceState.CANDIDATE: {1: LifecycleAction.CANDIDATE_CORE_CHECK_1},
+            SourceState.RESTORE: {1: LifecycleAction.RESTORE_CORE_CHECK_1},
         }
         action = action_by_state.get(self._active_source_state, {}).get(attempt_ordinal)
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({action}) if action is not None else frozenset()
         )
-        if attempt_ordinal not in {1, 2}:
+        if attempt_ordinal != 1:
             raise SessionBrokerError("CORE_CHECK_ATTEMPT_INVALID") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.CORE_CHECK, {}, _capability=_capability
         )
-        return _parse_core_check_result(
+        result = _parse_core_check_result(
             _exact_core_check_payload(output), attempt_ordinal=attempt_ordinal
         )
+        return _bind_evidence_origin(result, capability)
 
     def _restart_core(self, *, _capability: object = None) -> RestartResult:
         state = self._active_source_state
@@ -2329,7 +4264,7 @@ class PrivateInteractiveSessionBroker:
             SourceState.CANDIDATE: LifecycleAction.ACTIVATION_RESTART,
             SourceState.RESTORE: LifecycleAction.REMOVAL_RESTART,
         }.get(state)
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({action}) if action is not None else frozenset()
         )
         if state is None:
@@ -2337,11 +4272,11 @@ class PrivateInteractiveSessionBroker:
         if state in self._restarted_states:
             raise SessionBrokerError("CORE_RESTART_ALREADY_SUBMITTED") from None
         self._restarted_states.add(state)
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.RESTART_CORE, {}, _capability=_capability
         )
         result = self._simple_result(output, RestartResult, ("submitted", "accepted"))
-        return result
+        return _bind_evidence_origin(result, capability)
 
     def _wait_for_core_readiness(
         self, *, _capability: object = None
@@ -2350,21 +4285,22 @@ class PrivateInteractiveSessionBroker:
             SourceState.CANDIDATE: LifecycleAction.CANDIDATE_READINESS,
             SourceState.RESTORE: LifecycleAction.RESTORE_READINESS,
         }.get(self._active_source_state)
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({action}) if action is not None else frozenset()
         )
         if self._active_source_state is None:
             raise SessionBrokerError("CORE_READINESS_SOURCE_STATE_REQUIRED") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.CORE_READINESS,
             {"source_state": self._active_source_state.value},
             _capability=_capability,
         )
-        return self._simple_result(
+        result = self._simple_result(
             output,
             CoreReadinessResult,
             ("core_reachable", "core_running", "integration_loaded", "timed_out"),
         )
+        return _bind_evidence_origin(result, capability)
 
     def _inventory_temporary_services(
         self, expectation: ServiceExpectation, *, _capability: object = None
@@ -2373,18 +4309,19 @@ class PrivateInteractiveSessionBroker:
             ServiceExpectation.PRESENT: LifecycleAction.SERVICES_PRESENT,
             ServiceExpectation.ABSENT: LifecycleAction.SERVICES_ABSENT,
         }.get(expectation)
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({action}) if action is not None else frozenset()
         )
         if not isinstance(expectation, ServiceExpectation):
             raise SessionBrokerError("SERVICE_EXPECTATION_INVALID") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.SERVICE_INVENTORY,
             {"expectation": expectation.value},
             detail=expectation.value,
             _capability=_capability,
         )
-        return _parse_service_inventory_result(_exact_payload(output))
+        result = _parse_service_inventory_result(_exact_payload(output))
+        return _bind_evidence_origin(result, capability)
 
     def _invoke_phase_a(
         self,
@@ -2412,7 +4349,7 @@ class PrivateInteractiveSessionBroker:
             )
         else:
             actions = frozenset()
-        self._require_capability(_capability, actions)
+        capability = self._require_capability(_capability, actions)
         if nonce is not None and (
             not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
         ):
@@ -2432,19 +4369,24 @@ class PrivateInteractiveSessionBroker:
         }
         if evidence_label is not None:
             value["evidence_label"] = evidence_label.value
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.PHASE_A_HELPER,
             value,
             detail=operation.value,
             _capability=_capability,
         )
-        return _parse_phase_a_result(operation, output, expected_nonce=submitted_nonce)
+        result = _parse_phase_a_result(
+            operation, output, expected_nonce=submitted_nonce
+        )
+        return _bind_evidence_origin(result, capability)
 
     def _run_invalid_nonce_preflight(
         self, *, _capability: object = None
     ) -> PhaseAResult:
-        self._require_capability(_capability, frozenset({LifecycleAction.P0}))
-        output = self._execute_bounded_operation(
+        capability = self._require_capability(
+            _capability, frozenset({LifecycleAction.P0})
+        )
+        output = self.__execute_bounded_operation(
             BoundedOperation.PHASE_A_HELPER,
             {
                 "helper_operation": PhaseAOperation.PREFLIGHT.value,
@@ -2460,13 +4402,13 @@ class PrivateInteractiveSessionBroker:
             or result.http_handoff is not False
         ):
             self._fail(BrokerFailure.PROTOCOL)
-        return result
+        return _bind_evidence_origin(result, capability)
 
     def _install_staged_restore(
         self, manifest: SourceManifest, *, _capability: object = None
     ) -> InstallResult:
         """Activate one already-staged exact PR #41 source bundle."""
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({LifecycleAction.RESTORE_INSTALL})
         )
         if (
@@ -2474,7 +4416,7 @@ class PrivateInteractiveSessionBroker:
             or manifest.state is not SourceState.RESTORE
         ):
             raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.RESTORE,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
@@ -2492,7 +4434,7 @@ class PrivateInteractiveSessionBroker:
         )
         if result.installation_success and result.manifest_match:
             self._active_source_state = SourceState.RESTORE
-        return result
+        return _bind_evidence_origin(result, capability)
 
     def _restore_source(
         self,
@@ -2524,7 +4466,7 @@ class PrivateInteractiveSessionBroker:
 
     def _restore_private_backup(self, *, _capability: object = None) -> InstallResult:
         """Use the fixed verified private backup only as a restoration fallback."""
-        self._require_capability(
+        capability = self._require_capability(
             _capability, frozenset({LifecycleAction.BACKUP_FALLBACK})
         )
         if (
@@ -2533,7 +4475,7 @@ class PrivateInteractiveSessionBroker:
         ):
             raise SourceBundleError("PRIVATE_BACKUP_ALREADY_CONSUMED") from None
         self._backup_restore_attempted = True
-        output = self._execute_bounded_operation(
+        output = self.__execute_bounded_operation(
             BoundedOperation.RESTORE_BACKUP, {}, _capability=_capability
         )
         result = self._simple_result(
@@ -2548,15 +4490,41 @@ class PrivateInteractiveSessionBroker:
         )
         if result.installation_success and result.manifest_match:
             self._active_source_state = SourceState.RESTORE
-        return result
+        return _bind_evidence_origin(result, capability)
+
+    def _reconcile_private_backup(
+        self, *, _capability: object = None
+    ) -> FallbackReconciliationResult:
+        """Reconcile a durable fallback marker without replaying its permit."""
+        capability = self._require_capability(
+            _capability, frozenset({LifecycleAction.BACKUP_FALLBACK_RECONCILE})
+        )
+        output = self.__execute_bounded_operation(
+            BoundedOperation.RECONCILE_BACKUP, {}, _capability=_capability
+        )
+        value = _exact_payload(output)
+        if set(value) != {
+            "phase",
+            "restoration_applied",
+            "manifest_match",
+            "file_count",
+        }:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        result = FallbackReconciliationResult(
+            phase=value.get("phase"),
+            restoration_applied=value.get("restoration_applied"),
+            manifest_match=value.get("manifest_match"),
+            file_count=value.get("file_count"),
+        )
+        return _bind_evidence_origin(result, capability)
 
     def close(self) -> None:
         """Close the child process group privately and suppress every close message."""
         try:
             if self._master_fd is not None and not self._is_reaped():
                 try:
-                    os.write(self._master_fd, b"exit\n")
-                except OSError:
+                    self.__write_wire(_PrivateWirePacket(b"exit\n", self.__wire_issuer))
+                except (OSError, SessionBrokerError):
                     pass
                 self._drain_and_discard(0.05)
                 deadline = time.monotonic() + 0.25
@@ -2589,34 +4557,81 @@ class PrivateInteractiveSessionBroker:
             self._restarted_states.clear()
             self._backup_restore_attempted = False
             self._controller_binding = None
-            self.__write_token = object()
+            self.__wire_issuer = object()
 
 
 class FullPreflightLifecycleController:
     """The sole public live-capable, ordered full-preflight control surface."""
 
+    _RECOVERY_HIDDEN_ENTRYPOINTS = frozenset(
+        {
+            "admit_initial_repairs",
+            "create_backup",
+            "stage_candidate",
+            "install_candidate",
+            "verify_candidate_inventory",
+            "check_candidate_core",
+            "restart_for_candidate",
+            "await_candidate_readiness",
+            "verify_research_services_present",
+            "admit_post_activation_repairs",
+            "collect_a0",
+            "run_p0",
+            "collect_ap0",
+            "run_non_probe_preflight",
+            "lookup_non_probe_receipt",
+            "collect_a1",
+            "validate_research_final",
+            "collect_a2",
+        }
+    )
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_RECOVERY_HIDDEN_ENTRYPOINTS"):
+            journal = object.__getattribute__(self, "__dict__").get("_journal")
+            if journal is not None and journal.recovery_mode:
+                raise AttributeError("RECOVERY_ONLY_OPERATION_UNAVAILABLE")
+        return object.__getattribute__(self, name)
+
     def __init__(
         self,
         broker: Any,
         *,
-        is_relevant: Callable[[object], bool],
-        is_critical: Callable[[object], bool],
+        _test_construction_token: object = None,
     ) -> None:
         if (
             getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
             or getattr(broker, "_session_generation", None) is None
             or not callable(getattr(broker, "_register_lifecycle_controller", None))
-            or not callable(is_relevant)
-            or not callable(is_critical)
         ):
             raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
         self._broker = broker
-        self._is_relevant = is_relevant
-        self._is_critical = is_critical
         self._state = LifecycleState.BASELINE
         self._session_generation = broker._session_generation
+        self._session_generation_id = secrets.token_hex(16)
         self._seen_session_generations = [self._session_generation]
-        self._lifecycle_generation = object()
+        self._journal: _DurableLifecycleJournal | None = None
+        durable_required = (
+            _test_construction_token is not _NON_DURABLE_TEST_CONSTRUCTION_TOKEN
+        )
+        if durable_required:
+            self._journal = _DurableLifecycleJournal()
+            self._lifecycle_generation = self._journal.lifecycle_generation
+            self._current_source_generation = self._journal.source_generation
+            self._state = self._journal.state
+        else:
+            self._lifecycle_generation = object()
+            self._current_source_generation = object()
+        self._candidate_source_generation = (
+            self._journal._record["pr45_source"]["generation"]
+            if self._journal is not None
+            else object()
+        )
+        self._restore_source_generation = (
+            self._journal._record["pr41_restore"]["generation"]
+            if self._journal is not None
+            else object()
+        )
         self.__dispatch_token = object()
         try:
             self._capability_issuer = broker._register_lifecycle_controller(
@@ -2625,8 +4640,12 @@ class FullPreflightLifecycleController:
                 self._session_generation,
             )
         except (SessionBrokerError, TypeError, ValueError):
+            if self._journal is not None:
+                self._journal.close()
             raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
         if type(self._capability_issuer) is not _CapabilityIssuer:
+            if self._journal is not None:
+                self._journal.close()
             raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
         self._permits = {
             action: _InvocationPermit(
@@ -2634,6 +4653,18 @@ class FullPreflightLifecycleController:
             )
             for action in LifecycleAction
         }
+        if self._journal is not None:
+            for action in self._journal.consumed_actions:
+                self._permits[action].consumed = True
+        self._evidence_generations: dict[LifecycleAction, int] = {}
+        self._evidence_origins: dict[int, tuple[_EvidenceOrigin, int]] = {}
+        self._audit_instance_labels: dict[str, str] = {}
+        self._normal_chain_aborted = (
+            self._journal.recovery_mode if self._journal is not None else False
+        )
+        self._research_succeeded = (
+            self._journal.research_succeeded if self._journal is not None else False
+        )
         self._candidate_bundle: SourceBundle | None = None
         self._candidate_manifest: SourceManifest | None = None
         self._restore_bundle: SourceBundle | None = None
@@ -2641,17 +4672,20 @@ class FullPreflightLifecycleController:
         self._candidate_activation_generation: object | None = None
         self._snapshots: dict[AuditLabel, AuditSnapshot] = {}
         self._snapshot_generations: dict[AuditLabel, object] = {}
+        self._snapshot_origins: dict[AuditLabel, tuple[_EvidenceOrigin, int]] = {}
         self._audit_comparisons: dict[
             tuple[AuditLabel, AuditLabel], AuditComparison
         ] = {}
         self._preflight_result: PhaseAResult | None = None
         self._receipt_result: PhaseAResult | None = None
         self._preflight_nonce: str | None = None
-        self._ambiguous_nonce: str | None = None
-        self._core_transport_ambiguous: dict[SourceState, bool] = {
-            SourceState.CANDIDATE: False,
-            SourceState.RESTORE: False,
-        }
+        self._ambiguous_nonce: str | None = (
+            self._journal._record["known_nonce"]
+            if self._journal is not None
+            and self._journal._record["ambiguous_operation"]
+            == LifecycleAction.PREFLIGHT.value
+            else None
+        )
         self._restore_inventory: SourceInventoryResult | None = None
         self._restore_core_check: CoreCheckResult | None = None
         self._removal_restart: RestartResult | None = None
@@ -2659,10 +4693,11 @@ class FullPreflightLifecycleController:
         self._restore_readiness: CoreReadinessResult | None = None
         self._restore_services: ServiceInventoryResult | None = None
         self._restore_repairs: RepairsEvidence | None = None
+        self._recovery_tail_evidence: RestoreTailReconciliationEvidence | None = None
 
     @property
     def state(self) -> LifecycleState:
-        return self._state
+        return self._journal.state if self._journal is not None else self._state
 
     def _assert_session_binding(self) -> None:
         if (
@@ -2673,8 +4708,93 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("LIFECYCLE_SESSION_CHANGED") from None
 
     def _require_state(self, *states: LifecycleState) -> None:
-        if self._state not in states:
+        current = self.state
+        if self._journal is not None and self._journal.recovery_mode:
+            recovery_states = {
+                LifecycleState.RECOVERY_REQUIRED,
+                LifecycleState.ROLLBACK_REQUIRED,
+                LifecycleState.RESTORE_STAGED,
+                LifecycleState.PR41_RESTORED,
+                LifecycleState.RESTORE_INVENTORY_VERIFIED,
+                LifecycleState.RESTORE_CORE_CHECKED,
+                LifecycleState.REMOVAL_RESTART_CONSUMED,
+                LifecycleState.PR41_READY,
+                LifecycleState.RESEARCH_SERVICES_ABSENT,
+                LifecycleState.POST_RESTORE_REPAIRS_PASS,
+            }
+            if current not in recovery_states:
+                raise LifecycleControllerError("LIFECYCLE_RECOVERY_ONLY") from None
+        if current not in states:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
+
+    def _source_generation_for(self, action: LifecycleAction) -> object:
+        if action in _CANDIDATE_SOURCE_ACTIONS:
+            return self._candidate_source_generation
+        if action in _RESTORE_SOURCE_ACTIONS:
+            return self._restore_source_generation
+        return self._current_source_generation
+
+    def _operation_nonce(self, action: LifecycleAction) -> str | None:
+        if action in {LifecycleAction.PREFLIGHT, LifecycleAction.RECEIPT}:
+            return self._preflight_nonce
+        if action is LifecycleAction.AMBIGUOUS_RECEIPT:
+            return self._ambiguous_nonce
+        return None
+
+    def _advance(
+        self,
+        state: LifecycleState,
+        action: LifecycleAction,
+        *,
+        source_generation: object | None = None,
+        terminal: bool = False,
+    ) -> None:
+        if (
+            self.state not in _LIFECYCLE_ACTION_PREDECESSORS[action]
+            or state not in _LIFECYCLE_ACTION_SUCCESSORS[action]
+        ):
+            raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
+        generation = (
+            self._source_generation_for(action)
+            if source_generation is None
+            else source_generation
+        )
+        self._current_source_generation = generation
+        if self._journal is not None:
+            self._journal.transition(
+                state,
+                action=action,
+                source_generation=str(generation),
+                evidence_generation=self._evidence_generations.get(action),
+                recovery=self._normal_chain_aborted,
+                terminal=terminal,
+            )
+        self._state = state
+        if state is LifecycleState.A2_COLLECTED and not self._normal_chain_aborted:
+            self._research_succeeded = True
+
+    def _enter_recovery(self) -> None:
+        self._normal_chain_aborted = True
+        if self._journal is not None:
+            self._journal.transition(
+                LifecycleState.ROLLBACK_REQUIRED,
+                action=None,
+                source_generation=str(self._current_source_generation),
+                evidence_generation=None,
+                recovery=True,
+            )
+        self._state = LifecycleState.ROLLBACK_REQUIRED
+
+    def close(self) -> None:
+        """Release the owner lock; an active journal remains reconstructable."""
+        if self._journal is not None:
+            self._journal.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def bind_rollback_session(self, broker: PrivateInteractiveSessionBroker) -> None:
         """Explicitly bind unused rollback-only permits to one fresh session."""
@@ -2744,17 +4864,35 @@ class FullPreflightLifecycleController:
         action: LifecycleAction,
         callback: Callable[[_LifecycleCapability], Any],
         *,
+        broker_evidence: bool = True,
         _dispatch_token: object = None,
     ) -> Any:
         if _dispatch_token is not self.__dispatch_token:
             raise LifecycleControllerError("LIFECYCLE_DISPATCH_SCOPE_INVALID") from None
         self._assert_session_binding()
         allowed_predecessors = _LIFECYCLE_ACTION_PREDECESSORS.get(action)
-        if allowed_predecessors is None or self._state not in allowed_predecessors:
+        if allowed_predecessors is None or self.state not in allowed_predecessors:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         permit = self._permits[action]
         if permit.consumed:
             raise LifecycleControllerError("LIFECYCLE_PERMIT_CONSUMED") from None
+        source_generation = self._source_generation_for(action)
+        issuance_identity = secrets.token_hex(16)
+        reconciles_operation_id = (
+            self._journal.restore_tail_original_operation_id()
+            if self._journal is not None
+            and action is LifecycleAction.RESTORE_TAIL_RECONCILE
+            else None
+        )
+        if self._journal is not None:
+            self._journal.record_intent(
+                action,
+                source_generation=str(source_generation),
+                session_generation=self._session_generation_id,
+                issuance_identity=issuance_identity,
+                reconciles_operation_id=reconciles_operation_id,
+                nonce=self._operation_nonce(action),
+            )
         permit.consume(
             self._lifecycle_generation,
             self._session_generation,
@@ -2764,30 +4902,139 @@ class FullPreflightLifecycleController:
             self,
             self._capability_issuer.identity,
             self._lifecycle_generation,
+            source_generation,
             self._session_generation,
             action,
+            issuance_identity,
         )
         self._capability_issuer.issued.append(capability)
-        return callback(capability)
+        if self._journal is not None:
+            self._journal.record_dispatch_started(action)
+        try:
+            result = callback(capability)
+        except BaseException:
+            if self._journal is not None:
+                self._journal.record_ambiguous(action)
+            raise
+        if self._journal is not None:
+            if not broker_evidence and result is not None:
+                _bind_evidence_origin(result, capability)
+            origin = (
+                None if result is None else _claim_evidence_origin(result, capability)
+            )
+            if (broker_evidence and origin is None) or (
+                not broker_evidence and result is not None and origin is None
+            ):
+                self._journal.record_ambiguous(action)
+                raise SessionBrokerError(
+                    "PRIVATE_INTERACTIVE_SESSION_EVIDENCE_ORIGIN_INVALID"
+                ) from None
+            evidence_generation = self._journal.record_result(
+                action,
+                lifecycle_generation=str(self._lifecycle_generation),
+                source_generation=str(source_generation),
+                session_generation=self._session_generation_id,
+                issuance_identity=str(capability.issuance_identity),
+                audit_instance=(
+                    None
+                    if origin is None or origin.audit_instance is None
+                    else self._audit_instance_labels.setdefault(
+                        origin.audit_instance, secrets.token_hex(16)
+                    )
+                ),
+                nonce=None if origin is None else origin.nonce,
+            )
+            self._evidence_generations[action] = evidence_generation
+            if origin is not None:
+                self._evidence_origins[id(result)] = (
+                    origin,
+                    evidence_generation,
+                )
+        return result
 
     def __dispatch_action(
         self,
         action: LifecycleAction,
         callback: Callable[[_LifecycleCapability], Any],
+        *,
+        broker_evidence: bool = True,
     ) -> Any:
         return self._dispatch(
             action,
             callback,
+            broker_evidence=broker_evidence,
             _dispatch_token=self.__dispatch_token,
         )
 
     def _rollback(self) -> None:
-        self._state = LifecycleState.ROLLBACK_REQUIRED
+        restoration_states = {
+            LifecycleState.RESTORE_STAGED,
+            LifecycleState.PR41_RESTORED,
+            LifecycleState.RESTORE_INVENTORY_VERIFIED,
+            LifecycleState.RESTORE_CORE_CHECKED,
+            LifecycleState.REMOVAL_RESTART_CONSUMED,
+            LifecycleState.PR41_READY,
+            LifecycleState.RESEARCH_SERVICES_ABSENT,
+            LifecycleState.POST_RESTORE_REPAIRS_PASS,
+        }
+        ambiguous_action = (
+            None
+            if self._journal is None
+            else self._journal._record["ambiguous_operation"]
+        )
+        if ambiguous_action in {action.value for action in _RESTORE_SOURCE_ACTIONS}:
+            self._normal_chain_aborted = True
+            self._journal.transition(
+                LifecycleState.RECOVERY_REQUIRED,
+                action=None,
+                source_generation=str(self._current_source_generation),
+                evidence_generation=None,
+                recovery=True,
+            )
+            self._state = LifecycleState.RECOVERY_REQUIRED
+            raise LifecycleControllerError("LIFECYCLE_RECOVERY_REQUIRED") from None
+        if self.state in restoration_states:
+            self._normal_chain_aborted = True
+            if self._journal is not None:
+                self._journal.transition(
+                    LifecycleState.RESTORE_FAILED,
+                    action=None,
+                    source_generation=str(self._current_source_generation),
+                    evidence_generation=None,
+                    recovery=True,
+                    terminal=True,
+                )
+                self._journal.close()
+            self._state = LifecycleState.RESTORE_FAILED
+            raise LifecycleControllerError("LIFECYCLE_RESTORE_FAILED") from None
+        self._enter_recovery()
         raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+
+    def _restore_failure(self) -> NoReturn:
+        self._normal_chain_aborted = True
+        if self._journal is not None:
+            self._journal.transition(
+                LifecycleState.RESTORE_FAILED,
+                action=None,
+                source_generation=str(self._current_source_generation),
+                evidence_generation=None,
+                recovery=True,
+                terminal=True,
+            )
+            self._journal.close()
+        self._state = LifecycleState.RESTORE_FAILED
+        raise LifecycleControllerError("LIFECYCLE_RESTORE_FAILED") from None
 
     @staticmethod
     def _repairs_pass(evidence: object) -> bool:
-        return evidence == RepairsEvidence(True, 0, 0)
+        return (
+            isinstance(evidence, RepairsEvidence)
+            and evidence.shape_valid is True
+            and _exact_non_bool_int(evidence.relevant_count)
+            and _exact_non_bool_int(evidence.critical_count)
+            and evidence.relevant_count == 0
+            and evidence.critical_count == 0
+        )
 
     @staticmethod
     def _bundle_result_pass(
@@ -2797,17 +5044,20 @@ class FullPreflightLifecycleController:
             return False
         if isinstance(result, TransferResult):
             return (
-                result.success
+                result.success is True
+                and _exact_non_bool_int(result.file_count)
                 and result.file_count == expected_count
-                and result.manifest_match
-                and result.regular_files_only
+                and result.manifest_match is True
+                and result.regular_files_only is True
             )
         if isinstance(result, InstallResult):
             return (
-                result.installation_success
+                result.installation_success is True
+                and _exact_non_bool_int(result.expected_file_count)
                 and result.expected_file_count == expected_count
+                and _exact_non_bool_int(result.installed_file_count)
                 and result.installed_file_count == expected_count
-                and result.manifest_match
+                and result.manifest_match is True
             )
         return False
 
@@ -2815,10 +5065,14 @@ class FullPreflightLifecycleController:
     def _inventory_pass(result: object, expected_count: int) -> bool:
         return (
             isinstance(result, SourceInventoryResult)
+            and _exact_non_bool_int(result.expected_count)
             and result.expected_count == expected_count
+            and _exact_non_bool_int(result.observed_count)
             and result.observed_count == expected_count
-            and result.manifest_match
+            and result.manifest_match is True
+            and _exact_non_bool_int(result.unexpected_count)
             and result.unexpected_count == 0
+            and _exact_non_bool_int(result.missing_count)
             and result.missing_count == 0
         )
 
@@ -2826,39 +5080,43 @@ class FullPreflightLifecycleController:
     def _readiness_pass(result: object) -> bool:
         return (
             isinstance(result, CoreReadinessResult)
-            and result.core_reachable
-            and result.core_running
-            and result.integration_loaded
-            and not result.timed_out
+            and result.core_reachable is True
+            and result.core_running is True
+            and result.integration_loaded is True
+            and result.timed_out is False
         )
 
     @staticmethod
     def _services_present_pass(result: object) -> bool:
         return (
             isinstance(result, ServiceInventoryResult)
+            and _exact_non_bool_int(result.expected_present_count)
             and result.expected_present_count == 4
+            and _exact_non_bool_int(result.observed_present_count)
             and result.observed_present_count == 4
-            and result.all_expected_present
+            and result.all_expected_present is True
+            and _exact_non_bool_int(result.expected_absent_count)
             and result.expected_absent_count == 0
+            and _exact_non_bool_int(result.observed_absent_count)
             and result.observed_absent_count == 0
-            and result.all_expected_absent
+            and result.all_expected_absent is True
         )
 
     @staticmethod
     def _services_absent_pass(result: object) -> bool:
         return (
             isinstance(result, ServiceInventoryResult)
+            and _exact_non_bool_int(result.expected_present_count)
             and result.expected_present_count == 0
+            and _exact_non_bool_int(result.observed_present_count)
             and result.observed_present_count == 0
-            and result.all_expected_present
+            and result.all_expected_present is True
+            and _exact_non_bool_int(result.expected_absent_count)
             and result.expected_absent_count == 4
+            and _exact_non_bool_int(result.observed_absent_count)
             and result.observed_absent_count == 4
-            and result.all_expected_absent
+            and result.all_expected_absent is True
         )
-
-    @staticmethod
-    def _outer_transport_ambiguity(error: SessionBrokerError) -> bool:
-        return str(error).endswith(("_TIMEOUT", "_CHILD_EXITED", "_OUTPUT_LIMIT"))
 
     def admit_initial_repairs(self) -> RepairsEvidence:
         self._require_state(LifecycleState.BASELINE)
@@ -2867,8 +5125,6 @@ class FullPreflightLifecycleController:
                 LifecycleAction.INITIAL_REPAIRS,
                 lambda capability: self._broker._collect_resolution_info(
                     RepairsGate.INITIAL,
-                    self._is_relevant,
-                    self._is_critical,
                     _capability=capability,
                 ),
             )
@@ -2876,7 +5132,9 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("INITIAL_REPAIRS_ADMISSION_FAILED") from None
         if not self._repairs_pass(evidence):
             raise LifecycleControllerError("INITIAL_REPAIRS_ADMISSION_FAILED") from None
-        self._state = LifecycleState.INITIAL_REPAIRS_PASS
+        self._advance(
+            LifecycleState.INITIAL_REPAIRS_PASS, LifecycleAction.INITIAL_REPAIRS
+        )
         return evidence
 
     def create_backup(self) -> BackupResult:
@@ -2898,7 +5156,7 @@ class FullPreflightLifecycleController:
             and result.regular_files_only
         ):
             raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
-        self._state = LifecycleState.BACKUP_VERIFIED
+        self._advance(LifecycleState.BACKUP_VERIFIED, LifecycleAction.BACKUP)
         return result
 
     def stage_candidate(self, bundle: SourceBundle) -> TransferResult:
@@ -2925,7 +5183,9 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("CANDIDATE_TRANSFER_FAILED") from None
         self._candidate_bundle = bundle
         self._candidate_manifest = bundle.manifest
-        self._state = LifecycleState.CANDIDATE_STAGED
+        self._advance(
+            LifecycleState.CANDIDATE_STAGED, LifecycleAction.CANDIDATE_TRANSFER
+        )
         return result
 
     def install_candidate(self, manifest: SourceManifest) -> InstallResult:
@@ -2947,7 +5207,11 @@ class FullPreflightLifecycleController:
         if not self._bundle_result_pass(result, len(manifest.entries), InstallResult):
             self._rollback()
         self._candidate_activation_generation = object()
-        self._state = LifecycleState.CANDIDATE_INSTALLED
+        self._advance(
+            LifecycleState.CANDIDATE_INSTALLED,
+            LifecycleAction.CANDIDATE_INSTALL,
+            source_generation=self._candidate_source_generation,
+        )
         return result
 
     def verify_candidate_inventory(
@@ -2967,52 +5231,46 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not self._inventory_pass(result, len(manifest.entries)):
             self._rollback()
-        self._state = LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+        self._advance(
+            LifecycleState.CANDIDATE_INVENTORY_VERIFIED,
+            LifecycleAction.CANDIDATE_INVENTORY,
+        )
         return result
 
     def _check_core_for(
         self,
-        source_state: SourceState,
         first_action: LifecycleAction,
-        second_action: LifecycleAction,
     ) -> CoreCheckResult:
-        attempt = 2 if self._core_transport_ambiguous[source_state] else 1
-        action = first_action if attempt == 1 else second_action
         try:
             result = self.__dispatch_action(
-                action,
-                lambda capability: self._broker._check_core(
-                    attempt, _capability=capability
-                ),
+                first_action,
+                lambda capability: self._broker._check_core(1, _capability=capability),
             )
-        except SessionBrokerError as error:
-            if attempt == 1 and self._outer_transport_ambiguity(error):
-                session_survived = (
-                    getattr(self._broker, "state", None) is BrokerState.SESSION_ACTIVE
-                    and getattr(self._broker, "_session_generation", None)
-                    is self._session_generation
-                )
-                if session_survived:
-                    self._core_transport_ambiguous[source_state] = True
-                    raise LifecycleControllerError(
-                        "CORE_CHECK_TRANSPORT_AMBIGUOUS"
-                    ) from None
-                self._rollback()
+        except SessionBrokerError:
             self._rollback()
         except (TypeError, ValueError):
             self._rollback()
-        if not isinstance(result, CoreCheckResult) or not result.check_passed:
+        if (
+            not isinstance(result, CoreCheckResult)
+            or not _exact_non_bool_int(result.attempt_ordinal, minimum=1, maximum=2)
+            or result.attempt_ordinal != 1
+            or not _exact_non_bool_int(result.http_status, minimum=200, maximum=299)
+            or result.result != "ok"
+            or result.check_passed is not True
+            or result.error_class is not None
+        ):
             self._rollback()
         return result
 
     def check_candidate_core(self) -> CoreCheckResult:
         self._require_state(LifecycleState.CANDIDATE_INVENTORY_VERIFIED)
         result = self._check_core_for(
-            SourceState.CANDIDATE,
             LifecycleAction.CANDIDATE_CORE_CHECK_1,
-            LifecycleAction.CANDIDATE_CORE_CHECK_2,
         )
-        self._state = LifecycleState.CANDIDATE_CORE_CHECKED
+        self._advance(
+            LifecycleState.CANDIDATE_CORE_CHECKED,
+            LifecycleAction.CANDIDATE_CORE_CHECK_1,
+        )
         return result
 
     def _restart(
@@ -3027,7 +5285,9 @@ class FullPreflightLifecycleController:
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
         if not (
-            isinstance(result, RestartResult) and result.submitted and result.accepted
+            isinstance(result, RestartResult)
+            and result.submitted is True
+            and result.accepted is True
         ):
             self._rollback()
         return result
@@ -3037,7 +5297,10 @@ class FullPreflightLifecycleController:
         result = self._restart(
             SourceState.CANDIDATE, LifecycleAction.ACTIVATION_RESTART
         )
-        self._state = LifecycleState.ACTIVATION_RESTART_CONSUMED
+        self._advance(
+            LifecycleState.ACTIVATION_RESTART_CONSUMED,
+            LifecycleAction.ACTIVATION_RESTART,
+        )
         return result
 
     def await_candidate_readiness(self) -> CoreReadinessResult:
@@ -3053,7 +5316,9 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not self._readiness_pass(result):
             self._rollback()
-        self._state = LifecycleState.CANDIDATE_READY
+        self._advance(
+            LifecycleState.CANDIDATE_READY, LifecycleAction.CANDIDATE_READINESS
+        )
         return result
 
     def verify_research_services_present(self) -> ServiceInventoryResult:
@@ -3069,7 +5334,9 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not self._services_present_pass(result):
             self._rollback()
-        self._state = LifecycleState.RESEARCH_SERVICES_PRESENT
+        self._advance(
+            LifecycleState.RESEARCH_SERVICES_PRESENT, LifecycleAction.SERVICES_PRESENT
+        )
         return result
 
     def admit_post_activation_repairs(self) -> RepairsEvidence:
@@ -3079,8 +5346,6 @@ class FullPreflightLifecycleController:
                 LifecycleAction.POST_ACTIVATION_REPAIRS,
                 lambda capability: self._broker._collect_resolution_info(
                     RepairsGate.POST_ACTIVATION,
-                    self._is_relevant,
-                    self._is_critical,
                     _capability=capability,
                 ),
             )
@@ -3088,7 +5353,10 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not self._repairs_pass(evidence):
             self._rollback()
-        self._state = LifecycleState.POST_ACTIVATION_REPAIRS_PASS
+        self._advance(
+            LifecycleState.POST_ACTIVATION_REPAIRS_PASS,
+            LifecycleAction.POST_ACTIVATION_REPAIRS,
+        )
         return evidence
 
     def _collect_audit(
@@ -3122,16 +5390,76 @@ class FullPreflightLifecycleController:
             self._rollback()
         snapshot = result.audit
         self._snapshots[audit_label] = snapshot
+        if self._journal is not None:
+            origin = self._evidence_origins.get(id(result))
+            if origin is None:
+                self._rollback()
+            self._snapshot_origins[audit_label] = origin
         if self._candidate_activation_generation is not None:
             self._snapshot_generations[audit_label] = (
                 self._candidate_activation_generation
             )
         return snapshot
 
+    def _audit_origin_chain_valid(self, labels: tuple[AuditLabel, ...]) -> bool:
+        if self._journal is None:
+            return True
+        expected_actions = {
+            AuditLabel.A0: LifecycleAction.A0,
+            AuditLabel.AP0: LifecycleAction.AP0,
+            AuditLabel.A1: LifecycleAction.A1,
+            AuditLabel.A2: LifecycleAction.A2,
+        }
+        if set(self._snapshot_origins) != set(labels):
+            return False
+        origins = [self._snapshot_origins[label] for label in labels]
+        audit_instances = {origin.audit_instance for origin, _ in origins}
+        generations = [generation for _, generation in origins]
+        nonces = {origin.nonce for origin, _ in origins}
+        journal_identities = {
+            identity["generation"]: identity
+            for identity in self._journal._record["evidence_identities"]
+        }
+        return (
+            None not in audit_instances
+            and len(audit_instances) == 1
+            and None not in nonces
+            and len(nonces) == len(labels)
+            and generations == sorted(generations)
+            and len(generations) == len(set(generations))
+            and all(
+                origin.lifecycle_generation is self._lifecycle_generation
+                and origin.source_generation is self._candidate_source_generation
+                and origin.session_generation is self._session_generation
+                and origin.action is expected_actions[label]
+                and isinstance(origin.evidence, PhaseAResult)
+                and origin.evidence.audit is self._snapshots[label]
+                and origin.evidence.nonce == origin.nonce
+                and self._snapshots[label].nonce == origin.nonce
+                and self._snapshots[label].audit_instance_token == origin.audit_instance
+                and self._evidence_generations.get(expected_actions[label])
+                == generation
+                and journal_identities.get(generation)
+                == {
+                    "generation": generation,
+                    "lifecycle_generation": str(self._lifecycle_generation),
+                    "action": expected_actions[label].value,
+                    "source_generation": str(self._candidate_source_generation),
+                    "session_generation": self._session_generation_id,
+                    "issuance_identity": str(origin.issuance_identity),
+                    "audit_instance": self._audit_instance_labels[
+                        origin.audit_instance
+                    ],
+                    "nonce": origin.nonce,
+                }
+                for label, (origin, generation) in zip(labels, origins)
+            )
+        )
+
     def collect_a0(self) -> AuditSnapshot:
         self._require_state(LifecycleState.POST_ACTIVATION_REPAIRS_PASS)
         snapshot = self._collect_audit(AuditLabel.A0, LifecycleAction.A0)
-        self._state = LifecycleState.A0_COLLECTED
+        self._advance(LifecycleState.A0_COLLECTED, LifecycleAction.A0)
         return snapshot
 
     def run_p0(self) -> PhaseAResult:
@@ -3153,7 +5481,7 @@ class FullPreflightLifecycleController:
             or result.http_handoff is not False
         ):
             self._rollback()
-        self._state = LifecycleState.P0_COMPLETED
+        self._advance(LifecycleState.P0_COMPLETED, LifecycleAction.P0)
         return result
 
     def collect_ap0(self) -> AuditSnapshot:
@@ -3163,7 +5491,7 @@ class FullPreflightLifecycleController:
         if not comparison.zero_io_unchanged:
             self._rollback()
         self._audit_comparisons[(AuditLabel.A0, AuditLabel.AP0)] = comparison
-        self._state = LifecycleState.AP0_COLLECTED
+        self._advance(LifecycleState.AP0_COLLECTED, LifecycleAction.AP0)
         return snapshot
 
     def run_non_probe_preflight(self) -> PhaseAResult:
@@ -3193,9 +5521,15 @@ class FullPreflightLifecycleController:
         ):
             if isinstance(result, PhaseAResult) and result.exit_code == 78:
                 self._ambiguous_nonce = nonce
+                if self._journal is not None:
+                    self._journal.record_application_ambiguity(
+                        LifecycleAction.PREFLIGHT, nonce
+                    )
             self._rollback()
         self._preflight_result = result
-        self._state = LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED
+        self._advance(
+            LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED, LifecycleAction.PREFLIGHT
+        )
         return result
 
     @staticmethod
@@ -3227,11 +5561,15 @@ class FullPreflightLifecycleController:
         if not self._receipt_pass(result, nonce):
             self._rollback()
         self._receipt_result = result
-        self._state = LifecycleState.NON_PROBE_RECEIPT_COMPLETED
+        self._advance(
+            LifecycleState.NON_PROBE_RECEIPT_COMPLETED, LifecycleAction.RECEIPT
+        )
         return result
 
     def lookup_ambiguous_receipt(self) -> PhaseAResult:
-        self._require_state(LifecycleState.ROLLBACK_REQUIRED)
+        self._require_state(
+            LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED
+        )
         if self._ambiguous_nonce is None:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         nonce = self._ambiguous_nonce
@@ -3257,7 +5595,7 @@ class FullPreflightLifecycleController:
         if not comparison.zero_io_unchanged:
             self._rollback()
         self._audit_comparisons[(AuditLabel.AP0, AuditLabel.A1)] = comparison
-        self._state = LifecycleState.A1_COLLECTED
+        self._advance(LifecycleState.A1_COLLECTED, LifecycleAction.A1)
         return snapshot
 
     def validate_research_final(self) -> None:
@@ -3273,6 +5611,9 @@ class FullPreflightLifecycleController:
                     self._snapshot_generations.get(label) is not generation
                     for label in required_labels
                 )
+                or not self._audit_origin_chain_valid(
+                    (AuditLabel.A0, AuditLabel.AP0, AuditLabel.A1)
+                )
                 or self._preflight_result is None
                 or self._receipt_result is None
                 or not self._audit_comparisons[
@@ -3284,24 +5625,115 @@ class FullPreflightLifecycleController:
             ):
                 self._rollback()
 
-        self.__dispatch_action(LifecycleAction.RESEARCH_FINAL, validate)
-        self._state = LifecycleState.RESEARCH_FINAL_VALIDATED
+        self.__dispatch_action(
+            LifecycleAction.RESEARCH_FINAL, validate, broker_evidence=False
+        )
+        self._advance(
+            LifecycleState.RESEARCH_FINAL_VALIDATED, LifecycleAction.RESEARCH_FINAL
+        )
 
     def collect_a2(self) -> AuditSnapshot:
         self._require_state(LifecycleState.RESEARCH_FINAL_VALIDATED)
         snapshot = self._collect_audit(AuditLabel.A2, LifecycleAction.A2)
+        if not self._audit_origin_chain_valid(
+            (AuditLabel.A0, AuditLabel.AP0, AuditLabel.A1, AuditLabel.A2)
+        ):
+            self._rollback()
         adjacent = compare_audit_snapshots(self._snapshots[AuditLabel.A1], snapshot)
         cumulative = compare_audit_snapshots(self._snapshots[AuditLabel.A0], snapshot)
         if not adjacent.zero_io_unchanged or not cumulative.zero_io_unchanged:
             self._rollback()
         self._audit_comparisons[(AuditLabel.A1, AuditLabel.A2)] = adjacent
         self._audit_comparisons[(AuditLabel.A0, AuditLabel.A2)] = cumulative
-        self._state = LifecycleState.A2_COLLECTED
+        self._advance(LifecycleState.A2_COLLECTED, LifecycleAction.A2)
         return snapshot
+
+    def reconcile_restored_pr41(
+        self, bundle: SourceBundle
+    ) -> RestoreTailReconciliationEvidence:
+        """Freshly prove the full restore tail without replaying its operation."""
+        self._require_state(LifecycleState.RECOVERY_REQUIRED)
+        if (
+            not isinstance(bundle, SourceBundle)
+            or bundle.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
+        try:
+            validate_source_bundle(bundle)
+        except SourceBundleError:
+            raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
+        if self._journal is None:
+            raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
+        original_operation_id = self._journal.restore_tail_original_operation_id()
+        try:
+            restart_mode = self._journal.restore_tail_restart_mode()
+        except LifecycleControllerError:
+            self._restore_failure()
+        try:
+            result = self.__dispatch_action(
+                LifecycleAction.RESTORE_TAIL_RECONCILE,
+                lambda capability: self._broker._reconcile_restore_tail(
+                    bundle.manifest,
+                    original_operation_id,
+                    restart_mode,
+                    _capability=capability,
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._restore_failure()
+        expected = len(bundle.manifest.entries)
+        if not (
+            isinstance(result, RestoreTailReconciliationEvidence)
+            and result.original_operation_id == original_operation_id
+            and result.reconciliation_operation_id
+            == str(self._journal._record["operations"][-1]["issuance_identity"])
+            and _exact_non_bool_int(result.expected_count, minimum=1)
+            and result.expected_count == expected
+            and _exact_non_bool_int(result.observed_count, minimum=1)
+            and result.observed_count == expected
+            and result.manifest_match is True
+            and _exact_non_bool_int(result.unexpected_count)
+            and result.unexpected_count == 0
+            and _exact_non_bool_int(result.missing_count)
+            and result.missing_count == 0
+            and result.research_files_absent is True
+            and _exact_non_bool_int(result.core_http_status, minimum=200, maximum=299)
+            and result.core_result == "ok"
+            and result.core_check_passed is True
+            and result.restart_resolved is True
+            and result.core_reachable is True
+            and result.core_running is True
+            and result.integration_loaded is True
+            and result.timed_out is False
+            and _exact_non_bool_int(result.expected_absent_count, minimum=1)
+            and result.expected_absent_count == 4
+            and _exact_non_bool_int(result.observed_absent_count, minimum=1)
+            and result.observed_absent_count == 4
+            and result.all_expected_absent is True
+            and result.repairs_shape_valid is True
+            and _exact_non_bool_int(result.repairs_relevant_count)
+            and result.repairs_relevant_count == 0
+            and _exact_non_bool_int(result.repairs_critical_count)
+            and result.repairs_critical_count == 0
+        ):
+            self._restore_failure()
+        self._restore_bundle = bundle
+        self._restore_manifest = bundle.manifest
+        self._recovery_tail_evidence = result
+        self._advance(
+            LifecycleState.RESTORED_AFTER_ABORT,
+            LifecycleAction.RESTORE_TAIL_RECONCILE,
+            source_generation=self._restore_source_generation,
+            terminal=True,
+        )
+        self._journal.close()
+        return result
 
     def stage_restore(self, bundle: SourceBundle) -> TransferResult:
         self._require_state(
-            LifecycleState.A2_COLLECTED, LifecycleState.ROLLBACK_REQUIRED
+            LifecycleState.A2_COLLECTED,
+            LifecycleState.ROLLBACK_REQUIRED,
+            LifecycleState.RECOVERY_REQUIRED,
         )
         if (
             not isinstance(bundle, SourceBundle)
@@ -3320,14 +5752,14 @@ class FullPreflightLifecycleController:
                 ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
-            self._state = LifecycleState.ROLLBACK_REQUIRED
+            self._enter_recovery()
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
         if not self._bundle_result_pass(result, len(bundle.files), TransferResult):
-            self._state = LifecycleState.ROLLBACK_REQUIRED
+            self._enter_recovery()
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
         self._restore_bundle = bundle
         self._restore_manifest = bundle.manifest
-        self._state = LifecycleState.RESTORE_STAGED
+        self._advance(LifecycleState.RESTORE_STAGED, LifecycleAction.RESTORE_TRANSFER)
         return result
 
     def restore_pr41(self, manifest: SourceManifest) -> InstallResult:
@@ -3348,7 +5780,11 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not self._bundle_result_pass(result, len(manifest.entries), InstallResult):
             self._rollback()
-        self._state = LifecycleState.PR41_RESTORED
+        self._advance(
+            LifecycleState.PR41_RESTORED,
+            LifecycleAction.RESTORE_INSTALL,
+            source_generation=self._restore_source_generation,
+        )
         return result
 
     def verify_restore_inventory(
@@ -3369,25 +5805,32 @@ class FullPreflightLifecycleController:
         if not self._inventory_pass(result, len(manifest.entries)):
             self._rollback()
         self._restore_inventory = result
-        self._state = LifecycleState.RESTORE_INVENTORY_VERIFIED
+        self._advance(
+            LifecycleState.RESTORE_INVENTORY_VERIFIED,
+            LifecycleAction.RESTORE_INVENTORY,
+        )
         return result
 
     def check_restore_core(self) -> CoreCheckResult:
         self._require_state(LifecycleState.RESTORE_INVENTORY_VERIFIED)
         result = self._check_core_for(
-            SourceState.RESTORE,
             LifecycleAction.RESTORE_CORE_CHECK_1,
-            LifecycleAction.RESTORE_CORE_CHECK_2,
         )
         self._restore_core_check = result
-        self._state = LifecycleState.RESTORE_CORE_CHECKED
+        self._advance(
+            LifecycleState.RESTORE_CORE_CHECKED,
+            LifecycleAction.RESTORE_CORE_CHECK_1,
+        )
         return result
 
     def restart_for_restore(self) -> RestartResult:
         self._require_state(LifecycleState.RESTORE_CORE_CHECKED)
         result = self._restart(SourceState.RESTORE, LifecycleAction.REMOVAL_RESTART)
         self._removal_restart = result
-        self._state = LifecycleState.REMOVAL_RESTART_CONSUMED
+        self._advance(
+            LifecycleState.REMOVAL_RESTART_CONSUMED,
+            LifecycleAction.REMOVAL_RESTART,
+        )
         return result
 
     def await_restore_readiness(self) -> CoreReadinessResult:
@@ -3404,7 +5847,7 @@ class FullPreflightLifecycleController:
         if not self._readiness_pass(result):
             self._rollback()
         self._restore_readiness = result
-        self._state = LifecycleState.PR41_READY
+        self._advance(LifecycleState.PR41_READY, LifecycleAction.RESTORE_READINESS)
         return result
 
     def verify_research_services_absent(self) -> ServiceInventoryResult:
@@ -3421,7 +5864,9 @@ class FullPreflightLifecycleController:
         if not self._services_absent_pass(result):
             self._rollback()
         self._restore_services = result
-        self._state = LifecycleState.RESEARCH_SERVICES_ABSENT
+        self._advance(
+            LifecycleState.RESEARCH_SERVICES_ABSENT, LifecycleAction.SERVICES_ABSENT
+        )
         return result
 
     def admit_post_restore_repairs(self) -> RepairsEvidence:
@@ -3431,8 +5876,6 @@ class FullPreflightLifecycleController:
                 LifecycleAction.POST_RESTORE_REPAIRS,
                 lambda capability: self._broker._collect_resolution_info(
                     RepairsGate.POST_ROLLBACK,
-                    self._is_relevant,
-                    self._is_critical,
                     _capability=capability,
                 ),
             )
@@ -3441,10 +5884,32 @@ class FullPreflightLifecycleController:
         if not self._repairs_pass(evidence):
             self._rollback()
         self._restore_repairs = evidence
-        self._state = LifecycleState.POST_RESTORE_REPAIRS_PASS
+        self._advance(
+            LifecycleState.POST_RESTORE_REPAIRS_PASS,
+            LifecycleAction.POST_RESTORE_REPAIRS,
+        )
         return evidence
 
     def _final_restore_proof(self) -> FinalRestoreProof:
+        recovered = self._recovery_tail_evidence
+        if recovered is not None:
+            return FinalRestoreProof(
+                source_manifest_match=recovered.manifest_match is True,
+                research_files_absent=recovered.research_files_absent is True,
+                core_check_passed=recovered.core_check_passed is True,
+                restart_consumed=True,
+                restart_dispatched=True,
+                restart_submitted=True,
+                restart_accepted=recovered.restart_resolved is True,
+                core_reachable=recovered.core_reachable is True,
+                core_running=recovered.core_running is True,
+                integration_loaded=recovered.integration_loaded is True,
+                core_not_timed_out=recovered.timed_out is False,
+                research_services_absent=recovered.all_expected_absent is True,
+                repairs_shape_valid=recovered.repairs_shape_valid is True,
+                repairs_relevant_zero=recovered.repairs_relevant_count == 0,
+                repairs_critical_zero=recovered.repairs_critical_count == 0,
+            )
         inventory = self._restore_inventory
         core = self._restore_core_check
         restart = self._removal_restart
@@ -3466,27 +5931,76 @@ class FullPreflightLifecycleController:
             core_check_passed=(core is not None and core.check_passed),
             restart_consumed=restart_permit.consumed,
             restart_dispatched=SourceState.RESTORE in self._restart_dispatched,
-            restart_submitted=restart is not None and restart.submitted,
-            restart_accepted=restart is not None and restart.accepted,
-            core_reachable=readiness is not None and readiness.core_reachable,
-            core_running=readiness is not None and readiness.core_running,
-            integration_loaded=readiness is not None and readiness.integration_loaded,
-            core_not_timed_out=readiness is not None and not readiness.timed_out,
+            restart_submitted=restart is not None and restart.submitted is True,
+            restart_accepted=restart is not None and restart.accepted is True,
+            core_reachable=readiness is not None and readiness.core_reachable is True,
+            core_running=readiness is not None and readiness.core_running is True,
+            integration_loaded=(
+                readiness is not None and readiness.integration_loaded is True
+            ),
+            core_not_timed_out=readiness is not None and readiness.timed_out is False,
             research_services_absent=self._services_absent_pass(services),
-            repairs_shape_valid=repairs is not None and repairs.shape_valid,
-            repairs_relevant_zero=(repairs is not None and repairs.relevant_count == 0),
-            repairs_critical_zero=(repairs is not None and repairs.critical_count == 0),
+            repairs_shape_valid=(repairs is not None and repairs.shape_valid is True),
+            repairs_relevant_zero=(
+                repairs is not None
+                and _exact_non_bool_int(repairs.relevant_count)
+                and repairs.relevant_count == 0
+            ),
+            repairs_critical_zero=(
+                repairs is not None
+                and _exact_non_bool_int(repairs.critical_count)
+                and repairs.critical_count == 0
+            ),
+        )
+
+    def _normal_history_complete(self) -> bool:
+        if self._journal is None:
+            return self._research_succeeded and not self._normal_chain_aborted
+        observed = tuple(
+            LifecycleState(transition["stage"])
+            for transition in self._journal.transitions
+        )
+        position = 0
+        for state in observed:
+            if (
+                position < len(_NORMAL_LIFECYCLE_HISTORY)
+                and state is _NORMAL_LIFECYCLE_HISTORY[position]
+            ):
+                position += 1
+        return (
+            position == len(_NORMAL_LIFECYCLE_HISTORY)
+            and self._journal.research_succeeded
+            and not self._journal.recovery_mode
         )
 
     def complete(self) -> FinalRestoreProof:
         self._require_state(LifecycleState.POST_RESTORE_REPAIRS_PASS)
-        proof = self.__dispatch_action(
-            LifecycleAction.FINAL_ACCEPTANCE,
-            lambda _capability: self._final_restore_proof(),
+        normal = self._normal_history_complete()
+        action = (
+            LifecycleAction.FINAL_ACCEPTANCE_NORMAL
+            if normal
+            else LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT
         )
-        if not isinstance(proof, FinalRestoreProof) or not proof.complete:
+        proof = self.__dispatch_action(
+            action,
+            lambda _capability: self._final_restore_proof(),
+            broker_evidence=False,
+        )
+        if not isinstance(proof, FinalRestoreProof) or proof.complete is not True:
             self._rollback()
-        self._state = LifecycleState.COMPLETE
+        terminal = (
+            LifecycleState.COMPLETE_NORMAL
+            if normal
+            else LifecycleState.RESTORED_AFTER_ABORT
+        )
+        self._advance(
+            terminal,
+            action,
+            source_generation=self._restore_source_generation,
+            terminal=True,
+        )
+        if self._journal is not None:
+            self._journal.close()
         return proof
 
     def restore_private_backup_fallback(self) -> InstallResult:
@@ -3501,8 +6015,41 @@ class FullPreflightLifecycleController:
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
-        if not isinstance(result, InstallResult):
+        if not (
+            isinstance(result, InstallResult)
+            and result.installation_success is True
+            and _exact_non_bool_int(result.expected_file_count, minimum=1)
+            and _exact_non_bool_int(result.installed_file_count, minimum=1)
+            and result.installed_file_count == result.expected_file_count
+            and result.manifest_match is True
+        ):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+        return result
+
+    def reconcile_private_backup_fallback(self) -> FallbackReconciliationResult:
+        """Use the separate durable permit to resolve an interrupted fallback."""
+        self._require_state(
+            LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED
+        )
+        try:
+            result = self.__dispatch_action(
+                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+                lambda capability: self._broker._reconcile_private_backup(
+                    _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+        if not (
+            isinstance(result, FallbackReconciliationResult)
+            and result.phase == "reconciled"
+            and result.restoration_applied is True
+            and result.manifest_match is True
+            and _exact_non_bool_int(result.file_count, minimum=1)
+        ):
+            raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+        if self._journal is not None:
+            self._journal.record_fallback_reconciled()
         return result
 
 

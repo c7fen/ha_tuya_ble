@@ -148,14 +148,16 @@ prompts, helper output, and raw Supervisor responses remain inside the PTY.
 surface. The lower broker exposes only session `open`, `close`, and generic
 state; all Repairs, source, Core, restart, service-inventory, helper, and
 restoration adapters require a controller-minted capability even when their
-underscore-private names are reached directly. Each capability is bound by
-identity to the registered controller, lifecycle generation, broker session,
-and one exact action, and is consumed by bounded dispatch before PTY output.
+underscore-private names are reached directly. Each frozen capability is bound
+by identity to the registered controller, lifecycle generation, exact source
+generation, broker session, unique issuance identity, issuer ledger, and one
+exact action, and is consumed by bounded dispatch before PTY output.
 It cannot authorize another action, session, lifecycle, broker, or second use.
-The broker's raw PTY writer requires a distinct broker-owned write scope; a
-lifecycle capability can never authorize caller-provided terminal text.
-Bootstrap/login writes use that separate scope only for fixed, state-bound
-commands. Do not invoke or expose an internal broker adapter directly. The
+The broker has no ordinary raw PTY writer. Its only byte sink is a
+name-mangled method accepting a frozen, issuer-bound packet constructed inside
+the broker. Bootstrap/login writes use that sink only for fixed, state-bound
+commands, and the name-mangled bounded dispatcher accepts only typed operation
+enums. Do not invoke or expose an internal broker adapter directly. The
 controller has no command-string, argv, stdin/stdout
 bridge, remote-path, service-name, endpoint, environment-variable, arbitrary
 helper-operation, caller nonce, or caller audit-label argument.
@@ -164,9 +166,9 @@ Capability issuance is itself state-bound by an immutable action-to-predecessor
 table inside controller dispatch. Reaching a private dispatch method cannot mint
 an action capability from the wrong lifecycle state; rejection happens before
 permit consumption, capability issuance, callback execution, broker dispatch,
-or PTY output. Both Core-check capabilities require the same source-specific
-inventory predecessor, so the second capability remains only an outer-ambiguity
-allowance at that stage. Restore transfer alone permits either final candidate
+or PTY output. No second Core-check action is represented: outer transport
+ambiguity is not proof that a first request did not complete, so it enters
+recovery instead of replaying. Restore transfer alone permits either final candidate
 `A2_COLLECTED` or `ROLLBACK_REQUIRED`; ambiguous receipt and backup fallback are
 rollback-only.
 
@@ -207,8 +209,53 @@ BASELINE
 -> PR41_READY
 -> RESEARCH_SERVICES_ABSENT
 -> POST_RESTORE_REPAIRS_PASS
--> COMPLETE
+-> COMPLETE_NORMAL
 ```
+
+`COMPLETE_NORMAL` requires that entire ordered history, including A2 and the
+full PR #41 restoration proof, in one durable lifecycle generation. Successful
+PR #41 restoration after any aborted or ambiguous research step terminates as
+`RESTORED_AFTER_ABORT`. A restoration-stage failure terminates as
+`RESTORE_FAILED`; neither recovery outcome asserts research success.
+
+The controller owns one versioned durable continuity journal at a fixed,
+repository-owned location under the shared Git metadata directory. No caller
+or HA target selects its path. The owner-private directory and regular files
+reject symlinks, unexpected owner, mode, link count, oversized or malformed
+JSON, duplicate keys, unknown fields, and invalid transition ledgers. A
+separate owner-private lock file is held with non-blocking `flock` for the
+controller lifetime, so a second object or process cannot own the lifecycle.
+Journal updates use an owner-private temporary regular file, file `fsync`,
+atomic replacement, and directory `fsync`.
+
+Before any dispatch-capable callback, the journal durably records the exact
+operation intent and tombstone. It then distinguishes dispatch started, result
+durable, transition committed, ambiguity, and reconciliation. It retains
+lifecycle/source generations, exact PR #45 and PR #41 authorities,
+research-success and recovery flags, consumed actions, helper/restart
+tombstones, Core-check attempts, nonce state, and sanitized evidence identities.
+It never stores a target, token, raw response, PTY data, issue object, or device
+identifier. Opening an unfinished post-mutation journal yields
+`RECOVERY_REQUIRED`; research and candidate entrypoints are hidden on that
+instance, and only bounded reconciliation plus the PR #41 restoration tail are
+available. A fresh process cannot recreate a helper, restart, install, or
+Core-check permit. A clean abandoned preparation with no mutation-capable
+tombstone remains a hard stop until the repository-owned explicit discard
+operation removes it under the same exclusive lock; that operation refuses any
+post-mutation, rollback, recovery, or terminal journal.
+
+After process reconstruction, an interrupted PR #41 restore-tail action is
+never replayed. One separately tombstoned `RESTORE_TAIL_RECONCILE` operation is
+bound to the exact original operation identity and freshly re-observes exact
+PR #41 inventory, authoritative Core PASS, removal-restart resolution,
+readiness, research-service absence, and strict Repairs aggregates. It checks
+inventory and Core PASS before any still-required recovery restart. If the
+original removal restart was durably accepted, reconciliation only observes
+its resolved state; if that restart was consumed but not durably accepted,
+recovery fails without another restart. A valid compound proof commits
+`RESTORED_AFTER_ABORT` directly. Any crash or ambiguity in that one recovery
+operation exhausts the recovery budget as `RESTORE_FAILED`; no second
+reconciliation or final-acceptance permit can be minted.
 
 Every transition checks its exact predecessor and all local typed inputs before
 PTY output. Immediately before a represented action dispatch, the controller
@@ -249,13 +296,11 @@ Core check uses exactly `POST http://supervisor/core/check`. The remote adapter
 preserves the authoritative response body's `check_passed` value; it never
 synthesizes that field from HTTP status or `result`. Success requires a
 completed request, 2xx status, JSON object, exact string `result == "ok"`, and
-exact boolean `check_passed is true`. A completed FAIL is terminal. Attempt 2
-is permitted only after outer transport ambiguity left no completed result;
-the controller never reconnects or retries automatically. A terminal PTY
-timeout closes the broker and invalidates its session generation, so that
-lifecycle atomically enters `ROLLBACK_REQUIRED` and cannot use attempt 2. The
-two-attempt limit is an upper allowance only when the same bound session
-survives the outer ambiguity. A completed generic `error_class` response is a
+exact boolean `check_passed is true`, and no error condition. Parser and
+controller boundaries both reject integer `1`, strings, null, and arbitrary
+truthy objects. A completed FAIL or transport ambiguity is terminal for that
+attempt; the controller never reconnects or retries it. The durable journal
+records attempt state, so reconstruction cannot reset the budget. A completed generic `error_class` response is a
 typed Core-check FAIL, not transport ambiguity. Restart uses the fixed
 Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
 second submission for the same activated source state before PTY I/O.
@@ -272,8 +317,11 @@ the allowlisted counters, the documented four-field bounded events, and the
 optional nonce. Snapshot comparison reports exact instance, ordinal, counter,
 event, and overflow booleans without inventing semantic equivalence.
 
-The controller owns A0, AP0, A1, and A2 and binds them to one session and exact
-candidate activation generation. A0 requires strict post-activation Repairs
+The controller owns A0, AP0, A1, and A2 and binds every evidence object to the
+exact lifecycle, candidate source, producing action, monotonic evidence
+generation, broker session, audit instance, and nonce. Evidence is claimed once
+from the broker issuance ledger; an externally constructed lookalike or stale
+object from another lifecycle, source, or session cannot advance state. A0 requires strict post-activation Repairs
 admission and no history overflow; counters need not be absolute zero because
 the audit instance predates startup work. A0->AP0, AP0->A1, A1->A2, and the
 cumulative A0->A2 comparison must preserve the exact audit instance, event
@@ -286,7 +334,12 @@ enters `ROLLBACK_REQUIRED`. From there, the only normal recovery is exact PR
 #41 transfer, restore, inventory, authoritative Core check, one removal
 restart, readiness, service absence, and strict final Repairs. The private
 backup is a separately consumed last-resort fallback and never silently
-substitutes for PR #41 proof. Final acceptance is a typed, no-default proof
+substitutes for PR #41 proof. Its private remote marker distinguishes
+`intent_recorded`, `possibly_applied`, and `reconciled`. Process loss around the
+atomic exchange cannot authorize replay: a separate typed reconciliation
+permit compares the bounded backup identity with the live and stored trees,
+then recognizes a completed exchange or completes it only when non-application
+is proven. Final acceptance is a typed, no-default proof
 requiring exact source inventory with no research files, authoritative Core
 check, consumed/dispatched/accepted removal restart, full readiness including
 `tuya_ble`, all four temporary services absent, and strict Repairs shape/zero
@@ -294,7 +347,8 @@ counts. Transfer, install, and inventory result counts must equal the exact
 controller-owned bundle or manifest count; a self-consistent different count
 is not admission.
 
-If the bound PTY session was lost, rollback does not reconnect automatically.
+If the bound PTY session was lost while the controller object survives,
+rollback does not reconnect automatically.
 The caller must explicitly bind one fresh, already active and validated broker
 while the controller is in `ROLLBACK_REQUIRED`. The lifecycle generation and
 all consumed permits remain unchanged. Only still-unused PR #41 rollback-tail,
@@ -303,7 +357,9 @@ Candidate, helper, restart, and Core-check permits are never reset or rebound.
 The same broker, an inactive broker, or any previously seen session generation
 is rejected locally before PTY output. A successful rebind registers the same
 controller and lifecycle generation with a fresh broker issuer; it does not
-make an old capability valid in the new session.
+make an old capability valid in the new session. After process reconstruction,
+the durable journal instead exposes only recovery-safe entrypoints; it never
+seamlessly resumes research.
 
 The PR #45 audit helper and audit service exist only while the candidate source
 is active. Collect every required helper-backed snapshot, including any A2
@@ -365,10 +421,14 @@ if "issues" not in data or not isinstance(data["issues"], list):
 issues = data["issues"]
 ```
 
-Task-specific filtering of `issues` must happen in-process. Retained/public
-evidence should contain only allowlisted aggregate results such as shape-valid,
-relevant-count, and critical-count. Do not dump issue objects merely to debug a
-collector.
+Issue classification/projection happens only inside the broker. The normal
+controller interface accepts no caller-supplied classifier over full issue
+objects. In the fixed fail-closed projection, every returned issue is
+conservatively blocking; only an exact empty list can produce zero relevant and
+critical counts. Retained/public evidence contains only the allowlisted
+shape-valid, relevant-count, and critical-count fields. Do not dump issue
+objects merely to debug a collector. Admission requires `shape_valid is True`,
+exact non-boolean integer counts, and both counts exactly zero.
 
 Use the same strict decoder at every admission point in one live run: initial,
 post-activation, and post-rollback. Its only retained result is the allowlisted
