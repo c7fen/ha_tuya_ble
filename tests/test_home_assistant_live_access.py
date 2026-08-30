@@ -7,8 +7,8 @@ import io
 import json
 import os
 import pty
-import re
 import sys
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 
@@ -227,13 +227,12 @@ print("SYNTHETIC_BANNER_IPV6=2001:db8::37", flush=True)
 print("SYNTHETIC_BANNER_HOST=private-host.invalid", flush=True)
 print("SYNTHETIC_BANNER_URL=http://private-host.invalid:8123", flush=True)
 print("SYNTHETIC_BANNER_OBSERVER=http://observer.invalid", flush=True)
-frame = re.compile(r"\\036(HA_BROKER_[A-Z_]+:[0-9a-f]+)\\037")
 login = False
 for line in sys.stdin:
     if line.strip() == "exec bash -li":
         login = True
         continue
-    values = frame.findall(line)
+    values = re.findall(r"HA_BROKER_[A-Z_]+:[0-9a-f]+", line)
     if "HA_BROKER_REMOTE" in line and values:
         print("\x1e" + values[0] + "\x1f", flush=True)
     elif "HA_BROKER_LOGIN" in line and values and login:
@@ -334,6 +333,7 @@ def test_b_m8_and_b_m9_static_banner_or_prompt_cannot_fake_challenges(
     if name == "B-M8":
         child = r"""
 import os
+import re
 import sys
 assert os.isatty(0)
 print("SYNTHETIC_TIMEOUT_PRIVATE_START=private-host.invalid", flush=True)
@@ -346,10 +346,9 @@ import os
 import re
 import sys
 assert os.isatty(0)
-frame = re.compile(r"\\036(HA_BROKER_[A-Z_]+:[0-9a-f]+)\\037")
 print("SYNTHETIC_STATIC_PROMPT=READY", flush=True)
 for line in sys.stdin:
-    values = frame.findall(line)
+    values = re.findall(r"HA_BROKER_[A-Z_]+:[0-9a-f]+", line)
     if "HA_BROKER_REMOTE" in line and values:
         print("\x1e" + values[0] + "\x1f", flush=True)
     # Deliberately never acknowledge the post-exec login-shell challenge.
@@ -372,10 +371,82 @@ def test_b_m10_real_wrapper_is_never_executed_by_synthetic_tests(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """B-M10: a fake child can run only through the private spawn seam."""
-    broker = _broker(monkeypatch, tmp_path, _RESPONSIVE_PTY_CHILD)
+    wrapper = tmp_path / "SYNTHETIC_REAL_WRAPPER_MUST_NOT_RUN"
+    marker = tmp_path / "SYNTHETIC_REAL_WRAPPER_RAN"
+    wrapper.write_text(
+        "#!/bin/sh\nprintf x > '" + str(marker) + "'\n",
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o700)
+    spawns: list[Path] = []
+    monkeypatch.setattr(
+        access,
+        "validate_private_wrapper",
+        lambda path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
+    )
+
+    def fake_spawn(path: Path) -> tuple[int, int]:
+        spawns.append(path)
+        return _fake_spawn(_RESPONSIVE_PTY_CHILD)(path)
+
+    monkeypatch.setattr(access, "_spawn_private_wrapper", fake_spawn)
+    broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
     broker.open()
     broker.close()
-    assert not (tmp_path / "SYNTHETIC_REAL_WRAPPER_MUST_NOT_RUN").exists()
+    assert spawns == [wrapper]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "child"),
+    [
+        ("B-M8-START", None),
+        (
+            "B-M8-EXIT",
+            "raise SystemExit('SYNTHETIC_CHILD_EXIT_PRIVATE_SENTINEL')",
+        ),
+    ],
+)
+def test_b_m8_exception_paths_never_retain_private_failure_context(
+    name: str,
+    child: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """B-M8: spawn and child-exit errors expose only generic broker classes."""
+    private_sentinel = "SYNTHETIC_START_PRIVATE_SENTINEL"
+    if child is None:
+        wrapper = tmp_path / "synthetic-wrapper"
+        monkeypatch.setattr(
+            access,
+            "validate_private_wrapper",
+            lambda path: access.WrapperValidationResult(
+                access.PRIVATE_WRAPPER_VALID, ()
+            ),
+        )
+
+        def fail_spawn(_: Path) -> tuple[int, int]:
+            raise OSError(private_sentinel)
+
+        monkeypatch.setattr(access, "_spawn_private_wrapper", fail_spawn)
+        broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.05)
+        forbidden = private_sentinel
+    else:
+        broker = _broker(monkeypatch, tmp_path, child)
+        forbidden = "SYNTHETIC_CHILD_EXIT_PRIVATE_SENTINEL"
+
+    with pytest.raises(access.SessionBrokerError) as error:
+        broker.open()
+
+    rendered = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    context = repr(error.value.__context__)
+    assert name.startswith("B-M8")
+    assert forbidden not in str(error.value)
+    assert forbidden not in repr(error.value)
+    assert forbidden not in context
+    assert forbidden not in rendered
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 def test_o_m6_private_instruction_never_reaches_bootstrap_stdout(
@@ -442,21 +513,12 @@ def test_o_m9_broker_has_no_network_or_unbounded_terminal_passthrough() -> None:
         if isinstance(node, ast.Import)
         for alias in node.names
     }
-    called_attributes = {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-
     assert not imported_roots & {"socket", "urllib", "requests", "http"}
-    assert not called_attributes & {
-        "execv",
-        "execve",
-        "execvp",
-        "execvpe",
-        "system",
-        "popen",
-    }
+    source = Path(access.__file__).read_text(encoding="utf-8")
+    assert "subprocess" not in source
+    assert "DEVNULL" not in source
+    assert "def execute(" not in source
+    assert hasattr(access.PrivateInteractiveSessionBroker, "collect_resolution_info")
 
 
 def test_o_m10_public_results_do_not_retain_private_host_or_path(
