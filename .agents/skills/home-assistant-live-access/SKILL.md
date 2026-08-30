@@ -147,8 +147,16 @@ prompts, helper output, and raw Supervisor responses remain inside the PTY.
 `FullPreflightLifecycleController` is the only public live-capable operation
 surface. The lower broker exposes only session `open`, `close`, and generic
 state; all Repairs, source, Core, restart, service-inventory, helper, and
-restoration adapters are internal. Do not invoke or expose an internal broker
-adapter directly. The controller has no command-string, argv, stdin/stdout
+restoration adapters require a controller-minted capability even when their
+underscore-private names are reached directly. Each capability is bound by
+identity to the registered controller, lifecycle generation, broker session,
+and one exact action, and is consumed by bounded dispatch before PTY output.
+It cannot authorize another action, session, lifecycle, broker, or second use.
+The broker's raw PTY writer requires a distinct broker-owned write scope; a
+lifecycle capability can never authorize caller-provided terminal text.
+Bootstrap/login writes use that separate scope only for fixed, state-bound
+commands. Do not invoke or expose an internal broker adapter directly. The
+controller has no command-string, argv, stdin/stdout
 bridge, remote-path, service-name, endpoint, environment-variable, arbitrary
 helper-operation, caller nonce, or caller audit-label argument.
 
@@ -188,8 +196,11 @@ BASELINE
 Every transition checks its exact predecessor and all local typed inputs before
 PTY output. Immediately before a represented action dispatch, the controller
 consumes an action-specific permit bound to the current controller generation
-and broker session. Success, rejection, malformed output, transport failure,
-and exit 78 all leave that permit consumed. P0 also consumes its lifecycle
+and broker session, then mints the matching one-shot broker capability.
+The broker adapter validates the same action and bounded dispatch consumes the
+capability before its first write. Success, rejection, malformed output,
+transport failure, and exit 78 all leave the lifecycle permit and any dispatched
+capability consumed. P0 also consumes its lifecycle
 permit, while still requiring exit 65, `not_submitted`, and zero HTTP handoff.
 `PREFLIGHT` and its exact-nonce `RECEIPT` use distinct permits. Receipt lookup
 after exit 78 may use one separate permit; it cannot reset or replay the
@@ -273,7 +284,9 @@ all consumed permits remain unchanged. Only still-unused PR #41 rollback-tail,
 ambiguity-receipt, and backup-fallback permits are rebound to the fresh session.
 Candidate, helper, restart, and Core-check permits are never reset or rebound.
 The same broker, an inactive broker, or any previously seen session generation
-is rejected locally before PTY output.
+is rejected locally before PTY output. A successful rebind registers the same
+controller and lifecycle generation with a fresh broker issuer; it does not
+make an old capability valid in the new session.
 
 The PR #45 audit helper and audit service exist only while the candidate source
 is active. Collect every required helper-backed snapshot, including any A2
@@ -365,9 +378,9 @@ For agent/orchestrator execution:
 2. Let it privately consume the Home Assistant prompt/banner and establish the
    verified login shell.
 3. Wait only for its generic readiness sentinel.
-4. Use only the broker method that exactly represents the authorized operation
-  in that existing interactive session; never bridge raw remote stdout or
-  request a general command channel.
+4. Use only the lifecycle controller method for the current admitted state;
+   never call a broker adapter, bridge raw remote stdout, or request a general
+   command channel.
 5. Validate structured admission responses strictly before mutation gates.
 6. Keep authorization boundaries from the active task; this skill grants no
    deployment, restart, service-call, BLE, lock, or configuration permission by

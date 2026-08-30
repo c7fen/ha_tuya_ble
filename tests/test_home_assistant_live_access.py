@@ -407,7 +407,12 @@ def test_e_m1_to_e_m5_broker_enforces_exact_framed_json_boundary(
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
     try:
         evidence = broker._collect_resolution_info(
-            access.RepairsGate.INITIAL, _relevant, _critical
+            access.RepairsGate.INITIAL,
+            _relevant,
+            _critical,
+            _capability=_r32_controller_minted_capability(
+                broker, access.LifecycleAction.INITIAL_REPAIRS
+            ),
         )
     finally:
         broker.close()
@@ -445,7 +450,12 @@ def test_rejected_framed_payload_is_never_emitted(
 
     broker.open()
     evidence = broker._collect_resolution_info(
-        access.RepairsGate.INITIAL, _relevant, _critical
+        access.RepairsGate.INITIAL,
+        _relevant,
+        _critical,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.INITIAL_REPAIRS
+        ),
     )
     broker.close()
 
@@ -478,10 +488,20 @@ def test_b_m1_to_b_m6_private_pty_output_never_reaches_transcript(
 
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
     assert broker._collect_resolution_info(
-        access.RepairsGate.INITIAL, _relevant, _critical
+        access.RepairsGate.INITIAL,
+        _relevant,
+        _critical,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.INITIAL_REPAIRS
+        ),
     ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
     assert broker._collect_resolution_info(
-        access.RepairsGate.POST_ACTIVATION, _relevant, _critical
+        access.RepairsGate.POST_ACTIVATION,
+        _relevant,
+        _critical,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.POST_ACTIVATION_REPAIRS
+        ),
     ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
     broker.close()
 
@@ -577,7 +597,12 @@ def test_b_m7_wrapper_contents_never_reach_retained_output(
 
     broker.open()
     evidence = broker._collect_resolution_info(
-        access.RepairsGate.INITIAL, _relevant, _critical
+        access.RepairsGate.INITIAL,
+        _relevant,
+        _critical,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.INITIAL_REPAIRS
+        ),
     )
     broker.close()
 
@@ -1237,20 +1262,21 @@ def test_r30_restart_replay_rejected_before_second_remote_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One activated source state can submit at most one restart."""
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
-    broker._active_source_state = access.SourceState.CANDIDATE
-    broker._restarted_states = set()
+    broker = _r32_unbound_real_broker()
     calls: list[object] = []
 
-    def execute(operation: object, _value: object) -> bytes:
+    def execute(operation: object, _value: object, *, _capability: object) -> bytes:
         calls.append(operation)
         return b'{"submitted":true,"accepted":true}'
 
     monkeypatch.setattr(broker, "_execute_bounded_operation", execute)
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.ACTIVATION_RESTART
+    )
 
-    assert broker._restart_core().accepted is True
+    assert broker._restart_core(_capability=capability).accepted is True
     with pytest.raises(access.SessionBrokerError, match="ALREADY_SUBMITTED"):
-        broker._restart_core()
+        broker._restart_core(_capability=capability)
     assert calls == [access.BoundedOperation.RESTART_CORE]
 
 
@@ -1328,15 +1354,27 @@ def test_r30_helper_exit_78_invocation_is_not_replayed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One ambiguous helper operation causes exactly one remote dispatch."""
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    broker = _r32_unbound_real_broker()
     calls: list[object] = []
 
-    def execute(operation: object, _value: object, *, detail: str) -> bytes:
+    def execute(
+        operation: object,
+        _value: object,
+        *,
+        detail: str,
+        _capability: object,
+    ) -> bytes:
         calls.append((operation, detail))
         return b'{"exit_code":78,"outcome":"transport_ambiguous","nonce":"aaaaaaaaaaaaaaaa"}'
 
     monkeypatch.setattr(broker, "_execute_bounded_operation", execute)
-    result = broker._invoke_phase_a(access.PhaseAOperation.PREFLIGHT, nonce="a" * 16)
+    result = broker._invoke_phase_a(
+        access.PhaseAOperation.PREFLIGHT,
+        nonce="a" * 16,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.PREFLIGHT
+        ),
+    )
 
     assert result.exit_code == 78
     assert calls == [(access.BoundedOperation.PHASE_A_HELPER, "preflight")]
@@ -1470,7 +1508,8 @@ def test_r30_private_backup_restore_is_fixed_and_typed() -> None:
         access.PrivateInteractiveSessionBroker._restore_private_backup
     )
 
-    assert tuple(signature.parameters) == ("self",)
+    assert tuple(signature.parameters) == ("self", "_capability")
+    assert signature.parameters["_capability"].kind is inspect.Parameter.KEYWORD_ONLY
     assert access.BoundedOperation.RESTORE_BACKUP.value == "restore_backup"
 
 
@@ -1739,63 +1778,120 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
     )
 
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
+
+    def capability(action: access.LifecycleAction) -> object:
+        return _r32_controller_minted_capability(broker, action)
+
     assert broker._collect_resolution_info(
-        access.RepairsGate.INITIAL, _relevant, _critical
+        access.RepairsGate.INITIAL,
+        _relevant,
+        _critical,
+        _capability=capability(access.LifecycleAction.INITIAL_REPAIRS),
     ).shape_valid
-    assert broker._create_private_backup().success
-    assert broker._transfer_source_bundle(candidate).manifest_match
-    assert broker._install_staged_source(candidate.manifest).manifest_match
-    assert broker._verify_source_inventory(candidate.manifest).manifest_match
-    assert broker._check_core(1).check_passed
-    assert broker._restart_core().accepted
-    assert broker._wait_for_core_readiness().integration_loaded
+    assert broker._create_private_backup(
+        _capability=capability(access.LifecycleAction.BACKUP)
+    ).success
+    assert broker._transfer_source_bundle(
+        candidate,
+        _capability=capability(access.LifecycleAction.CANDIDATE_TRANSFER),
+    ).manifest_match
+    assert broker._install_staged_source(
+        candidate.manifest,
+        _capability=capability(access.LifecycleAction.CANDIDATE_INSTALL),
+    ).manifest_match
+    assert broker._verify_source_inventory(
+        candidate.manifest,
+        _capability=capability(access.LifecycleAction.CANDIDATE_INVENTORY),
+    ).manifest_match
+    assert broker._check_core(
+        1,
+        _capability=capability(access.LifecycleAction.CANDIDATE_CORE_CHECK_1),
+    ).check_passed
+    assert broker._restart_core(
+        _capability=capability(access.LifecycleAction.ACTIVATION_RESTART)
+    ).accepted
+    assert broker._wait_for_core_readiness(
+        _capability=capability(access.LifecycleAction.CANDIDATE_READINESS)
+    ).integration_loaded
     assert broker._inventory_temporary_services(
-        access.ServiceExpectation.PRESENT
+        access.ServiceExpectation.PRESENT,
+        _capability=capability(access.LifecycleAction.SERVICES_PRESENT),
     ).all_expected_present
     a0 = broker._invoke_phase_a(
         access.PhaseAOperation.AUDIT,
         nonce="b" * 16,
         evidence_label=access.AuditLabel.A0,
+        _capability=capability(access.LifecycleAction.A0),
     )
     assert a0.audit is not None
-    assert broker._run_invalid_nonce_preflight().http_handoff is False
+    assert (
+        broker._run_invalid_nonce_preflight(
+            _capability=capability(access.LifecycleAction.P0)
+        ).http_handoff
+        is False
+    )
     ap0 = broker._invoke_phase_a(
         access.PhaseAOperation.AUDIT,
         nonce="b" * 16,
         evidence_label=access.AuditLabel.AP0,
+        _capability=capability(access.LifecycleAction.AP0),
     )
     assert access.compare_audit_snapshots(a0.audit, ap0.audit).zero_io_unchanged
     assert (
         broker._invoke_phase_a(
-            access.PhaseAOperation.PREFLIGHT, nonce="b" * 16
+            access.PhaseAOperation.PREFLIGHT,
+            nonce="b" * 16,
+            _capability=capability(access.LifecycleAction.PREFLIGHT),
         ).exit_code
         == 0
     )
     assert broker._invoke_phase_a(
-        access.PhaseAOperation.RECEIPT, nonce="b" * 16
+        access.PhaseAOperation.RECEIPT,
+        nonce="b" * 16,
+        _capability=capability(access.LifecycleAction.RECEIPT),
     ).exit_code in {0, 66}
     a1 = broker._invoke_phase_a(
         access.PhaseAOperation.AUDIT,
         nonce="b" * 16,
         evidence_label=access.AuditLabel.A1,
+        _capability=capability(access.LifecycleAction.A1),
     )
     assert a1.audit is not None
     a2 = broker._invoke_phase_a(
         access.PhaseAOperation.AUDIT,
         nonce="b" * 16,
         evidence_label=access.AuditLabel.A2,
+        _capability=capability(access.LifecycleAction.A2),
     )
     assert a2.audit is not None
-    assert broker._restore_source(restore).manifest_match
-    assert broker._check_core(1).check_passed
-    assert broker._restart_core().accepted
-    assert broker._wait_for_core_readiness().integration_loaded
-    assert broker._verify_source_inventory(restore.manifest).manifest_match
+    assert broker._restore_source(
+        restore,
+        _transfer_capability=capability(access.LifecycleAction.RESTORE_TRANSFER),
+        _install_capability=capability(access.LifecycleAction.RESTORE_INSTALL),
+    ).manifest_match
+    assert broker._check_core(
+        1,
+        _capability=capability(access.LifecycleAction.RESTORE_CORE_CHECK_1),
+    ).check_passed
+    assert broker._restart_core(
+        _capability=capability(access.LifecycleAction.REMOVAL_RESTART)
+    ).accepted
+    assert broker._wait_for_core_readiness(
+        _capability=capability(access.LifecycleAction.RESTORE_READINESS)
+    ).integration_loaded
+    assert broker._verify_source_inventory(
+        restore.manifest,
+        _capability=capability(access.LifecycleAction.RESTORE_INVENTORY),
+    ).manifest_match
     assert broker._inventory_temporary_services(
-        access.ServiceExpectation.ABSENT
+        access.ServiceExpectation.ABSENT,
+        _capability=capability(access.LifecycleAction.SERVICES_ABSENT),
     ).all_expected_absent
     assert broker._collect_resolution_info(
-        access.RepairsGate.POST_ROLLBACK, _relevant, _critical
+        access.RepairsGate.POST_ROLLBACK,
+        _relevant,
+        _critical,
+        _capability=capability(access.LifecycleAction.POST_RESTORE_REPAIRS),
     ).shape_valid
     broker.close()
 
@@ -1830,12 +1926,10 @@ def test_r30_restart_allowance_consumed_on_every_first_dispatch(
     failure_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A lost or rejected first result cannot authorize a second restart."""
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
-    broker._active_source_state = access.SourceState.CANDIDATE
-    broker._restarted_states = set()
+    broker = _r32_unbound_real_broker()
     calls = 0
 
-    def execute(_operation: object, _value: object) -> bytes:
+    def execute(_operation: object, _value: object, *, _capability: object) -> bytes:
         nonlocal calls
         calls += 1
         if failure_mode == "exception":
@@ -1843,14 +1937,17 @@ def test_r30_restart_allowance_consumed_on_every_first_dispatch(
         return b'{"submitted":false,"accepted":false}'
 
     monkeypatch.setattr(broker, "_execute_bounded_operation", execute)
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.ACTIVATION_RESTART
+    )
 
     if failure_mode == "exception":
         with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
-            broker._restart_core()
+            broker._restart_core(_capability=capability)
     else:
-        assert broker._restart_core().submitted is False
+        assert broker._restart_core(_capability=capability).submitted is False
     with pytest.raises(access.SessionBrokerError, match="ALREADY_SUBMITTED"):
-        broker._restart_core()
+        broker._restart_core(_capability=capability)
     assert calls == 1
 
 
@@ -1858,10 +1955,14 @@ def test_r30_echo_suppression_must_succeed_before_operation_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed stty transition cannot release program or bundle bytes."""
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    broker = _r32_unbound_real_broker()
     broker._echo_disabled = False
     writes: list[str] = []
-    monkeypatch.setattr(broker, "_write_private", writes.append)
+
+    def write(value: str, **_kwargs: object) -> None:
+        writes.append(value)
+
+    monkeypatch.setattr(broker, "_write_private", write)
 
     def fail_read(_frame: bytes, **_kwargs: object) -> bytes:
         raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
@@ -1869,7 +1970,9 @@ def test_r30_echo_suppression_must_succeed_before_operation_bytes(
     monkeypatch.setattr(broker, "_read_until", fail_read)
 
     with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
-        broker._ensure_echo_disabled()
+        broker._ensure_echo_disabled(
+            _write_token=broker._PrivateInteractiveSessionBroker__write_token
+        )
     assert len(writes) == 1
     assert writes[0].startswith("stty -echo && ")
     assert "python3" not in writes[0]
@@ -2078,22 +2181,23 @@ def test_r30_broker_backup_fence_consumed_before_failed_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A lost fallback result cannot authorize a second remote exchange."""
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
-    broker._active_source_state = access.SourceState.CANDIDATE
-    broker._backup_restore_attempted = False
+    broker = _r32_unbound_real_broker()
     calls = 0
 
-    def execute(_operation: object, _value: object) -> bytes:
+    def execute(_operation: object, _value: object, *, _capability: object) -> bytes:
         nonlocal calls
         calls += 1
         raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
 
     monkeypatch.setattr(broker, "_execute_bounded_operation", execute)
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.BACKUP_FALLBACK
+    )
 
     with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
-        broker._restore_private_backup()
+        broker._restore_private_backup(_capability=capability)
     with pytest.raises(access.SourceBundleError, match="ALREADY_CONSUMED"):
-        broker._restore_private_backup()
+        broker._restore_private_backup(_capability=capability)
     assert calls == 1
 
 
@@ -2103,8 +2207,54 @@ class _R32ScriptedBroker:
     def __init__(self) -> None:
         self.state = access.BrokerState.SESSION_ACTIVE
         self._session_generation = object()
+        self._controller_binding: (
+            tuple[object, access._CapabilityIssuer, object, object] | None
+        ) = None
         self.calls: list[tuple[str, object]] = []
         self.responses: dict[str, list[object]] = {}
+
+    def _register_lifecycle_controller(
+        self,
+        controller: object,
+        lifecycle_generation: object,
+        session_generation: object,
+    ) -> object:
+        if (
+            self.state is not access.BrokerState.SESSION_ACTIVE
+            or self._session_generation is not session_generation
+            or self._controller_binding is not None
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_CONTROLLER_BINDING_INVALID")
+        issuer = access._CapabilityIssuer(object(), [], [])
+        self._controller_binding = (
+            controller,
+            issuer,
+            lifecycle_generation,
+            session_generation,
+        )
+        return issuer
+
+    def _consume_capability(
+        self,
+        capability: object,
+        *actions: access.LifecycleAction,
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            type(capability) is not access._LifecycleCapability
+            or binding is None
+            or capability.controller is not binding[0]
+            or capability.issuer is not binding[1].identity
+            or capability.lifecycle_generation is not binding[2]
+            or capability.session_generation is not binding[3]
+            or self._session_generation is not binding[3]
+            or capability.action not in actions
+            or not any(capability is issued for issued in binding[1].issued)
+            or any(capability is consumed for consumed in binding[1].consumed)
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_CAPABILITY_INVALID")
+        binding[1].consumed.append(capability)
+        capability.consumed = True
 
     def queue(self, name: str, *responses: object) -> None:
         self.responses.setdefault(name, []).extend(responses)
@@ -2122,19 +2272,44 @@ class _R32ScriptedBroker:
         gate: access.RepairsGate,
         _is_relevant: object,
         _is_critical: object,
+        *,
+        _capability: object = None,
     ) -> access.RepairsEvidence:
+        self._consume_capability(
+            _capability,
+            {
+                access.RepairsGate.INITIAL: access.LifecycleAction.INITIAL_REPAIRS,
+                access.RepairsGate.POST_ACTIVATION: (
+                    access.LifecycleAction.POST_ACTIVATION_REPAIRS
+                ),
+                access.RepairsGate.POST_ROLLBACK: (
+                    access.LifecycleAction.POST_RESTORE_REPAIRS
+                ),
+            }[gate],
+        )
         return self._next(
             "repairs",
             gate,
             access.RepairsEvidence(True, 0, 0),
         )
 
-    def _create_private_backup(self) -> access.BackupResult:
+    def _create_private_backup(
+        self, *, _capability: object = None
+    ) -> access.BackupResult:
+        self._consume_capability(_capability, access.LifecycleAction.BACKUP)
         return self._next("backup", None, access.BackupResult(True, 3, True, True))
 
     def _transfer_source_bundle(
-        self, bundle: access.SourceBundle
+        self, bundle: access.SourceBundle, *, _capability: object = None
     ) -> access.TransferResult:
+        self._consume_capability(
+            _capability,
+            (
+                access.LifecycleAction.CANDIDATE_TRANSFER
+                if bundle.state is access.SourceState.CANDIDATE
+                else access.LifecycleAction.RESTORE_TRANSFER
+            ),
+        )
         return self._next(
             "transfer",
             bundle.state,
@@ -2142,8 +2317,9 @@ class _R32ScriptedBroker:
         )
 
     def _install_staged_source(
-        self, manifest: access.SourceManifest
+        self, manifest: access.SourceManifest, *, _capability: object = None
     ) -> access.InstallResult:
+        self._consume_capability(_capability, access.LifecycleAction.CANDIDATE_INSTALL)
         return self._next(
             "install_candidate",
             manifest.state,
@@ -2153,8 +2329,9 @@ class _R32ScriptedBroker:
         )
 
     def _install_staged_restore(
-        self, manifest: access.SourceManifest
+        self, manifest: access.SourceManifest, *, _capability: object = None
     ) -> access.InstallResult:
+        self._consume_capability(_capability, access.LifecycleAction.RESTORE_INSTALL)
         return self._next(
             "install_restore",
             manifest.state,
@@ -2164,8 +2341,16 @@ class _R32ScriptedBroker:
         )
 
     def _verify_source_inventory(
-        self, manifest: access.SourceManifest
+        self, manifest: access.SourceManifest, *, _capability: object = None
     ) -> access.SourceInventoryResult:
+        self._consume_capability(
+            _capability,
+            (
+                access.LifecycleAction.CANDIDATE_INVENTORY
+                if manifest.state is access.SourceState.CANDIDATE
+                else access.LifecycleAction.RESTORE_INVENTORY
+            ),
+        )
         count = len(manifest.entries)
         return self._next(
             "inventory",
@@ -2173,17 +2358,38 @@ class _R32ScriptedBroker:
             access.SourceInventoryResult(count, count, True, 0, 0),
         )
 
-    def _check_core(self, attempt_ordinal: int) -> access.CoreCheckResult:
+    def _check_core(
+        self, attempt_ordinal: int, *, _capability: object = None
+    ) -> access.CoreCheckResult:
+        self._consume_capability(
+            _capability,
+            access.LifecycleAction.CANDIDATE_CORE_CHECK_1,
+            access.LifecycleAction.CANDIDATE_CORE_CHECK_2,
+            access.LifecycleAction.RESTORE_CORE_CHECK_1,
+            access.LifecycleAction.RESTORE_CORE_CHECK_2,
+        )
         return self._next(
             "core_check",
             attempt_ordinal,
             access.CoreCheckResult(attempt_ordinal, 200, "ok", True, None),
         )
 
-    def _restart_core(self) -> access.RestartResult:
+    def _restart_core(self, *, _capability: object = None) -> access.RestartResult:
+        self._consume_capability(
+            _capability,
+            access.LifecycleAction.ACTIVATION_RESTART,
+            access.LifecycleAction.REMOVAL_RESTART,
+        )
         return self._next("restart", None, access.RestartResult(True, True))
 
-    def _wait_for_core_readiness(self) -> access.CoreReadinessResult:
+    def _wait_for_core_readiness(
+        self, *, _capability: object = None
+    ) -> access.CoreReadinessResult:
+        self._consume_capability(
+            _capability,
+            access.LifecycleAction.CANDIDATE_READINESS,
+            access.LifecycleAction.RESTORE_READINESS,
+        )
         return self._next(
             "readiness",
             None,
@@ -2191,8 +2397,16 @@ class _R32ScriptedBroker:
         )
 
     def _inventory_temporary_services(
-        self, expectation: access.ServiceExpectation
+        self, expectation: access.ServiceExpectation, *, _capability: object = None
     ) -> access.ServiceInventoryResult:
+        self._consume_capability(
+            _capability,
+            (
+                access.LifecycleAction.SERVICES_PRESENT
+                if expectation is access.ServiceExpectation.PRESENT
+                else access.LifecycleAction.SERVICES_ABSENT
+            ),
+        )
         if expectation is access.ServiceExpectation.PRESENT:
             default = access.ServiceInventoryResult(4, 4, True, 0, 0, True)
         else:
@@ -2205,7 +2419,24 @@ class _R32ScriptedBroker:
         *,
         nonce: str | None = None,
         evidence_label: access.AuditLabel | None = None,
+        _capability: object = None,
     ) -> access.PhaseAResult:
+        if operation is access.PhaseAOperation.AUDIT:
+            action = {
+                access.AuditLabel.A0: access.LifecycleAction.A0,
+                access.AuditLabel.AP0: access.LifecycleAction.AP0,
+                access.AuditLabel.A1: access.LifecycleAction.A1,
+                access.AuditLabel.A2: access.LifecycleAction.A2,
+            }[evidence_label]
+            self._consume_capability(_capability, action)
+        elif operation is access.PhaseAOperation.PREFLIGHT:
+            self._consume_capability(_capability, access.LifecycleAction.PREFLIGHT)
+        else:
+            self._consume_capability(
+                _capability,
+                access.LifecycleAction.RECEIPT,
+                access.LifecycleAction.AMBIGUOUS_RECEIPT,
+            )
         if operation is access.PhaseAOperation.AUDIT:
             default = access.PhaseAResult(
                 operation,
@@ -2221,7 +2452,10 @@ class _R32ScriptedBroker:
             default = access.PhaseAResult(operation, 66, "receipt", nonce)
         return self._next("helper", (operation, nonce, evidence_label), default)
 
-    def _run_invalid_nonce_preflight(self) -> access.PhaseAResult:
+    def _run_invalid_nonce_preflight(
+        self, *, _capability: object = None
+    ) -> access.PhaseAResult:
+        self._consume_capability(_capability, access.LifecycleAction.P0)
         return self._next(
             "p0",
             None,
@@ -2234,7 +2468,10 @@ class _R32ScriptedBroker:
             ),
         )
 
-    def _restore_private_backup(self) -> access.InstallResult:
+    def _restore_private_backup(
+        self, *, _capability: object = None
+    ) -> access.InstallResult:
+        self._consume_capability(_capability, access.LifecycleAction.BACKUP_FALLBACK)
         return self._next(
             "backup_fallback",
             None,
@@ -2278,9 +2515,12 @@ def _r32_controller_minted_capability(
     action: access.LifecycleAction,
 ) -> object:
     """Capture one capability through the controller's guarded dispatch path."""
-    controller = access.FullPreflightLifecycleController(
-        broker, is_relevant=_relevant, is_critical=_critical
-    )
+    controller = getattr(broker, "_synthetic_test_controller", None)
+    if controller is None:
+        controller = access.FullPreflightLifecycleController(
+            broker, is_relevant=_relevant, is_critical=_critical
+        )
+        broker._synthetic_test_controller = controller
     dispatch_token = controller._FullPreflightLifecycleController__dispatch_token
     return controller._dispatch(
         action,
@@ -2476,10 +2716,30 @@ def test_r32_capability_and_raw_write_scope_are_distinct_one_shot_tokens(
         access.BoundedOperation.BACKUP, {}, _capability=capability
     )
     writes_after_first_use = list(writes)
+    controller = broker._synthetic_test_controller
+
+    assert capability.consumed is True
+    assert controller._permits[access.LifecycleAction.BACKUP].consumed is True
 
     with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
         broker._execute_bounded_operation(
             access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    capability.consumed = False
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    forged = access._LifecycleCapability(
+        capability.controller,
+        capability.issuer,
+        capability.lifecycle_generation,
+        capability.session_generation,
+        capability.action,
+    )
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=forged
         )
     with pytest.raises(access.SessionBrokerError, match="WRITE_SCOPE_INVALID"):
         access.PrivateInteractiveSessionBroker._write_private(
@@ -2582,16 +2842,21 @@ def test_r32_c1_m10_remote_core_check_never_synthesizes_authoritative_body_field
 def test_r32_core_check_completed_generic_error_is_typed_fail_not_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    broker = _r32_unbound_real_broker()
     monkeypatch.setattr(
         broker,
         "_execute_bounded_operation",
-        lambda _operation, _value: (
+        lambda _operation, _value, **_kwargs: (
             b'{"http_status":0,"result":"error","error_class":"REQUEST_FAILED"}'
         ),
     )
 
-    result = broker._check_core(1)
+    result = broker._check_core(
+        1,
+        _capability=_r32_controller_minted_capability(
+            broker, access.LifecycleAction.CANDIDATE_CORE_CHECK_1
+        ),
+    )
 
     assert result == access.CoreCheckResult(1, 0, "error", False, "REQUEST_FAILED")
 
@@ -2707,8 +2972,10 @@ def test_r32_c2_m9_and_m10_source_consumes_permit_before_helper_dispatch() -> No
     source = inspect.getsource(access.FullPreflightLifecycleController)
 
     consume = source.index("permit.consume(")
-    dispatch = source.index("callback()", consume)
+    mint = source.index("capability = _LifecycleCapability(", consume)
+    dispatch = source.index("callback(capability)", mint)
     assert consume < dispatch
+    assert consume < mint < dispatch
     assert "PERMIT_CONSUMED" in source
 
 
@@ -3033,12 +3300,12 @@ def test_r32_core_check_completed_fail_has_no_retry_but_outer_ambiguity_allows_a
 def test_r32_terminal_broker_timeout_requires_explicit_fresh_rollback_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    broker = object.__new__(access.PrivateInteractiveSessionBroker)
-    broker._state = access.BrokerState.SESSION_ACTIVE
-    broker._session_generation = object()
+    broker = _r32_unbound_real_broker()
     calls = 0
 
-    def terminal_timeout(_operation: object, _value: object) -> bytes:
+    def terminal_timeout(
+        _operation: object, _value: object, **_kwargs: object
+    ) -> bytes:
         nonlocal calls
         calls += 1
         broker._state = access.BrokerState.CLOSED

@@ -222,6 +222,49 @@ class LifecycleAction(StrEnum):
     BACKUP_FALLBACK = "backup_fallback"
 
 
+_BOUNDED_OPERATION_ACTIONS = {
+    BoundedOperation.BACKUP: frozenset({LifecycleAction.BACKUP}),
+    BoundedOperation.TRANSFER: frozenset(
+        {LifecycleAction.CANDIDATE_TRANSFER, LifecycleAction.RESTORE_TRANSFER}
+    ),
+    BoundedOperation.INSTALL: frozenset({LifecycleAction.CANDIDATE_INSTALL}),
+    BoundedOperation.SOURCE_INVENTORY: frozenset(
+        {LifecycleAction.CANDIDATE_INVENTORY, LifecycleAction.RESTORE_INVENTORY}
+    ),
+    BoundedOperation.CORE_CHECK: frozenset(
+        {
+            LifecycleAction.CANDIDATE_CORE_CHECK_1,
+            LifecycleAction.CANDIDATE_CORE_CHECK_2,
+            LifecycleAction.RESTORE_CORE_CHECK_1,
+            LifecycleAction.RESTORE_CORE_CHECK_2,
+        }
+    ),
+    BoundedOperation.RESTART_CORE: frozenset(
+        {LifecycleAction.ACTIVATION_RESTART, LifecycleAction.REMOVAL_RESTART}
+    ),
+    BoundedOperation.CORE_READINESS: frozenset(
+        {LifecycleAction.CANDIDATE_READINESS, LifecycleAction.RESTORE_READINESS}
+    ),
+    BoundedOperation.SERVICE_INVENTORY: frozenset(
+        {LifecycleAction.SERVICES_PRESENT, LifecycleAction.SERVICES_ABSENT}
+    ),
+    BoundedOperation.PHASE_A_HELPER: frozenset(
+        {
+            LifecycleAction.A0,
+            LifecycleAction.P0,
+            LifecycleAction.AP0,
+            LifecycleAction.PREFLIGHT,
+            LifecycleAction.RECEIPT,
+            LifecycleAction.A1,
+            LifecycleAction.A2,
+            LifecycleAction.AMBIGUOUS_RECEIPT,
+        }
+    ),
+    BoundedOperation.RESTORE: frozenset({LifecycleAction.RESTORE_INSTALL}),
+    BoundedOperation.RESTORE_BACKUP: frozenset({LifecycleAction.BACKUP_FALLBACK}),
+}
+
+
 _ROLLBACK_REBIND_ACTIONS = frozenset(
     {
         LifecycleAction.RESTORE_TRANSFER,
@@ -240,6 +283,7 @@ _ROLLBACK_REBIND_ACTIONS = frozenset(
 )
 
 _ROLLBACK_BROKER_ADAPTERS = (
+    "_register_lifecycle_controller",
     "_transfer_source_bundle",
     "_install_staged_restore",
     "_verify_source_inventory",
@@ -263,6 +307,37 @@ class SourceBundleError(ValueError):
 
 class LifecycleControllerError(RuntimeError):
     """A fixed lifecycle failure that contains no private operation data."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilityIssuer:
+    """Shared identity ledgers proving controller issuance and broker consumption."""
+
+    identity: object
+    issued: list[object]
+    consumed: list[object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ControllerBinding:
+    """One exact controller/lifecycle/session registration held by a broker."""
+
+    controller: object
+    issuer: _CapabilityIssuer
+    lifecycle_generation: object
+    session_generation: object
+
+
+@dataclass(slots=True)
+class _LifecycleCapability:
+    """A controller-minted, broker-validated, one-shot action capability."""
+
+    controller: object
+    issuer: object
+    lifecycle_generation: object
+    session_generation: object
+    action: LifecycleAction
+    consumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1655,6 +1730,8 @@ class PrivateInteractiveSessionBroker:
         self._active_source_state: SourceState | None = None
         self._restarted_states: set[SourceState] = set()
         self._backup_restore_attempted = False
+        self._controller_binding: _ControllerBinding | None = None
+        self.__write_token = object()
 
     def __repr__(self) -> str:
         """Never render the wrapper path, target, argv, or captured output."""
@@ -1710,7 +1787,69 @@ class PrivateInteractiveSessionBroker:
             return True
         return False
 
-    def _write_private(self, value: str) -> None:
+    def _register_lifecycle_controller(
+        self,
+        controller: object,
+        lifecycle_generation: object,
+        session_generation: object,
+    ) -> object:
+        """Register one exact controller identity for the active broker session."""
+        if (
+            self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not session_generation
+            or self._controller_binding is not None
+            or controller.__class__ is not FullPreflightLifecycleController
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_CONTROLLER_BINDING_INVALID"
+            ) from None
+        issuer = _CapabilityIssuer(object(), [], [])
+        self._controller_binding = _ControllerBinding(
+            controller,
+            issuer,
+            lifecycle_generation,
+            session_generation,
+        )
+        return issuer
+
+    def _require_capability(
+        self,
+        capability: object,
+        expected_actions: frozenset[LifecycleAction],
+        *,
+        consume: bool = False,
+    ) -> _LifecycleCapability:
+        """Validate every binding dimension and optionally consume the capability."""
+        binding = self._controller_binding
+        if (
+            type(capability) is not _LifecycleCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.lifecycle_generation is not binding.lifecycle_generation
+            or capability.session_generation is not binding.session_generation
+            or capability.action not in expected_actions
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+            capability.consumed = True
+        return capability
+
+    def _require_write_token(self, write_token: object) -> None:
+        if write_token is not self.__write_token:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_WRITE_SCOPE_INVALID"
+            ) from None
+
+    def _write_private(self, value: str, *, _write_token: object = None) -> None:
+        self._require_write_token(_write_token)
         if self._master_fd is None:
             self._fail(BrokerFailure.PROTOCOL)
         encoded = value.encode("ascii")
@@ -1769,20 +1908,24 @@ class PrivateInteractiveSessionBroker:
                 self._fail(BrokerFailure.CHILD_EXITED)
             captured.extend(chunk)
 
-    def _challenge(self, phase: str) -> None:
+    def _challenge(self, phase: str, *, _write_token: object = None) -> None:
+        self._require_write_token(_write_token)
         payload, frame = self._new_frame(phase)
-        self._write_private(self._frame_printf(payload) + "\n")
+        self._write_private(
+            self._frame_printf(payload) + "\n", _write_token=self.__write_token
+        )
         self._read_until(frame)
 
-    def _verify_interactive_login_bash(self) -> None:
+    def _verify_interactive_login_bash(self, *, _write_token: object = None) -> None:
         """Prove post-``exec`` Bash, interactive mode, and login-shell mode together."""
+        self._require_write_token(_write_token)
         payload, frame = self._new_frame("LOGIN")
         command = (
             'if [ -n "${BASH_VERSION-}" ] && '
             "case $- in *i*) true ;; *) false ;; esac && "
             f"shopt -q login_shell; then {self._frame_printf(payload)}; fi\n"
         )
-        self._write_private(command)
+        self._write_private(command, _write_token=self.__write_token)
         self._read_until(frame)
 
     def _drain_and_discard(self, duration_seconds: float) -> None:
@@ -1828,10 +1971,10 @@ class PrivateInteractiveSessionBroker:
                 "PRIVATE_INTERACTIVE_SESSION_START_FAILED"
             ) from None
         self._state = BrokerState.SSH_CHILD_STARTED
-        self._challenge("REMOTE")
+        self._challenge("REMOTE", _write_token=self.__write_token)
         self._state = BrokerState.REMOTE_INTERACTIVE_READY
-        self._write_private("exec bash -li\n")
-        self._verify_interactive_login_bash()
+        self._write_private("exec bash -li\n", _write_token=self.__write_token)
+        self._verify_interactive_login_bash(_write_token=self.__write_token)
         self._state = BrokerState.LOGIN_SHELL_READY
         self._session_generation = object()
         self._state = BrokerState.SESSION_ACTIVE
@@ -1843,8 +1986,20 @@ class PrivateInteractiveSessionBroker:
         gate: RepairsGate,
         is_relevant: Callable[[object], bool],
         is_critical: Callable[[object], bool],
+        *,
+        _capability: object = None,
     ) -> RepairsEvidence:
         """Collect only fixed ``ha resolution info --raw-json`` aggregate evidence."""
+        actions = {
+            RepairsGate.INITIAL: LifecycleAction.INITIAL_REPAIRS,
+            RepairsGate.POST_ACTIVATION: LifecycleAction.POST_ACTIVATION_REPAIRS,
+            RepairsGate.POST_ROLLBACK: LifecycleAction.POST_RESTORE_REPAIRS,
+        }
+        if not isinstance(gate, RepairsGate):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
+            ) from None
+        self._require_capability(_capability, frozenset({actions[gate]}), consume=True)
         if self._state is not BrokerState.SESSION_ACTIVE:
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE") from None
         start_payload, start_frame = self._new_frame("RESULT_START")
@@ -1853,7 +2008,7 @@ class PrivateInteractiveSessionBroker:
             f"{self._frame_printf(start_payload)}; ha resolution info --raw-json; "
             f"{self._frame_printf(end_payload)}\n"
         )
-        self._write_private(command)
+        self._write_private(command, _write_token=self.__write_token)
         self._read_until(start_frame)
         private_output = self._read_until(end_frame)
         response = _extract_exact_framed_json_object(private_output)
@@ -1865,11 +2020,15 @@ class PrivateInteractiveSessionBroker:
         )
         return repairs_evidence(result)
 
-    def _ensure_echo_disabled(self) -> None:
+    def _ensure_echo_disabled(self, *, _write_token: object = None) -> None:
+        self._require_write_token(_write_token)
         if self._echo_disabled:
             return
         payload, frame = self._new_frame("ECHO_OFF")
-        self._write_private(f"stty -echo && {self._frame_printf(payload)}\n")
+        self._write_private(
+            f"stty -echo && {self._frame_printf(payload)}\n",
+            _write_token=self.__write_token,
+        )
         self._read_until(frame)
         self._echo_disabled = True
 
@@ -1879,12 +2038,16 @@ class PrivateInteractiveSessionBroker:
         value: dict[str, object],
         *,
         detail: str = "fixed",
+        _capability: object = None,
     ) -> bytes:
         """Run one enum operation with bounded chunks and exact private frames."""
         if not isinstance(operation, BoundedOperation):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
+        self._require_capability(
+            _capability, _BOUNDED_OPERATION_ACTIONS[operation], consume=True
+        )
         if self._state is not BrokerState.SESSION_ACTIVE:
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE") from None
         if not isinstance(value, dict) or not re.fullmatch(r"[a-z0-9_]+", detail):
@@ -1902,7 +2065,7 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        self._ensure_echo_disabled()
+        self._ensure_echo_disabled(_write_token=self.__write_token)
         start_payload, start_frame = self._new_frame("OPERATION_START")
         end_payload, end_frame = self._new_frame("OPERATION_END")
         encoded_program = base64.b64encode(
@@ -1928,14 +2091,16 @@ class PrivateInteractiveSessionBroker:
             f"python3 -c {shlex.quote(bootstrap)} {operation.value}; "
             f"{self._frame_printf(end_payload)}\n"
         )
-        self._write_private(command)
+        self._write_private(command, _write_token=self.__write_token)
         self._read_until(start_frame)
-        self._write_private(str(len(program_chunks)) + "\n")
+        self._write_private(
+            str(len(program_chunks)) + "\n", _write_token=self.__write_token
+        )
         for chunk in program_chunks:
-            self._write_private(chunk + "\n")
-        self._write_private(str(len(chunks)) + "\n")
+            self._write_private(chunk + "\n", _write_token=self.__write_token)
+        self._write_private(str(len(chunks)) + "\n", _write_token=self.__write_token)
         for chunk in chunks:
-            self._write_private(chunk + "\n")
+            self._write_private(chunk + "\n", _write_token=self.__write_token)
         deadlines = {
             BoundedOperation.TRANSFER: 90.0,
             BoundedOperation.INSTALL: 90.0,
@@ -1979,20 +2144,33 @@ class PrivateInteractiveSessionBroker:
         except (KeyError, TypeError, ValueError):
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
 
-    def _create_private_backup(self) -> BackupResult:
-        output = self._execute_bounded_operation(BoundedOperation.BACKUP, {})
+    def _create_private_backup(self, *, _capability: object = None) -> BackupResult:
+        self._require_capability(_capability, frozenset({LifecycleAction.BACKUP}))
+        output = self._execute_bounded_operation(
+            BoundedOperation.BACKUP, {}, _capability=_capability
+        )
         return self._simple_result(
             output,
             BackupResult,
             ("success", "file_count", "manifest_match", "regular_files_only"),
         )
 
-    def _transfer_source_bundle(self, bundle: SourceBundle) -> TransferResult:
+    def _transfer_source_bundle(
+        self, bundle: SourceBundle, *, _capability: object = None
+    ) -> TransferResult:
+        action = (
+            LifecycleAction.CANDIDATE_TRANSFER
+            if isinstance(bundle, SourceBundle)
+            and bundle.state is SourceState.CANDIDATE
+            else LifecycleAction.RESTORE_TRANSFER
+        )
+        self._require_capability(_capability, frozenset({action}))
         validate_source_bundle(bundle)
         output = self._execute_bounded_operation(
             BoundedOperation.TRANSFER,
             _bundle_payload(bundle),
             detail=bundle.state.value,
+            _capability=_capability,
         )
         return self._simple_result(
             output,
@@ -2000,7 +2178,12 @@ class PrivateInteractiveSessionBroker:
             ("success", "file_count", "manifest_match", "regular_files_only"),
         )
 
-    def _install_staged_source(self, manifest: SourceManifest) -> InstallResult:
+    def _install_staged_source(
+        self, manifest: SourceManifest, *, _capability: object = None
+    ) -> InstallResult:
+        self._require_capability(
+            _capability, frozenset({LifecycleAction.CANDIDATE_INSTALL})
+        )
         if (
             not isinstance(manifest, SourceManifest)
             or manifest.state is not SourceState.CANDIDATE
@@ -2010,6 +2193,7 @@ class PrivateInteractiveSessionBroker:
             BoundedOperation.INSTALL,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
+            _capability=_capability,
         )
         result = self._simple_result(
             output,
@@ -2026,42 +2210,87 @@ class PrivateInteractiveSessionBroker:
         return result
 
     def _verify_source_inventory(
-        self, manifest: SourceManifest
+        self, manifest: SourceManifest, *, _capability: object = None
     ) -> SourceInventoryResult:
+        action = (
+            LifecycleAction.CANDIDATE_INVENTORY
+            if isinstance(manifest, SourceManifest)
+            and manifest.state is SourceState.CANDIDATE
+            else LifecycleAction.RESTORE_INVENTORY
+        )
+        self._require_capability(_capability, frozenset({action}))
         if not isinstance(manifest, SourceManifest):
             raise SourceBundleError("SOURCE_MANIFEST_INVALID") from None
         output = self._execute_bounded_operation(
             BoundedOperation.SOURCE_INVENTORY,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
+            _capability=_capability,
         )
         return _parse_source_inventory_result(_exact_payload(output))
 
-    def _check_core(self, attempt_ordinal: int) -> CoreCheckResult:
+    def _check_core(
+        self, attempt_ordinal: int, *, _capability: object = None
+    ) -> CoreCheckResult:
+        action_by_state = {
+            SourceState.CANDIDATE: {
+                1: LifecycleAction.CANDIDATE_CORE_CHECK_1,
+                2: LifecycleAction.CANDIDATE_CORE_CHECK_2,
+            },
+            SourceState.RESTORE: {
+                1: LifecycleAction.RESTORE_CORE_CHECK_1,
+                2: LifecycleAction.RESTORE_CORE_CHECK_2,
+            },
+        }
+        action = action_by_state.get(self._active_source_state, {}).get(attempt_ordinal)
+        self._require_capability(
+            _capability, frozenset({action}) if action is not None else frozenset()
+        )
         if attempt_ordinal not in {1, 2}:
             raise SessionBrokerError("CORE_CHECK_ATTEMPT_INVALID") from None
-        output = self._execute_bounded_operation(BoundedOperation.CORE_CHECK, {})
+        output = self._execute_bounded_operation(
+            BoundedOperation.CORE_CHECK, {}, _capability=_capability
+        )
         return _parse_core_check_result(
             _exact_core_check_payload(output), attempt_ordinal=attempt_ordinal
         )
 
-    def _restart_core(self) -> RestartResult:
+    def _restart_core(self, *, _capability: object = None) -> RestartResult:
         state = self._active_source_state
+        action = {
+            SourceState.CANDIDATE: LifecycleAction.ACTIVATION_RESTART,
+            SourceState.RESTORE: LifecycleAction.REMOVAL_RESTART,
+        }.get(state)
+        self._require_capability(
+            _capability, frozenset({action}) if action is not None else frozenset()
+        )
         if state is None:
             raise SessionBrokerError("CORE_RESTART_SOURCE_STATE_REQUIRED") from None
         if state in self._restarted_states:
             raise SessionBrokerError("CORE_RESTART_ALREADY_SUBMITTED") from None
         self._restarted_states.add(state)
-        output = self._execute_bounded_operation(BoundedOperation.RESTART_CORE, {})
+        output = self._execute_bounded_operation(
+            BoundedOperation.RESTART_CORE, {}, _capability=_capability
+        )
         result = self._simple_result(output, RestartResult, ("submitted", "accepted"))
         return result
 
-    def _wait_for_core_readiness(self) -> CoreReadinessResult:
+    def _wait_for_core_readiness(
+        self, *, _capability: object = None
+    ) -> CoreReadinessResult:
+        action = {
+            SourceState.CANDIDATE: LifecycleAction.CANDIDATE_READINESS,
+            SourceState.RESTORE: LifecycleAction.RESTORE_READINESS,
+        }.get(self._active_source_state)
+        self._require_capability(
+            _capability, frozenset({action}) if action is not None else frozenset()
+        )
         if self._active_source_state is None:
             raise SessionBrokerError("CORE_READINESS_SOURCE_STATE_REQUIRED") from None
         output = self._execute_bounded_operation(
             BoundedOperation.CORE_READINESS,
             {"source_state": self._active_source_state.value},
+            _capability=_capability,
         )
         return self._simple_result(
             output,
@@ -2070,14 +2299,22 @@ class PrivateInteractiveSessionBroker:
         )
 
     def _inventory_temporary_services(
-        self, expectation: ServiceExpectation
+        self, expectation: ServiceExpectation, *, _capability: object = None
     ) -> ServiceInventoryResult:
+        action = {
+            ServiceExpectation.PRESENT: LifecycleAction.SERVICES_PRESENT,
+            ServiceExpectation.ABSENT: LifecycleAction.SERVICES_ABSENT,
+        }.get(expectation)
+        self._require_capability(
+            _capability, frozenset({action}) if action is not None else frozenset()
+        )
         if not isinstance(expectation, ServiceExpectation):
             raise SessionBrokerError("SERVICE_EXPECTATION_INVALID") from None
         output = self._execute_bounded_operation(
             BoundedOperation.SERVICE_INVENTORY,
             {"expectation": expectation.value},
             detail=expectation.value,
+            _capability=_capability,
         )
         return _parse_service_inventory_result(_exact_payload(output))
 
@@ -2087,9 +2324,27 @@ class PrivateInteractiveSessionBroker:
         *,
         nonce: str | None = None,
         evidence_label: AuditLabel | None = None,
+        _capability: object = None,
     ) -> PhaseAResult:
         if not isinstance(operation, PhaseAOperation):
             raise SessionBrokerError("PHASE_A_HELPER_OPERATION_INVALID") from None
+        if operation is PhaseAOperation.AUDIT:
+            action = {
+                AuditLabel.A0: LifecycleAction.A0,
+                AuditLabel.AP0: LifecycleAction.AP0,
+                AuditLabel.A1: LifecycleAction.A1,
+                AuditLabel.A2: LifecycleAction.A2,
+            }.get(evidence_label)
+            actions = frozenset({action}) if action is not None else frozenset()
+        elif operation is PhaseAOperation.PREFLIGHT:
+            actions = frozenset({LifecycleAction.PREFLIGHT})
+        elif operation is PhaseAOperation.RECEIPT:
+            actions = frozenset(
+                {LifecycleAction.RECEIPT, LifecycleAction.AMBIGUOUS_RECEIPT}
+            )
+        else:
+            actions = frozenset()
+        self._require_capability(_capability, actions)
         if nonce is not None and (
             not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
         ):
@@ -2113,10 +2368,14 @@ class PrivateInteractiveSessionBroker:
             BoundedOperation.PHASE_A_HELPER,
             value,
             detail=operation.value,
+            _capability=_capability,
         )
         return _parse_phase_a_result(operation, output, expected_nonce=submitted_nonce)
 
-    def _run_invalid_nonce_preflight(self) -> PhaseAResult:
+    def _run_invalid_nonce_preflight(
+        self, *, _capability: object = None
+    ) -> PhaseAResult:
+        self._require_capability(_capability, frozenset({LifecycleAction.P0}))
         output = self._execute_bounded_operation(
             BoundedOperation.PHASE_A_HELPER,
             {
@@ -2124,6 +2383,7 @@ class PrivateInteractiveSessionBroker:
                 "invalid_nonce": True,
             },
             detail="invalid_nonce",
+            _capability=_capability,
         )
         result = _parse_phase_a_result(PhaseAOperation.PREFLIGHT, output)
         if (
@@ -2134,8 +2394,13 @@ class PrivateInteractiveSessionBroker:
             self._fail(BrokerFailure.PROTOCOL)
         return result
 
-    def _install_staged_restore(self, manifest: SourceManifest) -> InstallResult:
+    def _install_staged_restore(
+        self, manifest: SourceManifest, *, _capability: object = None
+    ) -> InstallResult:
         """Activate one already-staged exact PR #41 source bundle."""
+        self._require_capability(
+            _capability, frozenset({LifecycleAction.RESTORE_INSTALL})
+        )
         if (
             not isinstance(manifest, SourceManifest)
             or manifest.state is not SourceState.RESTORE
@@ -2145,6 +2410,7 @@ class PrivateInteractiveSessionBroker:
             BoundedOperation.RESTORE,
             {"manifest": _manifest_payload(manifest)},
             detail=manifest.state.value,
+            _capability=_capability,
         )
         result = self._simple_result(
             output,
@@ -2160,27 +2426,48 @@ class PrivateInteractiveSessionBroker:
             self._active_source_state = SourceState.RESTORE
         return result
 
-    def _restore_source(self, bundle: SourceBundle) -> InstallResult:
+    def _restore_source(
+        self,
+        bundle: SourceBundle,
+        *,
+        _transfer_capability: object = None,
+        _install_capability: object = None,
+    ) -> InstallResult:
         if (
             not isinstance(bundle, SourceBundle)
             or bundle.state is not SourceState.RESTORE
         ):
             raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+        self._require_capability(
+            _transfer_capability, frozenset({LifecycleAction.RESTORE_TRANSFER})
+        )
+        self._require_capability(
+            _install_capability, frozenset({LifecycleAction.RESTORE_INSTALL})
+        )
         validate_source_bundle(bundle)
-        transfer = self._transfer_source_bundle(bundle)
+        transfer = self._transfer_source_bundle(
+            bundle, _capability=_transfer_capability
+        )
         if not transfer.success or not transfer.manifest_match:
             self._fail(BrokerFailure.PROTOCOL)
-        return self._install_staged_restore(bundle.manifest)
+        return self._install_staged_restore(
+            bundle.manifest, _capability=_install_capability
+        )
 
-    def _restore_private_backup(self) -> InstallResult:
+    def _restore_private_backup(self, *, _capability: object = None) -> InstallResult:
         """Use the fixed verified private backup only as a restoration fallback."""
+        self._require_capability(
+            _capability, frozenset({LifecycleAction.BACKUP_FALLBACK})
+        )
         if (
             self._active_source_state is SourceState.RESTORE
             or self._backup_restore_attempted
         ):
             raise SourceBundleError("PRIVATE_BACKUP_ALREADY_CONSUMED") from None
         self._backup_restore_attempted = True
-        output = self._execute_bounded_operation(BoundedOperation.RESTORE_BACKUP, {})
+        output = self._execute_bounded_operation(
+            BoundedOperation.RESTORE_BACKUP, {}, _capability=_capability
+        )
         result = self._simple_result(
             output,
             InstallResult,
@@ -2233,6 +2520,8 @@ class PrivateInteractiveSessionBroker:
             self._active_source_state = None
             self._restarted_states.clear()
             self._backup_restore_attempted = False
+            self._controller_binding = None
+            self.__write_token = object()
 
 
 class FullPreflightLifecycleController:
@@ -2248,6 +2537,7 @@ class FullPreflightLifecycleController:
         if (
             getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
             or getattr(broker, "_session_generation", None) is None
+            or not callable(getattr(broker, "_register_lifecycle_controller", None))
             or not callable(is_relevant)
             or not callable(is_critical)
         ):
@@ -2259,6 +2549,17 @@ class FullPreflightLifecycleController:
         self._session_generation = broker._session_generation
         self._seen_session_generations = [self._session_generation]
         self._lifecycle_generation = object()
+        self.__dispatch_token = object()
+        try:
+            self._capability_issuer = broker._register_lifecycle_controller(
+                self,
+                self._lifecycle_generation,
+                self._session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if type(self._capability_issuer) is not _CapabilityIssuer:
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
         self._permits = {
             action: _InvocationPermit(
                 action, self._lifecycle_generation, self._session_generation
@@ -2348,13 +2649,37 @@ class FullPreflightLifecycleController:
                 "LIFECYCLE_ROLLBACK_BINDING_INVALID"
             ) from None
 
+        try:
+            new_issuer = broker._register_lifecycle_controller(
+                self,
+                self._lifecycle_generation,
+                new_session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError(
+                "LIFECYCLE_ROLLBACK_BINDING_INVALID"
+            ) from None
+        if type(new_issuer) is not _CapabilityIssuer:
+            raise LifecycleControllerError(
+                "LIFECYCLE_ROLLBACK_BINDING_INVALID"
+            ) from None
+
         for permit in permits_to_rebind:
             permit.session_generation = new_session_generation
         self._broker = broker
         self._session_generation = new_session_generation
+        self._capability_issuer = new_issuer
         self._seen_session_generations.append(new_session_generation)
 
-    def _dispatch(self, action: LifecycleAction, callback: Callable[[], Any]) -> Any:
+    def _dispatch(
+        self,
+        action: LifecycleAction,
+        callback: Callable[[_LifecycleCapability], Any],
+        *,
+        _dispatch_token: object = None,
+    ) -> Any:
+        if _dispatch_token is not self.__dispatch_token:
+            raise LifecycleControllerError("LIFECYCLE_DISPATCH_SCOPE_INVALID") from None
         self._assert_session_binding()
         permit = self._permits[action]
         if permit.consumed:
@@ -2364,7 +2689,26 @@ class FullPreflightLifecycleController:
             self._session_generation,
             action,
         )
-        return callback()
+        capability = _LifecycleCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._session_generation,
+            action,
+        )
+        self._capability_issuer.issued.append(capability)
+        return callback(capability)
+
+    def __dispatch_action(
+        self,
+        action: LifecycleAction,
+        callback: Callable[[_LifecycleCapability], Any],
+    ) -> Any:
+        return self._dispatch(
+            action,
+            callback,
+            _dispatch_token=self.__dispatch_token,
+        )
 
     def _rollback(self) -> None:
         self._state = LifecycleState.ROLLBACK_REQUIRED
@@ -2448,10 +2792,13 @@ class FullPreflightLifecycleController:
     def admit_initial_repairs(self) -> RepairsEvidence:
         self._require_state(LifecycleState.BASELINE)
         try:
-            evidence = self._dispatch(
+            evidence = self.__dispatch_action(
                 LifecycleAction.INITIAL_REPAIRS,
-                lambda: self._broker._collect_resolution_info(
-                    RepairsGate.INITIAL, self._is_relevant, self._is_critical
+                lambda capability: self._broker._collect_resolution_info(
+                    RepairsGate.INITIAL,
+                    self._is_relevant,
+                    self._is_critical,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2464,8 +2811,11 @@ class FullPreflightLifecycleController:
     def create_backup(self) -> BackupResult:
         self._require_state(LifecycleState.INITIAL_REPAIRS_PASS)
         try:
-            result = self._dispatch(
-                LifecycleAction.BACKUP, self._broker._create_private_backup
+            result = self.__dispatch_action(
+                LifecycleAction.BACKUP,
+                lambda capability: self._broker._create_private_backup(
+                    _capability=capability
+                ),
             )
         except (SessionBrokerError, TypeError, ValueError):
             raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
@@ -2492,9 +2842,11 @@ class FullPreflightLifecycleController:
         except SourceBundleError:
             raise LifecycleControllerError("CANDIDATE_BUNDLE_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.CANDIDATE_TRANSFER,
-                lambda: self._broker._transfer_source_bundle(bundle),
+                lambda capability: self._broker._transfer_source_bundle(
+                    bundle, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("CANDIDATE_TRANSFER_FAILED") from None
@@ -2513,9 +2865,11 @@ class FullPreflightLifecycleController:
         ):
             raise LifecycleControllerError("CANDIDATE_MANIFEST_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.CANDIDATE_INSTALL,
-                lambda: self._broker._install_staged_source(manifest),
+                lambda capability: self._broker._install_staged_source(
+                    manifest, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             self._rollback()
@@ -2532,9 +2886,11 @@ class FullPreflightLifecycleController:
         if manifest != self._candidate_manifest:
             raise LifecycleControllerError("CANDIDATE_MANIFEST_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.CANDIDATE_INVENTORY,
-                lambda: self._broker._verify_source_inventory(manifest),
+                lambda capability: self._broker._verify_source_inventory(
+                    manifest, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             self._rollback()
@@ -2552,7 +2908,12 @@ class FullPreflightLifecycleController:
         attempt = 2 if self._core_transport_ambiguous[source_state] else 1
         action = first_action if attempt == 1 else second_action
         try:
-            result = self._dispatch(action, lambda: self._broker._check_core(attempt))
+            result = self.__dispatch_action(
+                action,
+                lambda capability: self._broker._check_core(
+                    attempt, _capability=capability
+                ),
+            )
         except SessionBrokerError as error:
             if attempt == 1 and self._outer_transport_ambiguity(error):
                 session_survived = (
@@ -2586,12 +2947,12 @@ class FullPreflightLifecycleController:
     def _restart(
         self, source_state: SourceState, action: LifecycleAction
     ) -> RestartResult:
-        def dispatch_restart() -> RestartResult:
+        def dispatch_restart(capability: _LifecycleCapability) -> RestartResult:
             self._restart_dispatched.add(source_state)
-            return self._broker._restart_core()
+            return self._broker._restart_core(_capability=capability)
 
         try:
-            result = self._dispatch(action, dispatch_restart)
+            result = self.__dispatch_action(action, dispatch_restart)
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
         if not (
@@ -2611,9 +2972,11 @@ class FullPreflightLifecycleController:
     def await_candidate_readiness(self) -> CoreReadinessResult:
         self._require_state(LifecycleState.ACTIVATION_RESTART_CONSUMED)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.CANDIDATE_READINESS,
-                self._broker._wait_for_core_readiness,
+                lambda capability: self._broker._wait_for_core_readiness(
+                    _capability=capability
+                ),
             )
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
@@ -2625,10 +2988,10 @@ class FullPreflightLifecycleController:
     def verify_research_services_present(self) -> ServiceInventoryResult:
         self._require_state(LifecycleState.CANDIDATE_READY)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.SERVICES_PRESENT,
-                lambda: self._broker._inventory_temporary_services(
-                    ServiceExpectation.PRESENT
+                lambda capability: self._broker._inventory_temporary_services(
+                    ServiceExpectation.PRESENT, _capability=capability
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2641,12 +3004,13 @@ class FullPreflightLifecycleController:
     def admit_post_activation_repairs(self) -> RepairsEvidence:
         self._require_state(LifecycleState.RESEARCH_SERVICES_PRESENT)
         try:
-            evidence = self._dispatch(
+            evidence = self.__dispatch_action(
                 LifecycleAction.POST_ACTIVATION_REPAIRS,
-                lambda: self._broker._collect_resolution_info(
+                lambda capability: self._broker._collect_resolution_info(
                     RepairsGate.POST_ACTIVATION,
                     self._is_relevant,
                     self._is_critical,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2663,12 +3027,13 @@ class FullPreflightLifecycleController:
     ) -> AuditSnapshot:
         nonce = secrets.token_hex(16)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 action,
-                lambda: self._broker._invoke_phase_a(
+                lambda capability: self._broker._invoke_phase_a(
                     PhaseAOperation.AUDIT,
                     nonce=nonce,
                     evidence_label=audit_label,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2701,9 +3066,11 @@ class FullPreflightLifecycleController:
     def run_p0(self) -> PhaseAResult:
         self._require_state(LifecycleState.A0_COLLECTED)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.P0,
-                self._broker._run_invalid_nonce_preflight,
+                lambda capability: self._broker._run_invalid_nonce_preflight(
+                    _capability=capability
+                ),
             )
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
@@ -2733,10 +3100,12 @@ class FullPreflightLifecycleController:
         nonce = secrets.token_hex(16)
         self._preflight_nonce = nonce
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.PREFLIGHT,
-                lambda: self._broker._invoke_phase_a(
-                    PhaseAOperation.PREFLIGHT, nonce=nonce
+                lambda capability: self._broker._invoke_phase_a(
+                    PhaseAOperation.PREFLIGHT,
+                    nonce=nonce,
+                    _capability=capability,
                 ),
             )
         except SessionBrokerError:
@@ -2774,10 +3143,12 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         nonce = self._preflight_nonce
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.RECEIPT,
-                lambda: self._broker._invoke_phase_a(
-                    PhaseAOperation.RECEIPT, nonce=nonce
+                lambda capability: self._broker._invoke_phase_a(
+                    PhaseAOperation.RECEIPT,
+                    nonce=nonce,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2794,10 +3165,12 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         nonce = self._ambiguous_nonce
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.AMBIGUOUS_RECEIPT,
-                lambda: self._broker._invoke_phase_a(
-                    PhaseAOperation.RECEIPT, nonce=nonce
+                lambda capability: self._broker._invoke_phase_a(
+                    PhaseAOperation.RECEIPT,
+                    nonce=nonce,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2819,7 +3192,7 @@ class FullPreflightLifecycleController:
     def validate_research_final(self) -> None:
         self._require_state(LifecycleState.A1_COLLECTED)
 
-        def validate() -> None:
+        def validate(_capability: _LifecycleCapability) -> None:
             generation = self._candidate_activation_generation
             required_labels = {AuditLabel.A0, AuditLabel.AP0, AuditLabel.A1}
             if (
@@ -2840,7 +3213,7 @@ class FullPreflightLifecycleController:
             ):
                 self._rollback()
 
-        self._dispatch(LifecycleAction.RESEARCH_FINAL, validate)
+        self.__dispatch_action(LifecycleAction.RESEARCH_FINAL, validate)
         self._state = LifecycleState.RESEARCH_FINAL_VALIDATED
 
     def collect_a2(self) -> AuditSnapshot:
@@ -2869,9 +3242,11 @@ class FullPreflightLifecycleController:
         except SourceBundleError:
             raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.RESTORE_TRANSFER,
-                lambda: self._broker._transfer_source_bundle(bundle),
+                lambda capability: self._broker._transfer_source_bundle(
+                    bundle, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             self._state = LifecycleState.ROLLBACK_REQUIRED
@@ -2892,9 +3267,11 @@ class FullPreflightLifecycleController:
         ):
             raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.RESTORE_INSTALL,
-                lambda: self._broker._install_staged_restore(manifest),
+                lambda capability: self._broker._install_staged_restore(
+                    manifest, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             self._rollback()
@@ -2910,9 +3287,11 @@ class FullPreflightLifecycleController:
         if manifest != self._restore_manifest:
             raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.RESTORE_INVENTORY,
-                lambda: self._broker._verify_source_inventory(manifest),
+                lambda capability: self._broker._verify_source_inventory(
+                    manifest, _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             self._rollback()
@@ -2943,9 +3322,11 @@ class FullPreflightLifecycleController:
     def await_restore_readiness(self) -> CoreReadinessResult:
         self._require_state(LifecycleState.REMOVAL_RESTART_CONSUMED)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.RESTORE_READINESS,
-                self._broker._wait_for_core_readiness,
+                lambda capability: self._broker._wait_for_core_readiness(
+                    _capability=capability
+                ),
             )
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
@@ -2958,10 +3339,10 @@ class FullPreflightLifecycleController:
     def verify_research_services_absent(self) -> ServiceInventoryResult:
         self._require_state(LifecycleState.PR41_READY)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.SERVICES_ABSENT,
-                lambda: self._broker._inventory_temporary_services(
-                    ServiceExpectation.ABSENT
+                lambda capability: self._broker._inventory_temporary_services(
+                    ServiceExpectation.ABSENT, _capability=capability
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -2975,12 +3356,13 @@ class FullPreflightLifecycleController:
     def admit_post_restore_repairs(self) -> RepairsEvidence:
         self._require_state(LifecycleState.RESEARCH_SERVICES_ABSENT)
         try:
-            evidence = self._dispatch(
+            evidence = self.__dispatch_action(
                 LifecycleAction.POST_RESTORE_REPAIRS,
-                lambda: self._broker._collect_resolution_info(
+                lambda capability: self._broker._collect_resolution_info(
                     RepairsGate.POST_ROLLBACK,
                     self._is_relevant,
                     self._is_critical,
+                    _capability=capability,
                 ),
             )
         except (SessionBrokerError, TypeError, ValueError):
@@ -3027,8 +3409,9 @@ class FullPreflightLifecycleController:
 
     def complete(self) -> FinalRestoreProof:
         self._require_state(LifecycleState.POST_RESTORE_REPAIRS_PASS)
-        proof = self._dispatch(
-            LifecycleAction.FINAL_ACCEPTANCE, self._final_restore_proof
+        proof = self.__dispatch_action(
+            LifecycleAction.FINAL_ACCEPTANCE,
+            lambda _capability: self._final_restore_proof(),
         )
         if not isinstance(proof, FinalRestoreProof) or not proof.complete:
             self._rollback()
@@ -3039,9 +3422,11 @@ class FullPreflightLifecycleController:
         """Consume the fixed fallback once without treating it as PR #41 proof."""
         self._require_state(LifecycleState.ROLLBACK_REQUIRED)
         try:
-            result = self._dispatch(
+            result = self.__dispatch_action(
                 LifecycleAction.BACKUP_FALLBACK,
-                self._broker._restore_private_backup,
+                lambda capability: self._broker._restore_private_backup(
+                    _capability=capability
+                ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
