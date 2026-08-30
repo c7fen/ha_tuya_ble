@@ -12,6 +12,7 @@ import json
 import os
 import pty
 import select
+import stat
 import subprocess
 import sys
 import traceback
@@ -1624,6 +1625,177 @@ def test_r30_remote_program_synthetic_atomic_install_and_restore(
     )
 
 
+@pytest.mark.parametrize(
+    ("crash_point", "expected_outcome", "crash_code"),
+    (
+        ("after_marker", "staged_then_restored", 92),
+        ("after_exchange", "already_restored", 93),
+    ),
+)
+def test_r33_restore_crash_settles_exact_pr41_once(
+    crash_point: str,
+    expected_outcome: str,
+    crash_code: int,
+    tmp_path: Path,
+) -> None:
+    """Marker and post-exchange crashes settle only through reconciliation."""
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic original source\n")
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path, "transfer", access._bundle_payload(candidate)
+    )["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path,
+        "install",
+        {"manifest": access._manifest_payload(candidate.manifest)},
+    )["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path, "transfer", access._bundle_payload(restore)
+    )["manifest_match"]
+
+    marker_call = (
+        "        backup_marked = mark_restore_consumed(\n"
+        "            allow_existing=reconcile_existing_restore_marker\n"
+        "        )\n"
+    )
+    installed_check = (
+        "        mutated = True\n        installed = inventory_targets()\n"
+    )
+    counter_update = (
+        "        counter = ROOT / '.synthetic_restore_exchange_count'\n"
+        "        count = int(counter.read_text()) if counter.exists() else 0\n"
+        "        counter.write_text(str(count + 1))\n"
+    )
+    crash_replacements = {
+        "after_marker": {
+            marker_call: marker_call + f"        os._exit({crash_code})\n"
+        },
+        "after_exchange": {
+            installed_check: (
+                "        mutated = True\n"
+                + counter_update
+                + f"        os._exit({crash_code})\n"
+                + "        installed = inventory_targets()\n"
+            )
+        },
+    }[crash_point]
+    _run_synthetic_remote_program(
+        tmp_path,
+        "restore",
+        {"manifest": access._manifest_payload(restore.manifest)},
+        source_replacements=crash_replacements,
+        expected_crash_code=crash_code,
+    )
+
+    marker = tmp_path / ".ha_tuya_ble_r30_restore.consumed"
+    marker_metadata = marker.stat()
+    stage = tmp_path / ".ha_tuya_ble_r30_stage"
+    assert stat.S_ISREG(marker_metadata.st_mode)
+    assert stat.S_IMODE(marker_metadata.st_mode) == 0o600
+    assert marker_metadata.st_uid == os.getuid()
+    assert marker_metadata.st_nlink == 1
+    assert marker_metadata.st_size == 0
+    if crash_point == "after_marker":
+        assert (integration / ".phase_a_tools").is_dir()
+        assert [path.relative_to(stage).as_posix() for path in stage.rglob("*")] == [
+            "integration",
+            "integration/__init__.py",
+        ]
+    else:
+        assert not (integration / ".phase_a_tools").exists()
+        displaced_helper = stage / "integration" / ".phase_a_tools"
+        assert {path.name for path in displaced_helper.iterdir()} == {
+            "phase_a_status_probe_helper.py",
+            "phase_a_status_probe_lib.py",
+        }
+    assert (stage / "integration" / "__init__.py").read_bytes() == (
+        b"synthetic integration source\n"
+    )
+
+    request_json = """def request_json(url, method='GET', timeout=30):
+    if url.endswith('/core/check'):
+        return 200, {'result': 'ok', 'check_passed': True}
+    if url.endswith('/core/restart'):
+        return 200, {}
+    if url.endswith('/api/services'):
+        return 200, []
+    if url.endswith('/api/config'):
+        return 200, {'components': ['tuya_ble']}
+    if url.endswith('/api/'):
+        return 200, {'message': 'API running.'}
+    raise ValueError('synthetic_url')
+
+"""
+    original_request_json = access._REMOTE_CONTROL_PROGRAM[
+        access._REMOTE_CONTROL_PROGRAM.index(
+            "def request_json"
+        ) : access._REMOTE_CONTROL_PROGRAM.index("def core_check")
+    ]
+    repairs_run = """    completed = runner.run(
+        ['ha', 'resolution', 'info', '--raw-json'],
+        capture_output=True,
+        check=False,
+        timeout=40,
+    )
+"""
+    synthetic_repairs = (
+        "    completed = type('Completed', (), {"
+        "'returncode': 0, 'stderr': b'', "
+        '\'stdout\': b\'{\\"result\\":\\"ok\\",\\"data\\":{\\"issues\\":[]}}\''
+        "})()\n"
+    )
+    exchange_call = "            exchange(staged, INTEGRATION)\n"
+    counted_exchange = (
+        "            counter = ROOT / '.synthetic_restore_exchange_count'\n"
+        "            count = int(counter.read_text()) if counter.exists() else 0\n"
+        "            counter.write_text(str(count + 1))\n" + exchange_call
+    )
+    reconcile_value = access._bundle_payload(restore)
+    reconcile_value.update(
+        {
+            "original_operation_id": "1" * 32,
+            "reconciliation_operation_id": "2" * 32,
+            "original_action": access.LifecycleAction.RESTORE_INSTALL.value,
+            "original_phase": "dispatch_started",
+            "restart_mode": "submit_once",
+        }
+    )
+
+    reconciled = _run_synthetic_remote_program(
+        tmp_path,
+        "restore_tail_reconcile",
+        reconcile_value,
+        source_replacements={
+            original_request_json: request_json,
+            repairs_run: synthetic_repairs,
+            exchange_call: counted_exchange,
+        },
+    )
+
+    assert reconciled["source_recovery_outcome"] == expected_outcome
+    assert reconciled["manifest_match"] is True
+    assert reconciled["core_check_passed"] is True
+    assert reconciled["restart_resolved"] is True
+    assert reconciled["repairs_shape_valid"] is True
+    assert (tmp_path / ".synthetic_restore_exchange_count").read_text() == "1"
+    assert marker.is_file()
+    assert not stage.exists()
+    assert not (integration / ".phase_a_tools").exists()
+    assert (integration / "__init__.py").read_bytes() == (
+        b"synthetic integration source\n"
+    )
+
+
 def test_r30_remote_transfer_rejects_tampered_content_before_staging(
     tmp_path: Path,
 ) -> None:
@@ -2468,8 +2640,10 @@ class _R32ScriptedBroker:
 
     def _reconcile_restore_tail(
         self,
-        manifest: access.SourceManifest,
+        bundle: access.SourceBundle,
         original_operation_id: str,
+        original_action: str,
+        original_phase: str,
         restart_mode: str,
         *,
         _capability: object = None,
@@ -2478,13 +2652,20 @@ class _R32ScriptedBroker:
         self._consume_capability(
             _capability, access.LifecycleAction.RESTORE_TAIL_RECONCILE
         )
-        count = len(manifest.entries)
+        count = len(bundle.manifest.entries)
         result = self._next(
             "restore_reconcile",
-            manifest.state,
+            bundle.state,
             access.RestoreTailReconciliationEvidence(
                 original_operation_id,
                 str(_capability.issuance_identity),
+                original_action,
+                original_phase,
+                (
+                    "transferred_then_restored"
+                    if original_action == access.LifecycleAction.RESTORE_TRANSFER.value
+                    else "already_restored"
+                ),
                 count,
                 count,
                 True,
@@ -4384,6 +4565,34 @@ def test_r33_semantically_contradictory_journal_fails_closed(
         access._DurableLifecycleJournal._validate_record(record)
 
 
+@pytest.mark.parametrize(
+    "contradiction",
+    ("transition_without_committed_phase", "committed_phase_without_transition"),
+)
+def test_r33_operation_phase_and_transition_linkage_is_bidirectional(
+    contradiction: str,
+) -> None:
+    controller, _broker = _r33_controller()
+    controller.admit_initial_repairs()
+    journal = controller._journal
+    record = copy.deepcopy(journal._record)
+    controller.close()
+    operation = next(
+        item
+        for item in record["operations"]
+        if item["action"] == access.LifecycleAction.INITIAL_REPAIRS.value
+    )
+    if contradiction == "transition_without_committed_phase":
+        operation["phase"] = "result_durable"
+    else:
+        record["transitions"] = [record["transitions"][0]]
+        record["stage"] = access.LifecycleState.BASELINE.value
+        record["source_generation"] = record["transitions"][0]["source_generation"]
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal._validate_record(record)
+
+
 def test_r33_closed_controller_cannot_dispatch_after_releasing_owner_lock() -> None:
     controller, broker = _r33_controller()
     controller.close()
@@ -4513,41 +4722,47 @@ def test_r33_complete_normal_dominance_fixed_point_model() -> None:
     assert set(access._LIFECYCLE_ACTION_PREDECESSORS) == set(access.LifecycleAction)
     assert set(access._LIFECYCLE_ACTION_SUCCESSORS) == set(access.LifecycleAction)
     required = access._NORMAL_LIFECYCLE_HISTORY
-    reachable: set[tuple[access.LifecycleState, int, bool]] = {
-        (access.LifecycleState.BASELINE, 1, False)
-    }
-    changed = True
-    while changed:
-        changed = False
-        for state, prefix, recovery in tuple(reachable):
-            for action in access.LifecycleAction:
-                if state not in access._LIFECYCLE_ACTION_PREDECESSORS[action]:
-                    continue
-                if action is access.LifecycleAction.FINAL_ACCEPTANCE_NORMAL and (
-                    recovery or prefix != len(required)
-                ):
-                    continue
-                if action is access.LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT and (
-                    not recovery and prefix == len(required)
-                ):
-                    continue
-                for successor in access._LIFECYCLE_ACTION_SUCCESSORS[action]:
-                    next_prefix = prefix
-                    if prefix < len(required) and successor is required[prefix]:
-                        next_prefix += 1
-                    item = (successor, next_prefix, recovery)
+
+    def model(
+        successors: dict[access.LifecycleAction, frozenset[access.LifecycleState]],
+    ) -> set[tuple[access.LifecycleState, int, bool]]:
+        reachable = {(access.LifecycleState.BASELINE, 1, False)}
+        changed = True
+        while changed:
+            changed = False
+            for state, prefix, recovery in tuple(reachable):
+                for action in access.LifecycleAction:
+                    if state not in access._LIFECYCLE_ACTION_PREDECESSORS[action]:
+                        continue
+                    if action is access.LifecycleAction.FINAL_ACCEPTANCE_NORMAL and (
+                        recovery or prefix != len(required)
+                    ):
+                        continue
+                    if action is (
+                        access.LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT
+                    ) and (not recovery and prefix == len(required)):
+                        continue
+                    for successor in successors[action]:
+                        next_prefix = prefix
+                        if prefix < len(required) and successor is required[prefix]:
+                            next_prefix += 1
+                        item = (successor, next_prefix, recovery)
+                        if item not in reachable:
+                            reachable.add(item)
+                            changed = True
+                if state not in {
+                    access.LifecycleState.COMPLETE_NORMAL,
+                    access.LifecycleState.RESTORED_AFTER_ABORT,
+                    access.LifecycleState.RESTORE_FAILED,
+                }:
+                    item = (access.LifecycleState.ROLLBACK_REQUIRED, prefix, True)
                     if item not in reachable:
                         reachable.add(item)
                         changed = True
-            if state not in {
-                access.LifecycleState.COMPLETE_NORMAL,
-                access.LifecycleState.RESTORED_AFTER_ABORT,
-                access.LifecycleState.RESTORE_FAILED,
-            }:
-                item = (access.LifecycleState.ROLLBACK_REQUIRED, prefix, True)
-                if item not in reachable:
-                    reachable.add(item)
-                    changed = True
+        return reachable
+
+    production_successors = dict(access._LIFECYCLE_ACTION_SUCCESSORS)
+    reachable = model(production_successors)
 
     normal = [
         item for item in reachable if item[0] is access.LifecycleState.COMPLETE_NORMAL
@@ -4559,6 +4774,18 @@ def test_r33_complete_normal_dominance_fixed_point_model() -> None:
     assert any(
         state is access.LifecycleState.RESTORED_AFTER_ABORT or recovery
         for state, _prefix, recovery in reachable
+    )
+    mutated_successors = dict(production_successors)
+    mutated_successors[access.LifecycleAction.BACKUP] = frozenset(
+        {
+            *mutated_successors[access.LifecycleAction.BACKUP],
+            access.LifecycleState.COMPLETE_NORMAL,
+        }
+    )
+    assert any(
+        state is access.LifecycleState.COMPLETE_NORMAL
+        and (prefix != len(required) or recovery)
+        for state, prefix, recovery in model(mutated_successors)
     )
 
 
@@ -4689,7 +4916,7 @@ def test_r33_each_committed_restore_tail_step_reconciles_to_terminal(
     )
 
 
-def test_r33_restore_transfer_loss_fails_before_recovery_restart() -> None:
+def test_r33_restore_transfer_loss_recovers_before_restart() -> None:
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
@@ -4701,14 +4928,11 @@ def test_r33_restore_transfer_loss_fails_before_recovery_restart() -> None:
     first.stage_restore(restore)
 
     second, second_broker = _assert_r33_reconstructed_recovery_only(first)
-    second_broker.queue(
-        "restore_reconcile", access.SessionBrokerError("SYNTHETIC_INVENTORY_FAILED")
-    )
-    with pytest.raises(access.LifecycleControllerError, match="RESTORE_FAILED"):
-        second.reconcile_restored_pr41(restore)
+    evidence = second.reconcile_restored_pr41(restore)
 
-    assert second.state is access.LifecycleState.RESTORE_FAILED
-    assert [name for name, _ in second_broker.calls].count("restart") == 0
+    assert evidence.source_recovery_outcome == "transferred_then_restored"
+    assert second.state is access.LifecycleState.RESTORED_AFTER_ABORT
+    assert [name for name, _ in second_broker.calls].count("restart") == 1
 
 
 def test_r33_ambiguous_removal_restart_never_restarts_during_reconciliation() -> None:

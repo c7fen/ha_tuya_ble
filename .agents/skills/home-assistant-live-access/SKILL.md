@@ -227,6 +227,12 @@ separate owner-private lock file is held with non-blocking `flock` for the
 controller lifetime, so a second object or process cannot own the lifecycle.
 Journal updates use an owner-private temporary regular file, file `fsync`,
 atomic replacement, and directory `fsync`.
+Every action-bearing transition is bidirectionally linked to exactly one
+`transition_committed` operation by its action, source, session, issuance, and
+evidence generation. A committed operation without that transition, or a
+transition whose operation is only `result_durable`, is malformed. The
+non-transitioning fallback settlement uses only its explicit `reconciled`
+phase.
 
 Before any dispatch-capable callback, the journal durably records the exact
 operation intent and tombstone. It then distinguishes dispatch started, result
@@ -249,7 +255,20 @@ never replayed. One separately tombstoned `RESTORE_TAIL_RECONCILE` operation is
 bound to the exact original operation identity and freshly re-observes exact
 PR #41 inventory, authoritative Core PASS, removal-restart resolution,
 readiness, research-service absence, and strict Repairs aggregates. It checks
-inventory and Core PASS before any still-required recovery restart. If the
+the exact live and staged inventories first. For an interrupted transfer it
+may rebuild the exact admitted stage and install it; for an interrupted
+install it may install only an already exact stage. Mixed or unknown source
+state fails closed. If the ordinary restore crashed after creating its
+consumption marker but before exchange, only this separately tombstoned
+reconciliation may reuse it, and only after verifying that it is an empty,
+owner-private, single-link regular file and that live candidate plus staged
+PR #41 inventories are exact. Ordinary restore keeps exclusive marker
+creation. If a crash occurs after atomic exchange, reconciliation accepts and
+removes the remaining stage only when live PR #41 and the displaced staged
+candidate inventories are both exact, synchronizes the root, and performs no
+second exchange. Research-file absence also requires that no stage remains.
+It checks installed inventory and Core PASS before any still-required recovery
+restart. If the
 original removal restart was durably accepted, reconciliation only observes
 its resolved state; if that restart was consumed but not durably accepted,
 recovery fails without another restart. A valid compound proof commits

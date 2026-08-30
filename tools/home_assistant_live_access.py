@@ -775,6 +775,9 @@ class RestoreTailReconciliationEvidence:
 
     original_operation_id: str
     reconciliation_operation_id: str
+    original_action: str
+    original_phase: str
+    source_recovery_outcome: str
     expected_count: int
     observed_count: int
     manifest_match: bool
@@ -1692,6 +1695,57 @@ class _DurableLifecycleJournal:
                 in {"result_durable", "transition_committed", "reconciled"}
             ]
             invalid = invalid or evidence_actions != result_actions
+            if type(transitions) is list:
+                for operation in operations:
+                    if type(operation) is not dict:
+                        continue
+                    linked_transitions = [
+                        transition
+                        for transition in transitions
+                        if type(transition) is dict
+                        and transition.get("action") == operation.get("action")
+                        and transition.get("issuance_identity")
+                        == operation.get("issuance_identity")
+                    ]
+                    phase = operation.get("phase")
+                    invalid = invalid or (
+                        phase == "transition_committed" and len(linked_transitions) != 1
+                    )
+                    invalid = invalid or (
+                        phase != "transition_committed" and bool(linked_transitions)
+                    )
+                    if phase == "reconciled":
+                        invalid = (
+                            invalid
+                            or operation.get("action")
+                            != LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+                        )
+                    if len(linked_transitions) == 1:
+                        transition = linked_transitions[0]
+                        identity = next(
+                            (
+                                item
+                                for item in identities
+                                if type(item) is dict
+                                and item.get("generation")
+                                == transition.get("evidence_generation")
+                            ),
+                            None,
+                        )
+                        invalid = invalid or type(identity) is not dict
+                        invalid = invalid or any(
+                            (
+                                transition.get("source_generation")
+                                != operation.get("source_generation"),
+                                transition.get("session_generation")
+                                != operation.get("session_generation"),
+                                type(identity) is dict
+                                and identity.get("action") != operation.get("action"),
+                                type(identity) is dict
+                                and identity.get("issuance_identity")
+                                != operation.get("issuance_identity"),
+                            )
+                        )
             operation_issuances = [
                 operation.get("issuance_identity")
                 for operation in operations
@@ -1952,6 +2006,9 @@ class _DurableLifecycleJournal:
         return tuple(copy.deepcopy(self._record["transitions"]))
 
     def restore_tail_original_operation_id(self) -> str:
+        return self.restore_tail_original_operation()["issuance_identity"]
+
+    def restore_tail_original_operation(self) -> dict[str, object]:
         eligible = {
             LifecycleAction.RESTORE_TRANSFER.value,
             LifecycleAction.RESTORE_INSTALL.value,
@@ -1967,7 +2024,7 @@ class _DurableLifecycleJournal:
         ]
         if not matches:
             raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
-        return matches[-1]["issuance_identity"]
+        return copy.deepcopy(matches[-1])
 
     def restore_tail_restart_mode(self) -> str:
         matches = [
@@ -2979,6 +3036,23 @@ def inventory_stage():
         **inventory_root(STAGE / 'helper', 'helper'),
     }
 
+def settle_displaced_candidate_stage():
+    if not STAGE.exists():
+        return
+    if STAGE.is_symlink() or not STAGE.is_dir():
+        raise ValueError('restore_stage')
+    if {path.name for path in STAGE.iterdir()} != {'integration'}:
+        raise ValueError('restore_stage')
+    displaced = inventory_deployment(STAGE / 'integration')
+    if inventory_identity(displaced)['manifest_identity'] != (
+        '4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e'
+    ):
+        raise ValueError('restore_stage')
+    remove(STAGE)
+    sync_root()
+    if STAGE.exists():
+        raise ValueError('restore_stage')
+
 def inventory_result(expected, observed):
     return {
         'expected_count': len(expected),
@@ -3189,17 +3263,65 @@ def exchange(left, right):
         code = ctypes.get_errno()
         raise OSError(code, 'atomic_exchange')
 
-def mark_restore_consumed():
-    descriptor = os.open(
-        RESTORE_CONSUMED,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-    )
-    os.close(descriptor)
+def mark_restore_consumed(allow_existing=False):
+    if not isinstance(allow_existing, bool):
+        raise ValueError('restore_marker')
+    descriptor = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                RESTORE_CONSUMED,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            if not allow_existing:
+                raise
+            descriptor = os.open(RESTORE_CONSUMED, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o777 != 0o600
+            or metadata.st_size != 0
+        ):
+            raise ValueError('restore_marker')
+        if created:
+            os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if created:
+        sync_root()
+    return created
 
-def activate(value, restoring=False):
+def validate_restore_consumed():
+    descriptor = None
+    try:
+        descriptor = os.open(RESTORE_CONSUMED, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o777 != 0o600
+            or metadata.st_size != 0
+        ):
+            raise ValueError('restore_marker')
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+def activate(value, restoring=False, reconcile_existing_restore_marker=False):
     state, expected = expected_manifest(value)
-    if restoring != (state == 'restore') or inventory_stage() != expected:
+    if (
+        restoring != (state == 'restore')
+        or reconcile_existing_restore_marker and not restoring
+        or inventory_stage() != expected
+    ):
         raise ValueError('stage')
     staged = STAGE / 'integration'
     if not restoring:
@@ -3208,8 +3330,9 @@ def activate(value, restoring=False):
         raise ValueError('assembled')
     backup_marked = False
     if restoring:
-        mark_restore_consumed()
-        backup_marked = True
+        backup_marked = mark_restore_consumed(
+            allow_existing=reconcile_existing_restore_marker
+        )
     exchanged = INTEGRATION.exists()
     mutated = False
     try:
@@ -3483,6 +3606,8 @@ def restore_tail_reconcile(value):
     _, expected = expected_manifest(value)
     original = value.get('original_operation_id')
     reconciliation = value.get('reconciliation_operation_id')
+    original_action = value.get('original_action')
+    original_phase = value.get('original_phase')
     restart_mode = value.get('restart_mode')
     if not all(
         isinstance(item, str)
@@ -3493,6 +3618,48 @@ def restore_tail_reconcile(value):
         raise ValueError('operation_identity')
     if restart_mode not in {'submit_once', 'previously_committed'}:
         raise ValueError('restart_mode')
+    restore_actions = {
+        'restore_transfer', 'restore_install', 'restore_inventory',
+        'restore_core_check_1', 'removal_restart', 'restore_readiness',
+        'services_absent', 'post_restore_repairs',
+    }
+    operation_phases = {
+        'intent_durable', 'dispatch_started', 'result_durable',
+        'transition_committed', 'ambiguous',
+    }
+    if original_action not in restore_actions or original_phase not in operation_phases:
+        raise ValueError('original_operation')
+    live = inventory_targets()
+    source_recovery_outcome = 'already_restored'
+    if live == expected:
+        if STAGE.exists() and original_action != 'restore_install':
+            raise ValueError('restore_stage')
+        if STAGE.exists():
+            validate_restore_consumed()
+        settle_displaced_candidate_stage()
+    else:
+        if original_action == 'restore_transfer':
+            if inventory_stage() != expected:
+                transfer(value)
+                source_recovery_outcome = 'transferred_then_restored'
+            else:
+                source_recovery_outcome = 'staged_then_restored'
+            if inventory_stage() != expected:
+                raise ValueError('restore_stage')
+            activate(
+                value,
+                restoring=True,
+                reconcile_existing_restore_marker=True,
+            )
+        elif original_action == 'restore_install' and inventory_stage() == expected:
+            source_recovery_outcome = 'staged_then_restored'
+            activate(
+                value,
+                restoring=True,
+                reconcile_existing_restore_marker=True,
+            )
+        else:
+            raise ValueError('restore_inventory')
     inventory = inventory_result(expected, inventory_targets())
     if not (
         inventory['manifest_match'] is True
@@ -3544,6 +3711,7 @@ def restore_tail_reconcile(value):
         inventory['manifest_match'] is True
         and inventory['unexpected_count'] == 0
         and inventory['missing_count'] == 0
+        and not STAGE.exists()
     )
     restart_resolved = (
         restart['submitted'] is True
@@ -3558,6 +3726,9 @@ def restore_tail_reconcile(value):
     return {
         'original_operation_id': original,
         'reconciliation_operation_id': reconciliation,
+        'original_action': original_action,
+        'original_phase': original_phase,
+        'source_recovery_outcome': source_recovery_outcome,
         **inventory,
         'research_files_absent': research_files_absent,
         'core_http_status': core.get('http_status'),
@@ -4195,8 +4366,10 @@ class PrivateInteractiveSessionBroker:
 
     def _reconcile_restore_tail(
         self,
-        manifest: SourceManifest,
+        bundle: SourceBundle,
         original_operation_id: str,
+        original_action: str,
+        original_phase: str,
         restart_mode: str,
         *,
         _capability: object = None,
@@ -4206,10 +4379,11 @@ class PrivateInteractiveSessionBroker:
             _capability, frozenset({LifecycleAction.RESTORE_TAIL_RECONCILE})
         )
         if (
-            not isinstance(manifest, SourceManifest)
-            or manifest.state is not SourceState.RESTORE
+            not isinstance(bundle, SourceBundle)
+            or bundle.state is not SourceState.RESTORE
         ):
-            raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+            raise SourceBundleError("RESTORE_BUNDLE_INVALID") from None
+        validate_source_bundle(bundle)
         if (
             not isinstance(original_operation_id, str)
             or re.fullmatch(r"[0-9a-f]{32}", original_operation_id) is None
@@ -4217,15 +4391,34 @@ class PrivateInteractiveSessionBroker:
             raise SourceBundleError("RESTORE_OPERATION_ID_INVALID") from None
         if restart_mode not in {"submit_once", "previously_committed"}:
             raise SourceBundleError("RESTORE_RESTART_MODE_INVALID") from None
+        if original_action not in {
+            LifecycleAction.RESTORE_TRANSFER.value,
+            LifecycleAction.RESTORE_INSTALL.value,
+            LifecycleAction.RESTORE_INVENTORY.value,
+            LifecycleAction.RESTORE_CORE_CHECK_1.value,
+            LifecycleAction.REMOVAL_RESTART.value,
+            LifecycleAction.RESTORE_READINESS.value,
+            LifecycleAction.SERVICES_ABSENT.value,
+            LifecycleAction.POST_RESTORE_REPAIRS.value,
+        } or original_phase not in {
+            "intent_durable",
+            "dispatch_started",
+            "result_durable",
+            "transition_committed",
+            "ambiguous",
+        }:
+            raise SourceBundleError("RESTORE_OPERATION_PHASE_INVALID") from None
         output = self.__execute_bounded_operation(
             BoundedOperation.RESTORE_TAIL_RECONCILE,
             {
-                "manifest": _manifest_payload(manifest),
+                **_bundle_payload(bundle),
                 "original_operation_id": original_operation_id,
                 "reconciliation_operation_id": str(capability.issuance_identity),
+                "original_action": original_action,
+                "original_phase": original_phase,
                 "restart_mode": restart_mode,
             },
-            detail=manifest.state.value,
+            detail=bundle.state.value,
             _capability=_capability,
         )
         value = _exact_payload(output)
@@ -5664,7 +5857,10 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
         if self._journal is None:
             raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
-        original_operation_id = self._journal.restore_tail_original_operation_id()
+        original_operation = self._journal.restore_tail_original_operation()
+        original_operation_id = original_operation["issuance_identity"]
+        original_action = original_operation["action"]
+        original_phase = original_operation["phase"]
         try:
             restart_mode = self._journal.restore_tail_restart_mode()
         except LifecycleControllerError:
@@ -5673,8 +5869,10 @@ class FullPreflightLifecycleController:
             result = self.__dispatch_action(
                 LifecycleAction.RESTORE_TAIL_RECONCILE,
                 lambda capability: self._broker._reconcile_restore_tail(
-                    bundle.manifest,
+                    bundle,
                     original_operation_id,
+                    original_action,
+                    original_phase,
                     restart_mode,
                     _capability=capability,
                 ),
@@ -5685,8 +5883,22 @@ class FullPreflightLifecycleController:
         if not (
             isinstance(result, RestoreTailReconciliationEvidence)
             and result.original_operation_id == original_operation_id
+            and result.original_action == original_action
+            and result.original_phase == original_phase
             and result.reconciliation_operation_id
             == str(self._journal._record["operations"][-1]["issuance_identity"])
+            and result.source_recovery_outcome
+            in {
+                LifecycleAction.RESTORE_TRANSFER.value: {
+                    "already_restored",
+                    "staged_then_restored",
+                    "transferred_then_restored",
+                },
+                LifecycleAction.RESTORE_INSTALL.value: {
+                    "already_restored",
+                    "staged_then_restored",
+                },
+            }.get(original_action, {"already_restored"})
             and _exact_non_bool_int(result.expected_count, minimum=1)
             and result.expected_count == expected
             and _exact_non_bool_int(result.observed_count, minimum=1)
