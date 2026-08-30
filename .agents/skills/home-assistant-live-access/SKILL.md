@@ -45,6 +45,10 @@ interactive login. Recommended permissions are owner-only executable (`0700`)
 under an owner-only parent directory.
 
 The wrapper itself must never print the resolved target before launching SSH.
+It is a private target container only: retained automation must not invoke the
+raw wrapper directly. Use the repository's privacy-filtering interactive PTY
+session broker, which starts the wrapper privately and never forwards its
+startup banner or close output to the transcript.
 
 If the wrapper is absent, do **not** solve that by rendering `AGENTS.local.md`
 into the transcript. A separately authorized local-only bootstrap may create
@@ -71,8 +75,10 @@ network route merely because a linked worktree lacks `AGENTS.local.md`.
 On the verified primary workstation, SSH authentication is supplied by the
 existing SSH Key Agent and requires an **interactive SSH login**.
 
-Launch the private wrapper with an interactive terminal/PTY and keep that SSH
-session open for the bounded live task.
+The broker launches the private wrapper with an actual interactive terminal/PTY
+and keeps that SSH session open for the bounded live task. SSH Key Agent
+authentication remains interactive; the broker is not a non-interactive
+`ssh <target> "command"` replacement.
 
 Do **not** replace it with a one-shot command such as:
 
@@ -91,8 +97,8 @@ or SSH-agent environment variables.
 A direct/non-login command environment on this host may lack the Supervisor
 context required by the Home Assistant `ha` CLI.
 
-After the interactive SSH login succeeds, use a login Bash environment for
-Supervisor-backed commands. Preferred patterns are:
+After the interactive SSH login succeeds, the broker privately sends the
+login-shell command before reporting generic readiness:
 
 ```text
 exec bash -li
@@ -115,20 +121,33 @@ If a direct shell invocation lacks Supervisor context, first correct the login
 shell as above. Do not conclude that Supervisor is unavailable and do not create
 an alternate route merely because a non-login environment lacks the token.
 
+The broker uses explicit private lifecycle states: `SSH_CHILD_STARTED`,
+`REMOTE_INTERACTIVE_READY`, `LOGIN_SHELL_READY`, `SESSION_ACTIVE`, and
+`CLOSED`. It captures initial output and connection-close messages privately,
+uses bounded timeout/output limits, emits only `HA_INTERACTIVE_SESSION_READY`
+after the login-shell state, and returns only structured, allowlisted adapter
+results. It has no raw terminal-output passthrough.
+
 ## 5. Strict structured Repairs admission
 
 Repairs admission is fail-closed. When a supported Home Assistant response is
 used to prove the Repairs gate, the collector must validate the actual response
 shape before filtering or counting anything.
 
-For the currently verified structured response, require:
+The singular collector transport is `ha resolution info --raw-json` (or the
+exactly equivalent Supervisor `/resolution/info` response envelope). Validate
+the complete Supervisor envelope, not a guessed extracted payload. Require:
 
 - top-level value is an object/dictionary;
-- the object contains key `issues`;
-- `issues` is a list.
+- exact string `result` value `ok`;
+- object `data`;
+- key `issues` inside `data`;
+- list `data.issues`.
 
-A missing key, null value, array at the top level, string, malformed JSON, or any
-other response shape is an admission failure/indeterminate observation.
+A missing field, non-string or non-`ok` result, null/non-object data,
+null/non-list issues, array at the top level, malformed JSON, or any other
+response shape is an admission failure/indeterminate observation. The obsolete
+top-level `{"issues": []}` shape is deliberately rejected.
 
 **Forbidden:** silently converting an unexpected response into an empty list,
 for example logic equivalent to:
@@ -151,9 +170,16 @@ A minimal safe shape check is conceptually:
 payload = json.load(stream)
 if not isinstance(payload, dict):
     raise ValueError("repairs_response_shape")
-if "issues" not in payload or not isinstance(payload["issues"], list):
+if "result" not in payload or not isinstance(payload["result"], str):
+    raise ValueError("repairs_response_shape")
+if payload["result"] != "ok" or "data" not in payload:
+    raise ValueError("repairs_response_shape")
+if not isinstance(payload["data"], dict):
+    raise ValueError("repairs_response_shape")
+data = payload["data"]
+if "issues" not in data or not isinstance(data["issues"], list):
     raise ValueError("repairs_issues_shape")
-issues = payload["issues"]
+issues = data["issues"]
 ```
 
 Task-specific filtering of `issues` must happen in-process. Retained/public
@@ -182,12 +208,12 @@ admission failure as an invocation/service failure.
 
 For agent/orchestrator execution:
 
-1. Open one interactive SSH session using the private local wrapper.
-2. Wait for the Home Assistant command-line prompt/banner before sending remote
-   work.
-3. Enter the verified login-shell workflow.
-4. Execute the authorized bounded commands by sending them through that existing
-   interactive session.
+1. Start one interactive SSH session through the privacy-filtering PTY broker.
+2. Let it privately consume the Home Assistant prompt/banner and establish the
+   verified login shell.
+3. Wait only for its generic readiness sentinel.
+4. Execute authorized bounded commands through reviewed structured adapters in
+   that existing interactive session; never bridge raw remote stdout.
 5. Validate structured admission responses strictly before mutation gates.
 6. Keep authorization boundaries from the active task; this skill grants no
    deployment, restart, service-call, BLE, lock, or configuration permission by
@@ -219,6 +245,9 @@ operation merely to recover from orchestration problems.
   absolute evidence paths without using real private data.
 - Public reports should describe the route only as the verified private
   interactive SSH route.
+- R24's fail-closed D0 stop was correct and made no source or device mutation.
+  The confirmed correction target is a Supervisor schema-layer mismatch, not
+  PR #45, BLE, a device, or the interactive invocation contract.
 
 ## 8. Fail-closed access and admission decisions
 
