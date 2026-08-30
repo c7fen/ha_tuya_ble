@@ -11,15 +11,20 @@ import argparse
 import ast
 import json
 import os
+import pty
 import re
+import select
 import shlex
 import stat
+import subprocess
 import sys
+import termios
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO, TypeVar
 
 REPAIRS_RESPONSE_SHAPE_INVALID = "REPAIRS_RESPONSE_SHAPE_INVALID"
 ADMISSION_COLLECTOR = "ADMISSION_COLLECTOR"
@@ -27,9 +32,12 @@ ADMISSION_VALID = "ADMISSION_VALID"
 PRIVATE_WRAPPER_BOOTSTRAPPED = "PRIVATE_WRAPPER_BOOTSTRAPPED"
 PRIVATE_WRAPPER_VALID = "PRIVATE_WRAPPER_VALID"
 PRIVATE_WRAPPER_INVALID = "PRIVATE_WRAPPER_INVALID"
+HA_INTERACTIVE_SESSION_READY = "HA_INTERACTIVE_SESSION_READY"
 PRIVATE_ROUTE_ID = "home-assistant-private-ssh"
 SAFE_SSH_EXECUTABLES = frozenset({"ssh", "/usr/bin/ssh", "/bin/ssh"})
 SAFE_PRIVATE_ALIAS = re.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_COMMAND_DONE_MARKER = "__HA_INTERACTIVE_COMMAND_DONE__"
+_MAX_PTY_CAPTURE_BYTES = 64 * 1024
 
 
 class RepairsGate(StrEnum):
@@ -38,6 +46,42 @@ class RepairsGate(StrEnum):
     INITIAL = "initial"
     POST_ACTIVATION = "post_activation"
     POST_ROLLBACK = "post_rollback"
+
+
+class BrokerState(StrEnum):
+    """The explicit private session phases; no child output is public state."""
+
+    SSH_CHILD_STARTED = "SSH_CHILD_STARTED"
+    REMOTE_INTERACTIVE_READY = "REMOTE_INTERACTIVE_READY"
+    LOGIN_SHELL_READY = "LOGIN_SHELL_READY"
+    SESSION_ACTIVE = "SESSION_ACTIVE"
+    CLOSED = "CLOSED"
+
+
+class BrokerFailure(StrEnum):
+    """Fixed, non-transcript failure classes for a private session."""
+
+    CHILD_EXITED = "CHILD_EXITED"
+    OUTPUT_LIMIT = "OUTPUT_LIMIT"
+    PROTOCOL = "PROTOCOL"
+    TIMEOUT = "TIMEOUT"
+
+
+class SessionBrokerError(RuntimeError):
+    """A failure that intentionally never includes captured PTY bytes."""
+
+
+CommandResult = TypeVar("CommandResult")
+
+
+class StructuredSessionCommand(Protocol[CommandResult]):
+    """A bounded command with a sanitizer, never a raw terminal passthrough."""
+
+    def wire_command(self, completion_marker: str) -> str:
+        """Return the reviewed shell command plus an internal completion marker."""
+
+    def sanitize(self, private_output: bytes) -> CommandResult:
+        """Return only the command's structured, allowlisted result."""
 
 
 @dataclass(frozen=True)
@@ -97,7 +141,7 @@ def _invalid_repairs_result(gate: RepairsGate) -> RepairsGateResult:
 def decode_repairs_response(
     response: str,
 ) -> DecodedRepairs:
-    """Strictly decode the proven response shape without a permissive fallback."""
+    """Decode only the complete Supervisor ``ha --raw-json`` envelope."""
     try:
         payload = json.loads(response)
     except (TypeError, json.JSONDecodeError):
@@ -105,10 +149,17 @@ def decode_repairs_response(
 
     if not isinstance(payload, dict):
         return DecodedRepairs(shape_valid=False, issues=None)
-    if "issues" not in payload or not isinstance(payload["issues"], list):
+    if "result" not in payload or not isinstance(payload["result"], str):
+        return DecodedRepairs(shape_valid=False, issues=None)
+    if payload["result"] != "ok":
+        return DecodedRepairs(shape_valid=False, issues=None)
+    if "data" not in payload or not isinstance(payload["data"], dict):
+        return DecodedRepairs(shape_valid=False, issues=None)
+    data = payload["data"]
+    if "issues" not in data or not isinstance(data["issues"], list):
         return DecodedRepairs(shape_valid=False, issues=None)
 
-    return DecodedRepairs(shape_valid=True, issues=tuple(payload["issues"]))
+    return DecodedRepairs(shape_valid=True, issues=tuple(data["issues"]))
 
 
 def aggregate_decoded_repairs(
@@ -180,6 +231,233 @@ def repairs_evidence(result: RepairsGateResult) -> RepairsEvidence:
         relevant_count=result.aggregate.relevant_count,
         critical_count=result.aggregate.critical_count,
     )
+
+
+def _extract_single_json_object(private_output: bytes) -> str | None:
+    """Find one complete JSON object amid private PTY command echo and prompts."""
+    try:
+        text = private_output.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    decoder = json.JSONDecoder()
+    objects: list[object] = []
+    offset = 0
+    while True:
+        start = text.find("{", offset)
+        if start == -1:
+            break
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            offset = start + 1
+            continue
+        objects.append(value)
+        offset = start + end
+
+    if len(objects) != 1 or not isinstance(objects[0], dict):
+        return None
+    return json.dumps(objects[0], separators=(",", ":"), sort_keys=True)
+
+
+class ResolutionInfoCommand:
+    """The one supported structured Repairs command; output is aggregate-only."""
+
+    def __init__(
+        self,
+        gate: RepairsGate,
+        is_relevant: Callable[[object], bool],
+        is_critical: Callable[[object], bool],
+    ) -> None:
+        self._gate = gate
+        self._is_relevant = is_relevant
+        self._is_critical = is_critical
+
+    def wire_command(self, completion_marker: str) -> str:
+        return "ha resolution info --raw-json; " f"printf '%s\\n' '{completion_marker}'"
+
+    def sanitize(self, private_output: bytes) -> RepairsEvidence:
+        response = _extract_single_json_object(private_output)
+        result = collect_repairs_gate(
+            self._gate,
+            response if response is not None else "",
+            self._is_relevant,
+            self._is_critical,
+        )
+        return repairs_evidence(result)
+
+
+class PrivateInteractiveSessionBroker:
+    """Privately broker one actual interactive PTY session through a wrapper.
+
+    The wrapper argv and every byte emitted by its SSH child stay process-local.
+    This class publishes only the fixed readiness sentinel and structured command
+    adapter results. It intentionally provides no API for raw terminal output.
+    """
+
+    def __init__(
+        self,
+        wrapper_argv: list[str],
+        *,
+        remote_ready_marker: bytes,
+        login_ready_marker: bytes,
+        timeout_seconds: float = 15.0,
+        max_capture_bytes: int = _MAX_PTY_CAPTURE_BYTES,
+    ) -> None:
+        if (
+            not wrapper_argv
+            or not remote_ready_marker
+            or not login_ready_marker
+            or timeout_seconds <= 0
+            or max_capture_bytes <= 0
+        ):
+            raise ValueError("PRIVATE_SESSION_BROKER_CONFIGURATION_INVALID")
+        self._wrapper_argv = tuple(wrapper_argv)
+        self._remote_ready_marker = remote_ready_marker
+        self._login_ready_marker = login_ready_marker
+        self._timeout_seconds = timeout_seconds
+        self._max_capture_bytes = max_capture_bytes
+        self._master_fd: int | None = None
+        self._child: subprocess.Popen[bytes] | None = None
+        self._state = BrokerState.CLOSED
+
+    def __repr__(self) -> str:
+        """Never render the wrapper source, argv, target, or captured output."""
+        return f"PrivateInteractiveSessionBroker(state={self._state.value!r})"
+
+    @property
+    def state(self) -> BrokerState:
+        """Expose only the generic lifecycle state."""
+        return self._state
+
+    def _raise(self, failure: BrokerFailure) -> None:
+        self.close()
+        raise SessionBrokerError(f"PRIVATE_INTERACTIVE_SESSION_{failure.value}")
+
+    def _write_private(self, value: str) -> None:
+        if self._master_fd is None:
+            self._raise(BrokerFailure.PROTOCOL)
+        try:
+            os.write(self._master_fd, value.encode("utf-8"))
+        except OSError:
+            self._raise(BrokerFailure.CHILD_EXITED)
+
+    def _read_until(self, marker: bytes) -> bytes:
+        """Read a bounded private exchange, discarding it once its adapter returns."""
+        if self._master_fd is None or self._child is None:
+            self._raise(BrokerFailure.PROTOCOL)
+        captured = bytearray()
+        deadline = time.monotonic() + self._timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._raise(BrokerFailure.TIMEOUT)
+            readable, _, _ = select.select([self._master_fd], [], [], remaining)
+            if not readable:
+                self._raise(BrokerFailure.TIMEOUT)
+            try:
+                chunk = os.read(self._master_fd, 4096)
+            except OSError:
+                self._raise(BrokerFailure.CHILD_EXITED)
+            if not chunk:
+                self._raise(BrokerFailure.CHILD_EXITED)
+            captured.extend(chunk)
+            if len(captured) > self._max_capture_bytes:
+                self._raise(BrokerFailure.OUTPUT_LIMIT)
+            marker_index = captured.find(marker)
+            if marker_index >= 0:
+                return bytes(captured[:marker_index])
+
+    def _drain_and_discard(self, duration_seconds: float) -> None:
+        """Suppress startup/close output rather than preserving it for diagnostics."""
+        if self._master_fd is None:
+            return
+        deadline = time.monotonic() + duration_seconds
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([self._master_fd], [], [], 0.01)
+            if not readable:
+                continue
+            try:
+                if not os.read(self._master_fd, 4096):
+                    return
+            except OSError:
+                return
+
+    def open(self) -> BrokerState:
+        """Start the wrapper on a PTY and privately establish the login shell."""
+        if self._state is not BrokerState.CLOSED or self._child is not None:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_ALREADY_OPEN")
+        master_fd, slave_fd = pty.openpty()
+        terminal_attributes = termios.tcgetattr(slave_fd)
+        terminal_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
+        try:
+            self._child = subprocess.Popen(
+                self._wrapper_argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+            )
+        except OSError as error:
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_START_FAILED"
+            ) from error
+        os.close(slave_fd)
+        self._master_fd = master_fd
+        self._state = BrokerState.SSH_CHILD_STARTED
+        self._read_until(self._remote_ready_marker)
+        self._state = BrokerState.REMOTE_INTERACTIVE_READY
+        self._write_private("exec bash -li\n")
+        self._read_until(self._login_ready_marker)
+        self._state = BrokerState.LOGIN_SHELL_READY
+        self._state = BrokerState.SESSION_ACTIVE
+        print(HA_INTERACTIVE_SESSION_READY)
+        return self._state
+
+    def execute(
+        self, command: StructuredSessionCommand[CommandResult]
+    ) -> CommandResult:
+        """Run a reviewed bounded adapter and expose only its sanitized result."""
+        if self._state is not BrokerState.SESSION_ACTIVE:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE")
+        wire_command = command.wire_command(_COMMAND_DONE_MARKER)
+        if "\n" in wire_command or "\r" in wire_command:
+            raise ValueError("PRIVATE_INTERACTIVE_COMMAND_INVALID")
+        self._write_private(wire_command + "\n")
+        private_output = self._read_until(_COMMAND_DONE_MARKER.encode("ascii"))
+        return command.sanitize(private_output)
+
+    def close(self) -> None:
+        """Close/terminate privately and discard the local SSH close message."""
+        child = self._child
+        master_fd = self._master_fd
+        if child is not None and child.poll() is None and master_fd is not None:
+            try:
+                os.write(master_fd, b"exit\n")
+            except OSError:
+                pass
+            self._drain_and_discard(0.1)
+            try:
+                child.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    child.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=0.5)
+        if master_fd is not None:
+            self._drain_and_discard(0.05)
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        self._master_fd = None
+        self._child = None
+        self._state = BrokerState.CLOSED
 
 
 def _private_spec_from_stream(stream: TextIO) -> dict[str, object]:

@@ -218,8 +218,9 @@ for line in sys.stdin:
     command = line.strip()
     if command == "exec bash -li":
         print("LOGIN_PROMPT", flush=True)
-    elif command == "safe-status":
+    elif command.startswith("ha resolution info --raw-json; printf"):
         print('{"result": "ok", "data": {"issues": []}}', flush=True)
+        print("__HA_INTERACTIVE_COMMAND_DONE__", flush=True)
     elif command == "exit":
         print("SYNTHETIC_CLOSE_TARGET_SENTINEL=private-host.invalid", flush=True)
         break
@@ -233,11 +234,12 @@ for line in sys.stdin:
 
     assert broker.open() == access.BrokerState.SESSION_ACTIVE
     assert broker.execute(
-        access.ResolutionInfoCommand("safe-status")
+        access.ResolutionInfoCommand(access.RepairsGate.INITIAL, _relevant, _critical)
     ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
     broker.close()
 
-    rendered = capsys.readouterr().out + capsys.readouterr().err + repr(broker)
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + repr(broker)
     assert "HA_INTERACTIVE_SESSION_READY" in rendered
     assert all(
         sentinel not in rendered
@@ -250,6 +252,36 @@ for line in sys.stdin:
             "SYNTHETIC_CLOSE_TARGET_SENTINEL",
         )
     )
+
+
+def test_b_m8_timeout_discards_private_startup_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B-M8: timeout is generic and never dumps the private captured banner."""
+    child = r"""
+import os
+import sys
+
+assert os.isatty(0)
+print("SYNTHETIC_TIMEOUT_PRIVATE_BANNER_SENTINEL=private-host.invalid", flush=True)
+for _ in sys.stdin:
+    pass
+"""
+    broker = access.PrivateInteractiveSessionBroker(
+        [sys.executable, "-u", "-c", child],
+        remote_ready_marker=b"NEVER_ARRIVES",
+        login_ready_marker=b"LOGIN_PROMPT",
+        timeout_seconds=0.05,
+    )
+
+    with pytest.raises(access.SessionBrokerError) as error:
+        broker.open()
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + str(error.value) + repr(broker)
+    assert "PRIVATE_INTERACTIVE_SESSION_TIMEOUT" in rendered
+    assert "SYNTHETIC_TIMEOUT_PRIVATE_BANNER_SENTINEL" not in rendered
+    assert broker.state is access.BrokerState.CLOSED
 
 
 def test_o_m6_private_instruction_never_reaches_bootstrap_stdout(
@@ -307,8 +339,8 @@ def test_o_m8_validation_rejects_0755_wrapper_and_returns_nonzero(
     assert "PRIVATE_WRAPPER_INVALID" in capsys.readouterr().out
 
 
-def test_o_m9_tooling_has_no_execution_or_network_opener_path() -> None:
-    """O-M9: helper code writes/inspects a wrapper but never executes it."""
+def test_o_m9_broker_has_no_network_or_unbounded_terminal_passthrough() -> None:
+    """O-M9: the broker may start the local wrapper but never opens a network API."""
     tree = ast.parse(Path(access.__file__).read_text(encoding="utf-8"))
     imported_roots = {
         alias.name.split(".")[0]
@@ -322,7 +354,7 @@ def test_o_m9_tooling_has_no_execution_or_network_opener_path() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
 
-    assert not imported_roots & {"socket", "subprocess", "urllib", "requests", "http"}
+    assert not imported_roots & {"socket", "urllib", "requests", "http"}
     assert not called_attributes & {
         "execv",
         "execve",
