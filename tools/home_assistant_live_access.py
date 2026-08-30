@@ -593,6 +593,34 @@ def _exact_payload(private_output: bytes) -> dict[str, Any]:
     return payload
 
 
+def _exact_core_check_payload(private_output: bytes) -> dict[str, Any]:
+    """Decode only the Core-check allowlist, including a generic error class."""
+    extracted = _extract_exact_framed_json_object(private_output)
+    if extracted is None:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    try:
+        payload = json.loads(extracted)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    allowed = {"http_status", "result", "check_passed", "error_class"}
+    error_class = (
+        payload["error_class"]
+        if isinstance(payload, dict) and "error_class" in payload
+        else None
+    )
+    if (
+        not isinstance(payload, dict)
+        or not set(payload).issubset(allowed)
+        or error_class is not None
+        and (
+            not isinstance(error_class, str)
+            or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error_class)
+        )
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return payload
+
+
 def _bool(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError
@@ -653,12 +681,16 @@ def _parse_core_check_result(value: object, *, attempt_ordinal: int) -> CoreChec
         not isinstance(status, int)
         or isinstance(status, bool)
         or not isinstance(result, str)
-        or not isinstance(passed, bool)
         or error_class is not None
         and not isinstance(error_class, str)
     ):
         return invalid
-    exact_pass = 200 <= status < 300 and result == "ok" and passed is True
+    exact_pass = (
+        200 <= status < 300
+        and result == "ok"
+        and passed is True
+        and error_class is None
+    )
     return CoreCheckResult(
         attempt_ordinal,
         status,
@@ -1927,7 +1959,9 @@ class PrivateInteractiveSessionBroker:
     def _transfer_source_bundle(self, bundle: SourceBundle) -> TransferResult:
         validate_source_bundle(bundle)
         output = self._execute_bounded_operation(
-            BoundedOperation.TRANSFER, _bundle_payload(bundle)
+            BoundedOperation.TRANSFER,
+            _bundle_payload(bundle),
+            detail=bundle.state.value,
         )
         return self._simple_result(
             output,
@@ -1942,7 +1976,9 @@ class PrivateInteractiveSessionBroker:
         ):
             raise SourceBundleError("CANDIDATE_MANIFEST_REQUIRED") from None
         output = self._execute_bounded_operation(
-            BoundedOperation.INSTALL, {"manifest": _manifest_payload(manifest)}
+            BoundedOperation.INSTALL,
+            {"manifest": _manifest_payload(manifest)},
+            detail=manifest.state.value,
         )
         result = self._simple_result(
             output,
@@ -1966,6 +2002,7 @@ class PrivateInteractiveSessionBroker:
         output = self._execute_bounded_operation(
             BoundedOperation.SOURCE_INVENTORY,
             {"manifest": _manifest_payload(manifest)},
+            detail=manifest.state.value,
         )
         return _parse_source_inventory_result(_exact_payload(output))
 
@@ -1974,7 +2011,7 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError("CORE_CHECK_ATTEMPT_INVALID") from None
         output = self._execute_bounded_operation(BoundedOperation.CORE_CHECK, {})
         return _parse_core_check_result(
-            _exact_payload(output), attempt_ordinal=attempt_ordinal
+            _exact_core_check_payload(output), attempt_ordinal=attempt_ordinal
         )
 
     def _restart_core(self) -> RestartResult:
@@ -2076,6 +2113,7 @@ class PrivateInteractiveSessionBroker:
         output = self._execute_bounded_operation(
             BoundedOperation.RESTORE,
             {"manifest": _manifest_payload(manifest)},
+            detail=manifest.state.value,
         )
         result = self._simple_result(
             output,
@@ -2259,32 +2297,32 @@ class FullPreflightLifecycleController:
 
     @staticmethod
     def _bundle_result_pass(
-        result: object, _expected_count: int, result_type: type[Any]
+        result: object, expected_count: int, result_type: type[Any]
     ) -> bool:
         if not isinstance(result, result_type):
             return False
         if isinstance(result, TransferResult):
             return (
                 result.success
-                and result.file_count > 0
+                and result.file_count == expected_count
                 and result.manifest_match
                 and result.regular_files_only
             )
         if isinstance(result, InstallResult):
             return (
                 result.installation_success
-                and result.expected_file_count > 0
-                and result.installed_file_count == result.expected_file_count
+                and result.expected_file_count == expected_count
+                and result.installed_file_count == expected_count
                 and result.manifest_match
             )
         return False
 
     @staticmethod
-    def _inventory_pass(result: object, _expected_count: int) -> bool:
+    def _inventory_pass(result: object, expected_count: int) -> bool:
         return (
             isinstance(result, SourceInventoryResult)
-            and result.expected_count > 0
-            and result.observed_count == result.expected_count
+            and result.expected_count == expected_count
+            and result.observed_count == expected_count
             and result.manifest_match
             and result.unexpected_count == 0
             and result.missing_count == 0

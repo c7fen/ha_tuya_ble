@@ -1652,6 +1652,7 @@ for line in sys.stdin:
         emit(values[1])
     elif "HA_R30_OPERATION=" in line and len(values) == 2:
         operation = re.search(r"HA_R30_OPERATION=([a-z_]+)", line).group(1)
+        expected_count = 1 if "HA_R30_DETAIL=restore" in line else 3
         emit(values[0])
         if operation == "restart_core":
             restart_count += 1
@@ -1689,8 +1690,14 @@ for line in sys.stdin:
                 response = {"exit_code": 0, "outcome": "receipt", "nonce": "b" * 16}
             else:
                 response = {"exit_code": 0, "outcome": "preflight_ok", "nonce": "b" * 16}
+        elif operation == "transfer":
+            response = {"success": True, "file_count": expected_count, "manifest_match": True, "regular_files_only": True}
+        elif operation == "install":
+            response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
+        elif operation == "source_inventory":
+            response = {"expected_count": expected_count, "observed_count": expected_count, "manifest_match": True, "unexpected_count": 0, "missing_count": 0}
         elif operation == "restore":
-            response = {"installation_success": True, "expected_file_count": 3, "installed_file_count": 3, "manifest_match": True}
+            response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
         else:
             response = responses[operation]
         print(json.dumps(response, separators=(",", ":")), flush=True)
@@ -2328,6 +2335,31 @@ def test_r32_c1_m10_remote_core_check_never_synthesizes_authoritative_body_field
     assert "passed = 200 <= status < 300 and result == 'ok'" not in core_check
 
 
+def test_r32_core_check_completed_generic_error_is_typed_fail_not_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    monkeypatch.setattr(
+        broker,
+        "_execute_bounded_operation",
+        lambda _operation, _value: (
+            b'{"http_status":0,"result":"error","error_class":"REQUEST_FAILED"}'
+        ),
+    )
+
+    result = broker._check_core(1)
+
+    assert result == access.CoreCheckResult(1, 0, "error", False, "REQUEST_FAILED")
+
+
+def test_r32_core_check_specialized_payload_rejects_non_allowlisted_fields() -> None:
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._exact_core_check_payload(
+            b'{"http_status":0,"result":"error","error_class":"REQUEST_FAILED",'
+            b'"private_detail":"forbidden"}'
+        )
+
+
 @pytest.mark.parametrize(
     ("case", "response"),
     (
@@ -2754,6 +2786,39 @@ def test_r32_core_check_completed_fail_has_no_retry_but_outer_ambiguity_allows_a
     ] == [1, 2]
 
 
+def test_r32_terminal_broker_timeout_closes_generation_and_forbids_attempt_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    broker._state = access.BrokerState.SESSION_ACTIVE
+    broker._session_generation = object()
+    calls = 0
+
+    def terminal_timeout(_operation: object, _value: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        broker._state = access.BrokerState.CLOSED
+        broker._session_generation = None
+        raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+
+    monkeypatch.setattr(broker, "_execute_bounded_operation", terminal_timeout)
+    controller = access.FullPreflightLifecycleController(
+        broker, is_relevant=_relevant, is_critical=_critical
+    )
+    controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+
+    with pytest.raises(access.LifecycleControllerError, match="TRANSPORT_AMBIGUOUS"):
+        controller.check_candidate_core()
+    with pytest.raises(access.LifecycleControllerError, match="SESSION_CHANGED"):
+        controller.check_candidate_core()
+
+    assert calls == 1
+    assert (
+        controller._permits[access.LifecycleAction.CANDIDATE_CORE_CHECK_2].consumed
+        is False
+    )
+
+
 def test_r32_initial_and_final_repairs_require_shape_and_exact_zero_counts() -> None:
     for evidence in (
         access.RepairsEvidence(False, None, None),
@@ -2777,6 +2842,31 @@ def test_r32_service_admission_validates_exact_counts_not_result_booleans() -> N
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.verify_research_services_present()
+
+
+@pytest.mark.parametrize(
+    ("result", "result_type"),
+    (
+        (access.TransferResult(True, 2, True, True), access.TransferResult),
+        (access.InstallResult(True, 2, 2, True), access.InstallResult),
+        (access.InstallResult(True, 3, 2, True), access.InstallResult),
+    ),
+)
+def test_r32_bundle_admission_rejects_self_consistent_wrong_reported_count(
+    result: object, result_type: type[object]
+) -> None:
+    assert (
+        access.FullPreflightLifecycleController._bundle_result_pass(
+            result, 3, result_type
+        )
+        is False
+    )
+
+
+def test_r32_inventory_admission_rejects_self_consistent_wrong_reported_count() -> None:
+    result = access.SourceInventoryResult(2, 2, True, 0, 0)
+
+    assert access.FullPreflightLifecycleController._inventory_pass(result, 3) is False
 
 
 def test_r32_direct_broker_helper_bypass_is_unavailable_before_pty_write(

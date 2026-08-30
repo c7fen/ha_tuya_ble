@@ -223,9 +223,14 @@ synthesizes that field from HTTP status or `result`. Success requires a
 completed request, 2xx status, JSON object, exact string `result == "ok"`, and
 exact boolean `check_passed is true`. A completed FAIL is terminal. Attempt 2
 is permitted only after outer transport ambiguity left no completed result;
-the controller never reconnects or retries automatically. Restart uses the fixed
-Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
-second submission for the same activated source state before PTY I/O.
+the controller never reconnects or retries automatically. A terminal PTY
+timeout closes the broker and invalidates its session generation, so that
+lifecycle cannot use attempt 2. The two-attempt limit is an upper allowance
+only when the same bound session survives the outer ambiguity. A completed
+generic `error_class` response is a typed Core-check FAIL, not transport
+ambiguity. Restart uses the fixed Supervisor Core restart endpoint, has no
+retry loop, and the broker rejects a second submission for the same activated
+source state before PTY I/O.
 Readiness polling is bounded and verifies Core reachability, the running API,
 and `tuya_ble` in Core's loaded component set. Temporary service presence or
 absence remains a separate exact-count aggregate gate; result booleans alone
@@ -257,7 +262,9 @@ substitutes for PR #41 proof. Final acceptance is a typed, no-default proof
 requiring exact source inventory with no research files, authoritative Core
 check, consumed/dispatched/accepted removal restart, full readiness including
 `tuya_ble`, all four temporary services absent, and strict Repairs shape/zero
-counts.
+counts. Transfer, install, and inventory result counts must equal the exact
+controller-owned bundle or manifest count; a self-consistent different count
+is not admission.
 
 The PR #45 audit helper and audit service exist only while the candidate source
 is active. Collect every required helper-backed snapshot, including any A2
