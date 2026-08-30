@@ -131,6 +131,10 @@ with no arguments in a controlling PTY, and has no raw terminal-output or
 generic command passthrough. Every remote-shell, login-shell, and collection
 boundary uses a fresh broker-owned nonce inside an exact control-delimited
 frame; prompts, banners, and echoed commands cannot establish readiness.
+Post-`exec bash -li` readiness is stricter than a fresh frame alone: the frame
+is emitted only when the shell proves `BASH_VERSION`, interactive `$-` mode,
+and `shopt -q login_shell` together. A shell that ignores the `exec` command is
+an access failure, not a ready Supervisor context.
 
 ## 5. Strict structured Repairs admission
 
