@@ -400,6 +400,39 @@ def test_b_m7_wrapper_contents_never_reach_retained_output(
     assert private_content not in rendered
 
 
+def test_b_m9_login_readiness_requires_verified_interactive_login_bash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B-M9: ignoring ``exec bash -li`` cannot be rescued by a generic frame."""
+    child = r"""
+import os
+import re
+import sys
+
+assert os.isatty(0)
+for line in sys.stdin:
+    values = re.findall(r"HA_BROKER_[A-Z_]+:[0-9a-f]+", line)
+    if "HA_BROKER_REMOTE" in line and values:
+        print("\x1e" + values[0] + "\x1f", flush=True)
+    elif line.strip() == "exec bash -li":
+        # A shell that ignores this must never be admitted as login Bash.
+        continue
+    elif line.startswith("printf ") and "HA_BROKER_LOGIN" in line and values:
+        # This models the rejected generic post-exec challenge fallback.
+        print("\x1e" + values[0] + "\x1f", flush=True)
+"""
+    broker = _broker(monkeypatch, tmp_path, child)
+
+    with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
+        broker.open()
+
+    source = Path(access.__file__).read_text(encoding="utf-8")
+    assert "BASH_VERSION" in source
+    assert "shopt -q login_shell" in source
+    assert "case $- in *i*" in source
+    assert 'self._challenge("LOGIN")' not in source
+
+
 def test_b_m6_production_spawn_has_a_controlling_tty(tmp_path: Path) -> None:
     """B-M6: the unpatched production primitive gives its child a controlling TTY."""
     wrapper = tmp_path / "synthetic-controlling-tty"
