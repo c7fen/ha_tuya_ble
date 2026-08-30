@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pty
+import select
 import sys
 import traceback
 from dataclasses import asdict
@@ -247,7 +248,13 @@ for line in sys.stdin:
 """
 
 
-def _broker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, child: str):
+def _broker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    child: str,
+    *,
+    max_capture_bytes: int = 64 * 1024,
+):
     wrapper = tmp_path / "SYNTHETIC_REAL_WRAPPER_MUST_NOT_RUN"
     monkeypatch.setattr(
         access,
@@ -255,7 +262,11 @@ def _broker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, child: str):
         lambda path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
     )
     monkeypatch.setattr(access, "_spawn_private_wrapper", _fake_spawn(child))
-    return access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
+    return access.PrivateInteractiveSessionBroker(
+        wrapper,
+        timeout_seconds=0.2,
+        max_capture_bytes=max_capture_bytes,
+    )
 
 
 @pytest.mark.parametrize(
@@ -282,6 +293,9 @@ def test_b_m1_to_b_m6_private_pty_output_never_reaches_transcript(
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
     assert broker.collect_resolution_info(
         access.RepairsGate.INITIAL, _relevant, _critical
+    ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
+    assert broker.collect_resolution_info(
+        access.RepairsGate.POST_ACTIVATION, _relevant, _critical
     ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
     broker.close()
 
@@ -317,8 +331,62 @@ def test_b_m7_wrapper_is_validated_then_spawned_without_arguments(
     broker.open()
     broker.close()
 
-    assert validated == [wrapper]
+    assert validated == [wrapper, wrapper]
     assert spawned == [wrapper]
+
+
+def test_b_m7_revalidates_wrapper_immediately_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B-M7: a wrapper invalidated after construction is never spawned."""
+    wrapper = tmp_path / "synthetic-wrapper-path"
+    validation_calls = 0
+    spawned: list[Path] = []
+
+    def validate(_: Path) -> access.WrapperValidationResult:
+        nonlocal validation_calls
+        validation_calls += 1
+        status = (
+            access.PRIVATE_WRAPPER_VALID
+            if validation_calls == 1
+            else access.PRIVATE_WRAPPER_INVALID
+        )
+        return access.WrapperValidationResult(status, ())
+
+    monkeypatch.setattr(access, "validate_private_wrapper", validate)
+    monkeypatch.setattr(
+        access, "_spawn_private_wrapper", lambda path: spawned.append(path)
+    )
+    broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
+
+    with pytest.raises(access.SessionBrokerError, match="WRAPPER_INVALID"):
+        broker.open()
+
+    assert validation_calls == 2
+    assert spawned == []
+
+
+def test_b_m6_production_spawn_has_a_controlling_tty(tmp_path: Path) -> None:
+    """B-M6: the unpatched production primitive gives its child a controlling TTY."""
+    wrapper = tmp_path / "synthetic-controlling-tty"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "exec python3 -c 'import os; "
+        "assert os.isatty(0); "
+        "assert os.tcgetpgrp(0) == os.getpgrp(); "
+        'print("SYNTHETIC_CONTROLLING_TTY_OK", flush=True)\'\n',
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o700)
+
+    child_pid, master_fd = access._spawn_private_wrapper(wrapper)
+    try:
+        readable, _, _ = select.select([master_fd], [], [], 1)
+        assert readable
+        assert b"SYNTHETIC_CONTROLLING_TTY_OK" in os.read(master_fd, 4096)
+        assert os.waitpid(child_pid, 0)[0] == child_pid
+    finally:
+        os.close(master_fd)
 
 
 @pytest.mark.parametrize("name,child", [("B-M8", ""), ("B-M9", "")])
@@ -447,6 +515,30 @@ def test_b_m8_exception_paths_never_retain_private_failure_context(
     assert forbidden not in rendered
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+def test_b_m8_output_limit_precedes_a_valid_frame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B-M8: a valid frame after over-limit private bytes fails closed."""
+    child = r"""
+import os
+import re
+import sys
+
+assert os.isatty(0)
+for line in sys.stdin:
+    values = re.findall(r"HA_BROKER_[A-Z_]+:[0-9a-f]+", line)
+    if values:
+        print("SYNTHETIC_OVER_LIMIT_PRIVATE_BYTES" * 4, flush=True)
+        print("\x1e" + values[0] + "\x1f", flush=True)
+"""
+    broker = _broker(monkeypatch, tmp_path, child, max_capture_bytes=8)
+
+    with pytest.raises(access.SessionBrokerError, match="OUTPUT_LIMIT") as error:
+        broker.open()
+
+    assert "SYNTHETIC_OVER_LIMIT_PRIVATE_BYTES" not in str(error.value)
 
 
 def test_o_m6_private_instruction_never_reaches_bootstrap_stdout(
