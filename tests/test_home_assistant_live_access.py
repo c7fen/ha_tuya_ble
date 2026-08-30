@@ -2671,6 +2671,7 @@ def _r32_controller_minted_capability(
             broker, is_relevant=_relevant, is_critical=_critical
         )
         broker._synthetic_test_controller = controller
+    controller._state = next(iter(access._LIFECYCLE_ACTION_PREDECESSORS[action]))
     dispatch_token = controller._FullPreflightLifecycleController__dispatch_token
     return controller._dispatch(
         action,

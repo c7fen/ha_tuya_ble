@@ -160,6 +160,23 @@ controller has no command-string, argv, stdin/stdout
 bridge, remote-path, service-name, endpoint, environment-variable, arbitrary
 helper-operation, caller nonce, or caller audit-label argument.
 
+Capability issuance is itself state-bound by an immutable action-to-predecessor
+table inside controller dispatch. Reaching a private dispatch method cannot mint
+an action capability from the wrong lifecycle state; rejection happens before
+permit consumption, capability issuance, callback execution, broker dispatch,
+or PTY output. Both Core-check capabilities require the same source-specific
+inventory predecessor, so the second capability remains only an outer-ambiguity
+allowance at that stage. Restore transfer alone permits either final candidate
+`A2_COLLECTED` or `ROLLBACK_REQUIRED`; ambiguous receipt and backup fallback are
+rollback-only.
+
+Private method names and internal token attributes are implementation details,
+not a supported caller surface. This contract does not attempt an in-process
+reflection arms race against code deliberately extracting a broker-owned raw
+write token. Supported controller calls, direct broker calls without a minted
+capability, and private dispatch calls from a wrong state all enforce the
+bounded contract before PTY output.
+
 The exact success sequence is:
 
 ```text

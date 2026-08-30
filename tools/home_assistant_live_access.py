@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, TextIO
 
 REPAIRS_RESPONSE_SHAPE_INVALID = "REPAIRS_RESPONSE_SHAPE_INVALID"
@@ -220,6 +221,73 @@ class LifecycleAction(StrEnum):
     FINAL_ACCEPTANCE = "final_acceptance"
     AMBIGUOUS_RECEIPT = "ambiguous_receipt"
     BACKUP_FALLBACK = "backup_fallback"
+
+
+_LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
+    {
+        LifecycleAction.INITIAL_REPAIRS: frozenset({LifecycleState.BASELINE}),
+        LifecycleAction.BACKUP: frozenset({LifecycleState.INITIAL_REPAIRS_PASS}),
+        LifecycleAction.CANDIDATE_TRANSFER: frozenset({LifecycleState.BACKUP_VERIFIED}),
+        LifecycleAction.CANDIDATE_INSTALL: frozenset({LifecycleState.CANDIDATE_STAGED}),
+        LifecycleAction.CANDIDATE_INVENTORY: frozenset(
+            {LifecycleState.CANDIDATE_INSTALLED}
+        ),
+        LifecycleAction.CANDIDATE_CORE_CHECK_1: frozenset(
+            {LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.CANDIDATE_CORE_CHECK_2: frozenset(
+            {LifecycleState.CANDIDATE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.ACTIVATION_RESTART: frozenset(
+            {LifecycleState.CANDIDATE_CORE_CHECKED}
+        ),
+        LifecycleAction.CANDIDATE_READINESS: frozenset(
+            {LifecycleState.ACTIVATION_RESTART_CONSUMED}
+        ),
+        LifecycleAction.SERVICES_PRESENT: frozenset({LifecycleState.CANDIDATE_READY}),
+        LifecycleAction.POST_ACTIVATION_REPAIRS: frozenset(
+            {LifecycleState.RESEARCH_SERVICES_PRESENT}
+        ),
+        LifecycleAction.A0: frozenset({LifecycleState.POST_ACTIVATION_REPAIRS_PASS}),
+        LifecycleAction.P0: frozenset({LifecycleState.A0_COLLECTED}),
+        LifecycleAction.AP0: frozenset({LifecycleState.P0_COMPLETED}),
+        LifecycleAction.PREFLIGHT: frozenset({LifecycleState.AP0_COLLECTED}),
+        LifecycleAction.RECEIPT: frozenset(
+            {LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED}
+        ),
+        LifecycleAction.A1: frozenset({LifecycleState.NON_PROBE_RECEIPT_COMPLETED}),
+        LifecycleAction.RESEARCH_FINAL: frozenset({LifecycleState.A1_COLLECTED}),
+        LifecycleAction.A2: frozenset({LifecycleState.RESEARCH_FINAL_VALIDATED}),
+        LifecycleAction.RESTORE_TRANSFER: frozenset(
+            {LifecycleState.A2_COLLECTED, LifecycleState.ROLLBACK_REQUIRED}
+        ),
+        LifecycleAction.RESTORE_INSTALL: frozenset({LifecycleState.RESTORE_STAGED}),
+        LifecycleAction.RESTORE_INVENTORY: frozenset({LifecycleState.PR41_RESTORED}),
+        LifecycleAction.RESTORE_CORE_CHECK_1: frozenset(
+            {LifecycleState.RESTORE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.RESTORE_CORE_CHECK_2: frozenset(
+            {LifecycleState.RESTORE_INVENTORY_VERIFIED}
+        ),
+        LifecycleAction.REMOVAL_RESTART: frozenset(
+            {LifecycleState.RESTORE_CORE_CHECKED}
+        ),
+        LifecycleAction.RESTORE_READINESS: frozenset(
+            {LifecycleState.REMOVAL_RESTART_CONSUMED}
+        ),
+        LifecycleAction.SERVICES_ABSENT: frozenset({LifecycleState.PR41_READY}),
+        LifecycleAction.POST_RESTORE_REPAIRS: frozenset(
+            {LifecycleState.RESEARCH_SERVICES_ABSENT}
+        ),
+        LifecycleAction.FINAL_ACCEPTANCE: frozenset(
+            {LifecycleState.POST_RESTORE_REPAIRS_PASS}
+        ),
+        LifecycleAction.AMBIGUOUS_RECEIPT: frozenset(
+            {LifecycleState.ROLLBACK_REQUIRED}
+        ),
+        LifecycleAction.BACKUP_FALLBACK: frozenset({LifecycleState.ROLLBACK_REQUIRED}),
+    }
+)
 
 
 _BOUNDED_OPERATION_ACTIONS = {
@@ -2681,6 +2749,9 @@ class FullPreflightLifecycleController:
         if _dispatch_token is not self.__dispatch_token:
             raise LifecycleControllerError("LIFECYCLE_DISPATCH_SCOPE_INVALID") from None
         self._assert_session_binding()
+        allowed_predecessors = _LIFECYCLE_ACTION_PREDECESSORS.get(action)
+        if allowed_predecessors is None or self._state not in allowed_predecessors:
+            raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         permit = self._permits[action]
         if permit.consumed:
             raise LifecycleControllerError("LIFECYCLE_PERMIT_CONSUMED") from None
