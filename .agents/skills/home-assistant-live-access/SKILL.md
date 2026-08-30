@@ -219,13 +219,28 @@ PR #41 restoration after any aborted or ambiguous research step terminates as
 
 The controller owns one versioned durable continuity journal at a fixed,
 repository-owned location under the shared Git metadata directory. No caller
-or HA target selects its path. The owner-private directory and regular files
-reject symlinks, unexpected owner, mode, link count, oversized or malformed
-JSON, duplicate keys, unknown fields, and invalid transition ledgers. A
-separate owner-private lock file is held with non-blocking `flock` for the
-controller lifetime, so a second object or process cannot own the lifecycle.
-Journal updates use an owner-private temporary regular file, file `fsync`,
-atomic replacement, and directory `fsync`.
+or HA target selects its path. An adjacent lifecycle-root anchor is durably
+created before the first journal. It binds the original lifecycle and PR #41
+authority to the state-root directory identity and monotonically mirrors the
+journal revision. A verified baseline-backup identity is added to the journal
+and anchor in the same versioned transition. An anchor with a missing journal
+is recovery-required state, never a fresh baseline; a journal with a missing
+anchor is inconsistent state. Terminal journals and their anchors are retained.
+
+This continuity guarantee assumes that the independently stored anchor remains
+when the journal alone is lost. If an external actor destroys or corrupts both
+the anchor and journal storage, no local software can infer the erased history;
+protect and recover that state root as one durability domain.
+
+The owner-private directory and regular files reject symlinks, unexpected
+owner, mode, link count, oversized or malformed JSON, duplicate keys, unknown
+fields, and invalid transition ledgers. The controller first opens one stable
+state-root directory descriptor, acquires the owner-private non-blocking
+`flock` through that descriptor, and only then loads the anchor and journal.
+All later critical path operations remain relative to that same descriptor, so
+pathname replacement cannot split lock and journal authority. Journal updates
+increment one strict integer revision and use an owner-private temporary
+regular file, file `fsync`, atomic replacement, and directory `fsync`.
 
 Before any dispatch-capable callback, the journal durably records the exact
 operation intent and tombstone. It then distinguishes dispatch started, result
@@ -287,7 +302,16 @@ integration deployment tree. Installation and restoration use one Linux atomic
 directory exchange, so PR #41 restoration removes the research helper in the
 same operation without touching another custom component. The fixed private
 backup is independently verified and is only a fallback; exact PR #41 remains
-the restoration authority.
+the restoration authority. It is published once as a single no-clobber
+directory package containing the integration tree and its identity metadata.
+The package binds the lifecycle generation, PR #41 commit/tree, PR41 source
+generation, immutable backup generation, canonical manifest identity, and
+package digest. Each file and required directory is synced before atomic
+`RENAME_NOREPLACE` publication and parent-directory sync. No sidecar metadata
+exists and Candidate content cannot satisfy the PR #41 manifest. If publication
+succeeds but its response is lost, a separate read-only reconciliation
+operation verifies and adopts that exact package; creation is never replayed or
+allowed to replace it.
 
 Core check uses exactly `POST http://supervisor/core/check`. The remote adapter
 preserves the authoritative response body's `check_passed` value; it never
@@ -331,18 +355,19 @@ enters `ROLLBACK_REQUIRED`. From there, the only normal recovery is exact PR
 #41 transfer, restore, inventory, authoritative Core check, one removal
 restart, readiness, service absence, and strict final Repairs. The private
 backup is a separately consumed last-resort fallback and never silently
-substitutes for PR #41 proof. Its private remote marker distinguishes
-`intent_recorded`, `possibly_applied`, and `reconciled`. Process loss around the
-atomic exchange cannot authorize replay: a separate typed reconciliation
-permit compares the bounded backup identity with the live and stored trees,
-then recognizes a completed exchange or completes it only when non-application
-is proven. Final acceptance is a typed, no-default proof
-requiring exact source inventory with no research files, authoritative Core
-check, consumed/dispatched/accepted removal restart, full readiness including
-`tuya_ble`, all four temporary services absent, and strict Repairs shape/zero
-counts. Transfer, install, and inventory result counts must equal the exact
-controller-owned bundle or manifest count; a self-consistent different count
-is not admission.
+substitutes for PR #41 proof. Its private remote marker distinguishes monotonic
+intent, possible-dispatch, possible-application, and reconciled phases. Process
+loss around the atomic exchange cannot authorize replay: a separate typed,
+bounded, read-only reconciliation permit compares the bounded backup identity
+with the live and stored trees. Loss of that reconciliation's own response
+resumes the same reconciliation operation, with its attempt bound retained; it
+does not recreate fallback authority. Final acceptance is a typed, no-default
+proof requiring exact source inventory with no research files, authoritative
+Core check, consumed/dispatched/accepted removal restart, full readiness
+including `tuya_ble`, all four temporary services absent, and strict Repairs
+shape/zero counts. Transfer, install, and inventory result counts must equal
+the exact controller-owned bundle or manifest count; a self-consistent
+different count is not admission.
 
 If the bound PTY session was lost while the controller object survives,
 rollback does not reconnect automatically.

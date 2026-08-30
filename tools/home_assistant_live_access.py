@@ -51,6 +51,7 @@ _FRAME_END = b"\x1f"
 _LIFECYCLE_JOURNAL_SCHEMA = 1
 _MAX_LIFECYCLE_JOURNAL_BYTES = 128 * 1024
 _LIFECYCLE_STATE_ROOT: Path | None = None
+_LIFECYCLE_ANCHOR_NAME = "anchor.json"
 _LIFECYCLE_JOURNAL_NAME = "journal.json"
 _LIFECYCLE_LOCK_NAME = "journal.lock"
 _DISABLE_DURABLE_LIFECYCLE_FOR_TESTS = False
@@ -134,6 +135,7 @@ class BoundedOperation(StrEnum):
     RESTORE = "restore"
     RESTORE_BACKUP = "restore_backup"
     RECONCILE_BACKUP = "reconcile_backup"
+    RECONCILE_BACKUP_CREATION = "reconcile_backup_creation"
 
 
 class PhaseAOperation(StrEnum):
@@ -158,6 +160,39 @@ class AuditLabel(StrEnum):
     AP0 = "AP0"
     A1 = "A1"
     A2 = "A2"
+
+
+class FallbackPhase(StrEnum):
+    """Monotonic durable fallback/reconciliation phases."""
+
+    AVAILABLE = "available"
+    INTENT_DURABLE = "intent_recorded"
+    DISPATCH_POSSIBLE = "dispatch_possible"
+    RECONCILIATION_REQUIRED = "possibly_applied"
+    RECONCILED_PR41 = "reconciled"
+    RECONCILED_CANDIDATE = "reconciled_candidate"
+    RECONCILED_UNKNOWN = "reconciled_unknown"
+
+
+_FALLBACK_PHASE_SUCCESSORS = MappingProxyType(
+    {
+        FallbackPhase.AVAILABLE: frozenset({FallbackPhase.INTENT_DURABLE}),
+        FallbackPhase.INTENT_DURABLE: frozenset({FallbackPhase.DISPATCH_POSSIBLE}),
+        FallbackPhase.DISPATCH_POSSIBLE: frozenset(
+            {FallbackPhase.RECONCILIATION_REQUIRED}
+        ),
+        FallbackPhase.RECONCILIATION_REQUIRED: frozenset(
+            {
+                FallbackPhase.RECONCILED_PR41,
+                FallbackPhase.RECONCILED_CANDIDATE,
+                FallbackPhase.RECONCILED_UNKNOWN,
+            }
+        ),
+        FallbackPhase.RECONCILED_PR41: frozenset(),
+        FallbackPhase.RECONCILED_CANDIDATE: frozenset(),
+        FallbackPhase.RECONCILED_UNKNOWN: frozenset(),
+    }
+)
 
 
 class LifecycleState(StrEnum):
@@ -193,6 +228,7 @@ class LifecycleState(StrEnum):
     COMPLETE = "COMPLETE_NORMAL"
     RESTORED_AFTER_ABORT = "RESTORED_AFTER_ABORT"
     RESTORE_FAILED = "RESTORE_FAILED"
+    MANUAL_RECOVERY_REQUIRED = "MANUAL_RECOVERY_REQUIRED"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     ROLLBACK_REQUIRED = "ROLLBACK_REQUIRED"
 
@@ -201,6 +237,7 @@ class LifecycleState(StrEnum):
         return self in {
             LifecycleState.ROLLBACK_REQUIRED,
             LifecycleState.RESTORE_FAILED,
+            LifecycleState.MANUAL_RECOVERY_REQUIRED,
             LifecycleState.RECOVERY_REQUIRED,
         }
 
@@ -210,6 +247,7 @@ class LifecycleAction(StrEnum):
 
     INITIAL_REPAIRS = "initial_repairs"
     BACKUP = "backup"
+    BACKUP_RECONCILE = "backup_reconcile"
     CANDIDATE_TRANSFER = "candidate_transfer"
     CANDIDATE_INSTALL = "candidate_install"
     CANDIDATE_INVENTORY = "candidate_inventory"
@@ -244,6 +282,7 @@ _LIFECYCLE_ACTION_PREDECESSORS = MappingProxyType(
     {
         LifecycleAction.INITIAL_REPAIRS: frozenset({LifecycleState.BASELINE}),
         LifecycleAction.BACKUP: frozenset({LifecycleState.INITIAL_REPAIRS_PASS}),
+        LifecycleAction.BACKUP_RECONCILE: frozenset({LifecycleState.RECOVERY_REQUIRED}),
         LifecycleAction.CANDIDATE_TRANSFER: frozenset({LifecycleState.BACKUP_VERIFIED}),
         LifecycleAction.CANDIDATE_INSTALL: frozenset({LifecycleState.CANDIDATE_STAGED}),
         LifecycleAction.CANDIDATE_INVENTORY: frozenset(
@@ -313,6 +352,7 @@ _LIFECYCLE_ACTION_SUCCESSORS = MappingProxyType(
             {LifecycleState.INITIAL_REPAIRS_PASS}
         ),
         LifecycleAction.BACKUP: frozenset({LifecycleState.BACKUP_VERIFIED}),
+        LifecycleAction.BACKUP_RECONCILE: frozenset({LifecycleState.BACKUP_VERIFIED}),
         LifecycleAction.CANDIDATE_TRANSFER: frozenset(
             {LifecycleState.CANDIDATE_STAGED}
         ),
@@ -380,7 +420,12 @@ _LIFECYCLE_ACTION_SUCCESSORS = MappingProxyType(
         ),
         LifecycleAction.BACKUP_FALLBACK: frozenset({LifecycleState.ROLLBACK_REQUIRED}),
         LifecycleAction.BACKUP_FALLBACK_RECONCILE: frozenset(
-            {LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED}
+            {
+                LifecycleState.PR41_RESTORED,
+                LifecycleState.ROLLBACK_REQUIRED,
+                LifecycleState.RECOVERY_REQUIRED,
+                LifecycleState.MANUAL_RECOVERY_REQUIRED,
+            }
         ),
     }
 )
@@ -476,9 +521,19 @@ _RESTORE_SOURCE_ACTIONS = frozenset(
     }
 )
 
+_PR41_BOUND_ACTIONS = _RESTORE_SOURCE_ACTIONS | {
+    LifecycleAction.BACKUP,
+    LifecycleAction.BACKUP_RECONCILE,
+    LifecycleAction.BACKUP_FALLBACK,
+    LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+}
+
 
 _BOUNDED_OPERATION_ACTIONS = {
     BoundedOperation.BACKUP: frozenset({LifecycleAction.BACKUP}),
+    BoundedOperation.RECONCILE_BACKUP_CREATION: frozenset(
+        {LifecycleAction.BACKUP_RECONCILE}
+    ),
     BoundedOperation.TRANSFER: frozenset(
         {LifecycleAction.CANDIDATE_TRANSFER, LifecycleAction.RESTORE_TRANSFER}
     ),
@@ -535,6 +590,7 @@ _ROLLBACK_REBIND_ACTIONS = frozenset(
         LifecycleAction.FINAL_ACCEPTANCE,
         LifecycleAction.BACKUP_FALLBACK,
         LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+        LifecycleAction.BACKUP_RECONCILE,
     }
 )
 
@@ -551,6 +607,7 @@ _ROLLBACK_BROKER_ADAPTERS = (
     "_invoke_phase_a",
     "_restore_private_backup",
     "_reconcile_private_backup",
+    "_reconcile_private_backup_creation",
 )
 
 
@@ -735,6 +792,11 @@ class BackupResult:
     file_count: int
     manifest_match: bool
     regular_files_only: bool
+    lifecycle_generation: str = field(default="", repr=False)
+    source_generation: str = field(default="", repr=False)
+    backup_generation: str = field(default="", repr=False)
+    manifest_identity: str = field(default="", repr=False)
+    backup_digest: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -1024,12 +1086,18 @@ def _fixed_lifecycle_state_root() -> Path:
     return common / "ha_tuya_ble_issue_37_lifecycle_v1"
 
 
+def _lifecycle_anchor_path(root: Path) -> Path:
+    """Return the independently retained anchor beside one lifecycle root."""
+    return root.parent / f".{root.name}.{_LIFECYCLE_ANCHOR_NAME}"
+
+
 class _DurableLifecycleJournal:
     """Fixed-path, locked, atomic continuity record for one Issue-37 lifecycle."""
 
     _TOP_LEVEL_KEYS = frozenset(
         {
             "schema_version",
+            "revision",
             "lifecycle_generation",
             "active",
             "terminal",
@@ -1051,11 +1119,14 @@ class _DurableLifecycleJournal:
             "transitions",
             "operations",
             "fallback_phase",
+            "fallback_reconciliation_attempts",
+            "baseline_backup_identity",
         }
     )
     _RISKY_ACTIONS = frozenset(
         {
             LifecycleAction.BACKUP.value,
+            LifecycleAction.BACKUP_RECONCILE.value,
             LifecycleAction.CANDIDATE_TRANSFER.value,
             LifecycleAction.CANDIDATE_INSTALL.value,
             LifecycleAction.ACTIVATION_RESTART.value,
@@ -1075,18 +1146,36 @@ class _DurableLifecycleJournal:
 
     def __init__(self) -> None:
         self._directory = _fixed_lifecycle_state_root()
-        self._journal_path = self._directory / _LIFECYCLE_JOURNAL_NAME
-        self._lock_path = self._directory / _LIFECYCLE_LOCK_NAME
+        self._anchor_name = _lifecycle_anchor_path(self._directory).name
+        self._parent_fd: int | None = None
+        self._root_fd: int | None = None
         self._lock_fd: int | None = None
         self._closed = False
         self._secure_directory()
         self._acquire_lock()
         try:
+            newly_created = False
+            anchor = self._read_anchor()
             record = self._read_record()
             if record is None:
+                if anchor is not None:
+                    raise LifecycleControllerError(
+                        "RECOVERY_REQUIRED_MISSING_JOURNAL"
+                    ) from None
                 record = self._new_record()
+                self._write_anchor(self._new_anchor(record))
                 self._write_record(record)
-            elif record["active"] is True:
+                newly_created = True
+            elif anchor is None:
+                raise LifecycleControllerError("LIFECYCLE_ANCHOR_MISSING") from None
+            else:
+                self._validate_anchor(anchor, record)
+                self._reconcile_anchor_revision(anchor, record)
+            self._anchor = anchor if anchor is not None else self._read_anchor()
+            self._record = record
+            if not newly_created and record["active"] is not True:
+                raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETAINED") from None
+            if not newly_created:
                 consumed = set(record["consumed_operations"])
                 if not consumed.intersection(self._RISKY_ACTIONS):
                     raise LifecycleControllerError(
@@ -1128,9 +1217,9 @@ class _DurableLifecycleJournal:
                             "evidence_generation": None,
                         }
                     )
+                record["revision"] += 1
                 self._write_record(record)
-            else:
-                raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETAINED") from None
+                self._advance_anchor_revision(record["revision"])
             self._record = record
         except BaseException:
             self.close()
@@ -1153,20 +1242,84 @@ class _DurableLifecycleJournal:
         )
 
     def _secure_directory(self) -> None:
+        parent_descriptor: int | None = None
+        descriptor: int | None = None
         try:
-            self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            metadata = self._directory.lstat()
+            self._directory.parent.mkdir(parents=True, exist_ok=True)
+            parent_descriptor = os.open(
+                self._directory.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            parent_metadata = os.fstat(parent_descriptor)
+            if (
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != os.getuid()
+            ):
+                raise OSError
+            try:
+                os.mkdir(self._directory.name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            descriptor = os.open(
+                self._directory.name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+            metadata = os.fstat(descriptor)
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         if not self._safe_stat(metadata, mode=0o700, directory=True):
+            os.close(descriptor)
+            os.close(parent_descriptor)
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        self._root_fd = descriptor
+        self._parent_fd = parent_descriptor
 
-    def _open_regular(self, path: Path, flags: int, mode: int = 0o600) -> int:
+    def _open_parent_regular(self, name: str, flags: int, mode: int = 0o600) -> int:
+        if self._parent_fd is None or Path(name).name != name:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        try:
+            descriptor = os.open(
+                name,
+                flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                mode,
+                dir_fd=self._parent_fd,
+            )
+            metadata = os.fstat(descriptor)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        if not self._safe_stat(metadata, mode=0o600, directory=False):
+            os.close(descriptor)
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        return descriptor
+
+    def _open_regular(self, name: str, flags: int, mode: int = 0o600) -> int:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         close_on_exec = getattr(os, "O_CLOEXEC", 0)
+        if self._root_fd is None or Path(name).name != name:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         try:
-            descriptor = os.open(path, flags | nofollow | close_on_exec, mode)
+            descriptor = os.open(
+                name,
+                flags | nofollow | close_on_exec,
+                mode,
+                dir_fd=self._root_fd,
+            )
             metadata = os.fstat(descriptor)
+        except FileNotFoundError:
+            raise
         except OSError:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         if not self._safe_stat(metadata, mode=0o600, directory=False):
@@ -1175,7 +1328,9 @@ class _DurableLifecycleJournal:
         return descriptor
 
     def _acquire_lock(self) -> None:
-        descriptor = self._open_regular(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = self._open_regular(
+            _LIFECYCLE_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600
+        )
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -1186,15 +1341,12 @@ class _DurableLifecycleJournal:
         self._lock_fd = descriptor
 
     def _read_record(self) -> dict[str, object] | None:
+        if self._root_fd is None:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         try:
-            metadata = self._journal_path.lstat()
+            descriptor = self._open_regular(_LIFECYCLE_JOURNAL_NAME, os.O_RDONLY)
         except FileNotFoundError:
             return None
-        except OSError:
-            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
-        if not self._safe_stat(metadata, mode=0o600, directory=False):
-            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
-        descriptor = self._open_regular(self._journal_path, os.O_RDONLY)
         try:
             size = os.fstat(descriptor).st_size
             if size <= 0 or size > _MAX_LIFECYCLE_JOURNAL_BYTES:
@@ -1217,11 +1369,200 @@ class _DurableLifecycleJournal:
         self._validate_record(record)
         return record
 
+    def _read_anchor(self) -> dict[str, object] | None:
+        try:
+            descriptor = self._open_parent_regular(self._anchor_name, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        try:
+            size = os.fstat(descriptor).st_size
+            if size <= 0 or size > 4096:
+                raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+            raw = bytearray()
+            while len(raw) < size:
+                chunk = os.read(descriptor, size - len(raw))
+                if not chunk:
+                    raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+                raw.extend(chunk)
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        finally:
+            os.close(descriptor)
+        try:
+            return _strict_json_object(bytes(raw))
+        except LifecycleControllerError:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+
+    def _new_anchor(self, record: dict[str, object]) -> dict[str, object]:
+        if self._root_fd is None:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        root_metadata = os.fstat(self._root_fd)
+        return {
+            "schema_version": 1,
+            "state_root_generation": self._token(),
+            "state_root_device": root_metadata.st_dev,
+            "state_root_inode": root_metadata.st_ino,
+            "original_lifecycle_generation": record["lifecycle_generation"],
+            "pr41_commit": PR41_RESTORE_COMMIT,
+            "pr41_tree": PR41_RESTORE_TREE,
+            "baseline_backup_identity": None,
+            "root_revision": 0,
+        }
+
+    def _validate_anchor(
+        self, anchor: dict[str, object], record: dict[str, object]
+    ) -> None:
+        if self._root_fd is None:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        root_metadata = os.fstat(self._root_fd)
+        token = re.compile(r"[0-9a-f]{32}\Z")
+        valid = (
+            set(anchor)
+            == {
+                "schema_version",
+                "state_root_generation",
+                "state_root_device",
+                "state_root_inode",
+                "original_lifecycle_generation",
+                "pr41_commit",
+                "pr41_tree",
+                "baseline_backup_identity",
+                "root_revision",
+            }
+            and anchor.get("schema_version") == 1
+            and isinstance(anchor.get("state_root_generation"), str)
+            and token.fullmatch(anchor.get("state_root_generation", "")) is not None
+            and _exact_non_bool_int(anchor.get("state_root_device"), minimum=1)
+            and _exact_non_bool_int(anchor.get("state_root_inode"), minimum=1)
+            and anchor.get("state_root_device") == root_metadata.st_dev
+            and anchor.get("state_root_inode") == root_metadata.st_ino
+            and anchor.get("original_lifecycle_generation")
+            == record.get("lifecycle_generation")
+            and anchor.get("pr41_commit") == PR41_RESTORE_COMMIT
+            and anchor.get("pr41_tree") == PR41_RESTORE_TREE
+            and (
+                anchor.get("baseline_backup_identity") is None
+                or self._backup_identity_valid(
+                    anchor.get("baseline_backup_identity"),
+                    record.get("lifecycle_generation"),
+                    record,
+                )
+            )
+            and _exact_non_bool_int(anchor.get("root_revision"), maximum=10_000_000)
+        )
+        if not valid:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+
+    def _write_anchor(
+        self, anchor: dict[str, object], *, replace_existing: bool = False
+    ) -> None:
+        validation_record = getattr(
+            self,
+            "_record",
+            {"lifecycle_generation": anchor["original_lifecycle_generation"]},
+        )
+        self._validate_anchor(
+            anchor,
+            validation_record,
+        )
+        payload = json.dumps(
+            anchor, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        temporary = f".anchor-{self._token()}.tmp"
+        descriptor: int | None = None
+        try:
+            descriptor = self._open_parent_regular(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError
+                offset += written
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            if self._parent_fd is None:
+                raise OSError
+            if replace_existing:
+                os.replace(
+                    temporary,
+                    self._anchor_name,
+                    src_dir_fd=self._parent_fd,
+                    dst_dir_fd=self._parent_fd,
+                )
+            else:
+                os.link(
+                    temporary,
+                    self._anchor_name,
+                    src_dir_fd=self._parent_fd,
+                    dst_dir_fd=self._parent_fd,
+                    follow_symlinks=False,
+                )
+            os.fsync(self._parent_fd)
+        except OSError:
+            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if self._parent_fd is not None:
+                try:
+                    os.unlink(temporary, dir_fd=self._parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+
+    def _reconcile_anchor_revision(
+        self, anchor: dict[str, object], record: dict[str, object]
+    ) -> None:
+        anchor_revision = anchor["root_revision"]
+        journal_revision = record["revision"]
+        if journal_revision == anchor_revision:
+            if anchor.get("baseline_backup_identity") != record.get(
+                "baseline_backup_identity"
+            ):
+                raise LifecycleControllerError(
+                    "LIFECYCLE_BACKUP_IDENTITY_INVALID"
+                ) from None
+            return
+        if journal_revision == anchor_revision + 1:
+            repaired = copy.deepcopy(anchor)
+            repaired["root_revision"] = journal_revision
+            repaired["baseline_backup_identity"] = record.get(
+                "baseline_backup_identity"
+            )
+            self._write_anchor(repaired, replace_existing=True)
+            anchor.clear()
+            anchor.update(repaired)
+            return
+        raise LifecycleControllerError("LIFECYCLE_JOURNAL_REVISION_INVALID") from None
+
+    def _advance_anchor_revision(
+        self, revision: int, backup_identity: dict[str, object] | None = None
+    ) -> None:
+        if self._anchor["root_revision"] + 1 != revision:
+            raise LifecycleControllerError(
+                "LIFECYCLE_JOURNAL_REVISION_INVALID"
+            ) from None
+        candidate = copy.deepcopy(self._anchor)
+        candidate["root_revision"] = revision
+        if backup_identity is not None:
+            if candidate["baseline_backup_identity"] is not None:
+                raise LifecycleControllerError(
+                    "LIFECYCLE_BACKUP_ALREADY_VERIFIED"
+                ) from None
+            candidate["baseline_backup_identity"] = copy.deepcopy(backup_identity)
+        self._write_anchor(candidate, replace_existing=True)
+        self._anchor = candidate
+
     def _new_record(self) -> dict[str, object]:
         lifecycle = self._token()
         source = self._token()
         return {
             "schema_version": _LIFECYCLE_JOURNAL_SCHEMA,
+            "revision": 0,
             "lifecycle_generation": lifecycle,
             "active": True,
             "terminal": None,
@@ -1258,7 +1599,9 @@ class _DurableLifecycleJournal:
                 }
             ],
             "operations": [],
-            "fallback_phase": "available",
+            "fallback_phase": FallbackPhase.AVAILABLE.value,
+            "fallback_reconciliation_attempts": 0,
+            "baseline_backup_identity": None,
         }
 
     @classmethod
@@ -1271,8 +1614,12 @@ class _DurableLifecycleJournal:
             LifecycleState.COMPLETE_NORMAL.value,
             LifecycleState.RESTORED_AFTER_ABORT.value,
             LifecycleState.RESTORE_FAILED.value,
+            LifecycleState.MANUAL_RECOVERY_REQUIRED.value,
         }
         invalid = invalid or record.get("schema_version") != _LIFECYCLE_JOURNAL_SCHEMA
+        invalid = invalid or not _exact_non_bool_int(
+            record.get("revision"), maximum=10_000_000
+        )
         invalid = invalid or not isinstance(record.get("lifecycle_generation"), str)
         invalid = (
             invalid or token.fullmatch(record.get("lifecycle_generation", "")) is None
@@ -1571,11 +1918,18 @@ class _DurableLifecycleJournal:
                 invalid or record.get("ambiguous_operation") not in consumed_values
             )
         invalid = invalid or record.get("fallback_phase") not in {
-            "available",
-            "intent_recorded",
-            "possibly_applied",
-            "reconciled",
+            phase.value for phase in FallbackPhase
         }
+        invalid = invalid or not _exact_non_bool_int(
+            record.get("fallback_reconciliation_attempts"), maximum=8
+        )
+        backup_identity = record.get("baseline_backup_identity")
+        invalid = invalid or (
+            backup_identity is not None
+            and not cls._backup_identity_valid(
+                backup_identity, record.get("lifecycle_generation"), record
+            )
+        )
         if type(transitions) is list and transitions:
             invalid = invalid or transitions[-1].get("stage") != record.get("stage")
         terminal = record.get("terminal")
@@ -1603,13 +1957,18 @@ class _DurableLifecycleJournal:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
 
     def _write_record(self, record: dict[str, object]) -> None:
+        current = getattr(self, "_record", None)
+        if current is not None and record.get("revision") != current["revision"] + 1:
+            raise LifecycleControllerError(
+                "LIFECYCLE_JOURNAL_REVISION_INVALID"
+            ) from None
         self._validate_record(record)
         payload = json.dumps(
             record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
         if len(payload) > _MAX_LIFECYCLE_JOURNAL_BYTES:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
-        temporary = self._directory / f".journal-{self._token()}.tmp"
+        temporary = f".journal-{self._token()}.tmp"
         descriptor: int | None = None
         try:
             descriptor = self._open_regular(
@@ -1624,25 +1983,23 @@ class _DurableLifecycleJournal:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
-            os.replace(temporary, self._journal_path)
-            directory_fd = os.open(
-                self._directory,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
+            if self._root_fd is None:
+                raise OSError
+            os.replace(
+                temporary,
+                _LIFECYCLE_JOURNAL_NAME,
+                src_dir_fd=self._root_fd,
+                dst_dir_fd=self._root_fd,
             )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(self._root_fd)
         except OSError:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         finally:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                temporary.unlink()
+                if self._root_fd is not None:
+                    os.unlink(temporary, dir_fd=self._root_fd)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -1651,7 +2008,79 @@ class _DurableLifecycleJournal:
     def _commit(self, mutate: Callable[[dict[str, object]], None]) -> None:
         candidate = copy.deepcopy(self._record)
         mutate(candidate)
+        candidate["revision"] = self._record["revision"] + 1
         self._write_record(candidate)
+        backup_identity = (
+            candidate["baseline_backup_identity"]
+            if self._record["baseline_backup_identity"] is None
+            and candidate["baseline_backup_identity"] is not None
+            else None
+        )
+        self._advance_anchor_revision(candidate["revision"], backup_identity)
+        self._record = candidate
+
+    @staticmethod
+    def _backup_identity_valid(
+        value: object, lifecycle_generation: object, record: dict[str, object]
+    ) -> bool:
+        return (
+            type(value) is dict
+            and set(value)
+            == {
+                "lifecycle_generation",
+                "source_generation",
+                "pr41_commit",
+                "pr41_tree",
+                "backup_generation",
+                "manifest_identity",
+                "backup_digest",
+            }
+            and value.get("lifecycle_generation") == lifecycle_generation
+            and value.get("source_generation")
+            == record.get("pr41_restore", {}).get("generation")
+            and value.get("pr41_commit") == PR41_RESTORE_COMMIT
+            and value.get("pr41_tree") == PR41_RESTORE_TREE
+            and all(
+                isinstance(value.get(name), str)
+                and re.fullmatch(r"[0-9a-f]{32}", value[name]) is not None
+                for name in (
+                    "lifecycle_generation",
+                    "source_generation",
+                    "backup_generation",
+                )
+            )
+            and all(
+                isinstance(value.get(name), str)
+                and re.fullmatch(r"[0-9a-f]{64}", value[name]) is not None
+                for name in ("manifest_identity", "backup_digest")
+            )
+        )
+
+    def bind_baseline_backup(self, result: BackupResult) -> None:
+        identity = {
+            "lifecycle_generation": result.lifecycle_generation,
+            "source_generation": result.source_generation,
+            "pr41_commit": PR41_RESTORE_COMMIT,
+            "pr41_tree": PR41_RESTORE_TREE,
+            "backup_generation": result.backup_generation,
+            "manifest_identity": result.manifest_identity,
+            "backup_digest": result.backup_digest,
+        }
+        if not self._backup_identity_valid(
+            identity, self._record["lifecycle_generation"], self._record
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_BACKUP_IDENTITY_INVALID"
+            ) from None
+        candidate = copy.deepcopy(self._record)
+        if candidate["baseline_backup_identity"] is not None:
+            raise LifecycleControllerError(
+                "LIFECYCLE_BACKUP_ALREADY_VERIFIED"
+            ) from None
+        candidate["baseline_backup_identity"] = identity
+        candidate["revision"] = self._record["revision"] + 1
+        self._write_record(candidate)
+        self._advance_anchor_revision(candidate["revision"], identity)
         self._record = candidate
 
     @property
@@ -1720,7 +2149,7 @@ class _DurableLifecycleJournal:
             expected_source = record["source_generation"]
             if action in _CANDIDATE_SOURCE_ACTIONS:
                 expected_source = record["pr45_source"]["generation"]
-            elif action in _RESTORE_SOURCE_ACTIONS:
+            elif action in _PR41_BOUND_ACTIONS:
                 expected_source = record["pr41_restore"]["generation"]
             if source_generation != expected_source:
                 raise LifecycleControllerError(
@@ -1760,7 +2189,7 @@ class _DurableLifecycleJournal:
             if action is LifecycleAction.PREFLIGHT:
                 record["known_nonce"] = nonce
             if action is LifecycleAction.BACKUP_FALLBACK:
-                record["fallback_phase"] = "intent_recorded"
+                record["fallback_phase"] = FallbackPhase.INTENT_DURABLE.value
             record["operations"].append(
                 {
                     "action": action.value,
@@ -1786,12 +2215,23 @@ class _DurableLifecycleJournal:
                 LifecycleAction.BACKUP_FALLBACK,
                 LifecycleAction.BACKUP_FALLBACK_RECONCILE,
             }:
-                record["fallback_phase"] = {
-                    "dispatch_started": "possibly_applied",
-                    "result_durable": "possibly_applied",
-                    "transition_committed": "reconciled",
-                    "reconciled": "reconciled",
-                }.get(phase, record["fallback_phase"])
+                if action is LifecycleAction.BACKUP_FALLBACK:
+                    record["fallback_phase"] = {
+                        "dispatch_started": FallbackPhase.DISPATCH_POSSIBLE.value,
+                        "result_durable": (FallbackPhase.RECONCILIATION_REQUIRED.value),
+                    }.get(phase, record["fallback_phase"])
+                elif phase in {"result_durable", "reconciled"}:
+                    record["fallback_phase"] = FallbackPhase.RECONCILED_PR41.value
+            if (
+                action is LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                and phase == "dispatch_started"
+            ):
+                attempts = record["fallback_reconciliation_attempts"]
+                if not _exact_non_bool_int(attempts, maximum=7):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_RECONCILIATION_LIMIT"
+                    ) from None
+                record["fallback_reconciliation_attempts"] = attempts + 1
 
         self._commit(mutate)
 
@@ -1811,12 +2251,35 @@ class _DurableLifecycleJournal:
             record["ambiguous_operation"] = action.value
             record["recovery_mode"] = True
             record["rollback_mode"] = True
+            if action in {
+                LifecycleAction.BACKUP_FALLBACK,
+                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+            }:
+                record["fallback_phase"] = FallbackPhase.RECONCILIATION_REQUIRED.value
 
         self._commit(mutate)
 
     def record_fallback_reconciled(self) -> None:
         self._set_operation_phase(
             LifecycleAction.BACKUP_FALLBACK_RECONCILE, "reconciled"
+        )
+
+    @property
+    def fallback_reconciliation_resumable(self) -> bool:
+        operation = next(
+            (
+                item
+                for item in self._record["operations"]
+                if item["action"] == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+            ),
+            None,
+        )
+        return (
+            self._record["fallback_phase"]
+            == FallbackPhase.RECONCILIATION_REQUIRED.value
+            and operation is not None
+            and operation["phase"] == "ambiguous"
+            and self._record["fallback_reconciliation_attempts"] < 8
         )
 
     def record_result(
@@ -1829,6 +2292,7 @@ class _DurableLifecycleJournal:
         issuance_identity: str,
         audit_instance: str | None,
         nonce: str | None,
+        evidence: object = None,
     ) -> int:
         generation = self._record["evidence_generation"] + 1
 
@@ -1840,7 +2304,26 @@ class _DurableLifecycleJournal:
             ]
             if len(matches) != 1:
                 raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
-            matches[0]["phase"] = "result_durable"
+            matches[0]["phase"] = (
+                "reconciled"
+                if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                else "result_durable"
+            )
+            if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                if not isinstance(evidence, FallbackReconciliationResult):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_FALLBACK_RECONCILIATION_INVALID"
+                    ) from None
+                try:
+                    record["fallback_phase"] = {
+                        "reconciled": FallbackPhase.RECONCILED_PR41,
+                        "reconciled_candidate": FallbackPhase.RECONCILED_CANDIDATE,
+                        "reconciled_unknown": FallbackPhase.RECONCILED_UNKNOWN,
+                    }[evidence.phase].value
+                except KeyError:
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_FALLBACK_RECONCILIATION_INVALID"
+                    ) from None
             record["evidence_generation"] = generation
             record["evidence_identities"].append(
                 {
@@ -1854,6 +2337,49 @@ class _DurableLifecycleJournal:
                     "nonce": nonce,
                 }
             )
+            if (
+                action
+                in {
+                    LifecycleAction.BACKUP,
+                    LifecycleAction.BACKUP_RECONCILE,
+                }
+                and evidence is not None
+            ):
+                if not isinstance(evidence, BackupResult):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_BACKUP_IDENTITY_INVALID"
+                    ) from None
+                identity = {
+                    "lifecycle_generation": evidence.lifecycle_generation,
+                    "source_generation": evidence.source_generation,
+                    "pr41_commit": PR41_RESTORE_COMMIT,
+                    "pr41_tree": PR41_RESTORE_TREE,
+                    "backup_generation": evidence.backup_generation,
+                    "manifest_identity": evidence.manifest_identity,
+                    "backup_digest": evidence.backup_digest,
+                }
+                if not self._backup_identity_valid(
+                    identity, record["lifecycle_generation"], record
+                ):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_BACKUP_IDENTITY_INVALID"
+                    ) from None
+                record["baseline_backup_identity"] = identity
+                matches[0]["phase"] = "transition_committed"
+                record["stage"] = LifecycleState.BACKUP_VERIFIED.value
+                record["source_generation"] = record["pr41_restore"]["generation"]
+                record["recovery_mode"] = False
+                record["rollback_mode"] = False
+                record["ambiguous_operation"] = None
+                record["transitions"].append(
+                    {
+                        "sequence": len(record["transitions"]),
+                        "stage": LifecycleState.BACKUP_VERIFIED.value,
+                        "action": action.value,
+                        "source_generation": record["source_generation"],
+                        "evidence_generation": generation,
+                    }
+                )
 
         self._commit(mutate)
         return generation
@@ -1912,6 +2438,14 @@ class _DurableLifecycleJournal:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
+        root_descriptor = self._root_fd
+        self._root_fd = None
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        parent_descriptor = self._parent_fd
+        self._parent_fd = None
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def _source_path_allowed(path: object, state: SourceState) -> bool:
@@ -2062,6 +2596,20 @@ def _bundle_payload(bundle: SourceBundle) -> dict[str, object]:
     }
 
 
+def _backup_context_payload(
+    manifest: SourceManifest, capability: _LifecycleCapability
+) -> dict[str, object]:
+    if manifest.state is not SourceState.RESTORE:
+        raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+    validate_source_manifest(manifest)
+    return {
+        "lifecycle_generation": str(capability.lifecycle_generation),
+        "source_generation": str(capability.source_generation),
+        "source_state": "PR41_BASELINE",
+        "manifest": _manifest_payload(manifest),
+    }
+
+
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Build one JSON object while rejecting duplicate member names."""
     value: dict[str, Any] = {}
@@ -2088,6 +2636,56 @@ def _exact_payload(private_output: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict) or "error_class" in payload:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     return payload
+
+
+def _parse_backup_result(private_output: bytes) -> BackupResult:
+    value = _exact_payload(private_output)
+    if set(value) != {
+        "success",
+        "file_count",
+        "manifest_match",
+        "regular_files_only",
+        "lifecycle_generation",
+        "source_generation",
+        "backup_generation",
+        "manifest_identity",
+        "backup_digest",
+    }:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    try:
+        result = BackupResult(
+            _bool(value["success"]),
+            _count(value["file_count"]),
+            _bool(value["manifest_match"]),
+            _bool(value["regular_files_only"]),
+            *(
+                value[name]
+                for name in (
+                    "lifecycle_generation",
+                    "source_generation",
+                    "backup_generation",
+                    "manifest_identity",
+                    "backup_digest",
+                )
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if any(
+        not isinstance(getattr(result, name), str)
+        or re.fullmatch(r"[0-9a-f]{32}", getattr(result, name)) is None
+        for name in (
+            "lifecycle_generation",
+            "source_generation",
+            "backup_generation",
+        )
+    ) or any(
+        not isinstance(getattr(result, name), str)
+        or re.fullmatch(r"[0-9a-f]{64}", getattr(result, name)) is None
+        for name in ("manifest_identity", "backup_digest")
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return result
 
 
 def _exact_core_check_payload(private_output: bytes) -> dict[str, Any]:
@@ -2653,9 +3251,9 @@ ROOT = Path('/config')
 INTEGRATION = ROOT / 'custom_components' / 'tuya_ble'
 HELPER = INTEGRATION / '.phase_a_tools'
 STAGE = ROOT / '.ha_tuya_ble_r30_stage'
-BACKUP = ROOT / '.ha_tuya_ble_r30_backup'
-BACKUP_CONSUMED = ROOT / '.ha_tuya_ble_r30_backup.consumed'
-BACKUP_IDENTITY = ROOT / '.ha_tuya_ble_r30_backup.identity'
+BACKUP = ROOT / '.ha_tuya_ble_r36_backup'
+BACKUP_CONSUMED = ROOT / '.ha_tuya_ble_r36_backup.consumed'
+BACKUP_METADATA_NAME = 'metadata.json'
 RESTORE_CONSUMED = ROOT / '.ha_tuya_ble_r30_restore.consumed'
 EVIDENCE = Path('/var/lib/phase-a-status-probe')
 SERVICES = {
@@ -2873,14 +3471,61 @@ def read_private_json(path, keys):
         raise ValueError('private_state')
     return value
 
-def read_backup_identity():
-    value = read_private_json(BACKUP_IDENTITY, {'file_count', 'manifest_identity'})
+def validate_backup_context(value):
+    if not isinstance(value, dict) or set(value) != {
+        'lifecycle_generation', 'source_generation', 'source_state', 'manifest'
+    }:
+        raise ValueError('backup_context')
     if (
-        not isinstance(value['file_count'], int)
+        value['source_state'] != 'PR41_BASELINE'
+        or not isinstance(value['lifecycle_generation'], str)
+        or re.fullmatch('[0-9a-f]{32}', value['lifecycle_generation']) is None
+        or not isinstance(value['source_generation'], str)
+        or re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+    ):
+        raise ValueError('backup_context')
+    state, expected = expected_manifest(value)
+    if state != 'restore':
+        raise ValueError('backup_context')
+    return expected
+
+def backup_digest(value):
+    canonical = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
+    return hashlib.sha256(canonical).hexdigest()
+
+def read_backup_identity(context=None):
+    value = read_private_json(
+        BACKUP / BACKUP_METADATA_NAME,
+        {
+            'schema_version', 'lifecycle_generation', 'source_generation',
+            'source_state', 'pr41_commit', 'pr41_tree', 'backup_generation',
+            'file_count', 'manifest_identity', 'backup_digest'
+        },
+    )
+    identity_fields = {key: item for key, item in value.items() if key != 'backup_digest'}
+    if (
+        value['schema_version'] != 1
+        or value['source_state'] != 'PR41_BASELINE'
+        or value['pr41_commit'] != '4f73a9b008dcb89134bc41001c486f06d6056867'
+        or value['pr41_tree'] != '463ed8553da01eae591de611e76e45392ad9e7bf'
+        or not isinstance(value['lifecycle_generation'], str)
+        or re.fullmatch('[0-9a-f]{32}', value['lifecycle_generation']) is None
+        or not isinstance(value['source_generation'], str)
+        or re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+        or not isinstance(value['backup_generation'], str)
+        or re.fullmatch('[0-9a-f]{32}', value['backup_generation']) is None
+        or not isinstance(value['file_count'], int)
         or isinstance(value['file_count'], bool)
         or value['file_count'] < 1
         or not isinstance(value['manifest_identity'], str)
-        or len(value['manifest_identity']) != 64
+        or re.fullmatch('[0-9a-f]{64}', value['manifest_identity']) is None
+        or value['backup_digest'] != backup_digest(identity_fields)
+    ):
+        raise ValueError('backup_identity')
+    if context is not None and (
+        value['lifecycle_generation'] != context.get('lifecycle_generation')
+        or value['source_generation'] != context.get('source_generation')
+        or context.get('source_state') != 'PR41_BASELINE'
     ):
         raise ValueError('backup_identity')
     return value
@@ -2907,34 +3552,123 @@ def read_fallback_phase():
         'file_count': value['file_count'],
         'manifest_identity': value['manifest_identity'],
     }
-    if BACKUP_IDENTITY.exists() and identity != read_backup_identity():
+    package = read_backup_identity()
+    if (
+        identity['file_count'] != package['file_count']
+        or identity['manifest_identity'] != package['manifest_identity']
+    ):
         raise ValueError('backup_identity')
     return value['phase'], identity
 
-def backup():
+def sync_tree(root):
+    directories = []
+    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+        base = Path(directory)
+        directories.append(base)
+        if any((base / name).is_symlink() for name in names + files):
+            raise ValueError('symlink')
+        for name in files:
+            descriptor = os.open(base / name, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in directories:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+def publish_noreplace(source, destination):
+    function = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
+    if function is None:
+        raise OSError(errno.ENOSYS, 'atomic_noreplace')
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, 'atomic_noreplace')
+
+def backup(value):
+    expected = validate_backup_context(value)
+    if BACKUP.exists() or BACKUP_CONSUMED.exists():
+        raise ValueError('backup_exists')
     before = inventory_targets()
-    if not before:
-        raise ValueError('empty_source')
-    pending = BACKUP.with_name(BACKUP.name + '.pending')
-    remove(pending)
+    if before != expected:
+        raise ValueError('baseline_source')
+    pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
-    shutil.copytree(INTEGRATION, pending / 'integration', symlinks=True)
-    after = inventory_deployment(pending / 'integration')
-    if before != after:
-        remove(pending)
-        raise ValueError('backup_manifest')
-    if BACKUP.exists():
-        exchange(pending, BACKUP)
-        remove(pending)
-    else:
-        os.replace(pending, BACKUP)
-    write_private_json(BACKUP_IDENTITY, inventory_identity(after))
-    sync_root()
+    try:
+        shutil.copytree(INTEGRATION, pending / 'integration', symlinks=False)
+        after = inventory_deployment(pending / 'integration')
+        if before != after or after != expected:
+            raise ValueError('backup_manifest')
+        identity = inventory_identity(after)
+        metadata = {
+            'schema_version': 1,
+            'lifecycle_generation': value['lifecycle_generation'],
+            'source_generation': value['source_generation'],
+            'source_state': 'PR41_BASELINE',
+            'pr41_commit': '4f73a9b008dcb89134bc41001c486f06d6056867',
+            'pr41_tree': '463ed8553da01eae591de611e76e45392ad9e7bf',
+            'backup_generation': os.urandom(16).hex(),
+            **identity,
+        }
+        metadata['backup_digest'] = backup_digest(metadata)
+        metadata_path = pending / BACKUP_METADATA_NAME
+        payload = json.dumps(metadata, sort_keys=True, separators=(',', ':')).encode('ascii')
+        descriptor = os.open(
+            metadata_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        sync_tree(pending)
+        publish_noreplace(pending, BACKUP)
+        sync_root()
+        pending = None
+        return {
+            'success': True,
+            'file_count': len(after),
+            'manifest_match': True,
+            'regular_files_only': True,
+            'lifecycle_generation': metadata['lifecycle_generation'],
+            'source_generation': metadata['source_generation'],
+            'backup_generation': metadata['backup_generation'],
+            'manifest_identity': metadata['manifest_identity'],
+            'backup_digest': metadata['backup_digest'],
+        }
+    finally:
+        if pending is not None:
+            remove(pending)
+
+def reconcile_backup_creation(value):
+    expected = validate_backup_context(value)
+    identity = read_backup_identity(value)
+    packaged = inventory_deployment(BACKUP / 'integration')
+    observed_identity = inventory_identity(packaged)
+    if (
+        packaged != expected
+        or inventory_targets() != expected
+        or observed_identity['file_count'] != identity['file_count']
+        or observed_identity['manifest_identity'] != identity['manifest_identity']
+    ):
+        raise ValueError('backup_reconciliation')
     return {
-        'success': before == after,
-        'file_count': len(after),
-        'manifest_match': before == after,
+        'success': True,
+        'file_count': identity['file_count'],
+        'manifest_match': True,
         'regular_files_only': True,
+        'lifecycle_generation': identity['lifecycle_generation'],
+        'source_generation': identity['source_generation'],
+        'backup_generation': identity['backup_generation'],
+        'manifest_identity': identity['manifest_identity'],
+        'backup_digest': identity['backup_digest'],
     }
 
 def transfer(value):
@@ -3035,12 +3769,6 @@ def activate(value, restoring=False):
             os.replace(INTEGRATION, staged)
         raise
     remove(STAGE)
-    if restoring:
-        try:
-            remove(BACKUP)
-            BACKUP_IDENTITY.unlink(missing_ok=True)
-        except OSError:
-            pass
     return {
         'installation_success': True,
         'expected_file_count': len(expected),
@@ -3236,39 +3964,38 @@ def invoke_helper(value):
             result['preflight'] = response
     return result
 
-def restore_backup():
-    if BACKUP_CONSUMED.exists():
+def restore_backup(value):
+    expected_manifest_value = validate_backup_context(value)
+    if BACKUP_CONSUMED.exists() or RESTORE_CONSUMED.exists():
         raise ValueError('backup_consumed')
-    identity = read_backup_identity()
+    identity = read_backup_identity(value)
     source = BACKUP / 'integration'
     expected = inventory_deployment(source)
-    if inventory_identity(expected) != identity:
+    observed_identity = inventory_identity(expected)
+    if (
+        expected != expected_manifest_value
+        or observed_identity['file_count'] != identity['file_count']
+        or observed_identity['manifest_identity'] != identity['manifest_identity']
+    ):
         raise ValueError('backup')
     write_fallback_phase('intent_recorded', identity)
-    integration_existed = INTEGRATION.exists()
-    mutated = False
+    pending = ROOT / ('.ha_tuya_ble_r36_restore-' + os.urandom(16).hex())
     try:
+        shutil.copytree(source, pending, symlinks=False)
+        if inventory_deployment(pending) != expected:
+            raise ValueError('backup_restore')
+        sync_tree(pending)
         write_fallback_phase('possibly_applied', identity)
-        if integration_existed:
-            exchange(source, INTEGRATION)
+        if INTEGRATION.exists():
+            exchange(pending, INTEGRATION)
         else:
-            os.replace(source, INTEGRATION)
-        mutated = True
+            os.replace(pending, INTEGRATION)
         installed = inventory_targets()
-        if inventory_identity(installed) != identity:
+        if installed != expected:
             raise ValueError('backup_restore')
         write_fallback_phase('reconciled', identity)
-    except Exception:
-        if mutated and integration_existed:
-            exchange(source, INTEGRATION)
-        elif mutated:
-            os.replace(INTEGRATION, source)
-        raise
-    try:
-        remove(BACKUP)
-        BACKUP_IDENTITY.unlink(missing_ok=True)
-    except OSError:
-        pass
+    finally:
+        remove(pending)
     return {
         'installation_success': True,
         'expected_file_count': len(expected),
@@ -3276,44 +4003,44 @@ def restore_backup():
         'manifest_match': True,
     }
 
-def reconcile_backup():
-    phase, identity = read_fallback_phase()
+def reconcile_backup(value):
+    expected = validate_backup_context(value)
+    package_identity = read_backup_identity(value)
+    _phase, identity = read_fallback_phase()
     source = BACKUP / 'integration'
-    live = inventory_targets()
-    live_matches = inventory_identity(live) == identity
-    source_matches = source.exists() and inventory_identity(
-        inventory_deployment(source)
-    ) == identity
-    if not live_matches:
-        if phase not in {'intent_recorded', 'possibly_applied'} or not source_matches:
-            raise ValueError('backup_reconciliation')
-        write_fallback_phase('possibly_applied', identity)
-        if INTEGRATION.exists():
-            exchange(source, INTEGRATION)
-        else:
-            os.replace(source, INTEGRATION)
-        live = inventory_targets()
-        live_matches = inventory_identity(live) == identity
-    if not live_matches:
+    packaged = inventory_deployment(source)
+    observed_identity = inventory_identity(packaged)
+    if (
+        packaged != expected
+        or observed_identity['file_count'] != package_identity['file_count']
+        or observed_identity['manifest_identity'] != package_identity['manifest_identity']
+        or identity['file_count'] != package_identity['file_count']
+        or identity['manifest_identity'] != package_identity['manifest_identity']
+    ):
         raise ValueError('backup_reconciliation')
-    write_fallback_phase('reconciled', identity)
-    try:
-        remove(BACKUP)
-        BACKUP_IDENTITY.unlink(missing_ok=True)
-    except OSError:
-        pass
+    live = inventory_targets()
+    live_identity = inventory_identity(live)['manifest_identity']
+    live_matches = live == expected
+    if live_matches:
+        result_phase = 'reconciled'
+    elif live_identity == '4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e':
+        result_phase = 'reconciled_candidate'
+    else:
+        result_phase = 'reconciled_unknown'
     return {
-        'phase': 'reconciled',
-        'restoration_applied': True,
-        'manifest_match': True,
-        'file_count': identity['file_count'],
+        'phase': result_phase,
+        'restoration_applied': live_matches,
+        'manifest_match': live_matches,
+        'file_count': len(live),
     }
 
 value = receive()
 operation = sys.argv[1]
 try:
     if operation == 'backup':
-        result = backup()
+        result = backup(value)
+    elif operation == 'reconcile_backup_creation':
+        result = reconcile_backup_creation(value)
     elif operation == 'transfer':
         result = transfer(value)
     elif operation == 'install':
@@ -3334,9 +4061,9 @@ try:
     elif operation == 'restore':
         result = activate(value, restoring=True)
     elif operation == 'restore_backup':
-        result = restore_backup()
+        result = restore_backup(value)
     elif operation == 'reconcile_backup':
-        result = reconcile_backup()
+        result = reconcile_backup(value)
     else:
         raise ValueError('operation')
 except Exception:
@@ -3829,19 +4556,32 @@ class PrivateInteractiveSessionBroker:
         except (KeyError, TypeError, ValueError):
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
 
-    def _create_private_backup(self, *, _capability: object = None) -> BackupResult:
+    def _create_private_backup(
+        self, manifest: SourceManifest, *, _capability: object = None
+    ) -> BackupResult:
         capability = self._require_capability(
             _capability, frozenset({LifecycleAction.BACKUP})
         )
         output = self.__execute_bounded_operation(
-            BoundedOperation.BACKUP, {}, _capability=_capability
+            BoundedOperation.BACKUP,
+            _backup_context_payload(manifest, capability),
+            _capability=_capability,
         )
-        result = self._simple_result(
-            output,
-            BackupResult,
-            ("success", "file_count", "manifest_match", "regular_files_only"),
-        )
+        result = _parse_backup_result(output)
         return _bind_evidence_origin(result, capability)
+
+    def _reconcile_private_backup_creation(
+        self, manifest: SourceManifest, *, _capability: object = None
+    ) -> BackupResult:
+        capability = self._require_capability(
+            _capability, frozenset({LifecycleAction.BACKUP_RECONCILE})
+        )
+        output = self.__execute_bounded_operation(
+            BoundedOperation.RECONCILE_BACKUP_CREATION,
+            _backup_context_payload(manifest, capability),
+            _capability=_capability,
+        )
+        return _bind_evidence_origin(_parse_backup_result(output), capability)
 
     def _transfer_source_bundle(
         self, bundle: SourceBundle, *, _capability: object = None
@@ -4152,7 +4892,9 @@ class PrivateInteractiveSessionBroker:
             bundle.manifest, _capability=_install_capability
         )
 
-    def _restore_private_backup(self, *, _capability: object = None) -> InstallResult:
+    def _restore_private_backup(
+        self, manifest: SourceManifest, *, _capability: object = None
+    ) -> InstallResult:
         """Use the fixed verified private backup only as a restoration fallback."""
         capability = self._require_capability(
             _capability, frozenset({LifecycleAction.BACKUP_FALLBACK})
@@ -4164,7 +4906,9 @@ class PrivateInteractiveSessionBroker:
             raise SourceBundleError("PRIVATE_BACKUP_ALREADY_CONSUMED") from None
         self._backup_restore_attempted = True
         output = self.__execute_bounded_operation(
-            BoundedOperation.RESTORE_BACKUP, {}, _capability=_capability
+            BoundedOperation.RESTORE_BACKUP,
+            _backup_context_payload(manifest, capability),
+            _capability=_capability,
         )
         result = self._simple_result(
             output,
@@ -4181,14 +4925,16 @@ class PrivateInteractiveSessionBroker:
         return _bind_evidence_origin(result, capability)
 
     def _reconcile_private_backup(
-        self, *, _capability: object = None
+        self, manifest: SourceManifest, *, _capability: object = None
     ) -> FallbackReconciliationResult:
         """Reconcile a durable fallback marker without replaying its permit."""
         capability = self._require_capability(
             _capability, frozenset({LifecycleAction.BACKUP_FALLBACK_RECONCILE})
         )
         output = self.__execute_bounded_operation(
-            BoundedOperation.RECONCILE_BACKUP, {}, _capability=_capability
+            BoundedOperation.RECONCILE_BACKUP,
+            _backup_context_payload(manifest, capability),
+            _capability=_capability,
         )
         value = _exact_payload(output)
         if set(value) != {
@@ -4351,6 +5097,10 @@ class FullPreflightLifecycleController:
         if self._journal is not None:
             for action in self._journal.consumed_actions:
                 self._permits[action].consumed = True
+            if self._journal.fallback_reconciliation_resumable:
+                self._permits[LifecycleAction.BACKUP_FALLBACK_RECONCILE].consumed = (
+                    False
+                )
         self._evidence_generations: dict[LifecycleAction, int] = {}
         self._evidence_origins: dict[int, tuple[_EvidenceOrigin, int]] = {}
         self._audit_instance_labels: dict[str, str] = {}
@@ -4416,7 +5166,7 @@ class FullPreflightLifecycleController:
     def _source_generation_for(self, action: LifecycleAction) -> object:
         if action in _CANDIDATE_SOURCE_ACTIONS:
             return self._candidate_source_generation
-        if action in _RESTORE_SOURCE_ACTIONS:
+        if action in _PR41_BOUND_ACTIONS:
             return self._restore_source_generation
         return self._current_source_generation
 
@@ -4561,7 +5311,12 @@ class FullPreflightLifecycleController:
         if permit.consumed:
             raise LifecycleControllerError("LIFECYCLE_PERMIT_CONSUMED") from None
         source_generation = self._source_generation_for(action)
-        if self._journal is not None:
+        continuing_reconciliation = (
+            action is LifecycleAction.BACKUP_FALLBACK_RECONCILE
+            and self._journal is not None
+            and getattr(self._journal, "fallback_reconciliation_resumable", False)
+        )
+        if self._journal is not None and not continuing_reconciliation:
             self._journal.record_intent(
                 action,
                 source_generation=str(source_generation),
@@ -4589,6 +5344,10 @@ class FullPreflightLifecycleController:
         except BaseException:
             if self._journal is not None:
                 self._journal.record_ambiguous(action)
+                if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE and getattr(
+                    self._journal, "fallback_reconciliation_resumable", False
+                ):
+                    permit.consumed = False
             raise
         if self._journal is not None:
             if not broker_evidence and result is not None:
@@ -4617,6 +5376,7 @@ class FullPreflightLifecycleController:
                     )
                 ),
                 nonce=None if origin is None else origin.nonce,
+                evidence=result,
             )
             self._evidence_generations[action] = evidence_generation
             if origin is not None:
@@ -4780,26 +5540,102 @@ class FullPreflightLifecycleController:
         )
         return evidence
 
-    def create_backup(self) -> BackupResult:
+    def create_backup(self, manifest: SourceManifest) -> BackupResult:
         self._require_state(LifecycleState.INITIAL_REPAIRS_PASS)
-        try:
-            result = self.__dispatch_action(
-                LifecycleAction.BACKUP,
-                lambda capability: self._broker._create_private_backup(
-                    _capability=capability
-                ),
-            )
-        except (SessionBrokerError, TypeError, ValueError):
-            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
-        if not (
-            isinstance(result, BackupResult)
-            and result.success
-            and result.file_count > 0
-            and result.manifest_match
-            and result.regular_files_only
+        if (
+            not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
         ):
             raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
-        self._advance(LifecycleState.BACKUP_VERIFIED, LifecycleAction.BACKUP)
+        try:
+            validate_source_manifest(manifest)
+        except SourceBundleError:
+            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
+
+        def create(capability: _LifecycleCapability) -> BackupResult:
+            result = self._broker._create_private_backup(
+                manifest, _capability=capability
+            )
+            if not (
+                isinstance(result, BackupResult)
+                and result.success is True
+                and _exact_non_bool_int(result.file_count, minimum=1)
+                and result.manifest_match is True
+                and result.regular_files_only is True
+                and (
+                    self._journal is None
+                    or result.lifecycle_generation == str(self._lifecycle_generation)
+                    and result.source_generation == str(self._restore_source_generation)
+                )
+                and result.manifest_identity
+                == _source_manifest_digest(manifest.entries)
+                and re.fullmatch(r"[0-9a-f]{32}", result.backup_generation) is not None
+                and re.fullmatch(r"[0-9a-f]{64}", result.backup_digest) is not None
+            ):
+                raise SessionBrokerError(
+                    "PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+                ) from None
+            return result
+
+        try:
+            result = self.__dispatch_action(LifecycleAction.BACKUP, create)
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
+        if self._journal is None:
+            self._advance(LifecycleState.BACKUP_VERIFIED, LifecycleAction.BACKUP)
+        else:
+            self._state = LifecycleState.BACKUP_VERIFIED
+        self._restore_manifest = manifest
+        return result
+
+    def reconcile_backup_creation(self, manifest: SourceManifest) -> BackupResult:
+        """Adopt one exact no-clobber package after its result was lost."""
+        self._require_state(LifecycleState.RECOVERY_REQUIRED)
+        if (
+            self._journal is None
+            or not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
+            or self._journal._record["baseline_backup_identity"] is not None
+            or LifecycleAction.BACKUP not in self._journal.consumed_actions
+            or self._journal.action_transition_committed(LifecycleAction.BACKUP)
+        ):
+            raise LifecycleControllerError("BACKUP_RECONCILIATION_FAILED") from None
+        try:
+            validate_source_manifest(manifest)
+        except SourceBundleError:
+            raise LifecycleControllerError("BACKUP_RECONCILIATION_FAILED") from None
+
+        def reconcile(capability: _LifecycleCapability) -> BackupResult:
+            result = self._broker._reconcile_private_backup_creation(
+                manifest, _capability=capability
+            )
+            if not (
+                isinstance(result, BackupResult)
+                and result.success is True
+                and result.manifest_match is True
+                and result.regular_files_only is True
+                and _exact_non_bool_int(result.file_count, minimum=1)
+                and result.lifecycle_generation == str(self._lifecycle_generation)
+                and result.source_generation == str(self._restore_source_generation)
+                and result.manifest_identity
+                == _source_manifest_digest(manifest.entries)
+                and re.fullmatch(r"[0-9a-f]{32}", result.backup_generation) is not None
+                and re.fullmatch(r"[0-9a-f]{64}", result.backup_digest) is not None
+            ):
+                raise SessionBrokerError(
+                    "PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+                ) from None
+            return result
+
+        try:
+            result = self.__dispatch_action(
+                LifecycleAction.BACKUP_RECONCILE,
+                reconcile,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError("BACKUP_RECONCILIATION_FAILED") from None
+        self._state = LifecycleState.BACKUP_VERIFIED
+        self._restore_manifest = manifest
         return result
 
     def stage_candidate(self, bundle: SourceBundle) -> TransferResult:
@@ -5523,14 +6359,22 @@ class FullPreflightLifecycleController:
             self._journal.close()
         return proof
 
-    def restore_private_backup_fallback(self) -> InstallResult:
+    def restore_private_backup_fallback(
+        self, manifest: SourceManifest
+    ) -> InstallResult:
         """Consume the fixed fallback once without treating it as PR #41 proof."""
         self._require_state(LifecycleState.ROLLBACK_REQUIRED)
+        if (
+            not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+        self._restore_manifest = manifest
         try:
             result = self.__dispatch_action(
                 LifecycleAction.BACKUP_FALLBACK,
                 lambda capability: self._broker._restore_private_backup(
-                    _capability=capability
+                    manifest, _capability=capability
                 ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
@@ -5539,30 +6383,64 @@ class FullPreflightLifecycleController:
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
         return result
 
-    def reconcile_private_backup_fallback(self) -> FallbackReconciliationResult:
+    def reconcile_private_backup_fallback(
+        self, manifest: SourceManifest
+    ) -> FallbackReconciliationResult:
         """Use the separate durable permit to resolve an interrupted fallback."""
         self._require_state(
             LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED
         )
+        if (
+            not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
+        self._restore_manifest = manifest
+
+        def reconcile(capability: _LifecycleCapability) -> FallbackReconciliationResult:
+            result = self._broker._reconcile_private_backup(
+                manifest, _capability=capability
+            )
+            valid_shape = (
+                isinstance(result, FallbackReconciliationResult)
+                and _exact_non_bool_int(result.file_count, minimum=1)
+                and (
+                    result.phase == "reconciled"
+                    and result.restoration_applied is True
+                    and result.manifest_match is True
+                    or result.phase in {"reconciled_candidate", "reconciled_unknown"}
+                    and result.restoration_applied is False
+                    and result.manifest_match is False
+                )
+            )
+            if not valid_shape:
+                raise SessionBrokerError(
+                    "PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+                ) from None
+            return result
+
         try:
             result = self.__dispatch_action(
                 LifecycleAction.BACKUP_FALLBACK_RECONCILE,
-                lambda capability: self._broker._reconcile_private_backup(
-                    _capability=capability
-                ),
+                reconcile,
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
-        if not (
-            isinstance(result, FallbackReconciliationResult)
-            and result.phase == "reconciled"
-            and result.restoration_applied is True
-            and result.manifest_match is True
-            and _exact_non_bool_int(result.file_count, minimum=1)
-        ):
-            raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
-        if self._journal is not None:
-            self._journal.record_fallback_reconciled()
+        self._normal_chain_aborted = True
+        if result.phase == "reconciled":
+            self._advance(
+                LifecycleState.PR41_RESTORED,
+                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+                source_generation=self._restore_source_generation,
+            )
+        elif result.phase == "reconciled_unknown":
+            self._advance(
+                LifecycleState.MANUAL_RECOVERY_REQUIRED,
+                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+                terminal=True,
+            )
+            if self._journal is not None:
+                self._journal.close()
         return result
 
 
