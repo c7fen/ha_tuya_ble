@@ -2234,6 +2234,13 @@ class _R32ScriptedBroker:
             ),
         )
 
+    def _restore_private_backup(self) -> access.InstallResult:
+        return self._next(
+            "backup_fallback",
+            None,
+            access.InstallResult(True, 1, 1, True),
+        )
+
 
 def _r32_bundles() -> tuple[access.SourceBundle, access.SourceBundle]:
     candidate = access.build_source_bundle(
@@ -2786,7 +2793,7 @@ def test_r32_core_check_completed_fail_has_no_retry_but_outer_ambiguity_allows_a
     ] == [1, 2]
 
 
-def test_r32_terminal_broker_timeout_closes_generation_and_forbids_attempt_two(
+def test_r32_terminal_broker_timeout_requires_explicit_fresh_rollback_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broker = object.__new__(access.PrivateInteractiveSessionBroker)
@@ -2806,17 +2813,118 @@ def test_r32_terminal_broker_timeout_closes_generation_and_forbids_attempt_two(
         broker, is_relevant=_relevant, is_critical=_critical
     )
     controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    lifecycle_generation = controller._lifecycle_generation
 
-    with pytest.raises(access.LifecycleControllerError, match="TRANSPORT_AMBIGUOUS"):
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.check_candidate_core()
-    with pytest.raises(access.LifecycleControllerError, match="SESSION_CHANGED"):
-        controller.check_candidate_core()
-
+    assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
     assert calls == 1
     assert (
         controller._permits[access.LifecycleAction.CANDIDATE_CORE_CHECK_2].consumed
         is False
     )
+
+    fresh = _R32ScriptedBroker()
+    controller.bind_rollback_session(fresh)
+    assert (
+        controller._permits[access.LifecycleAction.RESTORE_TRANSFER].session_generation
+        is fresh._session_generation
+    )
+    assert (
+        controller._permits[
+            access.LifecycleAction.CANDIDATE_CORE_CHECK_2
+        ].session_generation
+        is not fresh._session_generation
+    )
+    _, restore = _r32_bundles()
+    proof = _r32_complete_restore_tail(controller, restore)
+
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.COMPLETE
+    assert controller._lifecycle_generation is lifecycle_generation
+    assert (
+        controller._permits[access.LifecycleAction.CANDIDATE_CORE_CHECK_1].consumed
+        is True
+    )
+    assert (
+        controller._permits[access.LifecycleAction.CANDIDATE_CORE_CHECK_2].consumed
+        is False
+    )
+
+
+def test_r32_helper_78_session_loss_rebinds_receipt_and_rollback_tail_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "a" * 16)
+    controller, original = _r32_controller()
+    controller._state = access.LifecycleState.AP0_COLLECTED
+    original.queue(
+        "helper",
+        access.PhaseAResult(
+            access.PhaseAOperation.PREFLIGHT,
+            78,
+            "transport_ambiguous",
+            "a" * 16,
+        ),
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.run_non_probe_preflight()
+    consumed_before = {
+        action for action, permit in controller._permits.items() if permit.consumed
+    }
+    original.state = access.BrokerState.CLOSED
+    original._session_generation = None
+    fresh = _R32ScriptedBroker()
+
+    controller.bind_rollback_session(fresh)
+    assert consumed_before == {
+        action for action, permit in controller._permits.items() if permit.consumed
+    }
+    receipt = controller.lookup_ambiguous_receipt()
+    _, restore = _r32_bundles()
+    proof = _r32_complete_restore_tail(controller, restore)
+
+    assert receipt.operation is access.PhaseAOperation.RECEIPT
+    assert proof.complete is True
+    assert consumed_before <= {
+        action for action, permit in controller._permits.items() if permit.consumed
+    }
+    assert [detail[0] for name, detail in original.calls if name == "helper"] == [
+        access.PhaseAOperation.PREFLIGHT
+    ]
+    assert [detail[0] for name, detail in fresh.calls if name == "helper"] == [
+        access.PhaseAOperation.RECEIPT
+    ]
+
+
+def test_r32_rollback_session_rebind_rejects_same_old_inactive_and_early_brokers() -> (
+    None
+):
+    controller, original = _r32_controller()
+    fresh = _R32ScriptedBroker()
+
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+        controller.bind_rollback_session(fresh)
+
+    controller._state = access.LifecycleState.ROLLBACK_REQUIRED
+    with pytest.raises(access.LifecycleControllerError, match="BINDING_INVALID"):
+        controller.bind_rollback_session(original)
+
+    inactive = _R32ScriptedBroker()
+    inactive.state = access.BrokerState.CLOSED
+    with pytest.raises(access.LifecycleControllerError, match="BINDING_INVALID"):
+        controller.bind_rollback_session(inactive)
+
+    old_generation = _R32ScriptedBroker()
+    old_generation._session_generation = original._session_generation
+    with pytest.raises(access.LifecycleControllerError, match="BINDING_INVALID"):
+        controller.bind_rollback_session(old_generation)
+
+    assert original.calls == []
+    assert fresh.calls == []
+    assert inactive.calls == []
+    assert old_generation.calls == []
 
 
 def test_r32_initial_and_final_repairs_require_shape_and_exact_zero_counts() -> None:

@@ -222,6 +222,37 @@ class LifecycleAction(StrEnum):
     BACKUP_FALLBACK = "backup_fallback"
 
 
+_ROLLBACK_REBIND_ACTIONS = frozenset(
+    {
+        LifecycleAction.RESTORE_TRANSFER,
+        LifecycleAction.RESTORE_INSTALL,
+        LifecycleAction.RESTORE_INVENTORY,
+        LifecycleAction.RESTORE_CORE_CHECK_1,
+        LifecycleAction.RESTORE_CORE_CHECK_2,
+        LifecycleAction.REMOVAL_RESTART,
+        LifecycleAction.RESTORE_READINESS,
+        LifecycleAction.SERVICES_ABSENT,
+        LifecycleAction.POST_RESTORE_REPAIRS,
+        LifecycleAction.FINAL_ACCEPTANCE,
+        LifecycleAction.AMBIGUOUS_RECEIPT,
+        LifecycleAction.BACKUP_FALLBACK,
+    }
+)
+
+_ROLLBACK_BROKER_ADAPTERS = (
+    "_transfer_source_bundle",
+    "_install_staged_restore",
+    "_verify_source_inventory",
+    "_check_core",
+    "_restart_core",
+    "_wait_for_core_readiness",
+    "_inventory_temporary_services",
+    "_collect_resolution_info",
+    "_invoke_phase_a",
+    "_restore_private_backup",
+)
+
+
 class SessionBrokerError(RuntimeError):
     """A failure that intentionally never includes captured PTY bytes."""
 
@@ -2226,6 +2257,7 @@ class FullPreflightLifecycleController:
         self._is_critical = is_critical
         self._state = LifecycleState.BASELINE
         self._session_generation = broker._session_generation
+        self._seen_session_generations = [self._session_generation]
         self._lifecycle_generation = object()
         self._permits = {
             action: _InvocationPermit(
@@ -2274,6 +2306,53 @@ class FullPreflightLifecycleController:
     def _require_state(self, *states: LifecycleState) -> None:
         if self._state not in states:
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
+
+    def bind_rollback_session(self, broker: PrivateInteractiveSessionBroker) -> None:
+        """Explicitly bind unused rollback-only permits to one fresh session."""
+        self._require_state(LifecycleState.ROLLBACK_REQUIRED)
+        new_session_generation = getattr(broker, "_session_generation", None)
+        current_binding_still_active = (
+            getattr(self._broker, "state", None) is BrokerState.SESSION_ACTIVE
+            and getattr(self._broker, "_session_generation", None)
+            is self._session_generation
+        )
+        if (
+            broker is self._broker
+            or current_binding_still_active
+            or getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or new_session_generation is None
+            or any(
+                new_session_generation is seen
+                for seen in self._seen_session_generations
+            )
+            or not all(
+                callable(getattr(broker, name, None))
+                for name in _ROLLBACK_BROKER_ADAPTERS
+            )
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_ROLLBACK_BINDING_INVALID"
+            ) from None
+
+        permits_to_rebind = tuple(
+            self._permits[action]
+            for action in _ROLLBACK_REBIND_ACTIONS
+            if not self._permits[action].consumed
+        )
+        if any(
+            permit.lifecycle_generation is not self._lifecycle_generation
+            or permit.session_generation is not self._session_generation
+            for permit in permits_to_rebind
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_ROLLBACK_BINDING_INVALID"
+            ) from None
+
+        for permit in permits_to_rebind:
+            permit.session_generation = new_session_generation
+        self._broker = broker
+        self._session_generation = new_session_generation
+        self._seen_session_generations.append(new_session_generation)
 
     def _dispatch(self, action: LifecycleAction, callback: Callable[[], Any]) -> Any:
         self._assert_session_binding()
@@ -2476,10 +2555,17 @@ class FullPreflightLifecycleController:
             result = self._dispatch(action, lambda: self._broker._check_core(attempt))
         except SessionBrokerError as error:
             if attempt == 1 and self._outer_transport_ambiguity(error):
-                self._core_transport_ambiguous[source_state] = True
-                raise LifecycleControllerError(
-                    "CORE_CHECK_TRANSPORT_AMBIGUOUS"
-                ) from None
+                session_survived = (
+                    getattr(self._broker, "state", None) is BrokerState.SESSION_ACTIVE
+                    and getattr(self._broker, "_session_generation", None)
+                    is self._session_generation
+                )
+                if session_survived:
+                    self._core_transport_ambiguous[source_state] = True
+                    raise LifecycleControllerError(
+                        "CORE_CHECK_TRANSPORT_AMBIGUOUS"
+                    ) from None
+                self._rollback()
             self._rollback()
         except (TypeError, ValueError):
             self._rollback()

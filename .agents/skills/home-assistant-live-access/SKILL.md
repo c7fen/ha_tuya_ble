@@ -225,12 +225,12 @@ exact boolean `check_passed is true`. A completed FAIL is terminal. Attempt 2
 is permitted only after outer transport ambiguity left no completed result;
 the controller never reconnects or retries automatically. A terminal PTY
 timeout closes the broker and invalidates its session generation, so that
-lifecycle cannot use attempt 2. The two-attempt limit is an upper allowance
-only when the same bound session survives the outer ambiguity. A completed
-generic `error_class` response is a typed Core-check FAIL, not transport
-ambiguity. Restart uses the fixed Supervisor Core restart endpoint, has no
-retry loop, and the broker rejects a second submission for the same activated
-source state before PTY I/O.
+lifecycle atomically enters `ROLLBACK_REQUIRED` and cannot use attempt 2. The
+two-attempt limit is an upper allowance only when the same bound session
+survives the outer ambiguity. A completed generic `error_class` response is a
+typed Core-check FAIL, not transport ambiguity. Restart uses the fixed
+Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
+second submission for the same activated source state before PTY I/O.
 Readiness polling is bounded and verifies Core reachability, the running API,
 and `tuya_ble` in Core's loaded component set. Temporary service presence or
 absence remains a separate exact-count aggregate gate; result booleans alone
@@ -265,6 +265,15 @@ check, consumed/dispatched/accepted removal restart, full readiness including
 counts. Transfer, install, and inventory result counts must equal the exact
 controller-owned bundle or manifest count; a self-consistent different count
 is not admission.
+
+If the bound PTY session was lost, rollback does not reconnect automatically.
+The caller must explicitly bind one fresh, already active and validated broker
+while the controller is in `ROLLBACK_REQUIRED`. The lifecycle generation and
+all consumed permits remain unchanged. Only still-unused PR #41 rollback-tail,
+ambiguity-receipt, and backup-fallback permits are rebound to the fresh session.
+Candidate, helper, restart, and Core-check permits are never reset or rebound.
+The same broker, an inactive broker, or any previously seen session generation
+is rejected locally before PTY output.
 
 The PR #45 audit helper and audit service exist only while the candidate source
 is active. Collect every required helper-backed snapshot, including any A2
