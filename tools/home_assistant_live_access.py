@@ -2295,7 +2295,10 @@ def _parse_phase_a_result(
                 )
             )
             or item["terminal_class"] is not None
-            and not isinstance(item["terminal_class"], str)
+            and (
+                not isinstance(item["terminal_class"], str)
+                or len(item["terminal_class"]) > 64
+            )
             or exit_code == 0
             and item["known"] is not True
             or exit_code == 66

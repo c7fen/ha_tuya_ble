@@ -5012,6 +5012,62 @@ def test_r35_cr_m1_exact_pr45_unknown_receipt_remains_unknown() -> None:
     )
 
 
+@pytest.mark.parametrize("terminal_class", (True, "x" * 65))
+def test_r35_receipt_terminal_class_matches_exact_pr45_text_bound(
+    terminal_class: object,
+) -> None:
+    nonce = "d" * 16
+    payload = {
+        "exit_code": 0,
+        "outcome": "receipt",
+        "nonce": nonce,
+        "receipt": {
+            "nonce": nonce,
+            "known": True,
+            "service_entered": True,
+            "request_handed_to_transport": False,
+            "terminal_class": terminal_class,
+            "response_available": False,
+        },
+    }
+
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_phase_a_result(
+            access.PhaseAOperation.RECEIPT,
+            json.dumps(payload).encode(),
+            expected_nonce=nonce,
+        )
+
+
+@pytest.mark.parametrize("terminal_class", (None, "", "x" * 64))
+def test_r35_receipt_terminal_class_accepts_exact_pr45_text_domain(
+    terminal_class: str | None,
+) -> None:
+    nonce = "d" * 16
+    payload = {
+        "exit_code": 0,
+        "outcome": "receipt",
+        "nonce": nonce,
+        "receipt": {
+            "nonce": nonce,
+            "known": True,
+            "service_entered": True,
+            "request_handed_to_transport": False,
+            "terminal_class": terminal_class,
+            "response_available": False,
+        },
+    }
+
+    result = access._parse_phase_a_result(
+        access.PhaseAOperation.RECEIPT,
+        json.dumps(payload).encode(),
+        expected_nonce=nonce,
+    )
+
+    assert result.receipt is not None
+    assert result.receipt.terminal_class == terminal_class
+
+
 @pytest.mark.parametrize(
     "payload",
     (
