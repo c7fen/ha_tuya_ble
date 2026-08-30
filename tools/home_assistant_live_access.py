@@ -27,9 +27,10 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, TextIO
+from typing import Any, Self, TextIO
 
 REPAIRS_RESPONSE_SHAPE_INVALID = "REPAIRS_RESPONSE_SHAPE_INVALID"
 ADMISSION_COLLECTOR = "ADMISSION_COLLECTOR"
@@ -1381,7 +1382,7 @@ class _DurableLifecycleJournal:
                 invalid = invalid or first.get("sequence") != 0
                 invalid = invalid or first.get("stage") != LifecycleState.BASELINE.value
                 invalid = invalid or first.get("action") is not None
-                for previous, transition in zip(transitions, transitions[1:]):
+                for previous, transition in pairwise(transitions):
                     try:
                         previous_state = LifecycleState(previous.get("stage"))
                         next_state = LifecycleState(transition.get("stage"))
@@ -4351,7 +4352,7 @@ class FullPreflightLifecycleController:
         if self._journal is not None:
             self._journal.close()
 
-    def __enter__(self) -> FullPreflightLifecycleController:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:

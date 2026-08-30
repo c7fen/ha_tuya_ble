@@ -4280,7 +4280,9 @@ def test_r33_complete_invalid_action_state_matrix_is_side_effect_free() -> None:
             ):
                 controller._dispatch(
                     action,
-                    lambda capability: callbacks.append(capability),
+                    lambda capability, callbacks=callbacks: callbacks.append(
+                        capability
+                    ),
                     _dispatch_token=(
                         controller._FullPreflightLifecycleController__dispatch_token
                     ),
@@ -4786,7 +4788,7 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
             controller._journal = journal
             callbacks = 0
 
-            def callback(_capability: object) -> object:
+            def callback(_capability: object, crash_at: str = crash_at) -> object:
                 nonlocal callbacks
                 callbacks += 1
                 if crash_at == "during_dispatch":
