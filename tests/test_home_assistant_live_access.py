@@ -366,6 +366,40 @@ def test_b_m7_revalidates_wrapper_immediately_before_spawn(
     assert spawned == []
 
 
+def test_b_m7_wrapper_contents_never_reach_retained_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B-M7: wrapper-source leakage is detected even when launch otherwise works."""
+    private_content = "SYNTHETIC_WRAPPER_CONTENT_PRIVATE_TARGET_SENTINEL"
+    wrapper = tmp_path / "synthetic-wrapper-content"
+    wrapper.write_text(
+        "#!/bin/sh\n# " + private_content + "\nexit 99\n",
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o700)
+    monkeypatch.setattr(
+        access,
+        "validate_private_wrapper",
+        lambda path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
+    )
+    monkeypatch.setattr(
+        access, "_spawn_private_wrapper", _fake_spawn(_RESPONSIVE_PTY_CHILD)
+    )
+    broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
+
+    broker.open()
+    evidence = broker.collect_resolution_info(
+        access.RepairsGate.INITIAL, _relevant, _critical
+    )
+    broker.close()
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + repr(broker) + repr(evidence)
+    assert private_content not in rendered
+
+
 def test_b_m6_production_spawn_has_a_controlling_tty(tmp_path: Path) -> None:
     """B-M6: the unpatched production primitive gives its child a controlling TTY."""
     wrapper = tmp_path / "synthetic-controlling-tty"
