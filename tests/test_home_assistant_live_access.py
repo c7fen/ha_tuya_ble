@@ -14,7 +14,7 @@ import select
 import subprocess
 import sys
 import traceback
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 
 import pytest
@@ -1003,7 +1003,7 @@ def _synthetic_r30_source_authorities(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """Keep synthetic source acceptance explicit and separate from Git authorities."""
-    if not request.node.name.startswith(("test_r30_", "test_r32_")):
+    if not request.node.name.startswith(("test_r30_", "test_r32_", "test_r33_")):
         return
     for state_name in ("CANDIDATE", "RESTORE"):
         manifest = _r30_manifest(state_name)
@@ -3691,3 +3691,141 @@ def test_r32_synthetic_controlling_pty_full_controller_lifecycle(
     assert proof.complete is True
     assert controller.state is access.LifecycleState.COMPLETE
     assert broker.state is access.BrokerState.CLOSED
+
+
+def test_r33_red_recovery_restore_has_distinct_terminal() -> None:
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_STAGED
+    candidate, restore = _r32_bundles()
+    controller._candidate_manifest = candidate.manifest
+    broker.queue(
+        "install_candidate",
+        access.InstallResult(False, 4, 0, False),
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    proof = _r32_complete_restore_tail(controller, restore)
+
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.RESTORED_AFTER_ABORT
+
+
+def test_r33_red_new_controller_cannot_refresh_restart_permit() -> None:
+    first, first_broker = _r32_controller()
+    first._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    first.restart_for_candidate()
+
+    second, second_broker = _r32_controller()
+    second._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    with pytest.raises(access.LifecycleControllerError):
+        second.restart_for_candidate()
+
+    assert [name for name, _ in first_broker.calls].count("restart") == 1
+    assert [name for name, _ in second_broker.calls].count("restart") == 0
+
+
+def test_r33_red_exit_78_remains_consumed_after_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "a" * 16)
+    first, first_broker = _r32_controller()
+    first._state = access.LifecycleState.AP0_COLLECTED
+    first_broker.queue(
+        "helper",
+        access.PhaseAResult(
+            access.PhaseAOperation.PREFLIGHT,
+            78,
+            "transport_ambiguous",
+            "a" * 16,
+        ),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        first.run_non_probe_preflight()
+
+    second, second_broker = _r32_controller()
+    second._state = access.LifecycleState.AP0_COLLECTED
+    with pytest.raises(access.LifecycleControllerError):
+        second.run_non_probe_preflight()
+    assert [name for name, _ in second_broker.calls].count("helper") == 0
+
+
+def test_r33_red_controller_rejects_truthy_core_check_result() -> None:
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    broker.queue("core_check", access.CoreCheckResult(1, 200, "ok", 1, None))
+
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.check_candidate_core()
+
+
+@pytest.mark.parametrize("invalid", (1, 0, "true", "false", object(), None))
+def test_r33_red_final_restore_proof_rejects_non_boolean_predicates(
+    invalid: object,
+) -> None:
+    values = dict(_R32_FINAL_PROOF_VALUES)
+    values["source_manifest_match"] = invalid
+    assert access.FinalRestoreProof(**values).complete is False
+
+
+def test_r33_red_repairs_rejects_bool_integer_lookalikes() -> None:
+    assert (
+        access.FullPreflightLifecycleController._repairs_pass(
+            access.RepairsEvidence(1, False, 0)
+        )
+        is False
+    )
+
+
+def test_r33_red_direct_state_assignment_is_not_predecessor_proof() -> None:
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.POST_ACTIVATION_REPAIRS_PASS
+
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+        controller.collect_a0()
+    assert broker.calls == []
+
+
+def test_r33_red_capability_is_immutable_and_cannot_be_relabelled() -> None:
+    broker = _r32_unbound_real_broker()
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.BACKUP
+    )
+
+    with pytest.raises((AttributeError, FrozenInstanceError)):
+        capability.action = access.LifecycleAction.ACTIVATION_RESTART
+
+
+def test_r33_red_snapshot_generation_mismatch_blocks_research_final() -> None:
+    controller, broker = _r32_controller()
+    generation = object()
+    controller._state = access.LifecycleState.A1_COLLECTED
+    controller._candidate_activation_generation = generation
+    controller._snapshots = {
+        label: _zero_audit_snapshot()
+        for label in (
+            access.AuditLabel.A0,
+            access.AuditLabel.AP0,
+            access.AuditLabel.A1,
+        )
+    }
+    controller._snapshot_generations = {
+        access.AuditLabel.A0: generation,
+        access.AuditLabel.AP0: generation,
+        access.AuditLabel.A1: object(),
+    }
+    controller._preflight_result = access.PhaseAResult(
+        access.PhaseAOperation.PREFLIGHT, 0, "preflight_ok", "a" * 16
+    )
+    controller._receipt_result = access.PhaseAResult(
+        access.PhaseAOperation.RECEIPT, 66, "receipt", "a" * 16
+    )
+    passing = access.AuditComparison(True, True, True, True, True)
+    controller._audit_comparisons = {
+        (access.AuditLabel.A0, access.AuditLabel.AP0): passing,
+        (access.AuditLabel.AP0, access.AuditLabel.A1): passing,
+    }
+
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.validate_research_final()
+    assert [name for name, _ in broker.calls] == []
