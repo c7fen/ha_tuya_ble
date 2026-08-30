@@ -4412,6 +4412,49 @@ def test_r33_r_m5_restore_install_loss_never_reopens_research() -> None:
     assert not hasattr(second, "install_candidate")
 
 
+def test_r35_reconstruction_committed_restore_tail_survives_each_process_loss() -> None:
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup()
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+
+    controller.stage_restore(restore)
+
+    def reconstruct(expected: access.LifecycleState) -> object:
+        nonlocal controller
+        controller.close()
+        controller, reconstructed_broker = _r33_controller()
+        assert controller.state is expected
+        assert controller._journal.recovery_mode is True
+        assert reconstructed_broker.calls == []
+        return controller
+
+    reconstruct(access.LifecycleState.RESTORE_STAGED)
+    controller.restore_pr41(restore.manifest)
+    reconstruct(access.LifecycleState.PR41_RESTORED)
+    controller.verify_restore_inventory(restore.manifest)
+    reconstruct(access.LifecycleState.RESTORE_INVENTORY_VERIFIED)
+    controller.check_restore_core()
+    reconstruct(access.LifecycleState.RESTORE_CORE_CHECKED)
+    controller.restart_for_restore()
+    reconstruct(access.LifecycleState.REMOVAL_RESTART_CONSUMED)
+    controller.await_restore_readiness()
+    reconstruct(access.LifecycleState.PR41_READY)
+    controller.verify_research_services_absent()
+    reconstruct(access.LifecycleState.RESEARCH_SERVICES_ABSENT)
+    controller.admit_post_restore_repairs()
+    reconstruct(access.LifecycleState.POST_RESTORE_REPAIRS_PASS)
+
+    proof = controller.complete()
+
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.RESTORED_AFTER_ABORT
+
+
 def test_r33_r_m6_removal_restart_cannot_replay_after_loss() -> None:
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
