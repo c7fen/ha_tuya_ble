@@ -125,18 +125,85 @@ The broker uses explicit private lifecycle states: `SSH_CHILD_STARTED`,
 `REMOTE_INTERACTIVE_READY`, `LOGIN_SHELL_READY`, `SESSION_ACTIVE`, and
 `CLOSED`. It captures initial output and connection-close messages privately,
 uses bounded timeout/output limits, emits only `HA_INTERACTIVE_SESSION_READY`
-after the login-shell state, and exposes only the fixed aggregate-only Repairs
-collector. It accepts only a pre-validated wrapper `Path`, executes that path
-with no arguments in a controlling PTY, and has no raw terminal-output or
-generic command passthrough. Every remote-shell, login-shell, and collection
-boundary uses a fresh broker-owned nonce inside an exact control-delimited
-frame; prompts, banners, and echoed commands cannot establish readiness.
+after the login-shell state, and exposes only fixed structured operations. It
+accepts only a pre-validated wrapper `Path`, executes that path with no
+arguments in a controlling PTY, and has no raw terminal-output or generic
+command passthrough. Every remote-shell, login-shell, and operation boundary
+uses a fresh broker-owned nonce inside an exact control-delimited frame;
+prompts, banners, echoed commands, ANSI text, and multiple machine results
+cannot establish readiness or satisfy a result boundary.
 Post-`exec bash -li` readiness is stricter than a fresh frame alone: the frame
 is emitted only when the shell proves `BASH_VERSION`, interactive `$-` mode,
 and `shopt -q login_shell` together. A shell that ignores the `exec` command is
 an access failure, not a ready Supervisor context.
 
-## 5. Strict structured Repairs admission
+Before sending structured data, the broker disables terminal echo through a
+broker-framed transition. The fixed remote program and source bundle then move
+through bounded textual chunks. Transferred source, private paths, shell
+prompts, helper output, and raw Supervisor responses remain inside the PTY.
+
+## 5. Bounded full-preflight control plane
+
+The broker's public live-capable API consists only of named methods for:
+
+- aggregate Repairs collection;
+- private source backup and fixed backup restoration;
+- exact source-bundle transfer, candidate installation, and PR #41 restoration;
+- aggregate source inventory verification;
+- direct Supervisor Core check, one restart per activated source state, and
+  bounded Core readiness;
+- exact temporary-service presence or absence inventory;
+- Phase-A `PREFLIGHT`, `AUDIT`, and `RECEIPT` helper calls;
+- the invalid-nonce local preflight discriminator.
+
+There is no command-string, argv, stdin/stdout bridge, remote-path, service-name,
+endpoint, environment-variable, or arbitrary helper-operation argument. The
+private dispatcher accepts only `BoundedOperation`; the helper operation enum
+contains only `PREFLIGHT`, `AUDIT`, and `RECEIPT`. It deliberately cannot
+represent `PROBE`, Device Status, Device Info, pairing, a datapoint write, a
+lock action, or a policy mutation.
+
+Candidate source is bound to exact PR #45 commit
+`a382c08cd4e8613dc214505bcb8a6f59f8da3022` and tree
+`73246ecd71f0953c7bf8a73df78d6506bee29c8e`. Restoration source is bound to
+exact PR #41 commit `4f73a9b008dcb89134bc41001c486f06d6056867` and tree
+`463ed8553da01eae591de611e76e45392ad9e7bf`. Local and remote admission both
+require the pinned canonical per-file manifest fingerprint, exact file count,
+exact SHA-256 content digests, regular files only, no duplicates, no traversal,
+and no unexpected helper file.
+
+The candidate helper is nested in a fixed hidden directory inside the Tuya BLE
+integration deployment tree. Installation and restoration use one Linux atomic
+directory exchange, so PR #41 restoration removes the research helper in the
+same operation without touching another custom component. The fixed private
+backup is independently verified and is only a fallback; exact PR #41 remains
+the restoration authority.
+
+Core check uses exactly `POST http://supervisor/core/check`. Success requires a
+2xx status, JSON, top-level `result == "ok"`, and `check_passed == true`. The
+caller may represent only attempt ordinal 1 or 2. Restart uses the fixed
+Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
+second submission for the same activated source state before PTY I/O.
+Readiness polling is bounded and verifies Core reachability, the running API,
+and `tuya_ble` in Core's loaded component set. Temporary service presence or
+absence remains a separate exact aggregate gate.
+
+Helper results preserve exits 0, 65, 66, 67, and 78. Outcomes are validated per
+operation and correlated to the exact submitted nonce. Exit 78 is terminal
+ambiguity and never authorizes replay. Audit responses retain only protocol
+version, opaque audit instance token, ordinal, overflow state, runtime duration,
+the allowlisted counters, the documented four-field bounded events, and the
+optional nonce. Snapshot comparison reports exact instance, ordinal, counter,
+event, and overflow booleans without inventing semantic equivalence.
+
+The PR #45 audit helper and audit service exist only while the candidate source
+is active. Collect every required helper-backed snapshot, including any A2
+label, before exact PR #41 restoration begins. After restoration, prove source
+identity, temporary-service absence, Core readiness, and final Repairs instead.
+Do not fabricate a post-restore audit snapshot: exact PR #41 intentionally
+contains neither the temporary helper nor its audit service.
+
+## 6. Strict structured Repairs admission
 
 Repairs admission is fail-closed. When a supported Home Assistant response is
 used to prove the Repairs gate, the collector must validate the actual response
@@ -211,7 +278,7 @@ If the structured schema changes, stop with the distinct
 the decoder before any deployment/restart proceeds. Do not label a predecessor
 admission failure as an invocation/service failure.
 
-## 6. Command execution model for agents
+## 7. Command execution model for agents
 
 For agent/orchestrator execution:
 
@@ -219,9 +286,9 @@ For agent/orchestrator execution:
 2. Let it privately consume the Home Assistant prompt/banner and establish the
    verified login shell.
 3. Wait only for its generic readiness sentinel.
-4. Use only the broker's fixed `collect_resolution_info` operation in that
-   existing interactive session; never bridge raw remote stdout or request a
-   general command channel.
+4. Use only the broker method that exactly represents the authorized operation
+  in that existing interactive session; never bridge raw remote stdout or
+  request a general command channel.
 5. Validate structured admission responses strictly before mutation gates.
 6. Keep authorization boundaries from the active task; this skill grants no
    deployment, restart, service-call, BLE, lock, or configuration permission by
@@ -231,7 +298,7 @@ For agent/orchestrator execution:
 Do not silently open additional sessions, retry device work, or broaden a live
 operation merely to recover from orchestration problems.
 
-## 7. Privacy and evidence
+## 8. Privacy and evidence
 
 - The exact Home Assistant host/address and private route remain local-only.
 - Never render private instruction-file contents into platform tool output.
@@ -257,7 +324,7 @@ operation merely to recover from orchestration problems.
   The confirmed correction target is a Supervisor schema-layer mismatch, not
   PR #45, BLE, a device, or the interactive invocation contract.
 
-## 8. Fail-closed access and admission decisions
+## 9. Fail-closed access and admission decisions
 
 Stop and request operator input only when the private local route cannot be
 launched through the established non-echoing mechanism, or when the interactive
