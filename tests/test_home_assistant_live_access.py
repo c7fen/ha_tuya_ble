@@ -3759,6 +3759,21 @@ def test_r33_red_controller_rejects_truthy_core_check_result() -> None:
         controller.check_candidate_core()
 
 
+def test_r33_red_stale_core_evidence_cannot_advance_new_lifecycle() -> None:
+    stale = access.CoreCheckResult(1, 200, "ok", True, None)
+    first, first_broker = _r32_controller()
+    first._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    first_broker.queue("core_check", stale)
+    assert first.check_candidate_core() is stale
+
+    second, second_broker = _r32_controller()
+    second._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    second_broker.queue("core_check", stale)
+    with pytest.raises(access.LifecycleControllerError):
+        second.check_candidate_core()
+    assert second.state is not access.LifecycleState.CANDIDATE_CORE_CHECKED
+
+
 @pytest.mark.parametrize("invalid", (1, 0, "true", "false", object(), None))
 def test_r33_red_final_restore_proof_rejects_non_boolean_predicates(
     invalid: object,
