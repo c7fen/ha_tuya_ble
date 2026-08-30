@@ -6,7 +6,8 @@ import ast
 import io
 import json
 import os
-import stat
+import pty
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -107,18 +108,22 @@ def test_s_m2_supervisor_envelope_preserves_issues_for_aggregation() -> None:
         ("S-M4", "[]"),
         ("S-M5", '{"data": {"issues": []}}'),
         ("S-M6", '{"result": "error", "data": {"issues": []}}'),
-        ("S-M7", '{"result": "ok"}'),
-        ("S-M8", '{"result": "ok", "data": null}'),
-        ("S-M9", '{"result": "ok", "data": {}}'),
-        ("S-M10", '{"result": "ok", "data": {"issues": null}}'),
-        ("S-M11", '{"result": "ok", "data": {"issues": {}}}'),
-        ("S-M12", "{"),
+        ("S-M7", '{"result": 1, "data": {"issues": []}}'),
+        ("S-M8", '{"result": "ok"}'),
+        ("S-M9", '{"result": "ok", "data": null}'),
+        ("S-M10", '{"result": "ok", "data": []}'),
+        ("S-M11", '{"result": "ok", "data": "wrong"}'),
+        ("S-M12", '{"result": "ok", "data": {}}'),
+        ("S-M13", '{"result": "ok", "data": {"issues": null}}'),
+        ("S-M14", '{"result": "ok", "data": {"issues": {}}}'),
+        ("S-M15", '{"result": "ok", "data": {"issues": "wrong"}}'),
+        ("S-M16", "{"),
     ],
 )
 def test_repairs_invalid_shapes_fail_closed_without_empty_issue_fallback(
     name: str, response: str
 ) -> None:
-    """S-M3 through S-M12: invalid shapes never become an empty list."""
+    """S-M3 through S-M16: invalid shapes never become an empty list."""
     decoded = access.decode_repairs_response(response)
     result = _collect(response)
 
@@ -198,90 +203,179 @@ def test_all_represented_gates_use_the_same_strict_decoder(
     assert calls == ["decode", "decode", "decode"]
 
 
-def test_b_m1_to_b_m10_private_pty_broker_hides_banner_and_preserves_session(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Synthetic child proves private startup, login-shell, commands, and close output."""
-    child = r"""
+def _fake_spawn(child: str):
+    """Return the narrow spawn seam used to test without executing a wrapper."""
+
+    def spawn(_: Path) -> tuple[int, int]:
+        child_pid, master_fd = pty.fork()
+        if child_pid == 0:
+            os.execv(sys.executable, [sys.executable, "-u", "-c", child])
+        return child_pid, master_fd
+
+    return spawn
+
+
+_RESPONSIVE_PTY_CHILD = r"""
 import os
+import re
 import sys
 
-if not os.isatty(0):
-    raise SystemExit("SYNTHETIC_PIPE_REGRESSION")
-print("SYNTHETIC_IPV4_SENTINEL=192.0.2.37", flush=True)
-print("SYNTHETIC_IPV6_SENTINEL=2001:db8::37", flush=True)
-print("SYNTHETIC_PRIVATE_HOST_SENTINEL=private-host.invalid", flush=True)
-print("SYNTHETIC_HOME_ASSISTANT_URL_SENTINEL=http://private-host.invalid:8123", flush=True)
-print("SYNTHETIC_OBSERVER_URL_SENTINEL=http://observer.invalid", flush=True)
-print("REMOTE_PROMPT", flush=True)
+assert os.isatty(0)
+assert os.tcgetpgrp(0) == os.getpgrp()
+print("SYNTHETIC_BANNER_IPV4=192.0.2.37", flush=True)
+print("SYNTHETIC_BANNER_IPV6=2001:db8::37", flush=True)
+print("SYNTHETIC_BANNER_HOST=private-host.invalid", flush=True)
+print("SYNTHETIC_BANNER_URL=http://private-host.invalid:8123", flush=True)
+print("SYNTHETIC_BANNER_OBSERVER=http://observer.invalid", flush=True)
+frame = re.compile(r"\\036(HA_BROKER_[A-Z_]+:[0-9a-f]+)\\037")
+login = False
 for line in sys.stdin:
-    command = line.strip()
-    if command == "exec bash -li":
-        print("LOGIN_PROMPT", flush=True)
-    elif command.startswith("ha resolution info --raw-json; printf"):
+    if line.strip() == "exec bash -li":
+        login = True
+        continue
+    values = frame.findall(line)
+    if "HA_BROKER_REMOTE" in line and values:
+        print("\x1e" + values[0] + "\x1f", flush=True)
+    elif "HA_BROKER_LOGIN" in line and values and login:
+        print("\x1e" + values[0] + "\x1f", flush=True)
+    elif "ha resolution info --raw-json" in line and login and len(values) == 2:
+        print("\x1e" + values[0] + "\x1f", flush=True)
         print('{"result": "ok", "data": {"issues": []}}', flush=True)
-        print("__HA_INTERACTIVE_COMMAND_DONE__", flush=True)
-    elif command == "exit":
-        print("SYNTHETIC_CLOSE_TARGET_SENTINEL=private-host.invalid", flush=True)
+        print("\x1e" + values[1] + "\x1f", flush=True)
+    elif line.strip() == "exit":
+        print("SYNTHETIC_CLOSE_TARGET=private-host.invalid", flush=True)
         break
 """
-    broker = access.PrivateInteractiveSessionBroker(
-        [sys.executable, "-u", "-c", child],
-        remote_ready_marker=b"REMOTE_PROMPT",
-        login_ready_marker=b"LOGIN_PROMPT",
-        timeout_seconds=1,
-    )
 
-    assert broker.open() == access.BrokerState.SESSION_ACTIVE
-    assert broker.execute(
-        access.ResolutionInfoCommand(access.RepairsGate.INITIAL, _relevant, _critical)
+
+def _broker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, child: str):
+    wrapper = tmp_path / "SYNTHETIC_REAL_WRAPPER_MUST_NOT_RUN"
+    monkeypatch.setattr(
+        access,
+        "validate_private_wrapper",
+        lambda path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
+    )
+    monkeypatch.setattr(access, "_spawn_private_wrapper", _fake_spawn(child))
+    return access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
+
+
+@pytest.mark.parametrize(
+    "name,sentinel",
+    [
+        ("B-M1", "SYNTHETIC_BANNER_IPV4"),
+        ("B-M2", "SYNTHETIC_BANNER_IPV6"),
+        ("B-M3", "SYNTHETIC_BANNER_HOST"),
+        ("B-M4", "SYNTHETIC_BANNER_URL"),
+        ("B-M5", "SYNTHETIC_BANNER_OBSERVER"),
+        ("B-M6", "SYNTHETIC_CLOSE_TARGET"),
+    ],
+)
+def test_b_m1_to_b_m6_private_pty_output_never_reaches_transcript(
+    name: str,
+    sentinel: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B-M1--6: banner/close leakage and pipe substitution are detected."""
+    broker = _broker(monkeypatch, tmp_path, _RESPONSIVE_PTY_CHILD)
+
+    assert broker.open() is access.BrokerState.SESSION_ACTIVE
+    assert broker.collect_resolution_info(
+        access.RepairsGate.INITIAL, _relevant, _critical
     ) == access.RepairsEvidence(shape_valid=True, relevant_count=0, critical_count=0)
     broker.close()
 
     captured = capsys.readouterr()
     rendered = captured.out + captured.err + repr(broker)
-    assert "HA_INTERACTIVE_SESSION_READY" in rendered
-    assert all(
-        sentinel not in rendered
-        for sentinel in (
-            "SYNTHETIC_IPV4_SENTINEL",
-            "SYNTHETIC_IPV6_SENTINEL",
-            "SYNTHETIC_PRIVATE_HOST_SENTINEL",
-            "SYNTHETIC_HOME_ASSISTANT_URL_SENTINEL",
-            "SYNTHETIC_OBSERVER_URL_SENTINEL",
-            "SYNTHETIC_CLOSE_TARGET_SENTINEL",
-        )
+    assert name.startswith("B-M")
+    assert access.HA_INTERACTIVE_SESSION_READY in rendered
+    assert sentinel not in rendered
+
+
+def test_b_m7_wrapper_is_validated_then_spawned_without_arguments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B-M7: only a validated wrapper path reaches the production spawn seam."""
+    wrapper = tmp_path / "synthetic-wrapper-path"
+    validated: list[Path] = []
+    spawned: list[Path] = []
+    monkeypatch.setattr(
+        access,
+        "validate_private_wrapper",
+        lambda path: (
+            validated.append(path)
+            or access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ())
+        ),
     )
 
+    def fake_spawn(path: Path) -> tuple[int, int]:
+        spawned.append(path)
+        return _fake_spawn(_RESPONSIVE_PTY_CHILD)(path)
 
-def test_b_m8_timeout_discards_private_startup_output(
+    monkeypatch.setattr(access, "_spawn_private_wrapper", fake_spawn)
+    broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.2)
+    broker.open()
+    broker.close()
+
+    assert validated == [wrapper]
+    assert spawned == [wrapper]
+
+
+@pytest.mark.parametrize("name,child", [("B-M8", ""), ("B-M9", "")])
+def test_b_m8_and_b_m9_static_banner_or_prompt_cannot_fake_challenges(
+    name: str,
+    child: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """B-M8: timeout is generic and never dumps the private captured banner."""
-    child = r"""
+    """B-M8/9: errors are generic and shell readiness needs fresh challenges."""
+    if name == "B-M8":
+        child = r"""
 import os
 import sys
-
 assert os.isatty(0)
-print("SYNTHETIC_TIMEOUT_PRIVATE_BANNER_SENTINEL=private-host.invalid", flush=True)
+print("SYNTHETIC_TIMEOUT_PRIVATE_START=private-host.invalid", flush=True)
 for _ in sys.stdin:
     pass
 """
-    broker = access.PrivateInteractiveSessionBroker(
-        [sys.executable, "-u", "-c", child],
-        remote_ready_marker=b"NEVER_ARRIVES",
-        login_ready_marker=b"LOGIN_PROMPT",
-        timeout_seconds=0.05,
-    )
+    else:
+        child = r"""
+import os
+import re
+import sys
+assert os.isatty(0)
+frame = re.compile(r"\\036(HA_BROKER_[A-Z_]+:[0-9a-f]+)\\037")
+print("SYNTHETIC_STATIC_PROMPT=READY", flush=True)
+for line in sys.stdin:
+    values = frame.findall(line)
+    if "HA_BROKER_REMOTE" in line and values:
+        print("\x1e" + values[0] + "\x1f", flush=True)
+    # Deliberately never acknowledge the post-exec login-shell challenge.
+"""
+    broker = _broker(monkeypatch, tmp_path, child)
 
     with pytest.raises(access.SessionBrokerError) as error:
         broker.open()
 
     captured = capsys.readouterr()
     rendered = captured.out + captured.err + str(error.value) + repr(broker)
+    assert name.startswith("B-M")
     assert "PRIVATE_INTERACTIVE_SESSION_TIMEOUT" in rendered
-    assert "SYNTHETIC_TIMEOUT_PRIVATE_BANNER_SENTINEL" not in rendered
-    assert broker.state is access.BrokerState.CLOSED
+    assert "SYNTHETIC_" not in rendered
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_b_m10_real_wrapper_is_never_executed_by_synthetic_tests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B-M10: a fake child can run only through the private spawn seam."""
+    broker = _broker(monkeypatch, tmp_path, _RESPONSIVE_PTY_CHILD)
+    broker.open()
+    broker.close()
+    assert not (tmp_path / "SYNTHETIC_REAL_WRAPPER_MUST_NOT_RUN").exists()
 
 
 def test_o_m6_private_instruction_never_reaches_bootstrap_stdout(
@@ -381,16 +475,14 @@ def test_o_m10_public_results_do_not_retain_private_host_or_path(
 
 def test_transcript_privacy_regression_excludes_all_forbidden_categories() -> None:
     """Public aggregate evidence excludes every synthetic private category."""
-    response = json.dumps(
-        {
-            "issues": [
-                {
-                    "scope": "integration",
-                    "severity": "critical",
-                    "synthetic_private_values": SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS,
-                }
-            ]
-        }
+    response = _resolution_response(
+        [
+            {
+                "scope": "integration",
+                "severity": "critical",
+                "synthetic_private_values": SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS,
+            }
+        ]
     )
 
     rendered = repr(access.repairs_evidence(_collect(response)))
