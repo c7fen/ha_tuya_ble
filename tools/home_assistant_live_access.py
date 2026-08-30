@@ -414,6 +414,32 @@ _NORMAL_LIFECYCLE_HISTORY = (
     LifecycleState.POST_RESTORE_REPAIRS_PASS,
 )
 
+_RECONSTRUCTABLE_RESTORE_STAGES = frozenset(
+    {
+        LifecycleState.RESTORE_STAGED,
+        LifecycleState.PR41_RESTORED,
+        LifecycleState.RESTORE_INVENTORY_VERIFIED,
+        LifecycleState.RESTORE_CORE_CHECKED,
+        LifecycleState.REMOVAL_RESTART_CONSUMED,
+        LifecycleState.PR41_READY,
+        LifecycleState.RESEARCH_SERVICES_ABSENT,
+        LifecycleState.POST_RESTORE_REPAIRS_PASS,
+    }
+)
+
+_RESTORE_ACTIVE_SOURCE_STAGES = _RECONSTRUCTABLE_RESTORE_STAGES - {
+    LifecycleState.RESTORE_STAGED
+}
+
+_RESTORE_RESTARTED_STAGES = frozenset(
+    {
+        LifecycleState.REMOVAL_RESTART_CONSUMED,
+        LifecycleState.PR41_READY,
+        LifecycleState.RESEARCH_SERVICES_ABSENT,
+        LifecycleState.POST_RESTORE_REPAIRS_PASS,
+    }
+)
+
 _CANDIDATE_SOURCE_ACTIONS = frozenset(
     {
         LifecycleAction.CANDIDATE_TRANSFER,
@@ -1069,16 +1095,39 @@ class _DurableLifecycleJournal:
                 record = copy.deepcopy(record)
                 record["recovery_mode"] = True
                 record["rollback_mode"] = True
-                record["stage"] = LifecycleState.RECOVERY_REQUIRED.value
-                record["transitions"].append(
-                    {
-                        "sequence": len(record["transitions"]),
-                        "stage": LifecycleState.RECOVERY_REQUIRED.value,
-                        "action": None,
-                        "source_generation": record["source_generation"],
-                        "evidence_generation": None,
-                    }
+                incomplete_restore = any(
+                    operation["action"]
+                    in {action.value for action in _RESTORE_SOURCE_ACTIONS}
+                    and operation["phase"] != "transition_committed"
+                    for operation in record["operations"]
                 )
+                stage = LifecycleState(record["stage"])
+                if incomplete_restore:
+                    restore_generation = record["pr41_restore"]["generation"]
+                    record["active"] = False
+                    record["terminal"] = LifecycleState.RESTORE_FAILED.value
+                    record["stage"] = LifecycleState.RESTORE_FAILED.value
+                    record["source_generation"] = restore_generation
+                    record["transitions"].append(
+                        {
+                            "sequence": len(record["transitions"]),
+                            "stage": LifecycleState.RESTORE_FAILED.value,
+                            "action": None,
+                            "source_generation": restore_generation,
+                            "evidence_generation": None,
+                        }
+                    )
+                elif stage not in _RECONSTRUCTABLE_RESTORE_STAGES:
+                    record["stage"] = LifecycleState.RECOVERY_REQUIRED.value
+                    record["transitions"].append(
+                        {
+                            "sequence": len(record["transitions"]),
+                            "stage": LifecycleState.RECOVERY_REQUIRED.value,
+                            "action": None,
+                            "source_generation": record["source_generation"],
+                            "evidence_generation": None,
+                        }
+                    )
                 self._write_record(record)
             else:
                 raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETAINED") from None
@@ -1631,6 +1680,26 @@ class _DurableLifecycleJournal:
             LifecycleAction(value) for value in self._record["consumed_operations"]
         )
 
+    def action_transition_committed(self, action: LifecycleAction) -> bool:
+        operation = next(
+            (
+                item
+                for item in self._record["operations"]
+                if item["action"] == action.value
+            ),
+            None,
+        )
+        return (
+            operation is not None
+            and operation["phase"] == "transition_committed"
+            and any(
+                transition["action"] == action.value
+                and LifecycleState(transition["stage"])
+                in _LIFECYCLE_ACTION_SUCCESSORS[action]
+                for transition in self._record["transitions"]
+            )
+        )
+
     @property
     def transitions(self) -> tuple[dict[str, object], ...]:
         return tuple(copy.deepcopy(self._record["transitions"]))
@@ -1864,14 +1933,52 @@ def _source_manifest_digest(entries: Iterable[SourceManifestEntry]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def validate_source_manifest(manifest: SourceManifest) -> None:
+    """Admit one exact authority-bound manifest without requiring file content."""
+    if not isinstance(manifest, SourceManifest) or not isinstance(
+        manifest.state, SourceState
+    ):
+        raise SourceBundleError("SOURCE_BUNDLE_MANIFEST_MISMATCH") from None
+    entries = manifest.entries
+    if type(entries) is not tuple or not entries or len(entries) > _MAX_SOURCE_FILES:
+        raise SourceBundleError("SOURCE_BUNDLE_MANIFEST_MISMATCH") from None
+    if any(type(entry) is not SourceManifestEntry for entry in entries):
+        raise SourceBundleError("SOURCE_BUNDLE_MANIFEST_MISMATCH") from None
+    paths = [entry.relative_path for entry in entries]
+    if len(paths) != len(set(paths)):
+        raise SourceBundleError("SOURCE_BUNDLE_DUPLICATE_FILE") from None
+    if any(not _source_path_allowed(path, manifest.state) for path in paths):
+        raise SourceBundleError("SOURCE_BUNDLE_UNEXPECTED_FILE") from None
+    if manifest.state is SourceState.CANDIDATE and not _HELPER_FILES.issubset(paths):
+        raise SourceBundleError("SOURCE_BUNDLE_MANIFEST_MISMATCH") from None
+    if any(
+        type(entry.size) is not int
+        or entry.size < 0
+        or not isinstance(entry.sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", entry.sha256) is None
+        for entry in entries
+    ):
+        raise SourceBundleError("SOURCE_BUNDLE_MANIFEST_MISMATCH") from None
+    if (
+        _source_manifest_digest(entries)
+        != _AUTHORITY_MANIFEST_DIGESTS[manifest.state.value]
+    ):
+        raise SourceBundleError("SOURCE_BUNDLE_AUTHORITY_MISMATCH") from None
+
+
 def build_source_bundle(
     state: SourceState,
     files: Iterable[SourceBundleFile],
     expected_manifest: SourceManifest,
 ) -> SourceBundle:
     """Admit only a complete bounded bundle matching the trusted manifest."""
-    if not isinstance(state, SourceState) or expected_manifest.state is not state:
+    if (
+        not isinstance(state, SourceState)
+        or not isinstance(expected_manifest, SourceManifest)
+        or expected_manifest.state is not state
+    ):
         raise SourceBundleError("SOURCE_BUNDLE_AUTHORITY_MISMATCH") from None
+    validate_source_manifest(expected_manifest)
     file_items = tuple(files)
     if not file_items or len(file_items) > _MAX_SOURCE_FILES:
         raise SourceBundleError("SOURCE_BUNDLE_SIZE_INVALID") from None
@@ -4226,6 +4333,15 @@ class FullPreflightLifecycleController:
             if self._journal is not None:
                 self._journal.close()
             raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if (
+            self._journal is not None
+            and type(broker) is PrivateInteractiveSessionBroker
+        ):
+            reconstructed_stage = self._journal.state
+            if reconstructed_stage in _RESTORE_ACTIVE_SOURCE_STAGES:
+                broker._active_source_state = SourceState.RESTORE
+            if reconstructed_stage in _RESTORE_RESTARTED_STAGES:
+                broker._restarted_states.add(SourceState.RESTORE)
         self._permits = {
             action: _InvocationPermit(
                 action, self._lifecycle_generation, self._session_generation
@@ -5088,6 +5204,20 @@ class FullPreflightLifecycleController:
         self._advance(LifecycleState.A2_COLLECTED, LifecycleAction.A2)
         return snapshot
 
+    def _bind_restore_manifest(self, manifest: SourceManifest) -> None:
+        if self._restore_manifest is None:
+            if self._journal is None or not self._journal.recovery_mode:
+                raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+            try:
+                validate_source_manifest(manifest)
+            except SourceBundleError:
+                raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+            if manifest.state is not SourceState.RESTORE:
+                raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+            self._restore_manifest = manifest
+        if manifest != self._restore_manifest:
+            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+
     def stage_restore(self, bundle: SourceBundle) -> TransferResult:
         self._require_state(
             LifecycleState.A2_COLLECTED,
@@ -5123,10 +5253,8 @@ class FullPreflightLifecycleController:
 
     def restore_pr41(self, manifest: SourceManifest) -> InstallResult:
         self._require_state(LifecycleState.RESTORE_STAGED)
-        if (
-            manifest != self._restore_manifest
-            or manifest.state is not SourceState.RESTORE
-        ):
+        self._bind_restore_manifest(manifest)
+        if manifest.state is not SourceState.RESTORE:
             raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
         try:
             result = self.__dispatch_action(
@@ -5150,8 +5278,7 @@ class FullPreflightLifecycleController:
         self, manifest: SourceManifest
     ) -> SourceInventoryResult:
         self._require_state(LifecycleState.PR41_RESTORED)
-        if manifest != self._restore_manifest:
-            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+        self._bind_restore_manifest(manifest)
         try:
             result = self.__dispatch_action(
                 LifecycleAction.RESTORE_INVENTORY,
@@ -5249,6 +5376,11 @@ class FullPreflightLifecycleController:
         )
         return evidence
 
+    def _durable_action_committed(self, action: LifecycleAction) -> bool:
+        return self._journal is not None and self._journal.action_transition_committed(
+            action
+        )
+
     def _final_restore_proof(self) -> FinalRestoreProof:
         inventory = self._restore_inventory
         core = self._restore_core_check
@@ -5257,37 +5389,91 @@ class FullPreflightLifecycleController:
         services = self._restore_services
         repairs = self._restore_repairs
         restart_permit = self._permits[LifecycleAction.REMOVAL_RESTART]
+        inventory_committed = self._durable_action_committed(
+            LifecycleAction.RESTORE_INVENTORY
+        )
+        core_committed = self._durable_action_committed(
+            LifecycleAction.RESTORE_CORE_CHECK_1
+        ) or self._durable_action_committed(LifecycleAction.RESTORE_CORE_CHECK_2)
+        restart_committed = self._durable_action_committed(
+            LifecycleAction.REMOVAL_RESTART
+        )
+        readiness_committed = self._durable_action_committed(
+            LifecycleAction.RESTORE_READINESS
+        )
+        services_committed = self._durable_action_committed(
+            LifecycleAction.SERVICES_ABSENT
+        )
+        repairs_committed = self._durable_action_committed(
+            LifecycleAction.POST_RESTORE_REPAIRS
+        )
         return FinalRestoreProof(
             source_manifest_match=(
-                inventory is not None
-                and self._restore_manifest is not None
-                and self._inventory_pass(inventory, len(self._restore_manifest.entries))
+                inventory_committed
+                or (
+                    inventory is not None
+                    and self._restore_manifest is not None
+                    and self._inventory_pass(
+                        inventory, len(self._restore_manifest.entries)
+                    )
+                )
             ),
             research_files_absent=(
-                inventory is not None
-                and inventory.unexpected_count == 0
-                and inventory.missing_count == 0
+                inventory_committed
+                or (
+                    inventory is not None
+                    and inventory.unexpected_count == 0
+                    and inventory.missing_count == 0
+                )
             ),
-            core_check_passed=(core is not None and core.check_passed),
+            core_check_passed=(
+                core_committed or (core is not None and core.check_passed)
+            ),
             restart_consumed=restart_permit.consumed,
-            restart_dispatched=SourceState.RESTORE in self._restart_dispatched,
-            restart_submitted=restart is not None and restart.submitted is True,
-            restart_accepted=restart is not None and restart.accepted is True,
-            core_reachable=readiness is not None and readiness.core_reachable is True,
-            core_running=readiness is not None and readiness.core_running is True,
-            integration_loaded=(
-                readiness is not None and readiness.integration_loaded is True
+            restart_dispatched=(
+                restart_committed or SourceState.RESTORE in self._restart_dispatched
             ),
-            core_not_timed_out=readiness is not None and readiness.timed_out is False,
-            research_services_absent=self._services_absent_pass(services),
-            repairs_shape_valid=(repairs is not None and repairs.shape_valid is True),
+            restart_submitted=(
+                restart_committed or restart is not None and restart.submitted is True
+            ),
+            restart_accepted=(
+                restart_committed or restart is not None and restart.accepted is True
+            ),
+            core_reachable=(
+                readiness_committed
+                or readiness is not None
+                and readiness.core_reachable is True
+            ),
+            core_running=(
+                readiness_committed
+                or readiness is not None
+                and readiness.core_running is True
+            ),
+            integration_loaded=(
+                readiness_committed
+                or readiness is not None
+                and readiness.integration_loaded is True
+            ),
+            core_not_timed_out=(
+                readiness_committed
+                or readiness is not None
+                and readiness.timed_out is False
+            ),
+            research_services_absent=(
+                services_committed or self._services_absent_pass(services)
+            ),
+            repairs_shape_valid=(
+                repairs_committed or repairs is not None and repairs.shape_valid is True
+            ),
             repairs_relevant_zero=(
-                repairs is not None
+                repairs_committed
+                or repairs is not None
                 and _exact_non_bool_int(repairs.relevant_count)
                 and repairs.relevant_count == 0
             ),
             repairs_critical_zero=(
-                repairs is not None
+                repairs_committed
+                or repairs is not None
                 and _exact_non_bool_int(repairs.critical_count)
                 and repairs.critical_count == 0
             ),

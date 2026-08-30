@@ -4355,10 +4355,11 @@ def test_r33_complete_normal_dominance_fixed_point_model() -> None:
 
 def _assert_r33_reconstructed_recovery_only(
     first: object,
+    expected: access.LifecycleState = access.LifecycleState.RECOVERY_REQUIRED,
 ) -> tuple[object, _R32ScriptedBroker]:
     first.close()
     second, broker = _r33_controller()
-    assert second.state is access.LifecycleState.RECOVERY_REQUIRED
+    assert second.state is expected
     for name in second._RECOVERY_HIDDEN_ENTRYPOINTS:
         assert not hasattr(second, name)
     assert broker.calls == []
@@ -4406,7 +4407,9 @@ def test_r33_r_m5_restore_install_loss_never_reopens_research() -> None:
     first.stage_restore(restore)
     first.restore_pr41(restore.manifest)
 
-    second, _second_broker = _assert_r33_reconstructed_recovery_only(first)
+    second, _second_broker = _assert_r33_reconstructed_recovery_only(
+        first, access.LifecycleState.PR41_RESTORED
+    )
 
     assert access.LifecycleAction.RESTORE_INSTALL in second._journal.consumed_actions
     assert not hasattr(second, "install_candidate")
@@ -4471,7 +4474,9 @@ def test_r33_r_m6_removal_restart_cannot_replay_after_loss() -> None:
     first.restart_for_restore()
     assert [name for name, _ in broker.calls].count("restart") == 1
 
-    second, second_broker = _assert_r33_reconstructed_recovery_only(first)
+    second, second_broker = _assert_r33_reconstructed_recovery_only(
+        first, access.LifecycleState.REMOVAL_RESTART_CONSUMED
+    )
 
     with pytest.raises(access.LifecycleControllerError):
         second.restart_for_restore()
@@ -5015,7 +5020,12 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
 
             reconstructed = access._DurableLifecycleJournal()
 
-            assert reconstructed.state is access.LifecycleState.RECOVERY_REQUIRED
+            expected_state = (
+                access.LifecycleState.RESTORE_FAILED
+                if action in access._RESTORE_SOURCE_ACTIONS
+                else access.LifecycleState.RECOVERY_REQUIRED
+            )
+            assert reconstructed.state is expected_state
             assert action in reconstructed.consumed_actions
             assert reconstructed._record["operations"][-1]["phase"] == phase
             reconstructed.close()
