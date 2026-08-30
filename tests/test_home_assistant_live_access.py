@@ -1003,7 +1003,7 @@ def _synthetic_r30_source_authorities(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """Keep synthetic source acceptance explicit and separate from Git authorities."""
-    if not request.node.name.startswith(("test_r30_", "test_r32_")):
+    if not request.node.name.startswith(("test_r30_", "test_r32_", "test_r35_")):
         return
     for state_name in ("CANDIDATE", "RESTORE"):
         manifest = _r30_manifest(state_name)
@@ -3691,3 +3691,97 @@ def test_r32_synthetic_controlling_pty_full_controller_lifecycle(
     assert proof.complete is True
     assert controller.state is access.LifecycleState.COMPLETE
     assert broker.state is access.BrokerState.CLOSED
+
+
+def test_r35_cr_m1_exact_pr45_unknown_receipt_remains_unknown() -> None:
+    """PR45 PREFLIGHT(N) -> RECEIPT(N) is an honest unknown/exit-66 result."""
+    nonce = "d" * 16
+    result = access._parse_phase_a_result(
+        access.PhaseAOperation.RECEIPT,
+        json.dumps(
+            {
+                "exit_code": 66,
+                "outcome": "receipt",
+                "nonce": nonce,
+                "receipt": {
+                    "nonce": nonce,
+                    "known": False,
+                    "service_entered": False,
+                    "request_handed_to_transport": False,
+                    "terminal_class": None,
+                    "response_available": False,
+                },
+            }
+        ).encode(),
+        expected_nonce=nonce,
+    )
+
+    assert result.exit_code == 66
+    assert result.receipt == access.ReceiptResponse(
+        nonce=nonce,
+        known=False,
+        service_entered=False,
+        request_handed_to_transport=False,
+        terminal_class=None,
+        response_available=False,
+    )
+
+
+def test_r35_cr_m2_unknown_receipt_is_not_a_mandatory_normal_gate() -> None:
+    """The old parent advanced through an unknown receipt; R35 removes that gate."""
+    controller, broker = _r32_advance_to_post_activation_repairs()
+    controller.collect_a0()
+    controller.run_p0()
+    controller.collect_ap0()
+    controller.run_non_probe_preflight()
+
+    controller.collect_a1()
+
+    assert controller.state is access.LifecycleState.A1_COLLECTED
+    assert all(
+        detail[0] is not access.PhaseAOperation.RECEIPT
+        for name, detail in broker.calls
+        if name == "helper"
+    )
+
+
+def test_r35_cr_m3_normal_lifecycle_cannot_fabricate_known_receipt() -> None:
+    """Shared receipt parsing is not normal-lifecycle transition authority."""
+    assert access.PhaseAOperation.RECEIPT.value == "receipt"
+    assert "RECEIPT" not in access.LifecycleAction.__members__
+    assert "AMBIGUOUS_RECEIPT" not in access.LifecycleAction.__members__
+    assert "NON_PROBE_RECEIPT_COMPLETED" not in access.LifecycleState.__members__
+    assert not hasattr(
+        access.FullPreflightLifecycleController, "lookup_non_probe_receipt"
+    )
+    assert not hasattr(
+        access.FullPreflightLifecycleController, "lookup_ambiguous_receipt"
+    )
+
+
+def test_r35_cr_m4_probe_remains_non_representable() -> None:
+    """A receipt must never be manufactured by exposing device-capable PROBE."""
+    assert "PROBE" not in access.PhaseAOperation.__members__
+    assert "PROBE" not in access.LifecycleAction.__members__
+    assert "probe" not in {operation.value for operation in access.PhaseAOperation}
+
+
+def test_r35_cr_m5_pr45_preflight_success_has_no_receipt_dependency() -> None:
+    """The exact normal sequence reaches A2 without a receipt operation."""
+    controller, broker = _r32_advance_to_post_activation_repairs()
+    controller.collect_a0()
+    controller.run_p0()
+    controller.collect_ap0()
+    controller.run_non_probe_preflight()
+    controller.collect_a1()
+    controller.validate_research_final()
+    controller.collect_a2()
+
+    assert controller.state is access.LifecycleState.A2_COLLECTED
+    assert [detail[0] for name, detail in broker.calls if name == "helper"] == [
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.PREFLIGHT,
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.AUDIT,
+    ]
