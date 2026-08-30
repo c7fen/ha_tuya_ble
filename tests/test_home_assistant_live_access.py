@@ -998,7 +998,9 @@ def _synthetic_r30_source_authorities(
 ) -> None:
     """Keep synthetic source acceptance explicit and separate from Git authorities."""
     monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path / "lifecycle")
-    if not request.node.name.startswith(("test_r30_", "test_r32_", "test_r33_")):
+    if not request.node.name.startswith(
+        ("test_r30_", "test_r32_", "test_r33_", "test_r37_")
+    ):
         return
     for state_name in ("CANDIDATE", "RESTORE"):
         manifest = _r30_manifest(state_name)
@@ -2648,7 +2650,11 @@ class _R32ScriptedBroker:
         *,
         _capability: object = None,
     ) -> access.RestoreTailReconciliationEvidence:
-        assert restart_mode in {"submit_once", "previously_committed"}
+        assert restart_mode in {
+            "submit_once",
+            "possibly_dispatched",
+            "previously_committed",
+        }
         self._consume_capability(
             _capability, access.LifecycleAction.RESTORE_TAIL_RECONCILE
         )
@@ -4956,10 +4962,10 @@ def test_r33_ambiguous_removal_restart_never_restarts_during_reconciliation() ->
         first.restart_for_restore()
 
     second, second_broker = _assert_r33_reconstructed_recovery_only(first)
-    with pytest.raises(access.LifecycleControllerError, match="RESTORE_FAILED"):
-        second.reconcile_restored_pr41(restore)
+    evidence = second.reconcile_restored_pr41(restore)
 
-    assert second.state is access.LifecycleState.RESTORE_FAILED
+    assert evidence.restart_resolved is True
+    assert second.state is access.LifecycleState.RESTORED_AFTER_ABORT
     assert [name for name, _ in second_broker.calls].count("restart") == 0
 
 
@@ -5334,7 +5340,7 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         def restore_tail_original_operation_id(self) -> str:
             return "a" * 32
 
-        def record_dispatch_started(self, _action: access.LifecycleAction) -> None:
+        def record_dispatch_possible(self, _action: access.LifecycleAction) -> None:
             self.phases.append("dispatch_started")
 
         def record_ambiguous(self, _action: access.LifecycleAction) -> None:
@@ -5404,6 +5410,10 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
                 callbacks += 1
                 if _crash_at == "during_dispatch":
                     raise SyntheticCrash
+                if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                    return access.FallbackReconciliationResult(
+                        "reconciled", True, True, 1
+                    )
                 return object()
 
             with pytest.raises(SyntheticCrash):
@@ -5426,7 +5436,11 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         controller._journal = journal
         controller._dispatch(
             action,
-            lambda _capability: object(),
+            lambda _capability: (
+                access.FallbackReconciliationResult("reconciled", True, True, 1)
+                if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                else object()
+            ),
             broker_evidence=False,
             _dispatch_token=(
                 controller._FullPreflightLifecycleController__dispatch_token
@@ -5627,6 +5641,16 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
                     issuance_identity="f" * 32,
                     audit_instance=None,
                     nonce=nonce,
+                    result=(
+                        {
+                            "phase": "reconciled",
+                            "restoration_applied": True,
+                            "manifest_match": True,
+                            "file_count": 1,
+                        }
+                        if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                        else None
+                    ),
                 )
             journal.close()
 
@@ -5641,3 +5665,474 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
             assert action in reconstructed.consumed_actions
             assert reconstructed._record["operations"][-1]["phase"] == phase
             reconstructed.close()
+
+
+def test_r37_red_1_terminal_stage_requires_exact_terminal_fields() -> None:
+    controller, _broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup()
+    controller.stage_candidate(candidate)
+    controller.install_candidate(candidate.manifest)
+    controller.verify_candidate_inventory(candidate.manifest)
+    controller.check_candidate_core()
+    controller.restart_for_candidate()
+    controller.await_candidate_readiness()
+    controller.verify_research_services_present()
+    controller.admit_post_activation_repairs()
+    controller.collect_a0()
+    controller.run_p0()
+    controller.collect_ap0()
+    controller.run_non_probe_preflight()
+    controller.lookup_non_probe_receipt()
+    controller.collect_a1()
+    controller.validate_research_final()
+    controller.collect_a2()
+    _r32_complete_restore_tail(controller, restore)
+    record = copy.deepcopy(controller._journal._record)
+    record["terminal"] = None
+    record["active"] = True
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal._validate_record(record)
+
+
+def test_r37_red_2_reconstructed_fallback_result_has_local_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    controller, broker = _r33_controller()
+    candidate, _restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup()
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    broker.queue(
+        "backup_fallback",
+        access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.restore_private_backup_fallback()
+
+    monkeypatch.setattr(
+        controller._journal,
+        "finalize_fallback_reconciliation_from_durable_result",
+        lambda **_kwargs: (_ for _ in ()).throw(SyntheticProcessLoss),
+    )
+    with pytest.raises(SyntheticProcessLoss):
+        controller.reconcile_private_backup_fallback()
+    operation = next(
+        item
+        for item in controller._journal._record["operations"]
+        if item["action"] == access.LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+    )
+    assert operation["phase"] == "result_durable"
+    controller.close()
+
+    reconstructed, reconstructed_broker = _r33_controller()
+    result = reconstructed.finalize_fallback_reconciliation_from_durable_result()
+
+    assert result == access.FallbackReconciliationResult("reconciled", True, True, 1)
+    assert reconstructed._journal._record["fallback_phase"] == "reconciled"
+    assert reconstructed_broker.calls == []
+
+
+def test_r37_red_3_dispatch_possible_is_durable_before_restart_callback() -> None:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    class ProbeJournal:
+        state = access.LifecycleState.RESTORE_CORE_CHECKED
+        recovery_mode = False
+
+        def __init__(self) -> None:
+            self.phases: list[str] = []
+
+        def record_intent(self, _action: object, **_kwargs: object) -> None:
+            self.phases.append("intent_durable")
+
+        def record_dispatch_possible(self, _action: object) -> None:
+            self.phases.append("dispatch_possible")
+            raise SyntheticProcessLoss
+
+    controller, broker = _r32_controller()
+    journal = ProbeJournal()
+    controller._journal = journal
+    callbacks = 0
+
+    def callback(_capability: object) -> object:
+        nonlocal callbacks
+        callbacks += 1
+        return access.RestartResult(True, True)
+
+    with pytest.raises(SyntheticProcessLoss):
+        controller._dispatch(
+            access.LifecycleAction.REMOVAL_RESTART,
+            callback,
+            _dispatch_token=(
+                controller._FullPreflightLifecycleController__dispatch_token
+            ),
+        )
+
+    assert journal.phases == ["intent_durable", "dispatch_possible"]
+    assert callbacks == 0
+    assert broker.calls == []
+
+
+def _r37_terminal_record(terminal: access.LifecycleState) -> dict[str, object]:
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup()
+    controller.stage_candidate(candidate)
+    if terminal is access.LifecycleState.COMPLETE_NORMAL:
+        controller.install_candidate(candidate.manifest)
+        controller.verify_candidate_inventory(candidate.manifest)
+        controller.check_candidate_core()
+        controller.restart_for_candidate()
+        controller.await_candidate_readiness()
+        controller.verify_research_services_present()
+        controller.admit_post_activation_repairs()
+        controller.collect_a0()
+        controller.run_p0()
+        controller.collect_ap0()
+        controller.run_non_probe_preflight()
+        controller.lookup_non_probe_receipt()
+        controller.collect_a1()
+        controller.validate_research_final()
+        controller.collect_a2()
+        _r32_complete_restore_tail(controller, restore)
+    else:
+        broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
+        with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+            controller.install_candidate(candidate.manifest)
+        if terminal is access.LifecycleState.RESTORED_AFTER_ABORT:
+            _r32_complete_restore_tail(controller, restore)
+        else:
+            controller.stage_restore(restore)
+            broker.queue("install_restore", access.InstallResult(False, 2, 0, False))
+            with pytest.raises(access.LifecycleControllerError, match="RESTORE_FAILED"):
+                controller.restore_pr41(restore.manifest)
+    record = copy.deepcopy(controller._journal._record)
+    controller.close()
+    return record
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        access.LifecycleState.COMPLETE_NORMAL,
+        access.LifecycleState.RESTORED_AFTER_ABORT,
+        access.LifecycleState.RESTORE_FAILED,
+    ),
+)
+def test_r37_c1_each_exact_terminal_combination_parses_and_is_retained(
+    terminal: access.LifecycleState,
+) -> None:
+    record = _r37_terminal_record(terminal)
+
+    access._DurableLifecycleJournal._validate_record(record)
+    with pytest.raises(access.LifecycleControllerError, match="TERMINAL_RETAINED"):
+        access._DurableLifecycleJournal()
+
+
+@pytest.mark.parametrize(
+    ("case", "terminal", "active"),
+    (
+        ("terminal_none", None, True),
+        ("wrong_terminal", access.LifecycleState.RESTORED_AFTER_ABORT.value, False),
+        ("active_true", access.LifecycleState.COMPLETE_NORMAL.value, True),
+        ("active_zero", access.LifecycleState.COMPLETE_NORMAL.value, 0),
+        ("active_one", access.LifecycleState.COMPLETE_NORMAL.value, 1),
+        ("active_string", access.LifecycleState.COMPLETE_NORMAL.value, "false"),
+    ),
+)
+def test_r37_c1_terminal_contradiction_rejects_fresh_parse_and_reconstruction(
+    case: str, terminal: object, active: object
+) -> None:
+    record = _r37_terminal_record(access.LifecycleState.COMPLETE_NORMAL)
+    record["terminal"] = terminal
+    record["active"] = active
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+    journal_path = Path(access._LIFECYCLE_STATE_ROOT) / access._LIFECYCLE_JOURNAL_NAME
+    journal_path.write_bytes(payload)
+    journal_path.chmod(0o600)
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal._validate_record(record)
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+
+    assert case
+    assert journal_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        access.LifecycleState.COMPLETE_NORMAL.value,
+        access.LifecycleState.RESTORED_AFTER_ABORT.value,
+        access.LifecycleState.RESTORE_FAILED.value,
+    ),
+)
+def test_r37_c1_nonterminal_stage_rejects_early_terminal_marker(
+    terminal: str,
+) -> None:
+    journal = access._DurableLifecycleJournal()
+    record = copy.deepcopy(journal._record)
+    journal.close()
+    record["terminal"] = terminal
+    record["active"] = False
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal._validate_record(record)
+
+
+def _r37_fallback_result_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[object, _R32ScriptedBroker]:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    controller, broker = _r33_controller()
+    candidate, _restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup()
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    broker.queue(
+        "backup_fallback",
+        access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.restore_private_backup_fallback()
+    monkeypatch.setattr(
+        controller._journal,
+        "finalize_fallback_reconciliation_from_durable_result",
+        lambda **_kwargs: (_ for _ in ()).throw(SyntheticProcessLoss),
+    )
+    with pytest.raises(SyntheticProcessLoss):
+        controller.reconcile_private_backup_fallback()
+    return controller, broker
+
+
+def test_r37_c2_local_finalization_is_idempotent_and_never_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, first_broker = _r37_fallback_result_durable(monkeypatch)
+    first.close()
+    second, second_broker = _r33_controller()
+    before_evidence = copy.deepcopy(second._journal._record["evidence_identities"])
+    before_consumed = copy.deepcopy(second._journal._record["consumed_operations"])
+
+    result = second.finalize_fallback_reconciliation_from_durable_result()
+    durable_bytes = second._journal._journal_path.read_bytes()
+    monkeypatch.setattr(
+        second._journal,
+        "_write_record",
+        lambda _record: pytest.fail("idempotent local finalization wrote twice"),
+    )
+    repeated = second.finalize_fallback_reconciliation_from_durable_result()
+
+    assert (
+        result
+        == repeated
+        == access.FallbackReconciliationResult("reconciled", True, True, 1)
+    )
+    assert second._journal._journal_path.read_bytes() == durable_bytes
+    assert second._journal._record["evidence_identities"] == before_evidence
+    assert second._journal._record["consumed_operations"] == before_consumed
+    assert [name for name, _ in first_broker.calls].count("backup_reconcile") == 1
+    assert second_broker.calls == []
+
+
+def test_r37_c2_local_finalization_recovers_before_and_after_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    first, _first_broker = _r37_fallback_result_durable(monkeypatch)
+    first.close()
+    before_commit, before_broker = _r33_controller()
+    durable_result_bytes = before_commit._journal._journal_path.read_bytes()
+    monkeypatch.setattr(
+        before_commit._journal,
+        "_write_record",
+        lambda _record: (_ for _ in ()).throw(
+            access.LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID")
+        ),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        before_commit.finalize_fallback_reconciliation_from_durable_result()
+    assert before_commit._journal._journal_path.read_bytes() == durable_result_bytes
+    assert before_broker.calls == []
+    before_commit.close()
+
+    after_commit, after_broker = _r33_controller()
+    real_write = after_commit._journal._write_record
+
+    def persist_then_die(record: dict[str, object]) -> None:
+        real_write(record)
+        raise SyntheticProcessLoss
+
+    monkeypatch.setattr(after_commit._journal, "_write_record", persist_then_die)
+    with pytest.raises(SyntheticProcessLoss):
+        after_commit.finalize_fallback_reconciliation_from_durable_result()
+    assert after_broker.calls == []
+    after_commit.close()
+
+    reconstructed, reconstructed_broker = _r33_controller()
+    reconciled_bytes = reconstructed._journal._journal_path.read_bytes()
+    monkeypatch.setattr(
+        reconstructed._journal,
+        "_write_record",
+        lambda _record: pytest.fail("durable local transition repeated"),
+    )
+    result = reconstructed.finalize_fallback_reconciliation_from_durable_result()
+
+    assert result.phase == "reconciled"
+    assert reconstructed._journal._journal_path.read_bytes() == reconciled_bytes
+    assert reconstructed_broker.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("phase", "unresolved"),
+        ("restoration_applied", 1),
+        ("manifest_match", "true"),
+        ("file_count", True),
+        ("file_count", 0),
+        ("missing", None),
+        ("extra", None),
+    ),
+)
+def test_r37_c2_durable_result_schema_rejects_substitutions(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    controller, _broker = _r37_fallback_result_durable(monkeypatch)
+    operation = next(
+        item
+        for item in controller._journal._record["operations"]
+        if item["action"] == access.LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+    )
+    if field == "missing":
+        del operation["result"]["phase"]
+    elif field == "extra":
+        operation["result"]["unexpected"] = "synthetic"
+    else:
+        operation["result"][field] = value
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal._validate_record(controller._journal._record)
+    controller.close()
+
+
+def test_r37_c2_local_finalization_requires_exact_persisted_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _broker = _r37_fallback_result_durable(monkeypatch)
+    journal = controller._journal
+    operation = journal.fallback_reconciliation_operation()
+    expected = {
+        "lifecycle_generation": journal.lifecycle_generation,
+        "source_generation": journal.source_generation,
+        "issuance_identity": operation["issuance_identity"],
+    }
+    before = journal._journal_path.read_bytes()
+    monkeypatch.setattr(
+        journal,
+        "_write_record",
+        lambda _record: pytest.fail("invalid binding reached journal write"),
+    )
+
+    for field in expected:
+        supplied = dict(expected)
+        supplied[field] = "0" * 32
+        with pytest.raises(
+            access.LifecycleControllerError, match="RECONCILIATION_UNAVAILABLE"
+        ):
+            access._DurableLifecycleJournal.finalize_fallback_reconciliation_from_durable_result(
+                journal, **supplied
+            )
+
+    assert journal._journal_path.read_bytes() == before
+    controller.close()
+
+
+@pytest.mark.parametrize("boundary", ("intent", "dispatch_possible"))
+def test_r37_c3_removal_restart_crash_boundary_has_exact_replay_count(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    first, first_broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    first.admit_initial_repairs()
+    first.create_backup()
+    first.stage_candidate(candidate)
+    first_broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        first.install_candidate(candidate.manifest)
+    first.stage_restore(restore)
+    first.restore_pr41(restore.manifest)
+    first.verify_restore_inventory(restore.manifest)
+    first.check_restore_core()
+    method_name = (
+        "record_intent" if boundary == "intent" else "record_dispatch_possible"
+    )
+    durable_method = getattr(first._journal, method_name)
+
+    def persist_then_die(*args: object, **kwargs: object) -> None:
+        durable_method(*args, **kwargs)
+        raise SyntheticProcessLoss
+
+    monkeypatch.setattr(first._journal, method_name, persist_then_die)
+    with pytest.raises(SyntheticProcessLoss):
+        first.restart_for_restore()
+    assert [name for name, _ in first_broker.calls].count("restart") == 0
+
+    second, second_broker = _assert_r33_reconstructed_recovery_only(first)
+    evidence = second.reconcile_restored_pr41(restore)
+
+    assert evidence.restart_resolved is True
+    assert second.state is access.LifecycleState.RESTORED_AFTER_ABORT
+    assert [name for name, _ in second_broker.calls].count("restart") == (
+        1 if boundary == "intent" else 0
+    )
+
+
+@pytest.mark.parametrize("boundary", ("intent", "dispatch_possible"))
+def test_r37_c3_activation_restart_never_replays_after_reconstruction(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    class SyntheticProcessLoss(BaseException):
+        pass
+
+    first, first_broker = _r33_advance_to_candidate_core()
+    method_name = (
+        "record_intent" if boundary == "intent" else "record_dispatch_possible"
+    )
+    durable_method = getattr(first._journal, method_name)
+
+    def persist_then_die(*args: object, **kwargs: object) -> None:
+        durable_method(*args, **kwargs)
+        raise SyntheticProcessLoss
+
+    monkeypatch.setattr(first._journal, method_name, persist_then_die)
+    with pytest.raises(SyntheticProcessLoss):
+        first.restart_for_candidate()
+    assert [name for name, _ in first_broker.calls].count("restart") == 0
+
+    second, second_broker = _assert_r33_reconstructed_recovery_only(first)
+
+    assert not hasattr(second, "restart_for_candidate")
+    assert [name for name, _ in second_broker.calls].count("restart") == 0
