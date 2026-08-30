@@ -54,7 +54,10 @@ and outside the parent directory containing canonical project roots.
   session broker in `tools/home_assistant_live_access.py`; it must never invoke
   the raw wrapper directly. The broker privately consumes login banners and
   local SSH close output, emits only generic readiness, enters `exec bash -li`,
-  and exposes bounded structured adapters rather than raw terminal output.
+  and exposes only the fixed, aggregate-only Repairs collector rather than a
+  raw terminal or generic command adapter. It must validate a wrapper `Path`
+  before launch, execute that path with no arguments in a controlling PTY, and
+  use fresh broker-owned challenge frames for each readiness/collection phase.
 - Do not invent a replacement alias, browser fallback, or alternate route
   merely because the current linked worktree lacks the private local file.
 - Do not invoke or invent a wrapper bootstrap merely because an untracked
@@ -74,11 +77,10 @@ and outside the parent directory containing canonical project roots.
 - Retained/public Repairs evidence is limited to exactly `shape_valid`,
   `relevant_count`, and `critical_count`; gate and decision metadata stay
   inside the orchestrator.
-- The singular Repairs transport is `ha resolution info --raw-json` (or an
-  exactly equivalent Supervisor `/resolution/info` response). Its canonical
-  response is the strict Supervisor envelope: string `result == "ok"`, object
-  `data`, and list `data.issues`. Do not accept the obsolete top-level
-  `issues` shape or substitute an empty list for an invalid response.
+- The singular Repairs transport is `ha resolution info --raw-json`. Its
+  canonical response is the strict Supervisor envelope: string `result ==
+  "ok"`, object `data`, and list `data.issues`. Do not accept the obsolete
+  top-level `issues` shape or substitute an empty list for an invalid response.
 - R24 correctly stopped fail-closed with no source or device mutation. Its
   known root cause is a collector schema-layer mismatch, not PR #45, a device,
   BLE, or the interactive invocation contract.

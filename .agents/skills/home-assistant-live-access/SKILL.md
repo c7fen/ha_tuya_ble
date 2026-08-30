@@ -125,8 +125,12 @@ The broker uses explicit private lifecycle states: `SSH_CHILD_STARTED`,
 `REMOTE_INTERACTIVE_READY`, `LOGIN_SHELL_READY`, `SESSION_ACTIVE`, and
 `CLOSED`. It captures initial output and connection-close messages privately,
 uses bounded timeout/output limits, emits only `HA_INTERACTIVE_SESSION_READY`
-after the login-shell state, and returns only structured, allowlisted adapter
-results. It has no raw terminal-output passthrough.
+after the login-shell state, and exposes only the fixed aggregate-only Repairs
+collector. It accepts only a pre-validated wrapper `Path`, executes that path
+with no arguments in a controlling PTY, and has no raw terminal-output or
+generic command passthrough. Every remote-shell, login-shell, and collection
+boundary uses a fresh broker-owned nonce inside an exact control-delimited
+frame; prompts, banners, and echoed commands cannot establish readiness.
 
 ## 5. Strict structured Repairs admission
 
@@ -134,8 +138,7 @@ Repairs admission is fail-closed. When a supported Home Assistant response is
 used to prove the Repairs gate, the collector must validate the actual response
 shape before filtering or counting anything.
 
-The singular collector transport is `ha resolution info --raw-json` (or the
-exactly equivalent Supervisor `/resolution/info` response envelope). Validate
+The singular collector transport is `ha resolution info --raw-json`. Validate
 the complete Supervisor envelope, not a guessed extracted payload. Require:
 
 - top-level value is an object/dictionary;
@@ -212,8 +215,9 @@ For agent/orchestrator execution:
 2. Let it privately consume the Home Assistant prompt/banner and establish the
    verified login shell.
 3. Wait only for its generic readiness sentinel.
-4. Execute authorized bounded commands through reviewed structured adapters in
-   that existing interactive session; never bridge raw remote stdout.
+4. Use only the broker's fixed `collect_resolution_info` operation in that
+   existing interactive session; never bridge raw remote stdout or request a
+   general command channel.
 5. Validate structured admission responses strictly before mutation gates.
 6. Keep authorization boundaries from the active task; this skill grants no
    deployment, restart, service-call, BLE, lock, or configuration permission by
