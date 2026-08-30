@@ -661,6 +661,7 @@ class _LifecycleCapability:
     session_generation: object
     action: LifecycleAction
     issuance_identity: object
+    backup_identity: object = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1328,6 +1329,14 @@ class _DurableLifecycleJournal:
         return descriptor
 
     def _acquire_lock(self) -> None:
+        if self._root_fd is None:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        try:
+            fcntl.flock(self._root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise LifecycleControllerError("LIFECYCLE_OWNER_ACTIVE") from None
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         descriptor = self._open_regular(
             _LIFECYCLE_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600
         )
@@ -1500,6 +1509,7 @@ class _DurableLifecycleJournal:
                     dst_dir_fd=self._parent_fd,
                     follow_symlinks=False,
                 )
+                os.unlink(temporary, dir_fd=self._parent_fd)
             os.fsync(self._parent_fd)
         except OSError:
             raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
@@ -2092,6 +2102,11 @@ class _DurableLifecycleJournal:
         return self._record["source_generation"]
 
     @property
+    def baseline_backup_identity(self) -> dict[str, object] | None:
+        value = self._record["baseline_backup_identity"]
+        return None if value is None else copy.deepcopy(value)
+
+    @property
     def state(self) -> LifecycleState:
         return LifecycleState(self._record["stage"])
 
@@ -2310,7 +2325,23 @@ class _DurableLifecycleJournal:
                 else "result_durable"
             )
             if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE:
-                if not isinstance(evidence, FallbackReconciliationResult):
+                if not (
+                    isinstance(evidence, FallbackReconciliationResult)
+                    and _exact_non_bool_int(evidence.file_count)
+                    and (
+                        evidence.phase == "reconciled"
+                        and evidence.restoration_applied is True
+                        and evidence.manifest_match is True
+                        and evidence.file_count >= 1
+                        or evidence.phase == "reconciled_candidate"
+                        and evidence.restoration_applied is False
+                        and evidence.manifest_match is False
+                        and evidence.file_count >= 1
+                        or evidence.phase == "reconciled_unknown"
+                        and evidence.restoration_applied is False
+                        and evidence.manifest_match is False
+                    )
+                ):
                     raise LifecycleControllerError(
                         "LIFECYCLE_FALLBACK_RECONCILIATION_INVALID"
                     ) from None
@@ -2324,6 +2355,29 @@ class _DurableLifecycleJournal:
                     raise LifecycleControllerError(
                         "LIFECYCLE_FALLBACK_RECONCILIATION_INVALID"
                     ) from None
+                matches[0]["phase"] = "transition_committed"
+                if evidence.phase == "reconciled":
+                    target = LifecycleState.PR41_RESTORED
+                    record["source_generation"] = record["pr41_restore"]["generation"]
+                elif evidence.phase == "reconciled_candidate":
+                    target = LifecycleState(record["stage"])
+                else:
+                    target = LifecycleState.MANUAL_RECOVERY_REQUIRED
+                    record["active"] = False
+                    record["terminal"] = target.value
+                record["stage"] = target.value
+                record["recovery_mode"] = True
+                record["rollback_mode"] = True
+                record["ambiguous_operation"] = None
+                record["transitions"].append(
+                    {
+                        "sequence": len(record["transitions"]),
+                        "stage": target.value,
+                        "action": action.value,
+                        "source_generation": record["source_generation"],
+                        "evidence_generation": generation,
+                    }
+                )
             record["evidence_generation"] = generation
             record["evidence_identities"].append(
                 {
@@ -2602,12 +2656,45 @@ def _backup_context_payload(
     if manifest.state is not SourceState.RESTORE:
         raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
     validate_source_manifest(manifest)
-    return {
+    payload = {
         "lifecycle_generation": str(capability.lifecycle_generation),
         "source_generation": str(capability.source_generation),
         "source_state": "PR41_BASELINE",
         "manifest": _manifest_payload(manifest),
     }
+    if (
+        capability.action
+        in {
+            LifecycleAction.BACKUP_FALLBACK,
+            LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+        }
+        and capability.backup_identity is not None
+    ):
+        identity = capability.backup_identity
+        if not (
+            type(identity) is dict
+            and identity.get("lifecycle_generation")
+            == str(capability.lifecycle_generation)
+            and identity.get("source_generation") == str(capability.source_generation)
+            and all(
+                isinstance(identity.get(name), str)
+                and re.fullmatch(pattern, identity[name]) is not None
+                for name, pattern in (
+                    ("backup_generation", r"[0-9a-f]{32}"),
+                    ("manifest_identity", r"[0-9a-f]{64}"),
+                    ("backup_digest", r"[0-9a-f]{64}"),
+                )
+            )
+        ):
+            raise SourceBundleError("BACKUP_IDENTITY_REQUIRED") from None
+        payload.update(
+            {
+                "backup_generation": identity["backup_generation"],
+                "manifest_identity": identity["manifest_identity"],
+                "backup_digest": identity["backup_digest"],
+            }
+        )
+    return payload
 
 
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -3241,6 +3328,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 import urllib.error
@@ -3369,28 +3457,104 @@ def remove(path):
     elif path.exists():
         shutil.rmtree(path)
 
-def inventory_root(root, prefix, excluded_top=None):
-    observed = {}
-    if not root.exists():
-        return observed
-    if root.is_symlink() or not root.is_dir():
+def open_root_relative(path):
+    try:
+        parts = path.relative_to(ROOT).parts
+    except ValueError:
         raise ValueError('root')
-    for directory, names, files in os.walk(root, followlinks=False):
-        base = Path(directory)
-        if base == root and excluded_top in names:
-            names.remove(excluded_top)
-        if any((base / name).is_symlink() for name in names):
-            raise ValueError('symlink')
-        for name in files:
-            path = base / name
-            if path.is_symlink() or not path.is_file():
-                raise ValueError('regular')
-            logical = prefix + '/' + path.relative_to(root).as_posix()
-            content = path.read_bytes()
+    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts:
+            if part in {'', '.', '..'}:
+                raise ValueError('root')
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+def replace_root_relative(source, destination):
+    source_parent = open_root_relative(source.parent)
+    destination_parent = open_root_relative(destination.parent)
+    try:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=source_parent,
+            dst_dir_fd=destination_parent,
+        )
+    finally:
+        os.close(source_parent)
+        os.close(destination_parent)
+
+def inventory_fd(descriptor, prefix, excluded_top=None, relative=()):
+    observed = {}
+    for name in sorted(os.listdir(descriptor)):
+        if not relative and name == excluded_top:
+            continue
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        logical_parts = relative + (name,)
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                observed.update(
+                    inventory_fd(child, prefix, excluded_top, logical_parts)
+                )
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                ):
+                    raise ValueError('regular')
+                content = bytearray()
+                while True:
+                    chunk = os.read(child, 65536)
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+                closed = os.fstat(child)
+                if (
+                    closed.st_dev != opened.st_dev
+                    or closed.st_ino != opened.st_ino
+                    or closed.st_size != len(content)
+                ):
+                    raise ValueError('regular')
+            finally:
+                os.close(child)
+            logical = prefix + '/' + PurePosixPath(*logical_parts).as_posix()
             observed[logical] = (
                 len(content), hashlib.sha256(content).hexdigest()
             )
+        else:
+            raise ValueError('regular')
     return observed
+
+def inventory_root(root, prefix, excluded_top=None):
+    try:
+        descriptor = open_root_relative(root)
+    except FileNotFoundError:
+        return {}
+    try:
+        return inventory_fd(descriptor, prefix, excluded_top)
+    finally:
+        os.close(descriptor)
 
 def inventory_targets():
     return {
@@ -3403,6 +3567,97 @@ def inventory_deployment(root):
         **inventory_root(root, 'integration', '.phase_a_tools'),
         **inventory_root(root / '.phase_a_tools', 'helper'),
     }
+
+def open_relative_directory(descriptor, parts, create=False):
+    current = os.dup(descriptor)
+    try:
+        for part in parts:
+            if part in {'', '.', '..'}:
+                raise ValueError('path')
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+def copy_deployment(source, destination, expected):
+    source_fd = open_root_relative(source)
+    destination_fd = open_root_relative(destination)
+    try:
+        for logical in sorted(expected):
+            prefix, relative = logical.split('/', 1)
+            parts = PurePosixPath(relative).parts
+            if prefix == 'helper':
+                parts = ('.phase_a_tools',) + parts
+            elif prefix != 'integration':
+                raise ValueError('path')
+            source_parent = open_relative_directory(source_fd, parts[:-1])
+            destination_parent = open_relative_directory(
+                destination_fd, parts[:-1], create=True
+            )
+            try:
+                source_file = os.open(
+                    parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent
+                )
+                destination_file = None
+                try:
+                    destination_file = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=destination_parent,
+                    )
+                    source_metadata = os.fstat(source_file)
+                    if (
+                        not stat.S_ISREG(source_metadata.st_mode)
+                        or source_metadata.st_nlink != 1
+                    ):
+                        raise ValueError('regular')
+                    digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(source_file, 65536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                        offset = 0
+                        while offset < len(chunk):
+                            written = os.write(destination_file, chunk[offset:])
+                            if written <= 0:
+                                raise OSError(errno.EIO, 'short_write')
+                            offset += written
+                    os.fchmod(destination_file, 0o600)
+                    os.fsync(destination_file)
+                    after = os.fstat(source_file)
+                    if (
+                        after.st_dev != source_metadata.st_dev
+                        or after.st_ino != source_metadata.st_ino
+                        or after.st_size != size
+                        or (size, digest.hexdigest()) != expected[logical]
+                    ):
+                        raise ValueError('manifest')
+                finally:
+                    os.close(source_file)
+                    if destination_file is not None:
+                        os.close(destination_file)
+            finally:
+                os.close(source_parent)
+                os.close(destination_parent)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
 
 def inventory_stage():
     return {
@@ -3430,7 +3685,10 @@ def inventory_identity(observed):
     }
 
 def sync_root():
-    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    sync_directory(ROOT)
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(descriptor)
     finally:
@@ -3455,25 +3713,55 @@ def write_private_json(path, value):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    os.replace(pending, path)
+    replace_root_relative(pending, path)
     sync_root()
 
 def read_private_json(path, keys):
-    metadata = path.lstat()
-    if (
-        not path.is_file() or path.is_symlink() or metadata.st_uid != os.getuid()
-        or metadata.st_nlink != 1 or metadata.st_mode & 0o777 != 0o600
-        or metadata.st_size < 2 or metadata.st_size > 4096
-    ):
-        raise ValueError('private_state')
-    value = decode_json(path.read_bytes())
+    parent = open_root_relative(path.parent)
+    try:
+        descriptor = os.open(
+            path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent
+        )
+    finally:
+        os.close(parent)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o777 != 0o600
+            or metadata.st_size < 2
+            or metadata.st_size > 4096
+        ):
+            raise ValueError('private_state')
+        raw = bytearray()
+        while len(raw) < metadata.st_size:
+            chunk = os.read(descriptor, metadata.st_size - len(raw))
+            if not chunk:
+                raise ValueError('private_state')
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != metadata.st_dev
+            or after.st_ino != metadata.st_ino
+            or after.st_size != len(raw)
+        ):
+            raise ValueError('private_state')
+    finally:
+        os.close(descriptor)
+    value = decode_json(bytes(raw))
     if not isinstance(value, dict) or set(value) != set(keys):
         raise ValueError('private_state')
     return value
 
 def validate_backup_context(value):
-    if not isinstance(value, dict) or set(value) != {
+    base_keys = {
         'lifecycle_generation', 'source_generation', 'source_state', 'manifest'
+    }
+    identity_keys = {'backup_generation', 'manifest_identity', 'backup_digest'}
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(base_keys), frozenset(base_keys | identity_keys)
     }:
         raise ValueError('backup_context')
     if (
@@ -3482,6 +3770,16 @@ def validate_backup_context(value):
         or re.fullmatch('[0-9a-f]{32}', value['lifecycle_generation']) is None
         or not isinstance(value['source_generation'], str)
         or re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+        or any(
+            not isinstance(value.get(name), str)
+            or re.fullmatch(pattern, value[name]) is None
+            for name, pattern in (
+                ('backup_generation', '[0-9a-f]{32}'),
+                ('manifest_identity', '[0-9a-f]{64}'),
+                ('backup_digest', '[0-9a-f]{64}'),
+            )
+            if name in value
+        )
     ):
         raise ValueError('backup_context')
     state, expected = expected_manifest(value)
@@ -3493,9 +3791,9 @@ def backup_digest(value):
     canonical = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
     return hashlib.sha256(canonical).hexdigest()
 
-def read_backup_identity(context=None):
+def read_backup_identity(context=None, package=BACKUP):
     value = read_private_json(
-        BACKUP / BACKUP_METADATA_NAME,
+        package / BACKUP_METADATA_NAME,
         {
             'schema_version', 'lifecycle_generation', 'source_generation',
             'source_state', 'pr41_commit', 'pr41_tree', 'backup_generation',
@@ -3526,6 +3824,11 @@ def read_backup_identity(context=None):
         value['lifecycle_generation'] != context.get('lifecycle_generation')
         or value['source_generation'] != context.get('source_generation')
         or context.get('source_state') != 'PR41_BASELINE'
+        or any(
+            value[name] != context.get(name)
+            for name in ('backup_generation', 'manifest_identity', 'backup_digest')
+            if name in context
+        )
     ):
         raise ValueError('backup_identity')
     return value
@@ -3561,34 +3864,63 @@ def read_fallback_phase():
     return value['phase'], identity
 
 def sync_tree(root):
-    directories = []
-    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
-        base = Path(directory)
-        directories.append(base)
-        if any((base / name).is_symlink() for name in names + files):
-            raise ValueError('symlink')
-        for name in files:
-            descriptor = os.open(base / name, os.O_RDONLY | os.O_NOFOLLOW)
+    descriptor = open_root_relative(root)
+    try:
+        sync_directory_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+def sync_directory_fd(descriptor):
+    for name in sorted(os.listdir(descriptor)):
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
             try:
-                os.fsync(descriptor)
+                sync_directory_fd(child)
             finally:
-                os.close(descriptor)
-    for directory in directories:
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or opened.st_nlink != 1
+                ):
+                    raise ValueError('regular')
+                os.fsync(child)
+            finally:
+                os.close(child)
+        else:
+            raise ValueError('regular')
+    os.fsync(descriptor)
 
 def publish_noreplace(source, destination):
+    if source.parent != ROOT or destination.parent != ROOT:
+        raise ValueError('atomic_noreplace')
     function = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
     if function is None:
         raise OSError(errno.ENOSYS, 'atomic_noreplace')
     function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     function.restype = ctypes.c_int
-    if function(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
-        code = ctypes.get_errno()
-        raise OSError(code, 'atomic_noreplace')
+    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if function(
+            descriptor,
+            os.fsencode(source.name),
+            descriptor,
+            os.fsencode(destination.name),
+            1,
+        ) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, 'atomic_noreplace')
+    finally:
+        os.close(descriptor)
 
 def backup(value):
     expected = validate_backup_context(value)
@@ -3600,7 +3932,8 @@ def backup(value):
     pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
     try:
-        shutil.copytree(INTEGRATION, pending / 'integration', symlinks=False)
+        (pending / 'integration').mkdir(mode=0o700)
+        copy_deployment(INTEGRATION, pending / 'integration', expected)
         after = inventory_deployment(pending / 'integration')
         if before != after or after != expected:
             raise ValueError('backup_manifest')
@@ -3624,14 +3957,26 @@ def backup(value):
             0o600,
         )
         try:
-            os.write(descriptor, payload)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, 'short_write')
+                offset += written
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
         sync_tree(pending)
+        if read_backup_identity(value, pending) != metadata:
+            raise ValueError('backup_identity')
         publish_noreplace(pending, BACKUP)
         sync_root()
         pending = None
+        if (
+            read_backup_identity(value) != metadata
+            or inventory_deployment(BACKUP / 'integration') != expected
+        ):
+            raise ValueError('backup_publication')
         return {
             'success': True,
             'file_count': len(after),
@@ -3713,7 +4058,7 @@ def transfer(value):
         remove(pending)
         raise ValueError('manifest')
     remove(STAGE)
-    os.replace(pending, STAGE)
+    replace_root_relative(pending, STAGE)
     sync_root()
     return {
         'success': True,
@@ -3728,9 +4073,21 @@ def exchange(left, right):
         raise OSError(errno.ENOSYS, 'atomic_exchange')
     function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     function.restype = ctypes.c_int
-    if function(-100, os.fsencode(left), -100, os.fsencode(right), 2) != 0:
-        code = ctypes.get_errno()
-        raise OSError(code, 'atomic_exchange')
+    left_parent = open_root_relative(left.parent)
+    right_parent = open_root_relative(right.parent)
+    try:
+        if function(
+            left_parent,
+            os.fsencode(left.name),
+            right_parent,
+            os.fsencode(right.name),
+            2,
+        ) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, 'atomic_exchange')
+    finally:
+        os.close(left_parent)
+        os.close(right_parent)
 
 def mark_restore_consumed():
     descriptor = os.open(
@@ -3746,7 +4103,7 @@ def activate(value, restoring=False):
         raise ValueError('stage')
     staged = STAGE / 'integration'
     if not restoring:
-        os.replace(STAGE / 'helper', staged / '.phase_a_tools')
+        replace_root_relative(STAGE / 'helper', staged / '.phase_a_tools')
     if inventory_deployment(staged) != expected:
         raise ValueError('assembled')
     if restoring:
@@ -3757,7 +4114,7 @@ def activate(value, restoring=False):
         if exchanged:
             exchange(staged, INTEGRATION)
         else:
-            os.replace(staged, INTEGRATION)
+            replace_root_relative(staged, INTEGRATION)
         mutated = True
         installed = inventory_targets()
         if installed != expected:
@@ -3766,7 +4123,7 @@ def activate(value, restoring=False):
         if mutated and exchanged:
             exchange(staged, INTEGRATION)
         elif mutated:
-            os.replace(INTEGRATION, staged)
+            replace_root_relative(INTEGRATION, staged)
         raise
     remove(STAGE)
     return {
@@ -3981,7 +4338,8 @@ def restore_backup(value):
     write_fallback_phase('intent_recorded', identity)
     pending = ROOT / ('.ha_tuya_ble_r36_restore-' + os.urandom(16).hex())
     try:
-        shutil.copytree(source, pending, symlinks=False)
+        pending.mkdir(mode=0o700)
+        copy_deployment(source, pending, expected)
         if inventory_deployment(pending) != expected:
             raise ValueError('backup_restore')
         sync_tree(pending)
@@ -3989,7 +4347,9 @@ def restore_backup(value):
         if INTEGRATION.exists():
             exchange(pending, INTEGRATION)
         else:
-            os.replace(pending, INTEGRATION)
+            replace_root_relative(pending, INTEGRATION)
+        sync_directory(INTEGRATION.parent)
+        sync_root()
         installed = inventory_targets()
         if installed != expected:
             raise ValueError('backup_restore')
@@ -5335,6 +5695,16 @@ class FullPreflightLifecycleController:
             self._session_generation,
             action,
             secrets.token_hex(16),
+            (
+                getattr(self._journal, "baseline_backup_identity", None)
+                if self._journal is not None
+                and action
+                in {
+                    LifecycleAction.BACKUP_FALLBACK,
+                    LifecycleAction.BACKUP_FALLBACK_RECONCILE,
+                }
+                else None
+            ),
         )
         self._capability_issuer.issued.append(capability)
         if self._journal is not None:
@@ -6403,12 +6773,17 @@ class FullPreflightLifecycleController:
             )
             valid_shape = (
                 isinstance(result, FallbackReconciliationResult)
-                and _exact_non_bool_int(result.file_count, minimum=1)
+                and _exact_non_bool_int(result.file_count)
                 and (
                     result.phase == "reconciled"
                     and result.restoration_applied is True
                     and result.manifest_match is True
-                    or result.phase in {"reconciled_candidate", "reconciled_unknown"}
+                    and result.file_count >= 1
+                    or result.phase == "reconciled_candidate"
+                    and result.restoration_applied is False
+                    and result.manifest_match is False
+                    and result.file_count >= 1
+                    or result.phase == "reconciled_unknown"
                     and result.restoration_applied is False
                     and result.manifest_match is False
                 )
@@ -6427,20 +6802,13 @@ class FullPreflightLifecycleController:
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
         self._normal_chain_aborted = True
-        if result.phase == "reconciled":
-            self._advance(
-                LifecycleState.PR41_RESTORED,
-                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
-                source_generation=self._restore_source_generation,
-            )
-        elif result.phase == "reconciled_unknown":
-            self._advance(
-                LifecycleState.MANUAL_RECOVERY_REQUIRED,
-                LifecycleAction.BACKUP_FALLBACK_RECONCILE,
-                terminal=True,
-            )
-            if self._journal is not None:
-                self._journal.close()
+        self._state = {
+            "reconciled": LifecycleState.PR41_RESTORED,
+            "reconciled_candidate": self.state,
+            "reconciled_unknown": LifecycleState.MANUAL_RECOVERY_REQUIRED,
+        }[result.phase]
+        if result.phase == "reconciled_unknown" and self._journal is not None:
+            self._journal.close()
         return result
 
 
