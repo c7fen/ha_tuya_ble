@@ -144,22 +144,60 @@ prompts, helper output, and raw Supervisor responses remain inside the PTY.
 
 ## 5. Bounded full-preflight control plane
 
-The broker's public live-capable API consists only of named methods for:
+`FullPreflightLifecycleController` is the only public live-capable operation
+surface. The lower broker exposes only session `open`, `close`, and generic
+state; all Repairs, source, Core, restart, service-inventory, helper, and
+restoration adapters are internal. Do not invoke or expose an internal broker
+adapter directly. The controller has no command-string, argv, stdin/stdout
+bridge, remote-path, service-name, endpoint, environment-variable, arbitrary
+helper-operation, caller nonce, or caller audit-label argument.
 
-- aggregate Repairs collection;
-- private source backup and fixed backup restoration;
-- exact source-bundle transfer, candidate installation, and PR #41 restoration;
-- aggregate source inventory verification;
-- direct Supervisor Core check, one restart per activated source state, and
-  bounded Core readiness;
-- exact temporary-service presence or absence inventory;
-- Phase-A `PREFLIGHT`, `AUDIT`, and `RECEIPT` helper calls;
-- the invalid-nonce local preflight discriminator.
+The exact success sequence is:
 
-There is no command-string, argv, stdin/stdout bridge, remote-path, service-name,
-endpoint, environment-variable, or arbitrary helper-operation argument. The
-private dispatcher accepts only `BoundedOperation`; the helper operation enum
-contains only `PREFLIGHT`, `AUDIT`, and `RECEIPT`. It deliberately cannot
+```text
+BASELINE
+-> INITIAL_REPAIRS_PASS
+-> BACKUP_VERIFIED
+-> CANDIDATE_STAGED
+-> CANDIDATE_INSTALLED
+-> CANDIDATE_INVENTORY_VERIFIED
+-> CANDIDATE_CORE_CHECKED
+-> ACTIVATION_RESTART_CONSUMED
+-> CANDIDATE_READY
+-> RESEARCH_SERVICES_PRESENT
+-> POST_ACTIVATION_REPAIRS_PASS
+-> A0_COLLECTED
+-> P0_COMPLETED
+-> AP0_COLLECTED
+-> NON_PROBE_PREFLIGHT_COMPLETED
+-> NON_PROBE_RECEIPT_COMPLETED
+-> A1_COLLECTED
+-> RESEARCH_FINAL_VALIDATED
+-> A2_COLLECTED
+-> RESTORE_STAGED
+-> PR41_RESTORED
+-> RESTORE_INVENTORY_VERIFIED
+-> RESTORE_CORE_CHECKED
+-> REMOVAL_RESTART_CONSUMED
+-> PR41_READY
+-> RESEARCH_SERVICES_ABSENT
+-> POST_RESTORE_REPAIRS_PASS
+-> COMPLETE
+```
+
+Every transition checks its exact predecessor and all local typed inputs before
+PTY output. Immediately before a represented action dispatch, the controller
+consumes an action-specific permit bound to the current controller generation
+and broker session. Success, rejection, malformed output, transport failure,
+and exit 78 all leave that permit consumed. P0 also consumes its lifecycle
+permit, while still requiring exit 65, `not_submitted`, and zero HTTP handoff.
+`PREFLIGHT` and its exact-nonce `RECEIPT` use distinct permits. Receipt lookup
+after exit 78 may use one separate permit; it cannot reset or replay the
+original action. Activation and removal restarts likewise use distinct permits
+consumed before dispatch.
+
+The private dispatcher accepts only `BoundedOperation`; the helper operation
+enum contains only `PREFLIGHT`, `AUDIT`, and `RECEIPT`. It deliberately cannot
 represent `PROBE`, Device Status, Device Info, pairing, a datapoint write, a
 lock action, or a policy mutation.
 
@@ -179,22 +217,47 @@ same operation without touching another custom component. The fixed private
 backup is independently verified and is only a fallback; exact PR #41 remains
 the restoration authority.
 
-Core check uses exactly `POST http://supervisor/core/check`. Success requires a
-2xx status, JSON, top-level `result == "ok"`, and `check_passed == true`. The
-caller may represent only attempt ordinal 1 or 2. Restart uses the fixed
+Core check uses exactly `POST http://supervisor/core/check`. The remote adapter
+preserves the authoritative response body's `check_passed` value; it never
+synthesizes that field from HTTP status or `result`. Success requires a
+completed request, 2xx status, JSON object, exact string `result == "ok"`, and
+exact boolean `check_passed is true`. A completed FAIL is terminal. Attempt 2
+is permitted only after outer transport ambiguity left no completed result;
+the controller never reconnects or retries automatically. Restart uses the fixed
 Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
 second submission for the same activated source state before PTY I/O.
 Readiness polling is bounded and verifies Core reachability, the running API,
 and `tuya_ble` in Core's loaded component set. Temporary service presence or
-absence remains a separate exact aggregate gate.
+absence remains a separate exact-count aggregate gate; result booleans alone
+are insufficient.
 
 Helper results preserve exits 0, 65, 66, 67, and 78. Outcomes are validated per
-operation and correlated to the exact submitted nonce. Exit 78 is terminal
-ambiguity and never authorizes replay. Audit responses retain only protocol
+operation and correlated to the exact controller-generated nonce. Exit 78 is
+terminal ambiguity and never authorizes replay. Audit responses retain only protocol
 version, opaque audit instance token, ordinal, overflow state, runtime duration,
 the allowlisted counters, the documented four-field bounded events, and the
 optional nonce. Snapshot comparison reports exact instance, ordinal, counter,
 event, and overflow booleans without inventing semantic equivalence.
+
+The controller owns A0, AP0, A1, and A2 and binds them to one session and exact
+candidate activation generation. A0 requires strict post-activation Repairs
+admission and no history overflow; counters need not be absolute zero because
+the audit instance predates startup work. A0->AP0, AP0->A1, A1->A2, and the
+cumulative A0->A2 comparison must preserve the exact audit instance, event
+ordinal, counters, events, and no-overflow state. Runtime duration is not an
+I/O predicate. A2 is the final candidate snapshot immediately before PR #41
+restoration.
+
+Any dispatched candidate-install uncertainty or later research-stage failure
+enters `ROLLBACK_REQUIRED`. From there, the only normal recovery is exact PR
+#41 transfer, restore, inventory, authoritative Core check, one removal
+restart, readiness, service absence, and strict final Repairs. The private
+backup is a separately consumed last-resort fallback and never silently
+substitutes for PR #41 proof. Final acceptance is a typed, no-default proof
+requiring exact source inventory with no research files, authoritative Core
+check, consumed/dispatched/accepted removal restart, full readiness including
+`tuya_ble`, all four temporary services absent, and strict Repairs shape/zero
+counts.
 
 The PR #45 audit helper and audit service exist only while the candidate source
 is active. Collect every required helper-backed snapshot, including any A2

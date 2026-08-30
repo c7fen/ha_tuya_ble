@@ -863,7 +863,7 @@ def test_o_m9_broker_has_no_network_or_unbounded_terminal_passthrough() -> None:
     assert "subprocess" not in source
     assert "DEVNULL" not in source
     assert "def execute(" not in source
-    assert hasattr(access.PrivateInteractiveSessionBroker, "collect_resolution_info")
+    assert hasattr(access.PrivateInteractiveSessionBroker, "_collect_resolution_info")
 
 
 def test_o_m10_public_results_do_not_retain_private_host_or_path(
@@ -1227,7 +1227,7 @@ def test_r30_restart_operation_has_no_retry_loop() -> None:
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "restart_core"
+        and node.name == "_restart_core"
     )
 
     assert not any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(restart))
@@ -2562,6 +2562,23 @@ def test_r32_c4_l_m5_p0_cannot_repeat_even_if_state_is_rewound() -> None:
     assert len(broker.calls) == 1
 
 
+def test_r32_c4_l_m16_ambiguous_restart_consumes_permit_before_dispatch() -> None:
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    broker.queue(
+        "restart", access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.restart_for_candidate()
+    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    call_count = len(broker.calls)
+
+    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+        controller.restart_for_candidate()
+    assert len(broker.calls) == call_count
+
+
 def test_r32_c4_l_m15_to_m18_no_replay_probe_or_generic_shell_surface() -> None:
     broker_callables = {
         name
@@ -2672,8 +2689,13 @@ def test_r32_c5_typed_final_proof_has_no_defaults_and_complete_proof_passes() ->
     ),
 )
 def test_r32_representative_post_install_failures_enter_ordered_pr41_rollback(
-    case: str, queued_name: str, failure: object, state: str
+    case: str,
+    queued_name: str,
+    failure: object,
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "a" * 16)
     controller, broker = _r32_controller()
     controller._state = getattr(access.LifecycleState, state)
     if state in {"NON_PROBE_RECEIPT_COMPLETED", "RESEARCH_FINAL_VALIDATED"}:
