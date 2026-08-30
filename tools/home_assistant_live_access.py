@@ -760,6 +760,51 @@ class FallbackReconciliationResult:
     file_count: int
 
 
+_FALLBACK_RECONCILIATION_RESULT_KEYS = frozenset(
+    {"phase", "restoration_applied", "manifest_match", "file_count"}
+)
+
+
+def _fallback_reconciliation_result_payload(
+    result: object,
+) -> dict[str, object] | None:
+    """Return the one exact successful fallback reconciliation result."""
+    if not (
+        type(result) is FallbackReconciliationResult
+        and result.phase == "reconciled"
+        and result.restoration_applied is True
+        and result.manifest_match is True
+        and _exact_non_bool_int(result.file_count, minimum=1)
+    ):
+        return None
+    return {
+        "phase": result.phase,
+        "restoration_applied": result.restoration_applied,
+        "manifest_match": result.manifest_match,
+        "file_count": result.file_count,
+    }
+
+
+def _fallback_reconciliation_result_from_payload(
+    payload: object,
+) -> FallbackReconciliationResult | None:
+    """Revalidate a journaled fallback result without coercing field types."""
+    if (
+        type(payload) is not dict
+        or set(payload) != _FALLBACK_RECONCILIATION_RESULT_KEYS
+    ):
+        return None
+    result = FallbackReconciliationResult(
+        phase=payload["phase"],
+        restoration_applied=payload["restoration_applied"],
+        manifest_match=payload["manifest_match"],
+        file_count=payload["file_count"],
+    )
+    return (
+        result if _fallback_reconciliation_result_payload(result) is not None else None
+    )
+
+
 @dataclass(frozen=True)
 class SourceInventoryResult:
     expected_count: int
@@ -1601,26 +1646,48 @@ class _DurableLifecycleJournal:
         if type(operations) is list:
             seen: set[str] = set()
             for operation in operations:
+                operation_keys = (
+                    frozenset(operation) if type(operation) is dict else frozenset()
+                )
+                base_operation_keys = {
+                    "action",
+                    "phase",
+                    "source_generation",
+                    "nonce",
+                    "session_generation",
+                    "issuance_identity",
+                    "reconciles_operation_id",
+                }
                 invalid = (
                     invalid
                     or type(operation) is not dict
-                    or set(operation)
-                    != {
-                        "action",
-                        "phase",
-                        "source_generation",
-                        "nonce",
-                        "session_generation",
-                        "issuance_identity",
-                        "reconciles_operation_id",
+                    or operation_keys
+                    not in {
+                        frozenset(base_operation_keys),
+                        frozenset(base_operation_keys | {"result"}),
                     }
                 )
                 if type(operation) is dict:
                     action = operation.get("action")
+                    phase = operation.get("phase")
                     invalid = invalid or action not in actions or action in seen
                     if isinstance(action, str):
                         seen.add(action)
-                    invalid = invalid or operation.get("phase") not in phases
+                    invalid = invalid or phase not in phases
+                    has_durable_result = "result" in operation
+                    result_allowed = (
+                        action == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+                        and phase in {"result_durable", "reconciled"}
+                    )
+                    invalid = invalid or (has_durable_result and not result_allowed)
+                    if has_durable_result:
+                        invalid = (
+                            invalid
+                            or _fallback_reconciliation_result_from_payload(
+                                operation.get("result")
+                            )
+                            is None
+                        )
                     invalid = invalid or not isinstance(
                         operation.get("source_generation"), str
                     )
@@ -1851,8 +1918,11 @@ class _DurableLifecycleJournal:
                 and record.get("research_succeeded") is True
             )
         terminal = record.get("terminal")
-        invalid = invalid or ((terminal is None) == (record.get("active") is False))
-        invalid = invalid or (terminal is not None and terminal != record.get("stage"))
+        stage = record.get("stage")
+        expected_terminal = stage if stage in terminal_values else None
+        expected_active = stage not in terminal_values
+        invalid = invalid or terminal != expected_terminal
+        invalid = invalid or record.get("active") is not expected_active
         invalid = invalid or (
             record.get("rollback_mode") is not record.get("recovery_mode")
         )
@@ -2036,6 +2106,12 @@ class _DurableLifecycleJournal:
             return "submit_once"
         if matches[0]["phase"] == "intent_durable":
             return "submit_once"
+        if matches[0]["phase"] in {
+            "dispatch_started",
+            "result_durable",
+            "ambiguous",
+        }:
+            return "possibly_dispatched"
         if matches[0]["phase"] == "transition_committed":
             return "previously_committed"
         raise LifecycleControllerError("RESTORE_RECONCILIATION_UNAVAILABLE")
@@ -2138,6 +2214,11 @@ class _DurableLifecycleJournal:
         self._commit(mutate)
 
     def record_dispatch_started(self, action: LifecycleAction) -> None:
+        """Compatibility spelling for the durable dispatch-possible boundary."""
+        self.record_dispatch_possible(action)
+
+    def record_dispatch_possible(self, action: LifecycleAction) -> None:
+        """Persist before any callback capable of broker or PTY submission."""
         self._set_operation_phase(action, "dispatch_started")
 
     def record_ambiguous(self, action: LifecycleAction) -> None:
@@ -2173,11 +2254,6 @@ class _DurableLifecycleJournal:
 
         self._commit(mutate)
 
-    def record_fallback_reconciled(self) -> None:
-        self._set_operation_phase(
-            LifecycleAction.BACKUP_FALLBACK_RECONCILE, "reconciled"
-        )
-
     def record_result(
         self,
         action: LifecycleAction,
@@ -2188,6 +2264,7 @@ class _DurableLifecycleJournal:
         issuance_identity: str,
         audit_instance: str | None,
         nonce: str | None,
+        result: dict[str, object] | None = None,
     ) -> int:
         generation = self._record["evidence_generation"] + 1
 
@@ -2200,6 +2277,14 @@ class _DurableLifecycleJournal:
             if len(matches) != 1:
                 raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
             matches[0]["phase"] = "result_durable"
+            if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                if _fallback_reconciliation_result_from_payload(result) is None:
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_JOURNAL_INVALID"
+                    ) from None
+                matches[0]["result"] = copy.deepcopy(result)
+            elif result is not None:
+                raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
             if (
                 matches[0]["session_generation"] != session_generation
                 or matches[0]["issuance_identity"] != issuance_identity
@@ -2221,6 +2306,82 @@ class _DurableLifecycleJournal:
 
         self._commit(mutate)
         return generation
+
+    def fallback_reconciliation_operation(self) -> dict[str, object]:
+        matches = [
+            operation
+            for operation in self._record["operations"]
+            if operation["action"] == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+        ]
+        if len(matches) != 1:
+            raise LifecycleControllerError("FALLBACK_RECONCILIATION_UNAVAILABLE")
+        return copy.deepcopy(matches[0])
+
+    def finalize_fallback_reconciliation_from_durable_result(
+        self,
+        *,
+        lifecycle_generation: str,
+        source_generation: str,
+        issuance_identity: str,
+    ) -> FallbackReconciliationResult:
+        """Commit only the local tail already proven by a durable typed result."""
+
+        def validated_result(record: dict[str, object]) -> FallbackReconciliationResult:
+            matches = [
+                operation
+                for operation in record["operations"]
+                if operation["action"]
+                == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+            ]
+            if len(matches) != 1:
+                raise LifecycleControllerError(
+                    "FALLBACK_RECONCILIATION_UNAVAILABLE"
+                ) from None
+            operation = matches[0]
+            evidence = [
+                identity
+                for identity in record["evidence_identities"]
+                if identity["action"] == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+                and identity["issuance_identity"] == issuance_identity
+            ]
+            result = _fallback_reconciliation_result_from_payload(
+                operation.get("result")
+            )
+            if (
+                operation.get("phase") not in {"result_durable", "reconciled"}
+                or operation.get("issuance_identity") != issuance_identity
+                or operation.get("source_generation") != source_generation
+                or record.get("lifecycle_generation") != lifecycle_generation
+                or record.get("source_generation") != source_generation
+                or len(evidence) != 1
+                or evidence[0].get("lifecycle_generation") != lifecycle_generation
+                or evidence[0].get("source_generation") != source_generation
+                or evidence[0].get("session_generation")
+                != operation.get("session_generation")
+                or result is None
+            ):
+                raise LifecycleControllerError(
+                    "FALLBACK_RECONCILIATION_UNAVAILABLE"
+                ) from None
+            return result
+
+        result = validated_result(self._record)
+        operation = self.fallback_reconciliation_operation()
+        if operation["phase"] == "reconciled":
+            return result
+
+        def mutate(record: dict[str, object]) -> None:
+            validated_result(record)
+            matches = [
+                item
+                for item in record["operations"]
+                if item["action"] == LifecycleAction.BACKUP_FALLBACK_RECONCILE.value
+            ]
+            matches[0]["phase"] = "reconciled"
+            record["fallback_phase"] = "reconciled"
+
+        self._commit(mutate)
+        return result
 
     def transition(
         self,
@@ -3616,7 +3777,9 @@ def restore_tail_reconcile(value):
         for item in (original, reconciliation)
     ):
         raise ValueError('operation_identity')
-    if restart_mode not in {'submit_once', 'previously_committed'}:
+    if restart_mode not in {
+        'submit_once', 'possibly_dispatched', 'previously_committed'
+    }:
         raise ValueError('restart_mode')
     restore_actions = {
         'restore_transfer', 'restore_install', 'restore_inventory',
@@ -3681,7 +3844,7 @@ def restore_tail_reconcile(value):
     restart = (
         restart_core()
         if restart_mode == 'submit_once'
-        else {'submitted': True, 'accepted': True}
+        else {'submitted': False, 'accepted': False}
     )
     ready = readiness()
     services = service_inventory('expected_absent')
@@ -3714,8 +3877,13 @@ def restore_tail_reconcile(value):
         and not STAGE.exists()
     )
     restart_resolved = (
-        restart['submitted'] is True
-        and restart['accepted'] is True
+        (
+            restart_mode in {'possibly_dispatched', 'previously_committed'}
+            or (
+                restart['submitted'] is True
+                and restart['accepted'] is True
+            )
+        )
         and
         core.get('check_passed') is True
         and ready['core_reachable'] is True
@@ -4389,7 +4557,11 @@ class PrivateInteractiveSessionBroker:
             or re.fullmatch(r"[0-9a-f]{32}", original_operation_id) is None
         ):
             raise SourceBundleError("RESTORE_OPERATION_ID_INVALID") from None
-        if restart_mode not in {"submit_once", "previously_committed"}:
+        if restart_mode not in {
+            "submit_once",
+            "possibly_dispatched",
+            "previously_committed",
+        }:
             raise SourceBundleError("RESTORE_RESTART_MODE_INVALID") from None
         if original_action not in {
             LifecycleAction.RESTORE_TRANSFER.value,
@@ -4709,6 +4881,8 @@ class PrivateInteractiveSessionBroker:
             manifest_match=value.get("manifest_match"),
             file_count=value.get("file_count"),
         )
+        if _fallback_reconciliation_result_payload(result) is None:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
         return _bind_evidence_origin(result, capability)
 
     def close(self) -> None:
@@ -5100,9 +5274,9 @@ class FullPreflightLifecycleController:
             action,
             issuance_identity,
         )
-        self._capability_issuer.issued.append(capability)
         if self._journal is not None:
-            self._journal.record_dispatch_started(action)
+            self._journal.record_dispatch_possible(action)
+        self._capability_issuer.issued.append(capability)
         try:
             result = callback(capability)
         except BaseException:
@@ -5122,6 +5296,14 @@ class FullPreflightLifecycleController:
                 raise SessionBrokerError(
                     "PRIVATE_INTERACTIVE_SESSION_EVIDENCE_ORIGIN_INVALID"
                 ) from None
+            durable_result = None
+            if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                durable_result = _fallback_reconciliation_result_payload(result)
+                if durable_result is None:
+                    self._journal.record_ambiguous(action)
+                    raise SessionBrokerError(
+                        "PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+                    ) from None
             evidence_generation = self._journal.record_result(
                 action,
                 lifecycle_generation=str(self._lifecycle_generation),
@@ -5136,6 +5318,7 @@ class FullPreflightLifecycleController:
                     )
                 ),
                 nonce=None if origin is None else origin.nonce,
+                result=durable_result,
             )
             self._evidence_generations[action] = evidence_generation
             if origin is not None:
@@ -6252,17 +6435,32 @@ class FullPreflightLifecycleController:
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
-        if not (
-            isinstance(result, FallbackReconciliationResult)
-            and result.phase == "reconciled"
-            and result.restoration_applied is True
-            and result.manifest_match is True
-            and _exact_non_bool_int(result.file_count, minimum=1)
-        ):
+        if _fallback_reconciliation_result_payload(result) is None:
             raise LifecycleControllerError("LIFECYCLE_ROLLBACK_REQUIRED") from None
         if self._journal is not None:
-            self._journal.record_fallback_reconciled()
+            operation = self._journal.fallback_reconciliation_operation()
+            result = self._journal.finalize_fallback_reconciliation_from_durable_result(
+                lifecycle_generation=str(self._lifecycle_generation),
+                source_generation=str(self._current_source_generation),
+                issuance_identity=str(operation["issuance_identity"]),
+            )
         return result
+
+    def finalize_fallback_reconciliation_from_durable_result(
+        self,
+    ) -> FallbackReconciliationResult:
+        """Finish a reconstructed fallback reconciliation without remote replay."""
+        self._require_state(
+            LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED
+        )
+        if self._journal is None:
+            raise LifecycleControllerError("FALLBACK_RECONCILIATION_UNAVAILABLE")
+        operation = self._journal.fallback_reconciliation_operation()
+        return self._journal.finalize_fallback_reconciliation_from_durable_result(
+            lifecycle_generation=str(self._lifecycle_generation),
+            source_generation=str(self._current_source_generation),
+            issuance_identity=str(operation["issuance_identity"]),
+        )
 
 
 def _private_spec_from_stream(stream: TextIO) -> dict[str, object]:
