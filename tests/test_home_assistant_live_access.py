@@ -5405,12 +5405,16 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
             controller._journal = journal
             callbacks = 0
 
-            def callback(_capability: object, _crash_at: str = crash_at) -> object:
+            def callback(
+                _capability: object,
+                _crash_at: str = crash_at,
+                _action: access.LifecycleAction = action,
+            ) -> object:
                 nonlocal callbacks
                 callbacks += 1
                 if _crash_at == "during_dispatch":
                     raise SyntheticCrash
-                if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                if _action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE:
                     return access.FallbackReconciliationResult(
                         "reconciled", True, True, 1
                     )
@@ -5436,9 +5440,9 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         controller._journal = journal
         controller._dispatch(
             action,
-            lambda _capability: (
+            lambda _capability, _action=action: (
                 access.FallbackReconciliationResult("reconciled", True, True, 1)
-                if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                if _action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
                 else object()
             ),
             broker_evidence=False,
