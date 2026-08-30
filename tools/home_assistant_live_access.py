@@ -220,31 +220,17 @@ def repairs_evidence(result: RepairsGateResult) -> RepairsEvidence:
     )
 
 
-def _extract_single_json_object(private_output: bytes) -> str | None:
-    """Find one complete JSON object amid private PTY command echo and prompts."""
+def _extract_exact_framed_json_object(private_output: bytes) -> str | None:
+    """Decode exactly one JSON object from a broker-bounded private payload."""
     try:
-        text = private_output.decode("utf-8")
-    except UnicodeDecodeError:
+        text = private_output.decode("utf-8").strip(" \t\r\n")
+        value = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
 
-    decoder = json.JSONDecoder()
-    objects: list[object] = []
-    offset = 0
-    while True:
-        start = text.find("{", offset)
-        if start == -1:
-            break
-        try:
-            value, end = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
-            offset = start + 1
-            continue
-        objects.append(value)
-        offset = start + end
-
-    if len(objects) != 1 or not isinstance(objects[0], dict):
+    if not isinstance(value, dict):
         return None
-    return json.dumps(objects[0], separators=(",", ":"), sort_keys=True)
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
 
 def _spawn_private_wrapper(wrapper_path: Path) -> tuple[int, int]:
@@ -482,7 +468,7 @@ class PrivateInteractiveSessionBroker:
         self._write_private(command)
         self._read_until(start_frame)
         private_output = self._read_until(end_frame)
-        response = _extract_single_json_object(private_output)
+        response = _extract_exact_framed_json_object(private_output)
         result = collect_repairs_gate(
             gate,
             response if response is not None else "",

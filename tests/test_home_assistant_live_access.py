@@ -73,6 +73,60 @@ def _resolution_response(issues: list[object]) -> str:
     )
 
 
+_VALID_FRAMED_OBJECT = b'{"result":"ok","data":{"issues":[]}}'
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "accepted"),
+    [
+        ("J-M1", _VALID_FRAMED_OBJECT, True),
+        ("J-M2", b"\r\n  " + _VALID_FRAMED_OBJECT + b" \t\r\n", True),
+        ("J-M3", b"{BROKEN " + _VALID_FRAMED_OBJECT, False),
+        ("J-M4", b"WARNING " + _VALID_FRAMED_OBJECT, False),
+        ("J-M5", _VALID_FRAMED_OBJECT + b" TRAILING", False),
+        ("J-M6", _VALID_FRAMED_OBJECT + b"\n" + _VALID_FRAMED_OBJECT, False),
+        (
+            "J-M7",
+            b'{"outer":BROKEN,"nested":' + _VALID_FRAMED_OBJECT + b"}",
+            False,
+        ),
+        ("J-M8", b"[" + _VALID_FRAMED_OBJECT + b"]", False),
+        ("J-M9", b"\x1b[31m" + _VALID_FRAMED_OBJECT, False),
+        ("J-M10", b"\xff" + _VALID_FRAMED_OBJECT, False),
+        (
+            "J-M11",
+            b'{"result":"ok","data":{"issues":[],"note":"{still json}"}}',
+            True,
+        ),
+        ("J-M12", b" \t\r\n", False),
+        ("J-M13", b"", False),
+        ("J-M14", b'{"result":"error","data":{"issues":[]}}', True),
+    ],
+)
+def test_j_m1_to_j_m14_exact_framed_json_object_extraction(
+    name: str, payload: bytes, accepted: bool
+) -> None:
+    """J-M1--14: only one complete framed JSON object crosses the boundary."""
+    extracted = access._extract_exact_framed_json_object(payload)
+
+    assert name.startswith("J-M")
+    assert (extracted is not None) is accepted
+    if extracted is not None:
+        assert isinstance(json.loads(extracted), dict)
+
+
+def test_j_m14_extraction_and_supervisor_semantics_remain_separate() -> None:
+    """J-M14: a complete error envelope extracts but fails semantic decoding."""
+    extracted = access._extract_exact_framed_json_object(
+        b'{"result":"error","data":{"issues":[]}}'
+    )
+
+    assert extracted is not None
+    assert access.decode_repairs_response(extracted) == access.DecodedRepairs(
+        shape_valid=False, issues=None
+    )
+
+
 def test_s_m1_official_supervisor_envelope_empty_issues_is_shape_valid() -> None:
     """S-M1: the complete Supervisor wrapper is the canonical transport."""
     response = _resolution_response([])
@@ -248,6 +302,43 @@ for line in sys.stdin:
 """
 
 
+def _resolution_pty_child(payload: bytes) -> str:
+    """Return a controlling-PTY child that emits one synthetic framed payload."""
+    return (
+        "_PAYLOAD = "
+        + repr(payload)
+        + "\n"
+        + r"""
+import os
+import re
+import sys
+
+assert os.isatty(0)
+assert os.tcgetpgrp(0) == os.getpgrp()
+login = False
+
+def emit_frame(value):
+    os.write(1, b"\x1e" + value.encode("ascii") + b"\x1f")
+
+for line in sys.stdin:
+    if line.strip() == "exec bash -li":
+        login = True
+        continue
+    values = re.findall(r"HA_BROKER_[A-Z_]+:[0-9a-f]+", line)
+    if "HA_BROKER_REMOTE" in line and values:
+        emit_frame(values[0])
+    elif "HA_BROKER_LOGIN" in line and values and login:
+        emit_frame(values[0])
+    elif "ha resolution info --raw-json" in line and login and len(values) == 2:
+        emit_frame(values[0])
+        os.write(1, _PAYLOAD)
+        emit_frame(values[1])
+    elif line.strip() == "exit":
+        break
+"""
+    )
+
+
 def _broker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -267,6 +358,97 @@ def _broker(
         timeout_seconds=0.2,
         max_capture_bytes=max_capture_bytes,
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "expected"),
+    [
+        (
+            "E-M1",
+            _VALID_FRAMED_OBJECT,
+            access.RepairsEvidence(True, 0, 0),
+        ),
+        (
+            "E-M2",
+            b"{BROKEN " + _VALID_FRAMED_OBJECT,
+            access.RepairsEvidence(False, None, None),
+        ),
+        (
+            "E-M3",
+            b"WARNING " + _VALID_FRAMED_OBJECT,
+            access.RepairsEvidence(False, None, None),
+        ),
+        (
+            "E-M4",
+            _VALID_FRAMED_OBJECT + b"\n" + _VALID_FRAMED_OBJECT,
+            access.RepairsEvidence(False, None, None),
+        ),
+        (
+            "E-M5",
+            b"\r\n \t" + _VALID_FRAMED_OBJECT + b" \t\r\n",
+            access.RepairsEvidence(True, 0, 0),
+        ),
+    ],
+)
+def test_e_m1_to_e_m5_broker_enforces_exact_framed_json_boundary(
+    name: str,
+    payload: bytes,
+    expected: access.RepairsEvidence,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """E-M1--5: framed PTY payloads cross extraction and semantic validation."""
+    broker = _broker(monkeypatch, tmp_path, _resolution_pty_child(payload))
+
+    assert broker.open() is access.BrokerState.SESSION_ACTIVE
+    try:
+        evidence = broker.collect_resolution_info(
+            access.RepairsGate.INITIAL, _relevant, _critical
+        )
+    finally:
+        broker.close()
+
+    assert name.startswith("E-M")
+    assert evidence == expected
+
+
+def test_malformed_inner_envelope_never_becomes_empty_valid_evidence() -> None:
+    """A valid-looking inner object cannot rescue a malformed framed payload."""
+    extracted = access._extract_exact_framed_json_object(
+        b"{BROKEN " + _VALID_FRAMED_OBJECT
+    )
+    result = access.collect_repairs_gate(
+        access.RepairsGate.INITIAL,
+        extracted if extracted is not None else "",
+        _relevant,
+        _critical,
+    )
+    evidence = access.repairs_evidence(result)
+
+    assert evidence == access.RepairsEvidence(False, None, None)
+    assert evidence != access.RepairsEvidence(True, 0, 0)
+
+
+def test_rejected_framed_payload_is_never_emitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rejected private payload bytes never reach output, errors, or evidence."""
+    sentinel = "SYNTHETIC_REJECTED_PRIVATE_PAYLOAD_SENTINEL"
+    payload = sentinel.encode("ascii") + b" " + _VALID_FRAMED_OBJECT
+    broker = _broker(monkeypatch, tmp_path, _resolution_pty_child(payload))
+
+    broker.open()
+    evidence = broker.collect_resolution_info(
+        access.RepairsGate.INITIAL, _relevant, _critical
+    )
+    broker.close()
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + repr(broker) + repr(evidence)
+    assert evidence == access.RepairsEvidence(False, None, None)
+    assert sentinel not in rendered
 
 
 @pytest.mark.parametrize(
