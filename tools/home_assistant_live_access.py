@@ -2120,6 +2120,7 @@ def _parse_service_inventory_result(payload: object) -> ServiceInventoryResult:
 
 def _parse_audit_snapshot(value: object) -> AuditSnapshot:
     required = {
+        "result",
         "protocol_version",
         "audit_instance_token",
         "event_ordinal",
@@ -2139,7 +2140,9 @@ def _parse_audit_snapshot(value: object) -> AuditSnapshot:
         counters = value["counters"]
         events = value["events"]
         if (
-            value["protocol_version"] != 1
+            value["result"] != "audit_snapshot"
+            or type(value["protocol_version"]) is not int
+            or value["protocol_version"] != 1
             or not isinstance(token, str)
             or not _NONCE.fullmatch(token)
             or nonce is not None

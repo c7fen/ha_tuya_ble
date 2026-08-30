@@ -1733,6 +1733,7 @@ for line in sys.stdin:
                     "outcome": "audit_snapshot",
                     "nonce": "b" * 16,
                     "audit": {
+                        "result": "audit_snapshot",
                         "protocol_version": 1,
                         "audit_instance_token": "a" * 32,
                         "event_ordinal": 0,
@@ -5028,6 +5029,35 @@ def test_r35_helper_schema_rejects_bool_extra_and_duplicate_fields(
             access.PhaseAOperation.PREFLIGHT,
             payload,
             expected_nonce="d" * 16,
+        )
+
+
+@pytest.mark.parametrize("protocol_version", (True, 1.0, "1"))
+def test_r35_audit_schema_requires_result_and_exact_integer_protocol(
+    protocol_version: object,
+) -> None:
+    nonce = "d" * 16
+    payload = {
+        "exit_code": 0,
+        "outcome": "audit_snapshot",
+        "nonce": nonce,
+        "audit": {
+            "result": "audit_snapshot",
+            "protocol_version": protocol_version,
+            "audit_instance_token": "a" * 32,
+            "event_ordinal": 0,
+            "history_overflow": False,
+            "runtime_ms": 0,
+            "counters": {name: 0 for name in access.AUDIT_COUNTER_NAMES},
+            "events": [],
+            "nonce": nonce,
+        },
+    }
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_phase_a_result(
+            access.PhaseAOperation.AUDIT,
+            json.dumps(payload).encode(),
+            expected_nonce=nonce,
         )
 
 
