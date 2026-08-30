@@ -2254,6 +2254,243 @@ def _r32_bundles() -> tuple[access.SourceBundle, access.SourceBundle]:
     return candidate, restore
 
 
+def _r32_unbound_real_broker() -> access.PrivateInteractiveSessionBroker:
+    """Return an active synthetic broker shell without opening a PTY."""
+    broker = object.__new__(access.PrivateInteractiveSessionBroker)
+    broker._state = access.BrokerState.SESSION_ACTIVE
+    broker._session_generation = object()
+    broker._active_source_state = access.SourceState.CANDIDATE
+    broker._restarted_states = set()
+    broker._backup_restore_attempted = False
+    broker._echo_disabled = True
+    broker._master_fd = 123
+    broker._child_pid = 456
+    broker._residual = bytearray()
+    broker._timeout_seconds = 1.0
+    broker._max_capture_bytes = 4096
+    broker._controller_binding = None
+    broker._PrivateInteractiveSessionBroker__write_token = object()
+    return broker
+
+
+def _r32_controller_minted_capability(
+    broker: access.PrivateInteractiveSessionBroker,
+    action: access.LifecycleAction,
+) -> object:
+    """Capture one capability through the controller's guarded dispatch path."""
+    controller = access.FullPreflightLifecycleController(
+        broker, is_relevant=_relevant, is_critical=_critical
+    )
+    dispatch_token = controller._FullPreflightLifecycleController__dispatch_token
+    return controller._dispatch(
+        action,
+        lambda capability: capability,
+        _dispatch_token=dispatch_token,
+    )
+
+
+def test_r32_direct_raw_writer_and_bounded_dispatch_require_distinct_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither arbitrary PTY text nor a bounded action accepts a raw caller."""
+    broker = _r32_unbound_real_broker()
+    writes: list[bytes] = []
+    monkeypatch.setattr(access.os, "write", lambda _fd, value: writes.append(value))
+
+    with pytest.raises(access.SessionBrokerError, match="WRITE_SCOPE_INVALID"):
+        broker._write_private("synthetic arbitrary PTY text\n")
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(access.BoundedOperation.BACKUP, {})
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    ("name", "invoke"),
+    (
+        (
+            "repairs",
+            lambda broker, candidate, restore: broker._collect_resolution_info(
+                access.RepairsGate.INITIAL, _relevant, _critical
+            ),
+        ),
+        (
+            "backup",
+            lambda broker, candidate, restore: broker._create_private_backup(),
+        ),
+        (
+            "candidate transfer",
+            lambda broker, candidate, restore: broker._transfer_source_bundle(
+                candidate
+            ),
+        ),
+        (
+            "candidate install",
+            lambda broker, candidate, restore: broker._install_staged_source(
+                candidate.manifest
+            ),
+        ),
+        (
+            "candidate inventory",
+            lambda broker, candidate, restore: broker._verify_source_inventory(
+                candidate.manifest
+            ),
+        ),
+        (
+            "Core check",
+            lambda broker, candidate, restore: broker._check_core(1),
+        ),
+        (
+            "restart",
+            lambda broker, candidate, restore: broker._restart_core(),
+        ),
+        (
+            "readiness",
+            lambda broker, candidate, restore: broker._wait_for_core_readiness(),
+        ),
+        (
+            "services",
+            lambda broker, candidate, restore: broker._inventory_temporary_services(
+                access.ServiceExpectation.PRESENT
+            ),
+        ),
+        (
+            "helper",
+            lambda broker, candidate, restore: broker._invoke_phase_a(
+                access.PhaseAOperation.PREFLIGHT
+            ),
+        ),
+        (
+            "P0",
+            lambda broker, candidate, restore: broker._run_invalid_nonce_preflight(),
+        ),
+        (
+            "restore install",
+            lambda broker, candidate, restore: broker._install_staged_restore(
+                restore.manifest
+            ),
+        ),
+        (
+            "combined restore",
+            lambda broker, candidate, restore: broker._restore_source(restore),
+        ),
+        (
+            "backup fallback",
+            lambda broker, candidate, restore: broker._restore_private_backup(),
+        ),
+    ),
+)
+def test_r32_every_live_broker_adapter_rejects_direct_calls_before_dispatch(
+    name: str,
+    invoke: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Underscore-private adapter names are not an authorization boundary."""
+    broker = _r32_unbound_real_broker()
+    candidate, restore = _r32_bundles()
+    broker_calls: list[str] = []
+
+    def unexpected_bounded_call(*_args: object, **_kwargs: object) -> bytes:
+        broker_calls.append("bounded")
+        raise AssertionError("direct adapter reached bounded dispatch")
+
+    def unexpected_write(*_args: object, **_kwargs: object) -> None:
+        broker_calls.append("write")
+        raise AssertionError("direct adapter reached PTY write")
+
+    monkeypatch.setattr(broker, "_execute_bounded_operation", unexpected_bounded_call)
+    monkeypatch.setattr(broker, "_write_private", unexpected_write)
+
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        invoke(broker, candidate, restore)
+
+    assert broker_calls == [], name
+
+
+def test_r32_capability_is_action_session_generation_and_broker_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured capability cannot be redirected across any binding dimension."""
+    broker = _r32_unbound_real_broker()
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.BACKUP
+    )
+    writes: list[str] = []
+    monkeypatch.setattr(
+        broker,
+        "_write_private",
+        lambda *_args, **_kwargs: writes.append("write"),
+    )
+    monkeypatch.setattr(broker, "_read_until", lambda *_args, **_kwargs: b"{}")
+
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.RESTART_CORE, {}, _capability=capability
+        )
+    assert writes == []
+
+    original_session = broker._session_generation
+    broker._session_generation = object()
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    broker._session_generation = original_session
+    assert writes == []
+
+    original_generation = capability.lifecycle_generation
+    capability.lifecycle_generation = object()
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    capability.lifecycle_generation = original_generation
+    assert writes == []
+
+    other_broker = _r32_unbound_real_broker()
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        other_broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    assert writes == []
+
+
+def test_r32_capability_and_raw_write_scope_are_distinct_one_shot_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded use consumes a capability; it can never become a raw-write token."""
+    broker = _r32_unbound_real_broker()
+    capability = _r32_controller_minted_capability(
+        broker, access.LifecycleAction.BACKUP
+    )
+    writes: list[object] = []
+    monkeypatch.setattr(
+        broker,
+        "_write_private",
+        lambda *_args, **_kwargs: writes.append("bounded"),
+    )
+    monkeypatch.setattr(broker, "_read_until", lambda *_args, **_kwargs: b"{}")
+    monkeypatch.setattr(access.os, "write", lambda *_args: writes.append("raw"))
+
+    broker._execute_bounded_operation(
+        access.BoundedOperation.BACKUP, {}, _capability=capability
+    )
+    writes_after_first_use = list(writes)
+
+    with pytest.raises(access.SessionBrokerError, match="CAPABILITY_INVALID"):
+        broker._execute_bounded_operation(
+            access.BoundedOperation.BACKUP, {}, _capability=capability
+        )
+    with pytest.raises(access.SessionBrokerError, match="WRITE_SCOPE_INVALID"):
+        access.PrivateInteractiveSessionBroker._write_private(
+            broker,
+            "synthetic arbitrary PTY text\n",
+            _write_token=capability,
+        )
+
+    assert writes == writes_after_first_use
+
+
 def _r32_controller(
     broker: _R32ScriptedBroker | None = None,
 ) -> tuple[object, _R32ScriptedBroker]:
