@@ -6095,8 +6095,10 @@ def test_r36_backup_publication_crash_has_no_split_identity_state(
         ),
         "after_publish": (
             "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n",
-            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n"
-            "        os._exit(92)\n",
+            (
+                "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n"
+                "        os._exit(92)\n"
+            ),
             92,
         ),
     }[crash_point]
