@@ -3983,7 +3983,14 @@ def sync_tree(root):
     finally:
         os.close(descriptor)
 
-def sync_directory_fd(descriptor):
+def inode_record(metadata, kind):
+    return (
+        kind, metadata.st_dev, metadata.st_ino, metadata.st_size,
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+def sync_directory_fd(descriptor, relative=()):
+    observed = {}
     for name in sorted(os.listdir(descriptor)):
         metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
@@ -4000,7 +4007,16 @@ def sync_directory_fd(descriptor):
                     or not stat.S_ISDIR(opened.st_mode)
                 ):
                     raise ValueError('directory')
-                sync_directory_fd(child)
+                observed.update(sync_directory_fd(child, relative + (name,)))
+                closed = os.fstat(child)
+                if (
+                    closed.st_dev != opened.st_dev
+                    or closed.st_ino != opened.st_ino
+                ):
+                    raise ValueError('directory')
+                observed['/'.join(relative + (name,))] = inode_record(
+                    closed, 'directory'
+                )
             finally:
                 os.close(child)
         elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
@@ -4014,11 +4030,69 @@ def sync_directory_fd(descriptor):
                 ):
                     raise ValueError('regular')
                 os.fsync(child)
+                closed = os.fstat(child)
+                if (
+                    closed.st_dev != opened.st_dev
+                    or closed.st_ino != opened.st_ino
+                ):
+                    raise ValueError('regular')
+                observed['/'.join(relative + (name,))] = inode_record(
+                    closed, 'regular'
+                )
             finally:
                 os.close(child)
         else:
             raise ValueError('regular')
     os.fsync(descriptor)
+    return observed
+
+def directory_inode_snapshot(descriptor, relative=()):
+    observed = {}
+    for name in sorted(os.listdir(descriptor)):
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        logical = '/'.join(relative + (name,))
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise ValueError('directory')
+                observed.update(
+                    directory_inode_snapshot(child, relative + (name,))
+                )
+                closed = os.fstat(child)
+                if (
+                    closed.st_dev != opened.st_dev
+                    or closed.st_ino != opened.st_ino
+                ):
+                    raise ValueError('directory')
+                observed[logical] = inode_record(closed, 'directory')
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or opened.st_nlink != 1
+                ):
+                    raise ValueError('regular')
+                observed[logical] = inode_record(opened, 'regular')
+            finally:
+                os.close(child)
+        else:
+            raise ValueError('regular')
+    return observed
 
 def publish_noreplace(source, destination, source_fd):
     if source.parent != ROOT or destination.parent != ROOT:
@@ -4080,9 +4154,9 @@ def backup(value):
         raise ValueError('baseline_source')
     pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
-    pending_fd = open_root_relative(pending)
-    live_fd = staged_fd = package_fd = source_fd = None
+    pending_fd = live_fd = staged_fd = package_fd = source_fd = None
     try:
+        pending_fd = open_root_relative(pending)
         os.mkdir('integration', mode=0o700, dir_fd=pending_fd)
         live_fd = open_root_relative(INTEGRATION)
         staged_fd = open_relative_directory(pending_fd, ('integration',))
@@ -4119,7 +4193,7 @@ def backup(value):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        sync_directory_fd(pending_fd)
+        synced_inodes = sync_directory_fd(pending_fd)
         if read_backup_identity_fd(value, pending_fd) != metadata:
             raise ValueError('backup_identity')
         package_fd = publish_noreplace(pending, BACKUP, pending_fd)
@@ -4129,7 +4203,11 @@ def backup(value):
         source_fd = open_relative_directory(package_fd, ('integration',))
         published = inventory_deployment_fd(source_fd)
         assert_root_relative_identity(BACKUP, package_fd)
-        if published_identity != metadata or published != expected:
+        if (
+            published_identity != metadata
+            or published != expected
+            or directory_inode_snapshot(package_fd) != synced_inodes
+        ):
             raise ValueError('backup_publication')
         return {
             'success': True,
@@ -4151,7 +4229,8 @@ def backup(value):
             os.close(staged_fd)
         if live_fd is not None:
             os.close(live_fd)
-        os.close(pending_fd)
+        if pending_fd is not None:
+            os.close(pending_fd)
         if pending is not None:
             remove(pending)
 

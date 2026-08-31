@@ -6133,9 +6133,9 @@ def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        sync_directory_fd(pending_fd)\n"
+            "        synced_inodes = sync_directory_fd(pending_fd)\n"
             "        if read_backup_identity_fd(value, pending_fd) != metadata:\n": (
-                "        sync_directory_fd(pending_fd)\n"
+                "        synced_inodes = sync_directory_fd(pending_fd)\n"
                 "        moved = pending.with_name(pending.name + '.swapped')\n"
                 "        pending.rename(moved)\n"
                 "        shutil.copytree(moved, pending)\n"
@@ -6148,12 +6148,39 @@ def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
+def test_r36_backup_rejects_child_swap_after_bound_recursive_fsync(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "        synced_inodes = sync_directory_fd(pending_fd)\n"
+            "        if read_backup_identity_fd(value, pending_fd) != metadata:\n": (
+                "        synced_inodes = sync_directory_fd(pending_fd)\n"
+                "        child = pending / 'integration'\n"
+                "        moved = pending / 'integration.swapped'\n"
+                "        child.rename(moved)\n"
+                "        shutil.copytree(moved, child)\n"
+                "        if read_backup_identity_fd(value, pending_fd) != metadata:\n"
+            )
+        },
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+
+
 @pytest.mark.parametrize(
     ("source_replacements", "published"),
     (
         (
             {
-                "        sync_directory_fd(pending_fd)\n": (
+                "        synced_inodes = sync_directory_fd(pending_fd)\n": (
                     "        raise OSError(5, 'synthetic file fsync')\n"
                 )
             },
