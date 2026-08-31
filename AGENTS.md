@@ -110,6 +110,25 @@ and outside the parent directory containing canonical project roots.
 - Keep device-scoped security material private, mode-restricted, and fail
   closed; never introduce a product-wide fallback.
 
+## Proportionality and scope
+
+- The lock integrations in this project are used for interior doors within a
+  building.
+- Keep engineering and validation proportional to the requested functionality
+  and the concrete demonstrated defect.
+- Do not automatically expand scoped work into broad hardening, fuzzing,
+  mutation, adversarial, filesystem-race, or theoretical edge-case campaigns.
+- Add analysis or tests beyond the requested scope only when the user explicitly
+  requests them or they are needed to reproduce or close a concrete defect.
+- Preserve established invariants while prioritizing functionality,
+  deterministic regressions, compatibility, state consistency, recovery
+  behavior, and maintainability.
+- A theoretical possibility is not a new blocking requirement unless it
+  violates an explicit project contract or has a concrete reproducer.
+- After the scoped defect and its relevant regressions are resolved, stop rather
+  than automatically opening another assurance cycle.
+- Ask the user before materially expanding scope.
+
 ## Validation and commits
 
 - Run Black before committing.
