@@ -6121,14 +6121,40 @@ def test_r36_backup_publication_crash_has_no_split_identity_state(
         ) == {"error_class": "OPERATION_FAILED"}
 
 
+def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "        sync_directory_fd(pending_fd)\n"
+            "        if read_backup_identity_fd(value, pending_fd) != metadata:\n": (
+                "        sync_directory_fd(pending_fd)\n"
+                "        moved = pending.with_name(pending.name + '.swapped')\n"
+                "        pending.rename(moved)\n"
+                "        shutil.copytree(moved, pending)\n"
+                "        if read_backup_identity_fd(value, pending_fd) != metadata:\n"
+            )
+        },
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
 @pytest.mark.parametrize(
     ("source_replacements", "published"),
     (
         (
             {
-                "def sync_tree(root):\n": (
-                    "def sync_tree(root):\n"
-                    "    raise OSError(5, 'synthetic file fsync')\n"
+                "        sync_directory_fd(pending_fd)\n": (
+                    "        raise OSError(5, 'synthetic file fsync')\n"
                 )
             },
             False,

@@ -4080,11 +4080,14 @@ def backup(value):
         raise ValueError('baseline_source')
     pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
-    pending_fd = package_fd = source_fd = None
+    pending_fd = open_root_relative(pending)
+    live_fd = staged_fd = package_fd = source_fd = None
     try:
-        (pending / 'integration').mkdir(mode=0o700)
-        copy_deployment(INTEGRATION, pending / 'integration', expected)
-        after = inventory_deployment(pending / 'integration')
+        os.mkdir('integration', mode=0o700, dir_fd=pending_fd)
+        live_fd = open_root_relative(INTEGRATION)
+        staged_fd = open_relative_directory(pending_fd, ('integration',))
+        copy_deployment_fd(live_fd, staged_fd, expected)
+        after = inventory_deployment_fd(staged_fd)
         if before != after or after != expected:
             raise ValueError('backup_manifest')
         identity = inventory_identity(after)
@@ -4099,12 +4102,12 @@ def backup(value):
             **identity,
         }
         metadata['backup_digest'] = backup_digest(metadata)
-        metadata_path = pending / BACKUP_METADATA_NAME
         payload = json.dumps(metadata, sort_keys=True, separators=(',', ':')).encode('ascii')
         descriptor = os.open(
-            metadata_path,
+            BACKUP_METADATA_NAME,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
+            dir_fd=pending_fd,
         )
         try:
             offset = 0
@@ -4116,8 +4119,7 @@ def backup(value):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        sync_tree(pending)
-        pending_fd = open_root_relative(pending)
+        sync_directory_fd(pending_fd)
         if read_backup_identity_fd(value, pending_fd) != metadata:
             raise ValueError('backup_identity')
         package_fd = publish_noreplace(pending, BACKUP, pending_fd)
@@ -4145,8 +4147,11 @@ def backup(value):
             os.close(source_fd)
         if package_fd is not None:
             os.close(package_fd)
-        if pending_fd is not None:
-            os.close(pending_fd)
+        if staged_fd is not None:
+            os.close(staged_fd)
+        if live_fd is not None:
+            os.close(live_fd)
+        os.close(pending_fd)
         if pending is not None:
             remove(pending)
 
