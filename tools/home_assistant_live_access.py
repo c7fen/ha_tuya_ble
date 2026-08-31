@@ -924,6 +924,8 @@ class SourceInventoryResult:
 class CurrentSourceInventoryResult:
     classification: CurrentSourceClassification
     evidence: SourceInventoryResult | None = None
+    failure_stage: DispatchFailureStage | None = None
+    failure_class: DispatchFailureClass | None = None
 
 
 def _source_inventory_exact(result: object, expected_count: int) -> bool:
@@ -5904,9 +5906,14 @@ class PrivateInteractiveSessionBroker:
                 return CurrentSourceInventoryResult(
                     CurrentSourceClassification.EXACT_PR45, candidate_result
                 )
-        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError) as error:
+            failure = _bounded_dispatch_failure(
+                DispatchFailureStage.UNKNOWN, error
+            )
             return CurrentSourceInventoryResult(
-                CurrentSourceClassification.INDETERMINATE
+                CurrentSourceClassification.INDETERMINATE,
+                failure_stage=failure.stage,
+                failure_class=failure.failure_class,
             )
         return CurrentSourceInventoryResult(CurrentSourceClassification.OTHER)
 
@@ -6274,10 +6281,19 @@ def _inspect_current_source(
             restore_manifest,
             _capability=capability,
         )
-    except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
-        return CurrentSourceInventoryResult(CurrentSourceClassification.INDETERMINATE)
+    except (SessionBrokerError, SourceBundleError, TypeError, ValueError) as error:
+        failure = _bounded_dispatch_failure(DispatchFailureStage.UNKNOWN, error)
+        return CurrentSourceInventoryResult(
+            CurrentSourceClassification.INDETERMINATE,
+            failure_stage=failure.stage,
+            failure_class=failure.failure_class,
+        )
     if not isinstance(result, CurrentSourceInventoryResult):
-        return CurrentSourceInventoryResult(CurrentSourceClassification.INDETERMINATE)
+        return CurrentSourceInventoryResult(
+            CurrentSourceClassification.INDETERMINATE,
+            failure_stage=DispatchFailureStage.RESULT_VALIDATION,
+            failure_class=DispatchFailureClass.SCHEMA,
+        )
     return result
 
 

@@ -239,6 +239,9 @@ the state-neutral current-source inventory. Only an `EXACT_PR41` result may be
 followed by explicit terminal retirement; then close the handle and create a
 fresh lifecycle later. For `EXACT_PR45`, `OTHER`, or `INDETERMINATE`, retain the
 terminal rather than retiring it merely to start over.
+When retained-terminal current-source inspection returns `INDETERMINATE`, report
+its bounded `failure_stage` and `failure_class`, do not retire the terminal, and
+stop for targeted diagnosis.
 
 This continuity guarantee assumes that the independently stored anchor remains
 when the journal alone is lost. If an external actor destroys or corrupts both

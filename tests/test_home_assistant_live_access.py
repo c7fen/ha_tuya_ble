@@ -1008,6 +1008,7 @@ def _synthetic_r30_source_authorities(
                 "test_r36_",
                 "test_r44_",
                 "test_r47_",
+                "test_r50_",
             )
         ),
     )
@@ -1020,6 +1021,7 @@ def _synthetic_r30_source_authorities(
             "test_r36_",
             "test_r44_",
             "test_r47_",
+            "test_r50_",
         )
     ):
         return
@@ -7095,12 +7097,21 @@ def test_r47_production_retained_terminal_inspection_is_state_neutral() -> None:
     before_root_entries = set(root.iterdir())
     before_record = json.loads(before_journal)
     inspection_broker = _r47_inspection_broker()
+    inspection_broker.queue(
+        "current_source_inventory",
+        access._DispatchFailure(
+            access.DispatchFailureStage.RESPONSE_WAIT,
+            access.DispatchFailureClass.TIMEOUT,
+        ),
+    )
     inspector = access.RetainedTerminalLifecycleInspector(inspection_broker)
     before_metadata = inspector.metadata
 
     result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
 
-    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is access.DispatchFailureStage.RESPONSE_WAIT
+    assert result.failure_class is access.DispatchFailureClass.TIMEOUT
     assert inspector.metadata == before_metadata
     assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
     assert journal_path.read_bytes() == before_journal
@@ -7127,6 +7138,11 @@ def test_r47_production_retained_terminal_inspection_is_state_neutral() -> None:
         )
     )
     assert [name for name, _ in inspection_broker.calls] == ["current_source_inventory"]
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_terminal()
     inspector.close()
 
 
@@ -7293,6 +7309,85 @@ def test_r44_real_current_source_inventory_has_four_bounded_outcomes(
             access.CurrentSourceClassification.EXACT_PR45,
         }
     )
+    if classification is access.CurrentSourceClassification.INDETERMINATE:
+        assert result.failure_stage is access.DispatchFailureStage.UNKNOWN
+        assert result.failure_class is access.DispatchFailureClass.TIMEOUT
+    else:
+        assert result.failure_stage is None
+        assert result.failure_class is None
+    controller.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_location", "expected_stage", "expected_class"),
+    (
+        (
+            "control",
+            access.DispatchFailureStage.CONTROL_PROGRAM,
+            access.DispatchFailureClass.CHILD_EXIT,
+        ),
+        (
+            "wait",
+            access.DispatchFailureStage.RESPONSE_WAIT,
+            access.DispatchFailureClass.TIMEOUT,
+        ),
+        (
+            "parse",
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.DispatchFailureClass.FRAMING,
+        ),
+    ),
+)
+def test_r50_current_source_inventory_preserves_bounded_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_location: str,
+    expected_stage: access.DispatchFailureStage,
+    expected_class: access.DispatchFailureClass,
+) -> None:
+    broker = _r32_unbound_real_broker()
+    controller = access.FullPreflightLifecycleController(broker)
+    candidate, restore = _r32_bundles()
+    if failure_location == "control":
+
+        def write(_packet: object) -> None:
+            raise access.SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"
+            )
+
+        monkeypatch.setattr(
+            broker, "_PrivateInteractiveSessionBroker__write_wire", write
+        )
+        monkeypatch.setattr(broker, "_read_until", lambda *_args, **_kwargs: b"")
+    elif failure_location == "wait":
+        reads = 0
+
+        def read(*_args: object, **_kwargs: object) -> bytes:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise access.SessionBrokerError(
+                    "PRIVATE_INTERACTIVE_SESSION_TIMEOUT"
+                )
+            return b""
+
+        monkeypatch.setattr(
+            broker,
+            "_PrivateInteractiveSessionBroker__write_wire",
+            lambda _packet: None,
+        )
+        monkeypatch.setattr(broker, "_read_until", read)
+    else:
+        monkeypatch.setattr(
+            broker,
+            "_PrivateInteractiveSessionBroker__execute_bounded_operation",
+            lambda *_args, **_kwargs: b"synthetic malformed response",
+        )
+
+    result = controller.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is expected_stage
+    assert result.failure_class is expected_class
     controller.close()
 
 
