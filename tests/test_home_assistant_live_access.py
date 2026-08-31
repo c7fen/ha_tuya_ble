@@ -2157,8 +2157,8 @@ def test_r30_backup_post_exchange_failure_requires_separate_reconciliation(
         "restore_backup",
         _r36_backup_payload(),
         source_replacements={
-            "        installed = inventory_targets()\n": (
-                "        raise ValueError('synthetic_after_exchange')\n"
+            "            installed = inventory_deployment_fd(installed_fd)\n": (
+                "            raise ValueError('synthetic_after_exchange')\n"
             )
         },
     )
@@ -2262,14 +2262,16 @@ def test_r33_s_fallback_process_loss_is_reconciled_without_blind_replay(
     )["manifest_match"]
     replacements = {
         "before_exchange": {
-            "    write_fallback_phase('intent_recorded', identity)\n": (
-                "    write_fallback_phase('intent_recorded', identity)\n"
-                "    os._exit(91)\n"
+            "        write_fallback_phase('intent_recorded', identity)\n"
+            "        pending = ROOT / ": (
+                "        write_fallback_phase('intent_recorded', identity)\n"
+                "        os._exit(91)\n"
+                "        pending = ROOT / "
             )
         },
         "after_exchange": {
-            "            exchange(pending, INTEGRATION)\n": (
-                "            exchange(pending, INTEGRATION)\n"
+            "            installed_fd = publish_directory_bound(pending, INTEGRATION)\n": (
+                "            installed_fd = publish_directory_bound(pending, INTEGRATION)\n"
                 "            os._exit(91)\n"
             )
         },
@@ -2324,7 +2326,7 @@ def test_r36_fallback_exchange_requires_live_parent_directory_fsync(
         "restore_backup",
         payload,
         source_replacements={
-            "        sync_directory(INTEGRATION.parent)\n": (
+            "        os.fsync(destination_parent)\n": (
                 "        raise OSError(5, 'synthetic live parent fsync')\n"
             )
         },
@@ -2338,6 +2340,91 @@ def test_r36_fallback_exchange_requires_live_parent_directory_fsync(
     reconciled = _run_synthetic_remote_program(tmp_path, "reconcile_backup", payload)
     assert reconciled["phase"] == "reconciled"
     assert reconciled["restoration_applied"] is True
+
+
+def test_r36_fallback_rejects_backup_package_path_swap_before_exchange(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    original = b"synthetic integration source\n"
+    (integration / "__init__.py").write_bytes(original)
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    payload = _r36_backup_payload()
+    assert _run_synthetic_remote_program(tmp_path, "backup", payload)["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path, "transfer", access._bundle_payload(candidate)
+    )["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path,
+        "install",
+        {"manifest": access._manifest_payload(candidate.manifest)},
+    )["manifest_match"]
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        "restore_backup",
+        payload,
+        source_replacements={
+            "        identity = read_backup_identity_fd(value, package_fd)\n": (
+                "        identity = read_backup_identity_fd(value, package_fd)\n"
+                "        moved = BACKUP.with_name(BACKUP.name + '.swapped')\n"
+                "        BACKUP.rename(moved)\n"
+                "        shutil.copytree(moved, BACKUP)\n"
+                "        (BACKUP / 'integration' / '__init__.py').write_bytes("
+                "b'synthetic hostile package\\n')\n"
+            )
+        },
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+    assert (integration / "__init__.py").read_bytes() == original
+    assert (integration / ".phase_a_tools").is_dir()
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup.consumed").exists()
+
+
+def test_r36_fallback_rejects_live_parent_swap_before_durable_sync(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    payload = _r36_backup_payload()
+    assert _run_synthetic_remote_program(tmp_path, "backup", payload)["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path, "transfer", access._bundle_payload(candidate)
+    )["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path,
+        "install",
+        {"manifest": access._manifest_payload(candidate.manifest)},
+    )["manifest_match"]
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        "restore_backup",
+        payload,
+        source_replacements={
+            "        os.fsync(source_parent)\n": (
+                "        if destination == INTEGRATION:\n"
+                "            displaced = ROOT / 'synthetic-displaced-parent'\n"
+                "            destination.parent.rename(displaced)\n"
+                "            destination.parent.mkdir(mode=0o700)\n"
+                "        os.fsync(source_parent)\n"
+            )
+        },
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+    marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
+    assert json.loads(marker.read_text(encoding="ascii"))["phase"] == (
+        "possibly_applied"
+    )
 
 
 def test_r33_s_controller_uses_distinct_fallback_reconciliation_permit() -> None:
@@ -6151,6 +6238,26 @@ def test_r36_stable_root_rejects_lock_and_journal_symlinks(
 
     with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
         access._DurableLifecycleJournal()
+
+
+def test_r36_failed_lock_admission_releases_stable_root_owner(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lifecycle"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "synthetic-target"
+    target.write_text("synthetic\n", encoding="ascii")
+    lock = root / access._LIFECYCLE_LOCK_NAME
+    lock.symlink_to(target)
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+
+    lock.unlink()
+    descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    journal = access._DurableLifecycleJournal()
+    journal.close()
 
 
 def test_r36_replacing_locked_filename_cannot_create_second_owner(

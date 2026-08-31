@@ -1152,9 +1152,9 @@ class _DurableLifecycleJournal:
         self._root_fd: int | None = None
         self._lock_fd: int | None = None
         self._closed = False
-        self._secure_directory()
-        self._acquire_lock()
         try:
+            self._secure_directory()
+            self._acquire_lock()
             newly_created = False
             anchor = self._read_anchor()
             record = self._read_record()
@@ -3336,6 +3336,7 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 ROOT = Path('/config')
+ROOT_FD = None
 INTEGRATION = ROOT / 'custom_components' / 'tuya_ble'
 HELPER = INTEGRATION / '.phase_a_tools'
 STAGE = ROOT / '.ha_tuya_ble_r30_stage'
@@ -3462,7 +3463,9 @@ def open_root_relative(path):
         parts = path.relative_to(ROOT).parts
     except ValueError:
         raise ValueError('root')
-    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if ROOT_FD is None:
+        raise ValueError('root')
+    descriptor = os.dup(ROOT_FD)
     try:
         for part in parts:
             if part in {'', '.', '..'}:
@@ -3493,6 +3496,27 @@ def replace_root_relative(source, destination):
         os.close(source_parent)
         os.close(destination_parent)
 
+def root_relative_exists(path):
+    parent = open_root_relative(path.parent)
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(parent)
+
+def assert_root_relative_identity(path, descriptor):
+    current = open_root_relative(path)
+    try:
+        expected = os.fstat(descriptor)
+        observed = os.fstat(current)
+        if expected.st_dev != observed.st_dev or expected.st_ino != observed.st_ino:
+            raise ValueError('directory')
+    finally:
+        os.close(current)
+
 def inventory_fd(descriptor, prefix, excluded_top=None, relative=()):
     observed = {}
     for name in sorted(os.listdir(descriptor)):
@@ -3507,6 +3531,13 @@ def inventory_fd(descriptor, prefix, excluded_top=None, relative=()):
                 dir_fd=descriptor,
             )
             try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise ValueError('directory')
                 observed.update(
                     inventory_fd(child, prefix, excluded_top, logical_parts)
                 )
@@ -3556,17 +3587,41 @@ def inventory_root(root, prefix, excluded_top=None):
     finally:
         os.close(descriptor)
 
+def inventory_deployment_fd(descriptor):
+    observed = inventory_fd(descriptor, 'integration', '.phase_a_tools')
+    try:
+        helper = open_relative_directory(descriptor, ('.phase_a_tools',))
+    except FileNotFoundError:
+        return observed
+    try:
+        observed.update(inventory_fd(helper, 'helper'))
+    finally:
+        os.close(helper)
+    return observed
+
 def inventory_targets():
-    return {
-        **inventory_root(INTEGRATION, 'integration', '.phase_a_tools'),
-        **inventory_root(HELPER, 'helper'),
-    }
+    try:
+        descriptor = open_root_relative(INTEGRATION)
+    except FileNotFoundError:
+        return {}
+    try:
+        observed = inventory_deployment_fd(descriptor)
+        assert_root_relative_identity(INTEGRATION, descriptor)
+        return observed
+    finally:
+        os.close(descriptor)
 
 def inventory_deployment(root):
-    return {
-        **inventory_root(root, 'integration', '.phase_a_tools'),
-        **inventory_root(root / '.phase_a_tools', 'helper'),
-    }
+    try:
+        descriptor = open_root_relative(root)
+    except FileNotFoundError:
+        return {}
+    try:
+        observed = inventory_deployment_fd(descriptor)
+        assert_root_relative_identity(root, descriptor)
+        return observed
+    finally:
+        os.close(descriptor)
 
 def open_relative_directory(descriptor, parts, create=False):
     current = os.dup(descriptor)
@@ -3591,70 +3646,73 @@ def open_relative_directory(descriptor, parts, create=False):
         os.close(current)
         raise
 
+def copy_deployment_fd(source_fd, destination_fd, expected):
+    for logical in sorted(expected):
+        prefix, relative = logical.split('/', 1)
+        parts = PurePosixPath(relative).parts
+        if prefix == 'helper':
+            parts = ('.phase_a_tools',) + parts
+        elif prefix != 'integration':
+            raise ValueError('path')
+        source_parent = open_relative_directory(source_fd, parts[:-1])
+        destination_parent = open_relative_directory(
+            destination_fd, parts[:-1], create=True
+        )
+        try:
+            source_file = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent
+            )
+            destination_file = None
+            try:
+                destination_file = os.open(
+                    parts[-1],
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=destination_parent,
+                )
+                source_metadata = os.fstat(source_file)
+                if (
+                    not stat.S_ISREG(source_metadata.st_mode)
+                    or source_metadata.st_nlink != 1
+                ):
+                    raise ValueError('regular')
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = os.read(source_file, 65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+                    offset = 0
+                    while offset < len(chunk):
+                        written = os.write(destination_file, chunk[offset:])
+                        if written <= 0:
+                            raise OSError(errno.EIO, 'short_write')
+                        offset += written
+                os.fchmod(destination_file, 0o600)
+                os.fsync(destination_file)
+                after = os.fstat(source_file)
+                if (
+                    after.st_dev != source_metadata.st_dev
+                    or after.st_ino != source_metadata.st_ino
+                    or after.st_size != size
+                    or (size, digest.hexdigest()) != expected[logical]
+                ):
+                    raise ValueError('manifest')
+            finally:
+                os.close(source_file)
+                if destination_file is not None:
+                    os.close(destination_file)
+        finally:
+            os.close(source_parent)
+            os.close(destination_parent)
+
 def copy_deployment(source, destination, expected):
     source_fd = open_root_relative(source)
     destination_fd = open_root_relative(destination)
     try:
-        for logical in sorted(expected):
-            prefix, relative = logical.split('/', 1)
-            parts = PurePosixPath(relative).parts
-            if prefix == 'helper':
-                parts = ('.phase_a_tools',) + parts
-            elif prefix != 'integration':
-                raise ValueError('path')
-            source_parent = open_relative_directory(source_fd, parts[:-1])
-            destination_parent = open_relative_directory(
-                destination_fd, parts[:-1], create=True
-            )
-            try:
-                source_file = os.open(
-                    parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent
-                )
-                destination_file = None
-                try:
-                    destination_file = os.open(
-                        parts[-1],
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=destination_parent,
-                    )
-                    source_metadata = os.fstat(source_file)
-                    if (
-                        not stat.S_ISREG(source_metadata.st_mode)
-                        or source_metadata.st_nlink != 1
-                    ):
-                        raise ValueError('regular')
-                    digest = hashlib.sha256()
-                    size = 0
-                    while True:
-                        chunk = os.read(source_file, 65536)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                        size += len(chunk)
-                        offset = 0
-                        while offset < len(chunk):
-                            written = os.write(destination_file, chunk[offset:])
-                            if written <= 0:
-                                raise OSError(errno.EIO, 'short_write')
-                            offset += written
-                    os.fchmod(destination_file, 0o600)
-                    os.fsync(destination_file)
-                    after = os.fstat(source_file)
-                    if (
-                        after.st_dev != source_metadata.st_dev
-                        or after.st_ino != source_metadata.st_ino
-                        or after.st_size != size
-                        or (size, digest.hexdigest()) != expected[logical]
-                    ):
-                        raise ValueError('manifest')
-                finally:
-                    os.close(source_file)
-                    if destination_file is not None:
-                        os.close(destination_file)
-            finally:
-                os.close(source_parent)
-                os.close(destination_parent)
+        copy_deployment_fd(source_fd, destination_fd, expected)
     finally:
         os.close(source_fd)
         os.close(destination_fd)
@@ -3685,10 +3743,12 @@ def inventory_identity(observed):
     }
 
 def sync_root():
-    sync_directory(ROOT)
+    if ROOT_FD is None:
+        raise ValueError('root')
+    os.fsync(ROOT_FD)
 
 def sync_directory(path):
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = open_root_relative(path)
     try:
         os.fsync(descriptor)
     finally:
@@ -3696,34 +3756,42 @@ def sync_directory(path):
 
 def write_private_json(path, value):
     pending = path.with_name(path.name + '.pending')
-    pending.unlink(missing_ok=True)
     payload = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
     if len(payload) > 4096:
         raise ValueError('private_state')
-    descriptor = os.open(
-        pending,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-    )
-    try:
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
-        os.fchmod(descriptor, 0o600)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    replace_root_relative(pending, path)
-    sync_root()
-
-def read_private_json(path, keys):
     parent = open_root_relative(path.parent)
     try:
+        try:
+            os.unlink(pending.name, dir_fd=parent)
+        except FileNotFoundError:
+            pass
         descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent
+            pending.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent,
         )
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(pending.name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+        sync_root()
     finally:
         os.close(parent)
+
+def read_private_json_fd(parent, name, keys):
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent
+        )
+    except OSError:
+        raise ValueError('private_state')
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -3754,6 +3822,13 @@ def read_private_json(path, keys):
     if not isinstance(value, dict) or set(value) != set(keys):
         raise ValueError('private_state')
     return value
+
+def read_private_json(path, keys):
+    parent = open_root_relative(path.parent)
+    try:
+        return read_private_json_fd(parent, path.name, keys)
+    finally:
+        os.close(parent)
 
 def validate_backup_context(value):
     base_keys = {
@@ -3791,9 +3866,10 @@ def backup_digest(value):
     canonical = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
     return hashlib.sha256(canonical).hexdigest()
 
-def read_backup_identity(context=None, package=BACKUP):
-    value = read_private_json(
-        package / BACKUP_METADATA_NAME,
+def read_backup_identity_fd(context, package_fd):
+    value = read_private_json_fd(
+        package_fd,
+        BACKUP_METADATA_NAME,
         {
             'schema_version', 'lifecycle_generation', 'source_generation',
             'source_state', 'pr41_commit', 'pr41_tree', 'backup_generation',
@@ -3833,6 +3909,13 @@ def read_backup_identity(context=None, package=BACKUP):
         raise ValueError('backup_identity')
     return value
 
+def read_backup_identity(context=None, package=BACKUP):
+    package_fd = open_root_relative(package)
+    try:
+        return read_backup_identity_fd(context, package_fd)
+    finally:
+        os.close(package_fd)
+
 def write_fallback_phase(phase, identity):
     if phase not in {'intent_recorded', 'possibly_applied', 'reconciled'}:
         raise ValueError('fallback_phase')
@@ -3845,7 +3928,7 @@ def write_fallback_phase(phase, identity):
         },
     )
 
-def read_fallback_phase():
+def read_fallback_phase(package_identity=None):
     value = read_private_json(
         BACKUP_CONSUMED, {'phase', 'file_count', 'manifest_identity'}
     )
@@ -3855,7 +3938,11 @@ def read_fallback_phase():
         'file_count': value['file_count'],
         'manifest_identity': value['manifest_identity'],
     }
-    package = read_backup_identity()
+    package = (
+        read_backup_identity()
+        if package_identity is None
+        else package_identity
+    )
     if (
         identity['file_count'] != package['file_count']
         or identity['manifest_identity'] != package['manifest_identity']
@@ -3880,6 +3967,13 @@ def sync_directory_fd(descriptor):
                 dir_fd=descriptor,
             )
             try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise ValueError('directory')
                 sync_directory_fd(child)
             finally:
                 os.close(child)
@@ -4088,6 +4182,72 @@ def exchange(left, right):
     finally:
         os.close(left_parent)
         os.close(right_parent)
+
+def publish_directory_bound(source, destination):
+    function = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
+    if function is None:
+        raise OSError(errno.ENOSYS, 'atomic_publish')
+    function.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+        ctypes.c_char_p, ctypes.c_uint
+    ]
+    function.restype = ctypes.c_int
+    source_parent = open_root_relative(source.parent)
+    destination_parent = open_root_relative(destination.parent)
+    source_fd = destination_fd = None
+    try:
+        source_fd = os.open(
+            source.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=source_parent,
+        )
+        source_identity = os.fstat(source_fd)
+        try:
+            destination_metadata = os.stat(
+                destination.name,
+                dir_fd=destination_parent,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            destination_metadata = None
+        if destination_metadata is not None and not stat.S_ISDIR(
+            destination_metadata.st_mode
+        ):
+            raise ValueError('directory')
+        flag = 2 if destination_metadata is not None else 1
+        if function(
+            source_parent,
+            os.fsencode(source.name),
+            destination_parent,
+            os.fsencode(destination.name),
+            flag,
+        ) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, 'atomic_publish')
+        os.fsync(source_parent)
+        os.fsync(destination_parent)
+        sync_root()
+        destination_fd = os.open(
+            destination.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=destination_parent,
+        )
+        installed_identity = os.fstat(destination_fd)
+        if (
+            installed_identity.st_dev != source_identity.st_dev
+            or installed_identity.st_ino != source_identity.st_ino
+        ):
+            raise ValueError('directory')
+        return destination_fd
+    except BaseException:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        raise
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        os.close(source_parent)
+        os.close(destination_parent)
 
 def mark_restore_consumed():
     descriptor = os.open(
@@ -4323,39 +4483,54 @@ def invoke_helper(value):
 
 def restore_backup(value):
     expected_manifest_value = validate_backup_context(value)
-    if BACKUP_CONSUMED.exists() or RESTORE_CONSUMED.exists():
-        raise ValueError('backup_consumed')
-    identity = read_backup_identity(value)
-    source = BACKUP / 'integration'
-    expected = inventory_deployment(source)
-    observed_identity = inventory_identity(expected)
-    if (
-        expected != expected_manifest_value
-        or observed_identity['file_count'] != identity['file_count']
-        or observed_identity['manifest_identity'] != identity['manifest_identity']
+    if root_relative_exists(BACKUP_CONSUMED) or root_relative_exists(
+        RESTORE_CONSUMED
     ):
-        raise ValueError('backup')
-    write_fallback_phase('intent_recorded', identity)
-    pending = ROOT / ('.ha_tuya_ble_r36_restore-' + os.urandom(16).hex())
+        raise ValueError('backup_consumed')
+    package_fd = open_root_relative(BACKUP)
+    source_fd = pending_fd = installed_fd = None
     try:
-        pending.mkdir(mode=0o700)
-        copy_deployment(source, pending, expected)
-        if inventory_deployment(pending) != expected:
-            raise ValueError('backup_restore')
-        sync_tree(pending)
-        write_fallback_phase('possibly_applied', identity)
-        if INTEGRATION.exists():
-            exchange(pending, INTEGRATION)
-        else:
-            replace_root_relative(pending, INTEGRATION)
-        sync_directory(INTEGRATION.parent)
-        sync_root()
-        installed = inventory_targets()
-        if installed != expected:
-            raise ValueError('backup_restore')
-        write_fallback_phase('reconciled', identity)
+        identity = read_backup_identity_fd(value, package_fd)
+        source_fd = open_relative_directory(package_fd, ('integration',))
+        expected = inventory_deployment_fd(source_fd)
+        observed_identity = inventory_identity(expected)
+        if (
+            expected != expected_manifest_value
+            or observed_identity['file_count'] != identity['file_count']
+            or observed_identity['manifest_identity'] != identity['manifest_identity']
+        ):
+            raise ValueError('backup')
+        assert_root_relative_identity(BACKUP, package_fd)
+        write_fallback_phase('intent_recorded', identity)
+        pending = ROOT / ('.ha_tuya_ble_r36_restore-' + os.urandom(16).hex())
+        try:
+            pending.mkdir(mode=0o700)
+            pending_fd = open_root_relative(pending)
+            copy_deployment_fd(source_fd, pending_fd, expected)
+            if inventory_deployment_fd(pending_fd) != expected:
+                raise ValueError('backup_restore')
+            sync_directory_fd(pending_fd)
+            assert_root_relative_identity(BACKUP, package_fd)
+            os.close(pending_fd)
+            pending_fd = None
+            write_fallback_phase('possibly_applied', identity)
+            installed_fd = publish_directory_bound(pending, INTEGRATION)
+            installed = inventory_deployment_fd(installed_fd)
+            if installed != expected:
+                raise ValueError('backup_restore')
+            assert_root_relative_identity(INTEGRATION, installed_fd)
+            assert_root_relative_identity(BACKUP, package_fd)
+            write_fallback_phase('reconciled', identity)
+        finally:
+            remove(pending)
     finally:
-        remove(pending)
+        if installed_fd is not None:
+            os.close(installed_fd)
+        if pending_fd is not None:
+            os.close(pending_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+        os.close(package_fd)
     return {
         'installation_success': True,
         'expected_file_count': len(expected),
@@ -4365,19 +4540,27 @@ def restore_backup(value):
 
 def reconcile_backup(value):
     expected = validate_backup_context(value)
-    package_identity = read_backup_identity(value)
-    _phase, identity = read_fallback_phase()
-    source = BACKUP / 'integration'
-    packaged = inventory_deployment(source)
-    observed_identity = inventory_identity(packaged)
-    if (
-        packaged != expected
-        or observed_identity['file_count'] != package_identity['file_count']
-        or observed_identity['manifest_identity'] != package_identity['manifest_identity']
-        or identity['file_count'] != package_identity['file_count']
-        or identity['manifest_identity'] != package_identity['manifest_identity']
-    ):
-        raise ValueError('backup_reconciliation')
+    package_fd = open_root_relative(BACKUP)
+    source_fd = None
+    try:
+        package_identity = read_backup_identity_fd(value, package_fd)
+        _phase, identity = read_fallback_phase(package_identity)
+        source_fd = open_relative_directory(package_fd, ('integration',))
+        packaged = inventory_deployment_fd(source_fd)
+        observed_identity = inventory_identity(packaged)
+        if (
+            packaged != expected
+            or observed_identity['file_count'] != package_identity['file_count']
+            or observed_identity['manifest_identity'] != package_identity['manifest_identity']
+            or identity['file_count'] != package_identity['file_count']
+            or identity['manifest_identity'] != package_identity['manifest_identity']
+        ):
+            raise ValueError('backup_reconciliation')
+        assert_root_relative_identity(BACKUP, package_fd)
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        os.close(package_fd)
     live = inventory_targets()
     live_identity = inventory_identity(live)['manifest_identity']
     live_matches = live == expected
@@ -4394,6 +4577,10 @@ def reconcile_backup(value):
         'file_count': len(live),
     }
 
+ROOT_FD = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+root_metadata = os.fstat(ROOT_FD)
+if not stat.S_ISDIR(root_metadata.st_mode):
+    raise ValueError('root')
 value = receive()
 operation = sys.argv[1]
 try:
