@@ -138,6 +138,38 @@ class DispatchFailureClass(StrEnum):
     UNKNOWN = "unknown"
 
 
+class RemoteFailureScope(StrEnum):
+    """Fixed remote boundary that rejected or failed an operation."""
+
+    BOOTSTRAP = "BOOTSTRAP"
+    ROOT = "ROOT"
+    REQUEST = "REQUEST"
+    SOURCE_INVENTORY = "SOURCE_INVENTORY"
+    BACKUP = "BACKUP"
+    TRANSFER = "TRANSFER"
+    INSTALL = "INSTALL"
+    RESTORE = "RESTORE"
+    CORE = "CORE"
+    PHASE_A = "PHASE_A"
+    OTHER = "OTHER"
+
+
+class RemoteFailureReason(StrEnum):
+    """Fixed remote rejection or failure reason with no private detail."""
+
+    ROOT = "ROOT"
+    PAYLOAD = "PAYLOAD"
+    AUTHORITY = "AUTHORITY"
+    MANIFEST = "MANIFEST"
+    PATH = "PATH"
+    DIRECTORY = "DIRECTORY"
+    REGULAR_FILE = "REGULAR_FILE"
+    FILESYSTEM = "FILESYSTEM"
+    PRIVATE_STATE = "PRIVATE_STATE"
+    VALIDATION = "VALIDATION"
+    UNKNOWN = "UNKNOWN"
+
+
 class SourceState(StrEnum):
     """The two exact repository authorities accepted by the control plane."""
 
@@ -651,15 +683,30 @@ class SessionBrokerError(RuntimeError):
     """A failure that intentionally never includes captured PTY bytes."""
 
 
+class _RemoteOperationFailure(SessionBrokerError):
+    """One exact bounded remote failure with no free-form detail."""
+
+    def __init__(self, scope: RemoteFailureScope, reason: RemoteFailureReason) -> None:
+        super().__init__("PRIVATE_INTERACTIVE_SESSION_REMOTE_OPERATION_FAILED")
+        self.scope = scope
+        self.reason = reason
+
+
 class _DispatchFailure(SessionBrokerError):
     """A sanitized bounded dispatch failure with no exception text."""
 
     def __init__(
-        self, stage: DispatchFailureStage, failure_class: DispatchFailureClass
+        self,
+        stage: DispatchFailureStage,
+        failure_class: DispatchFailureClass,
+        remote_failure_scope: RemoteFailureScope | None = None,
+        remote_failure_reason: RemoteFailureReason | None = None,
     ) -> None:
         super().__init__("PRIVATE_INTERACTIVE_SESSION_DISPATCH_FAILED")
         self.stage = stage
         self.failure_class = failure_class
+        self.remote_failure_scope = remote_failure_scope
+        self.remote_failure_reason = remote_failure_reason
 
 
 def _bounded_dispatch_failure(
@@ -668,7 +715,13 @@ def _bounded_dispatch_failure(
     """Discard exception text and retain only one fixed diagnostic class."""
     if isinstance(error, _DispatchFailure):
         return error
-    if isinstance(error, SessionBrokerError):
+    remote_failure_scope = None
+    remote_failure_reason = None
+    if isinstance(error, _RemoteOperationFailure):
+        failure_class = DispatchFailureClass.REMOTE_OPERATION
+        remote_failure_scope = error.scope
+        remote_failure_reason = error.reason
+    elif isinstance(error, SessionBrokerError):
         error_code = (
             error.args[0]
             if len(error.args) == 1 and isinstance(error.args[0], str)
@@ -693,7 +746,12 @@ def _bounded_dispatch_failure(
         failure_class = DispatchFailureClass.IO
     else:
         failure_class = DispatchFailureClass.UNKNOWN
-    return _DispatchFailure(stage, failure_class)
+    return _DispatchFailure(
+        stage,
+        failure_class,
+        remote_failure_scope,
+        remote_failure_reason,
+    )
 
 
 class SourceBundleError(ValueError):
@@ -930,6 +988,8 @@ class CurrentSourceInventoryResult:
     evidence: SourceInventoryResult | None = None
     failure_stage: DispatchFailureStage | None = None
     failure_class: DispatchFailureClass | None = None
+    remote_failure_scope: RemoteFailureScope | None = None
+    remote_failure_reason: RemoteFailureReason | None = None
 
 
 def _source_inventory_exact(result: object, expected_count: int) -> bool:
@@ -1984,6 +2044,15 @@ class _DurableLifecycleJournal:
                         frozenset(
                             base_operation_keys | {"failure_stage", "failure_class"}
                         ),
+                        frozenset(
+                            base_operation_keys
+                            | {
+                                "failure_stage",
+                                "failure_class",
+                                "remote_failure_scope",
+                                "remote_failure_reason",
+                            }
+                        ),
                     }
                 )
                 if type(operation) is dict:
@@ -2010,6 +2079,9 @@ class _DurableLifecycleJournal:
                     )
                     has_failure = "failure_stage" in operation
                     invalid = invalid or has_failure != ("failure_class" in operation)
+                    has_remote_scope = "remote_failure_scope" in operation
+                    has_remote_reason = "remote_failure_reason" in operation
+                    invalid = invalid or has_remote_scope != has_remote_reason
                     if has_failure:
                         invalid = invalid or operation.get("phase") != "ambiguous"
                         invalid = invalid or operation.get("failure_stage") not in {
@@ -2018,6 +2090,17 @@ class _DurableLifecycleJournal:
                         invalid = invalid or operation.get("failure_class") not in {
                             item.value for item in DispatchFailureClass
                         }
+                    if has_remote_scope:
+                        invalid = (
+                            invalid
+                            or not has_failure
+                            or operation.get("failure_class")
+                            != DispatchFailureClass.REMOTE_OPERATION.value
+                            or operation.get("remote_failure_scope")
+                            not in {item.value for item in RemoteFailureScope}
+                            or operation.get("remote_failure_reason")
+                            not in {item.value for item in RemoteFailureReason}
+                        )
             if type(record.get("consumed_operations")) is list:
                 invalid = invalid or seen != set(record["consumed_operations"])
             evidence_actions: list[object] = []
@@ -2410,6 +2493,8 @@ class _DurableLifecycleJournal:
             if phase != "ambiguous":
                 matches[0].pop("failure_stage", None)
                 matches[0].pop("failure_class", None)
+                matches[0].pop("remote_failure_scope", None)
+                matches[0].pop("remote_failure_reason", None)
             if action in {
                 LifecycleAction.BACKUP_FALLBACK,
                 LifecycleAction.BACKUP_FALLBACK_RECONCILE,
@@ -2442,7 +2527,19 @@ class _DurableLifecycleJournal:
         action: LifecycleAction,
         stage: DispatchFailureStage = DispatchFailureStage.UNKNOWN,
         failure_class: DispatchFailureClass = DispatchFailureClass.UNKNOWN,
+        remote_failure_scope: RemoteFailureScope | None = None,
+        remote_failure_reason: RemoteFailureReason | None = None,
     ) -> None:
+        if (remote_failure_scope is None) != (remote_failure_reason is None) or (
+            remote_failure_scope is not None
+            and (
+                failure_class is not DispatchFailureClass.REMOTE_OPERATION
+                or not isinstance(remote_failure_scope, RemoteFailureScope)
+                or not isinstance(remote_failure_reason, RemoteFailureReason)
+            )
+        ):
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+
         def mutate(record: dict[str, object]) -> None:
             matches = [
                 operation
@@ -2454,6 +2551,9 @@ class _DurableLifecycleJournal:
             matches[0]["phase"] = "ambiguous"
             matches[0]["failure_stage"] = stage.value
             matches[0]["failure_class"] = failure_class.value
+            if remote_failure_scope is not None and remote_failure_reason is not None:
+                matches[0]["remote_failure_scope"] = remote_failure_scope.value
+                matches[0]["remote_failure_reason"] = remote_failure_reason.value
             record["ambiguous_operation"] = action.value
             record["recovery_mode"] = True
             record["rollback_mode"] = True
@@ -2954,10 +3054,19 @@ def _exact_payload(private_output: bytes) -> dict[str, Any]:
         payload = _strict_json_loads(extracted)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
-    if payload == {"error_class": "OPERATION_FAILED"}:
-        raise SessionBrokerError(
-            "PRIVATE_INTERACTIVE_SESSION_REMOTE_OPERATION_FAILED"
-        ) from None
+    if (
+        isinstance(payload, dict)
+        and "error_class" in payload
+        and payload["error_class"] == "OPERATION_FAILED"
+    ):
+        if set(payload) != {"error_class", "error_scope", "error_reason"}:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        try:
+            scope = RemoteFailureScope(payload["error_scope"])
+            reason = RemoteFailureReason(payload["error_reason"])
+        except (TypeError, ValueError):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        raise _RemoteOperationFailure(scope, reason) from None
     if not isinstance(payload, dict) or "error_class" in payload:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     return payload
@@ -3596,6 +3705,67 @@ COUNTERS = {
     'datapoint_protocol_packets', 'other_packets', 'reconnect_schedules',
     'disconnects',
 }
+
+REMOTE_SCOPES = {
+    'BOOTSTRAP', 'ROOT', 'REQUEST', 'SOURCE_INVENTORY', 'BACKUP', 'TRANSFER',
+    'INSTALL', 'RESTORE', 'CORE', 'PHASE_A', 'OTHER',
+}
+REMOTE_REASONS = {
+    'ROOT', 'PAYLOAD', 'AUTHORITY', 'MANIFEST', 'PATH', 'DIRECTORY',
+    'REGULAR_FILE', 'FILESYSTEM', 'PRIVATE_STATE', 'VALIDATION', 'UNKNOWN',
+}
+REMOTE_REASON_BY_TOKEN = {
+    'root': 'ROOT',
+    'authority': 'AUTHORITY',
+    'manifest': 'MANIFEST',
+    'fingerprint': 'MANIFEST',
+    'helper': 'MANIFEST',
+    'path': 'PATH',
+    'directory': 'DIRECTORY',
+    'regular': 'REGULAR_FILE',
+    'private_state': 'PRIVATE_STATE',
+    'backup_identity': 'PRIVATE_STATE',
+    'fallback_phase': 'PRIVATE_STATE',
+}
+
+def remote_error(scope, reason):
+    if scope not in REMOTE_SCOPES:
+        scope = 'OTHER'
+    if reason not in REMOTE_REASONS:
+        reason = 'UNKNOWN'
+    return {
+        'error_class': 'OPERATION_FAILED',
+        'error_scope': scope,
+        'error_reason': reason,
+    }
+
+def operation_scope(operation):
+    return {
+        'backup': 'BACKUP',
+        'reconcile_backup_creation': 'BACKUP',
+        'transfer': 'TRANSFER',
+        'install': 'INSTALL',
+        'source_inventory': 'SOURCE_INVENTORY',
+        'core_check': 'CORE',
+        'restart_core': 'CORE',
+        'core_readiness': 'CORE',
+        'service_inventory': 'CORE',
+        'phase_a_helper': 'PHASE_A',
+        'restore': 'RESTORE',
+        'restore_backup': 'RESTORE',
+        'reconcile_backup': 'RESTORE',
+    }.get(operation, 'OTHER')
+
+def operation_reason(error):
+    if isinstance(error, OSError):
+        return 'FILESYSTEM'
+    if (
+        isinstance(error, ValueError)
+        and len(error.args) == 1
+        and isinstance(error.args[0], str)
+    ):
+        return REMOTE_REASON_BY_TOKEN.get(error.args[0], 'VALIDATION')
+    return 'UNKNOWN'
 
 def reject_duplicate_pairs(pairs):
     value = {}
@@ -5170,44 +5340,52 @@ def reconcile_backup(value):
         'file_count': len(live),
     }
 
-ROOT_FD = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-root_metadata = os.fstat(ROOT_FD)
-if not stat.S_ISDIR(root_metadata.st_mode):
-    raise ValueError('root')
-value = receive()
 operation = sys.argv[1]
 try:
-    if operation == 'backup':
-        result = backup(value)
-    elif operation == 'reconcile_backup_creation':
-        result = reconcile_backup_creation(value)
-    elif operation == 'transfer':
-        result = transfer(value)
-    elif operation == 'install':
-        result = activate(value)
-    elif operation == 'source_inventory':
-        _, expected = expected_manifest(value)
-        result = inventory_result(expected, inventory_targets())
-    elif operation == 'core_check':
-        result = core_check()
-    elif operation == 'restart_core':
-        result = restart_core()
-    elif operation == 'core_readiness':
-        result = readiness()
-    elif operation == 'service_inventory':
-        result = service_inventory(value['expectation'])
-    elif operation == 'phase_a_helper':
-        result = invoke_helper(value)
-    elif operation == 'restore':
-        result = activate(value, restoring=True)
-    elif operation == 'restore_backup':
-        result = restore_backup(value)
-    elif operation == 'reconcile_backup':
-        result = reconcile_backup(value)
-    else:
-        raise ValueError('operation')
+    ROOT_FD = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root_metadata = os.fstat(ROOT_FD)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError('root')
 except Exception:
-    result = {'error_class': 'OPERATION_FAILED'}
+    result = remote_error('ROOT', 'ROOT')
+else:
+    try:
+        value = receive()
+    except Exception:
+        result = remote_error('REQUEST', 'PAYLOAD')
+    else:
+        try:
+            if operation == 'backup':
+                result = backup(value)
+            elif operation == 'reconcile_backup_creation':
+                result = reconcile_backup_creation(value)
+            elif operation == 'transfer':
+                result = transfer(value)
+            elif operation == 'install':
+                result = activate(value)
+            elif operation == 'source_inventory':
+                _, expected = expected_manifest(value)
+                result = inventory_result(expected, inventory_targets())
+            elif operation == 'core_check':
+                result = core_check()
+            elif operation == 'restart_core':
+                result = restart_core()
+            elif operation == 'core_readiness':
+                result = readiness()
+            elif operation == 'service_inventory':
+                result = service_inventory(value['expectation'])
+            elif operation == 'phase_a_helper':
+                result = invoke_helper(value)
+            elif operation == 'restore':
+                result = activate(value, restoring=True)
+            elif operation == 'restore_backup':
+                result = restore_backup(value)
+            elif operation == 'reconcile_backup':
+                result = reconcile_backup(value)
+            else:
+                raise ValueError('operation')
+        except Exception as error:
+            result = remote_error(operation_scope(operation), operation_reason(error))
 print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
 """
 
@@ -5663,7 +5841,8 @@ class PrivateInteractiveSessionBroker:
             " assert hashlib.sha256(raw).hexdigest()==expected\n"
             " exec(compile(raw,'<ha-r30-control>','exec'))\n"
             "except Exception:\n"
-            ' print(\'{"error_class":"OPERATION_FAILED"}\',flush=True)\n'
+            ' print(\'{"error_class":"OPERATION_FAILED","error_scope":"BOOTSTRAP",'
+            '"error_reason":"UNKNOWN"}\',flush=True)\n'
         )
         bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
         command = (
@@ -5923,6 +6102,8 @@ class PrivateInteractiveSessionBroker:
                 CurrentSourceClassification.INDETERMINATE,
                 failure_stage=failure.stage,
                 failure_class=failure.failure_class,
+                remote_failure_scope=failure.remote_failure_scope,
+                remote_failure_reason=failure.remote_failure_reason,
             )
         return CurrentSourceInventoryResult(CurrentSourceClassification.OTHER)
 
@@ -6296,6 +6477,8 @@ def _inspect_current_source(
             CurrentSourceClassification.INDETERMINATE,
             failure_stage=failure.stage,
             failure_class=failure.failure_class,
+            remote_failure_scope=failure.remote_failure_scope,
+            remote_failure_reason=failure.remote_failure_reason,
         )
     if not isinstance(result, CurrentSourceInventoryResult):
         return CurrentSourceInventoryResult(
@@ -6755,10 +6938,20 @@ class FullPreflightLifecycleController:
                 if isinstance(error, _DispatchFailure):
                     failure_stage = error.stage
                     failure_class = error.failure_class
+                    remote_failure_scope = error.remote_failure_scope
+                    remote_failure_reason = error.remote_failure_reason
                 else:
                     failure_stage = DispatchFailureStage.CALLBACK
                     failure_class = DispatchFailureClass.CALLBACK
-                self._journal.record_ambiguous(action, failure_stage, failure_class)
+                    remote_failure_scope = None
+                    remote_failure_reason = None
+                self._journal.record_ambiguous(
+                    action,
+                    failure_stage,
+                    failure_class,
+                    remote_failure_scope,
+                    remote_failure_reason,
+                )
                 if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE and getattr(
                     self._journal, "fallback_reconciliation_resumable", False
                 ):

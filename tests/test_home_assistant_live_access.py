@@ -1023,6 +1023,7 @@ def _synthetic_r30_source_authorities(
             "test_r47_",
             "test_r50_",
             "test_r53_",
+            "test_r55_",
         )
     ):
         return
@@ -1599,6 +1600,14 @@ def _run_synthetic_remote_program(
     return result
 
 
+def _assert_remote_failure(result: object) -> None:
+    assert isinstance(result, dict)
+    assert set(result) == {"error_class", "error_scope", "error_reason"}
+    assert result["error_class"] == "OPERATION_FAILED"
+    assert access.RemoteFailureScope(result["error_scope"])
+    assert access.RemoteFailureReason(result["error_reason"])
+
+
 def _r53_local_pty_source_inspection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1607,6 +1616,7 @@ def _r53_local_pty_source_inspection(
     operation: access.BoundedOperation = access.BoundedOperation.SOURCE_INVENTORY,
     result_emission: str | None = None,
     invalid_deployment: bool = False,
+    source_replacements: dict[str, str] | None = None,
 ) -> object:
     replacement_bin = tmp_path / "bin"
     replacement_bin.mkdir()
@@ -1661,6 +1671,9 @@ def _r53_local_pty_source_inspection(
         )
         assert remote_program.count(original_emission) == 1
         remote_program = remote_program.replace(original_emission, result_emission)
+    for original, replacement in (source_replacements or {}).items():
+        assert remote_program.count(original) == 1
+        remote_program = remote_program.replace(original, replacement)
     monkeypatch.setattr(access, "_REMOTE_CONTROL_PROGRAM", remote_program)
 
     broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=2.0)
@@ -1695,7 +1708,7 @@ def _r53_local_pty_source_inspection(
     return result
 
 
-def test_r53_real_control_program_source_inventory_crosses_local_pty(
+def test_r55_successful_source_inventory_has_no_failure_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1706,6 +1719,8 @@ def test_r53_real_control_program_source_inventory_crosses_local_pty(
         access.CurrentSourceClassification.EXACT_PR45,
         access.SourceInventoryResult(3, 3, True, 0, 0),
     )
+    assert result.remote_failure_scope is None
+    assert result.remote_failure_reason is None
 
 
 def test_r53_remote_startup_failure_is_not_malformed_framing(
@@ -1719,7 +1734,58 @@ def test_r53_remote_startup_failure_is_not_malformed_framing(
     assert result.failure_class.value == "remote_operation"
 
 
-def test_r53_exact_remote_error_result_is_not_malformed_framing(
+def test_r55_root_failure_has_bounded_remote_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = _r53_local_pty_source_inspection(monkeypatch, tmp_path, root_exists=False)
+
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert result.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
+    assert result.remote_failure_scope is access.RemoteFailureScope.ROOT
+    assert result.remote_failure_reason is access.RemoteFailureReason.ROOT
+
+
+def test_r55_malformed_request_has_bounded_remote_diagnosis(tmp_path: Path) -> None:
+    source = access._REMOTE_CONTROL_PROGRAM.replace(
+        "ROOT = Path('/config')", f"ROOT = Path({str(tmp_path)!r})"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", source, "source_inventory"],
+        input="1\nnot-base64\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+        env={},
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "REQUEST",
+        "error_reason": "PAYLOAD",
+    }
+
+
+def test_r55_manifest_authority_failure_has_bounded_remote_diagnosis(
+    tmp_path: Path,
+) -> None:
+    payload = {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))}
+    payload["manifest"]["authority_commit"] = "0" * 40
+
+    result = _run_synthetic_remote_program(tmp_path, "source_inventory", payload)
+
+    assert result == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "SOURCE_INVENTORY",
+        "error_reason": "AUTHORITY",
+    }
+
+
+def test_r55_source_inventory_file_shape_failure_has_bounded_diagnosis(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1731,6 +1797,8 @@ def test_r53_exact_remote_error_result_is_not_malformed_framing(
     assert result.classification is access.CurrentSourceClassification.INDETERMINATE
     assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
     assert result.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
+    assert result.remote_failure_scope is access.RemoteFailureScope.SOURCE_INVENTORY
+    assert result.remote_failure_reason is access.RemoteFailureReason.REGULAR_FILE
 
 
 @pytest.mark.parametrize(
@@ -1756,7 +1824,7 @@ def test_r53_exact_remote_error_result_is_not_malformed_framing(
     ),
     ids=("prefix", "suffix", "multiple", "duplicate-member"),
 )
-def test_r53_malformed_source_inventory_payload_remains_framing_failure(
+def test_r55_malformed_source_inventory_payload_remains_framing_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     result_emission: str,
@@ -1772,6 +1840,53 @@ def test_r53_malformed_source_inventory_payload_remains_framing_failure(
     assert result.classification is access.CurrentSourceClassification.INDETERMINATE
     assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
     assert result.failure_class is access.DispatchFailureClass.FRAMING
+    assert result.remote_failure_scope is None
+    assert result.remote_failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement", "scope", "reason"),
+    (
+        (
+            access.BoundedOperation.BACKUP,
+            {
+                "        result = backup(value)\n": "        raise ValueError('private_state')\n"
+            },
+            access.RemoteFailureScope.BACKUP,
+            access.RemoteFailureReason.PRIVATE_STATE,
+        ),
+        (
+            access.BoundedOperation.TRANSFER,
+            {
+                "        result = transfer(value)\n": "        raise OSError(errno.EIO, 'not retained')\n"
+            },
+            access.RemoteFailureScope.TRANSFER,
+            access.RemoteFailureReason.FILESYSTEM,
+        ),
+    ),
+)
+def test_r55_shared_operation_failure_metadata_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: access.BoundedOperation,
+    replacement: dict[str, str],
+    scope: access.RemoteFailureScope,
+    reason: access.RemoteFailureReason,
+) -> None:
+    with pytest.raises(access._DispatchFailure) as raised:
+        _r53_local_pty_source_inspection(
+            monkeypatch,
+            tmp_path,
+            root_exists=True,
+            operation=operation,
+            source_replacements=replacement,
+        )
+
+    assert raised.value.stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert raised.value.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
+    assert raised.value.remote_failure_scope is scope
+    assert raised.value.remote_failure_reason is reason
+    assert "not retained" not in repr(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -1818,6 +1933,40 @@ def test_r47_r53_retained_exact_pr41_inspection_is_state_neutral() -> None:
     inspector.close()
 
 
+def test_r55_retained_remote_diagnosis_is_state_neutral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access, "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS", False)
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    broker = _r47_inspection_broker()
+    broker.queue(
+        "current_source_inventory",
+        access.CurrentSourceInventoryResult(
+            access.CurrentSourceClassification.INDETERMINATE,
+            failure_stage=access.DispatchFailureStage.RESPONSE_PARSE,
+            failure_class=access.DispatchFailureClass.REMOTE_OPERATION,
+            remote_failure_scope=access.RemoteFailureScope.SOURCE_INVENTORY,
+            remote_failure_reason=access.RemoteFailureReason.DIRECTORY,
+        ),
+    )
+    inspector = access.RetainedTerminalLifecycleInspector(broker)
+    before_metadata = inspector.metadata
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.remote_failure_scope is access.RemoteFailureScope.SOURCE_INVENTORY
+    assert result.remote_failure_reason is access.RemoteFailureReason.DIRECTORY
+    assert inspector.metadata == before_metadata
+    assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    assert [name for name, _ in broker.calls] == ["current_source_inventory"]
+    inspector.close()
+
+
 def _remote_definition_namespace(
     tmp_path: Path, source_replacements: dict[str, str] | None = None
 ) -> dict[str, object]:
@@ -1827,7 +1976,7 @@ def _remote_definition_namespace(
     for original, replacement in (source_replacements or {}).items():
         assert source.count(original) == 1
         source = source.replace(original, replacement)
-    definitions, marker, _runtime = source.partition("ROOT_FD = os.open(")
+    definitions, marker, _runtime = source.partition("operation = sys.argv[1]")
     assert marker
     namespace: dict[str, object] = {"__name__": "synthetic_r40_remote"}
     exec(  # noqa: S102 - execute the synthetic remote definitions under test.
@@ -1903,7 +2052,7 @@ def test_r30_remote_transfer_rejects_tampered_content_before_staging(
 
     result = _run_synthetic_remote_program(tmp_path, "transfer", value)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r30_stage").exists()
 
 
@@ -1921,7 +2070,7 @@ def test_r30_remote_authority_rejected_before_filesystem_mutation(
 
     result = _run_synthetic_remote_program(tmp_path, "transfer", value)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r30_stage").exists()
 
 
@@ -2297,7 +2446,7 @@ def test_r30_remote_tree_authority_rejected_before_filesystem_mutation(
 
     result = _run_synthetic_remote_program(tmp_path, "transfer", value)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r30_stage").exists()
 
 
@@ -2341,7 +2490,7 @@ def test_r30_private_backup_fallback_is_consumed_once(tmp_path: Path) -> None:
     )
 
     assert restored["manifest_match"] is True
-    assert repeated == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(repeated)
     assert (integration / "__init__.py").read_bytes() == original
     assert not (integration / ".phase_a_tools").exists()
     assert (tmp_path / ".ha_tuya_ble_r36_backup").is_dir()
@@ -2376,7 +2525,7 @@ def test_r30_backup_cleanup_failure_remains_consumed(tmp_path: Path) -> None:
     )
 
     assert restored["manifest_match"] is True
-    assert repeated == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(repeated)
     assert (integration / "__init__.py").read_bytes() == original
     marker = json.loads(
         (tmp_path / ".ha_tuya_ble_r36_backup.consumed").read_text(encoding="ascii")
@@ -2417,13 +2566,13 @@ def test_r30_backup_post_exchange_failure_requires_separate_reconciliation(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     assert not (integration / ".phase_a_tools").exists()
     marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
     assert json.loads(marker.read_text(encoding="ascii"))["phase"] == "possibly_applied"
-    assert _run_synthetic_remote_program(
-        tmp_path, "restore_backup", _r36_backup_payload()
-    ) == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(
+        _run_synthetic_remote_program(tmp_path, "restore_backup", _r36_backup_payload())
+    )
     reconciled = _run_synthetic_remote_program(
         tmp_path, "reconcile_backup", _r36_backup_payload()
     )
@@ -2471,14 +2620,14 @@ def test_r30_authoritative_restore_keeps_monotonic_tombstone_across_new_backup(
         {"manifest": access._manifest_payload(restore.manifest)},
     )["manifest_match"]
 
-    assert _run_synthetic_remote_program(
-        tmp_path, "restore_backup", _r36_backup_payload()
-    ) == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(
+        _run_synthetic_remote_program(tmp_path, "restore_backup", _r36_backup_payload())
+    )
     marker = tmp_path / ".ha_tuya_ble_r30_restore.consumed"
     assert marker.is_file()
-    assert _run_synthetic_remote_program(tmp_path, "backup", _r36_backup_payload()) == {
-        "error_class": "OPERATION_FAILED"
-    }
+    _assert_remote_failure(
+        _run_synthetic_remote_program(tmp_path, "backup", _r36_backup_payload())
+    )
     assert marker.exists()
 
 
@@ -2540,9 +2689,9 @@ def test_r33_s_fallback_process_loss_is_reconciled_without_blind_replay(
     )
     marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
     assert json.loads(marker.read_text(encoding="ascii"))["phase"] == expected_phase
-    assert _run_synthetic_remote_program(
-        tmp_path, "restore_backup", _r36_backup_payload()
-    ) == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(
+        _run_synthetic_remote_program(tmp_path, "restore_backup", _r36_backup_payload())
+    )
 
     reconciled = _run_synthetic_remote_program(
         tmp_path, "reconcile_backup", _r36_backup_payload()
@@ -2586,7 +2735,7 @@ def test_r36_fallback_exchange_requires_live_parent_directory_fsync(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
     assert json.loads(marker.read_text(encoding="ascii"))["phase"] == (
         "possibly_applied"
@@ -2652,7 +2801,7 @@ def test_r36_fallback_rejects_backup_package_path_swap_before_exchange(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     assert (integration / "__init__.py").read_bytes() == original
     assert (integration / ".phase_a_tools").is_dir()
     assert not (tmp_path / ".ha_tuya_ble_r36_backup.consumed").exists()
@@ -2693,7 +2842,7 @@ def test_r36_fallback_rejects_live_parent_swap_before_durable_sync(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
     assert json.loads(marker.read_text(encoding="ascii"))["phase"] == (
         "possibly_applied"
@@ -2756,7 +2905,7 @@ def test_r36_backup_publication_and_adoption_reject_package_inode_swap(
         source_replacements={needle: replacement},
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
 
 
 def test_r36_fallback_post_marker_swap_downgrades_reconciliation(
@@ -2796,7 +2945,7 @@ def test_r36_fallback_post_marker_swap_downgrades_reconciliation(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
     assert json.loads(marker.read_text(encoding="ascii"))["phase"] == (
         "possibly_applied"
@@ -5984,7 +6133,7 @@ def test_r35_transfer_rejects_noncanonical_base64_before_staging(
 
     result = _run_synthetic_remote_program(tmp_path, "transfer", value)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r30_stage").exists()
 
 
@@ -6251,7 +6400,7 @@ def test_r36_d_m2_candidate_content_cannot_become_pr41_backup(
 
     result = _run_synthetic_remote_program(tmp_path, "backup", _r36_backup_payload())
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6303,7 +6452,7 @@ def test_r36_d_m3_to_m5_backup_is_one_bound_atomic_package(
         _r36_backup_payload(lifecycle_generation="c" * 32),
     )
 
-    assert repeated == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(repeated)
     assert before == {
         path.relative_to(package).as_posix(): path.read_bytes()
         for path in package.rglob("*")
@@ -6337,7 +6486,7 @@ def test_r36_m21_foreign_lifecycle_backup_package_is_rejected(
         _r36_backup_payload(lifecycle_generation="c" * 32),
     )
 
-    assert rejected == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(rejected)
     assert not (second_root / ".ha_tuya_ble_r36_backup.consumed").exists()
 
 
@@ -6353,7 +6502,7 @@ def test_r36_backup_rejects_altered_pr41_authority_before_publication(
 
     result = _run_synthetic_remote_program(tmp_path, "backup", payload)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6370,7 +6519,7 @@ def test_r36_backup_tamper_is_rejected_without_consuming_package(
 
     result = _run_synthetic_remote_program(tmp_path, "restore_backup", payload)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup.consumed").exists()
 
 
@@ -6404,7 +6553,7 @@ def test_r36_restore_requires_exact_journal_bound_backup_generation_and_digest(
 
     result = _run_synthetic_remote_program(tmp_path, "restore_backup", bound)
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup.consumed").exists()
 
 
@@ -6444,9 +6593,9 @@ def test_r36_backup_publication_crash_has_no_split_identity_state(
         assert not package.exists()
     else:
         assert (package / "metadata.json").is_file()
-        assert _run_synthetic_remote_program(
-            tmp_path, "backup", _r36_backup_payload()
-        ) == {"error_class": "OPERATION_FAILED"}
+        _assert_remote_failure(
+            _run_synthetic_remote_program(tmp_path, "backup", _r36_backup_payload())
+        )
 
 
 def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
@@ -6474,7 +6623,7 @@ def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6504,7 +6653,7 @@ def test_r36_backup_rejects_child_swap_after_bound_recursive_fsync(
         },
     )
 
-    assert failed == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(failed)
 
 
 def _sync_written_file_accepts_discontinuity(
@@ -6603,7 +6752,7 @@ def test_r40_red_1_backup_rejects_byte_identical_written_child_inode_swap(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6631,7 +6780,7 @@ def test_r40_red_2_backup_rejects_size_change_after_written_child_fsync(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6664,7 +6813,7 @@ def test_r40_red_3_backup_rejects_package_root_churn_after_fsync(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6692,7 +6841,7 @@ def test_r40_backup_rejects_package_root_state_change_before_publication(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6716,7 +6865,7 @@ def test_r40_package_root_fsync_failure_never_publishes(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -6758,7 +6907,7 @@ def test_r40_red_4_backup_rejects_transient_symlink_at_child_entry_check(
         },
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
@@ -7034,7 +7183,7 @@ def test_r40_i_m1_to_i_m8_source_mutations_are_detected(
     )
 
     if mutant in {"I-M3", "I-M7"}:
-        assert result == {"error_class": "OPERATION_FAILED"}
+        _assert_remote_failure(result)
         assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
     else:
         assert result["success"] is True
@@ -7086,7 +7235,7 @@ def test_r36_backup_persistence_failures_never_publish_success(
         source_replacements=source_replacements,
     )
 
-    assert result == {"error_class": "OPERATION_FAILED"}
+    _assert_remote_failure(result)
     package = tmp_path / ".ha_tuya_ble_r36_backup"
     assert package.exists() is published
     if published:
@@ -7731,6 +7880,98 @@ def test_r44_response_failure_records_bounded_stage_and_class(
     assert operation["failure_stage"] == expected_stage.value
     assert operation["failure_class"] == expected_class.value
     controller.close()
+
+
+def test_r55_backup_remote_failure_is_durable_and_reconstructable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access, "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS", False)
+    broker = _r32_unbound_real_broker()
+    controller = _r44_controller_at_backup(broker)
+    _candidate, restore = _r32_bundles()
+    monkeypatch.setattr(
+        broker,
+        "_PrivateInteractiveSessionBroker__execute_bounded_operation",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "error_class": "OPERATION_FAILED",
+                "error_scope": "BACKUP",
+                "error_reason": "FILESYSTEM",
+            }
+        ).encode("ascii"),
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="BACKUP_VERIFICATION"):
+        controller.create_backup(restore.manifest)
+
+    operation = controller._journal._record["operations"][-1]
+    assert operation["failure_stage"] == "RESPONSE_PARSE"
+    assert operation["failure_class"] == "remote_operation"
+    assert operation["remote_failure_scope"] == "BACKUP"
+    assert operation["remote_failure_reason"] == "FILESYSTEM"
+    controller.close()
+
+    reconstructed = access._DurableLifecycleJournal()
+    assert reconstructed._record["operations"][-1] == operation
+    reconstructed.close()
+
+
+def test_r55_transfer_remote_failure_is_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access, "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS", False)
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    broker.queue(
+        "transfer",
+        access._DispatchFailure(
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.DispatchFailureClass.REMOTE_OPERATION,
+            access.RemoteFailureScope.TRANSFER,
+            access.RemoteFailureReason.FILESYSTEM,
+        ),
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="CANDIDATE_TRANSFER"):
+        controller.stage_candidate(candidate)
+
+    operation = controller._journal._record["operations"][-1]
+    assert operation["failure_stage"] == "RESPONSE_PARSE"
+    assert operation["failure_class"] == "remote_operation"
+    assert operation["remote_failure_scope"] == "TRANSFER"
+    assert operation["remote_failure_reason"] == "FILESYSTEM"
+    controller.close()
+
+
+def test_r55_historical_remote_failure_without_optional_metadata_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access, "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS", False)
+    broker = _r32_unbound_real_broker()
+    controller = _r44_controller_at_backup(broker)
+    journal = controller._journal
+    action = access.LifecycleAction.BACKUP
+    journal.record_intent(
+        action,
+        source_generation=journal._record["pr41_restore"]["generation"],
+        nonce=None,
+    )
+    journal.record_dispatch_started(action)
+    journal.record_ambiguous(
+        action,
+        access.DispatchFailureStage.RESPONSE_PARSE,
+        access.DispatchFailureClass.REMOTE_OPERATION,
+    )
+    controller.close()
+
+    reconstructed = access._DurableLifecycleJournal()
+    operation = reconstructed._record["operations"][-1]
+    assert operation["failure_class"] == "remote_operation"
+    assert "remote_failure_scope" not in operation
+    assert "remote_failure_reason" not in operation
+    reconstructed.close()
 
 
 def test_r44_raw_callback_exception_text_is_not_persisted() -> None:
