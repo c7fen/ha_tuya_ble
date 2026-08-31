@@ -6175,6 +6175,127 @@ def test_r36_backup_rejects_child_swap_after_bound_recursive_fsync(
     assert failed == {"error_class": "OPERATION_FAILED"}
 
 
+def test_r40_red_1_backup_rejects_byte_identical_written_child_inode_swap(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+            "        after = inventory_deployment_fd(staged_fd)\n": (
+                "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+                "        child = pending / 'integration' / '__init__.py'\n"
+                "        replacement = pending / 'synthetic-byte-identical-child'\n"
+                "        replacement.write_bytes(child.read_bytes())\n"
+                "        os.replace(replacement, child)\n"
+                "        after = inventory_deployment_fd(staged_fd)\n"
+            )
+        },
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_red_2_backup_rejects_written_child_state_change_during_fsync(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    content = b"synthetic integration source\n"
+    (integration / "__init__.py").write_bytes(content)
+    mutation = (
+        "                original_fsync = os.fsync\n"
+        "                def mutate_during_fsync(target):\n"
+        "                    original_fsync(target)\n"
+        f"                    replacement = {content!r}\n"
+        "                    os.ftruncate(target, 0)\n"
+        "                    os.lseek(target, 0, os.SEEK_SET)\n"
+        "                    offset = 0\n"
+        "                    while offset < len(replacement):\n"
+        "                        written = os.write(target, replacement[offset:])\n"
+        "                        if written <= 0:\n"
+        "                            raise OSError(errno.EIO, 'short_write')\n"
+        "                        offset += written\n"
+        "                os.fsync = mutate_during_fsync\n"
+        "                try:\n"
+        "                    os.fsync(destination_file)\n"
+        "                finally:\n"
+        "                    os.fsync = original_fsync\n"
+    )
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={"                os.fsync(destination_file)\n": mutation},
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_red_3_backup_rejects_package_root_swap_before_durability(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "        pending_fd = open_root_relative(pending)\n"
+            "        os.mkdir('integration', mode=0o700, dir_fd=pending_fd)\n": (
+                "        pending_fd = open_root_relative(pending)\n"
+                "        moved = pending.with_name(pending.name + '.root-swapped')\n"
+                "        pending.rename(moved)\n"
+                "        shutil.copytree(moved, pending)\n"
+                "        os.mkdir('integration', mode=0o700, dir_fd=pending_fd)\n"
+            )
+        },
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_red_4_backup_rejects_written_child_name_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+            "        after = inventory_deployment_fd(staged_fd)\n": (
+                "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+                "        child = pending / 'integration' / '__init__.py'\n"
+                "        moved = child.with_name('__init__.py.displaced')\n"
+                "        child.rename(moved)\n"
+                "        child.symlink_to(moved.name)\n"
+                "        after = inventory_deployment_fd(staged_fd)\n"
+            )
+        },
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
 @pytest.mark.parametrize(
     ("source_replacements", "published"),
     (
