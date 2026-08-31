@@ -1007,6 +1007,7 @@ def _synthetic_r30_source_authorities(
                 "test_r35_reconstruction_",
                 "test_r36_",
                 "test_r44_",
+                "test_r47_",
             )
         ),
     )
@@ -1018,6 +1019,7 @@ def _synthetic_r30_source_authorities(
             "test_r35_",
             "test_r36_",
             "test_r44_",
+            "test_r47_",
         )
     ):
         return
@@ -7052,6 +7054,182 @@ def test_r44_terminal_source_inventory_is_byte_neutral() -> None:
     } == before_permits
     assert [name for name, _ in terminal_broker.calls] == ["current_source_inventory"]
     terminal.close()
+
+
+def _r47_retained_restore_failed() -> tuple[object, object]:
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 3, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    broker.queue(
+        "transfer",
+        access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.stage_restore(restore)
+    controller.close()
+
+    terminal, _ = _r33_controller()
+    assert terminal.state is access.LifecycleState.RESTORE_FAILED
+    terminal.close()
+    return candidate, restore
+
+
+def _r47_inspection_broker() -> _R32ScriptedBroker:
+    broker = _R32ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    return broker
+
+
+def test_r47_production_retained_terminal_inspection_is_state_neutral() -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before_journal = journal_path.read_bytes()
+    before_anchor = anchor_path.read_bytes()
+    before_root_entries = set(root.iterdir())
+    before_record = json.loads(before_journal)
+    inspection_broker = _r47_inspection_broker()
+    inspector = access.RetainedTerminalLifecycleInspector(inspection_broker)
+    before_metadata = inspector.metadata
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert inspector.metadata == before_metadata
+    assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
+    assert journal_path.read_bytes() == before_journal
+    assert anchor_path.read_bytes() == before_anchor
+    assert set(root.iterdir()) == before_root_entries
+    assert inspector._journal._record == before_record
+    assert inspector._journal._record["operations"] == before_record["operations"]
+    assert (
+        inspector._journal._record["consumed_operations"]
+        == before_record["consumed_operations"]
+    )
+    assert not hasattr(inspector, "_permits")
+    assert not any(
+        hasattr(inspector, name)
+        for name in (
+            "create_backup",
+            "stage_candidate",
+            "install_candidate",
+            "restart_for_candidate",
+            "check_candidate_core",
+            "run_non_probe_preflight",
+            "collect_a0",
+            "stage_restore",
+        )
+    )
+    assert [name for name, _ in inspection_broker.calls] == ["current_source_inventory"]
+    inspector.close()
+
+
+def test_r47_terminal_retirement_after_exact_pr41_allows_fresh_lifecycle() -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    inspector = access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+    terminal_generation = inspector.metadata.lifecycle_generation
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+
+    inspector.retire_terminal()
+
+    assert not journal_path.exists()
+    assert not anchor_path.exists()
+    inspector.close()
+
+    fresh = access.FullPreflightLifecycleController(_r47_inspection_broker())
+    assert fresh.state is access.LifecycleState.BASELINE
+    assert fresh._journal.lifecycle_generation != terminal_generation
+    assert json.loads(journal_path.read_bytes())["revision"] == 0
+    assert anchor_path.is_file()
+    fresh.close()
+
+
+def test_r47_terminal_retirement_requires_source_proof() -> None:
+    _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    inspector = access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_terminal()
+
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
+
+
+@pytest.mark.parametrize(
+    "classification",
+    (
+        access.CurrentSourceClassification.EXACT_PR45,
+        access.CurrentSourceClassification.OTHER,
+        access.CurrentSourceClassification.INDETERMINATE,
+    ),
+)
+def test_r47_terminal_retirement_rejects_non_pr41(
+    classification: access.CurrentSourceClassification,
+) -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    broker = _r47_inspection_broker()
+    broker.queue(
+        "current_source_inventory",
+        (
+            access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+            if classification is access.CurrentSourceClassification.INDETERMINATE
+            else access.CurrentSourceInventoryResult(classification)
+        ),
+    )
+    inspector = access.RetainedTerminalLifecycleInspector(broker)
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_terminal()
+
+    assert result.classification is classification
+    assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
+
+
+def test_r47_normal_controller_still_rejects_retained_terminal() -> None:
+    _r47_retained_restore_failed()
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="LIFECYCLE_TERMINAL_RETAINED"
+    ):
+        access.FullPreflightLifecycleController(_r47_inspection_broker())
+
+
+def test_r47_active_lifecycle_cannot_open_terminal_retirement() -> None:
+    active, _ = _r33_controller()
+    assert active.state is access.LifecycleState.BASELINE
+    active.close()
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="LIFECYCLE_TERMINAL_REQUIRED"
+    ):
+        access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
 
 
 @pytest.mark.parametrize(

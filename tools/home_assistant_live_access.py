@@ -1253,7 +1253,7 @@ class _DurableLifecycleJournal:
         }
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
         self._directory = _fixed_lifecycle_state_root()
         self._anchor_name = _lifecycle_anchor_path(self._directory).name
         self._parent_fd: int | None = None
@@ -1267,6 +1267,10 @@ class _DurableLifecycleJournal:
             anchor = self._read_anchor()
             record = self._read_record()
             if record is None:
+                if _retained_terminal_inspection:
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_TERMINAL_REQUIRED"
+                    ) from None
                 if anchor is not None:
                     raise LifecycleControllerError(
                         "RECOVERY_REQUIRED_MISSING_JOURNAL"
@@ -1282,9 +1286,15 @@ class _DurableLifecycleJournal:
                 self._reconcile_anchor_revision(anchor, record)
             self._anchor = anchor if anchor is not None else self._read_anchor()
             self._record = record
-            if not newly_created and record["active"] is not True:
+            if _retained_terminal_inspection and record["active"] is True:
+                raise LifecycleControllerError("LIFECYCLE_TERMINAL_REQUIRED") from None
+            if (
+                not _retained_terminal_inspection
+                and not newly_created
+                and record["active"] is not True
+            ):
                 raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETAINED") from None
-            if not newly_created:
+            if not _retained_terminal_inspection and not newly_created:
                 consumed = set(record["consumed_operations"])
                 if not consumed.intersection(self._RISKY_ACTIONS):
                     raise LifecycleControllerError(
@@ -1336,6 +1346,10 @@ class _DurableLifecycleJournal:
             except OSError as cleanup_error:
                 _ = cleanup_error
             raise
+
+    @classmethod
+    def open_retained_terminal(cls) -> Self:
+        return cls(_retained_terminal_inspection=True)
 
     @staticmethod
     def _token() -> str:
@@ -2651,6 +2665,36 @@ class _DurableLifecycleJournal:
                 record["active"] = False
 
         self._commit(mutate)
+
+    def retire_terminal(self) -> None:
+        if (
+            self._closed
+            or self._record["active"] is not False
+            or self._record["terminal"] is None
+            or self._root_fd is None
+            or self._parent_fd is None
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_TERMINAL_RETIREMENT_INVALID"
+            ) from None
+        anchor_removed = False
+        journal_removed = False
+        try:
+            os.unlink(self._anchor_name, dir_fd=self._parent_fd)
+            anchor_removed = True
+            os.fsync(self._parent_fd)
+            os.unlink(_LIFECYCLE_JOURNAL_NAME, dir_fd=self._root_fd)
+            journal_removed = True
+            os.fsync(self._root_fd)
+        except OSError:
+            if anchor_removed and not journal_removed:
+                try:
+                    self._write_anchor(self._anchor)
+                except LifecycleControllerError:
+                    pass
+            raise LifecycleControllerError(
+                "LIFECYCLE_TERMINAL_RETIREMENT_FAILED"
+            ) from None
 
     def close(self) -> None:
         if self._closed:
@@ -5274,7 +5318,11 @@ class PrivateInteractiveSessionBroker:
             self._state is not BrokerState.SESSION_ACTIVE
             or self._session_generation is not session_generation
             or self._controller_binding is not None
-            or controller.__class__ is not FullPreflightLifecycleController
+            or controller.__class__
+            not in {
+                FullPreflightLifecycleController,
+                RetainedTerminalLifecycleInspector,
+            }
         ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_CONTROLLER_BINDING_INVALID"
@@ -6197,6 +6245,128 @@ class PrivateInteractiveSessionBroker:
             self.__wire_issuer = object()
 
 
+def _inspect_current_source(
+    owner: Any,
+    candidate_manifest: SourceManifest,
+    restore_manifest: SourceManifest,
+) -> CurrentSourceInventoryResult:
+    owner._assert_session_binding()
+    try:
+        validate_source_manifest(candidate_manifest)
+        validate_source_manifest(restore_manifest)
+    except (SourceBundleError, TypeError, ValueError):
+        raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
+    if (
+        candidate_manifest.state is not SourceState.CANDIDATE
+        or restore_manifest.state is not SourceState.RESTORE
+    ):
+        raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
+    capability = _SourceInspectionCapability(
+        owner,
+        owner._capability_issuer.identity,
+        owner._session_generation,
+        secrets.token_hex(16),
+    )
+    owner._capability_issuer.issued.append(capability)
+    try:
+        result = owner._broker._inspect_current_source(
+            candidate_manifest,
+            restore_manifest,
+            _capability=capability,
+        )
+    except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+        return CurrentSourceInventoryResult(CurrentSourceClassification.INDETERMINATE)
+    if not isinstance(result, CurrentSourceInventoryResult):
+        return CurrentSourceInventoryResult(CurrentSourceClassification.INDETERMINATE)
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedTerminalMetadata:
+    """Reportable identity of one retained terminal lifecycle."""
+
+    state: LifecycleState
+    revision: int
+    lifecycle_generation: str
+
+
+class RetainedTerminalLifecycleInspector:
+    """Inspection-only handle for one retained terminal lifecycle."""
+
+    def __init__(self, broker: Any) -> None:
+        if (
+            getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(broker, "_session_generation", None) is None
+            or not callable(getattr(broker, "_register_lifecycle_controller", None))
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        self._broker = broker
+        self._session_generation = broker._session_generation
+        self._source_classification: CurrentSourceClassification | None = None
+        self._retired = False
+        self._journal = _DurableLifecycleJournal.open_retained_terminal()
+        try:
+            self._capability_issuer = broker._register_lifecycle_controller(
+                self,
+                self._journal.lifecycle_generation,
+                self._session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if type(self._capability_issuer) is not _CapabilityIssuer:
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+
+    @property
+    def metadata(self) -> RetainedTerminalMetadata:
+        return RetainedTerminalMetadata(
+            self._journal.state,
+            self._journal._record["revision"],
+            self._journal.lifecycle_generation,
+        )
+
+    def _assert_session_binding(self) -> None:
+        if (
+            getattr(self._broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(self._broker, "_session_generation", None)
+            is not self._session_generation
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_CHANGED") from None
+
+    def inspect_current_source(
+        self,
+        candidate_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+    ) -> CurrentSourceInventoryResult:
+        if self._retired:
+            raise LifecycleControllerError("LIFECYCLE_TERMINAL_RETIRED") from None
+        result = _inspect_current_source(self, candidate_manifest, restore_manifest)
+        self._source_classification = result.classification
+        return result
+
+    def retire_terminal(self) -> None:
+        self._assert_session_binding()
+        if (
+            self._retired
+            or self._source_classification is not CurrentSourceClassification.EXACT_PR41
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED"
+            ) from None
+        self._journal.retire_terminal()
+        self._retired = True
+
+    def close(self) -> None:
+        self._journal.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 class FullPreflightLifecycleController:
     """The sole public live-capable, ordered full-preflight control surface."""
 
@@ -6693,39 +6863,7 @@ class FullPreflightLifecycleController:
         candidate_manifest: SourceManifest,
         restore_manifest: SourceManifest,
     ) -> CurrentSourceInventoryResult:
-        self._assert_session_binding()
-        try:
-            validate_source_manifest(candidate_manifest)
-            validate_source_manifest(restore_manifest)
-        except (SourceBundleError, TypeError, ValueError):
-            raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
-        if (
-            candidate_manifest.state is not SourceState.CANDIDATE
-            or restore_manifest.state is not SourceState.RESTORE
-        ):
-            raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
-        capability = _SourceInspectionCapability(
-            self,
-            self._capability_issuer.identity,
-            self._session_generation,
-            secrets.token_hex(16),
-        )
-        self._capability_issuer.issued.append(capability)
-        try:
-            result = self._broker._inspect_current_source(
-                candidate_manifest,
-                restore_manifest,
-                _capability=capability,
-            )
-        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
-            return CurrentSourceInventoryResult(
-                CurrentSourceClassification.INDETERMINATE
-            )
-        if not isinstance(result, CurrentSourceInventoryResult):
-            return CurrentSourceInventoryResult(
-                CurrentSourceClassification.INDETERMINATE
-            )
-        return result
+        return _inspect_current_source(self, candidate_manifest, restore_manifest)
 
     def resolve_pre_source_abort(
         self,

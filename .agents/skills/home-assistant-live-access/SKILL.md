@@ -144,8 +144,10 @@ prompts, helper output, and raw Supervisor responses remain inside the PTY.
 
 ## 5. Bounded full-preflight control plane
 
-`FullPreflightLifecycleController` is the only public live-capable operation
-surface. The lower broker exposes only session `open`, `close`, and generic
+`FullPreflightLifecycleController` is the only public lifecycle-progression
+surface. The explicit `RetainedTerminalLifecycleInspector` is limited to
+terminal metadata, state-neutral current-source inventory, and authorized
+terminal retirement. The lower broker exposes only session `open`, `close`, and generic
 state; all Repairs, source, Core, restart, service-inventory, helper, and
 restoration adapters require a controller-minted capability even when their
 underscore-private names are reached directly. Each frozen capability is bound
@@ -231,6 +233,12 @@ journal revision. A verified baseline-backup identity is added to the journal
 and anchor in the same versioned transition. An anchor with a missing journal
 is recovery-required state, never a fresh baseline; a journal with a missing
 anchor is inconsistent state. Terminal journals and their anchors are retained.
+
+For a retained terminal, open the explicit terminal inspection handle and run
+the state-neutral current-source inventory. Only an `EXACT_PR41` result may be
+followed by explicit terminal retirement; then close the handle and create a
+fresh lifecycle later. For `EXACT_PR45`, `OTHER`, or `INDETERMINATE`, retain the
+terminal rather than retiring it merely to start over.
 
 This continuity guarantee assumes that the independently stored anchor remains
 when the journal alone is lost. If an external actor destroys or corrupts both
