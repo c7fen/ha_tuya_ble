@@ -4020,7 +4020,7 @@ def sync_directory_fd(descriptor):
             raise ValueError('regular')
     os.fsync(descriptor)
 
-def publish_noreplace(source, destination):
+def publish_noreplace(source, destination, source_fd):
     if source.parent != ROOT or destination.parent != ROOT:
         raise ValueError('atomic_noreplace')
     function = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
@@ -4031,7 +4031,18 @@ def publish_noreplace(source, destination):
     if ROOT_FD is None:
         raise ValueError('root')
     descriptor = os.dup(ROOT_FD)
+    destination_fd = None
     try:
+        source_identity = os.fstat(source_fd)
+        source_entry = os.stat(
+            source.name, dir_fd=descriptor, follow_symlinks=False
+        )
+        if (
+            source_entry.st_dev != source_identity.st_dev
+            or source_entry.st_ino != source_identity.st_ino
+            or not stat.S_ISDIR(source_identity.st_mode)
+        ):
+            raise ValueError('directory')
         if function(
             descriptor,
             os.fsencode(source.name),
@@ -4041,6 +4052,22 @@ def publish_noreplace(source, destination):
         ) != 0:
             code = ctypes.get_errno()
             raise OSError(code, 'atomic_noreplace')
+        destination_fd = os.open(
+            destination.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        destination_identity = os.fstat(destination_fd)
+        if (
+            destination_identity.st_dev != source_identity.st_dev
+            or destination_identity.st_ino != source_identity.st_ino
+        ):
+            raise ValueError('directory')
+        return destination_fd
+    except BaseException:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        raise
     finally:
         os.close(descriptor)
 
@@ -4053,6 +4080,7 @@ def backup(value):
         raise ValueError('baseline_source')
     pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
+    pending_fd = package_fd = source_fd = None
     try:
         (pending / 'integration').mkdir(mode=0o700)
         copy_deployment(INTEGRATION, pending / 'integration', expected)
@@ -4089,24 +4117,18 @@ def backup(value):
         finally:
             os.close(descriptor)
         sync_tree(pending)
-        if read_backup_identity(value, pending) != metadata:
+        pending_fd = open_root_relative(pending)
+        if read_backup_identity_fd(value, pending_fd) != metadata:
             raise ValueError('backup_identity')
-        publish_noreplace(pending, BACKUP)
+        package_fd = publish_noreplace(pending, BACKUP, pending_fd)
         sync_root()
         pending = None
-        package_fd = open_root_relative(BACKUP)
-        source_fd = None
-        try:
-            published_identity = read_backup_identity_fd(value, package_fd)
-            source_fd = open_relative_directory(package_fd, ('integration',))
-            published = inventory_deployment_fd(source_fd)
-            assert_root_relative_identity(BACKUP, package_fd)
-            if published_identity != metadata or published != expected:
-                raise ValueError('backup_publication')
-        finally:
-            if source_fd is not None:
-                os.close(source_fd)
-            os.close(package_fd)
+        published_identity = read_backup_identity_fd(value, package_fd)
+        source_fd = open_relative_directory(package_fd, ('integration',))
+        published = inventory_deployment_fd(source_fd)
+        assert_root_relative_identity(BACKUP, package_fd)
+        if published_identity != metadata or published != expected:
+            raise ValueError('backup_publication')
         return {
             'success': True,
             'file_count': len(after),
@@ -4119,6 +4141,12 @@ def backup(value):
             'backup_digest': metadata['backup_digest'],
         }
     finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if package_fd is not None:
+            os.close(package_fd)
+        if pending_fd is not None:
+            os.close(pending_fd)
         if pending is not None:
             remove(pending)
 

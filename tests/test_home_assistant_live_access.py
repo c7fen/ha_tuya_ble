@@ -2432,8 +2432,12 @@ def test_r36_fallback_rejects_live_parent_swap_before_durable_sync(
     (
         (
             "backup",
+            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n",
+        ),
+        (
+            "backup",
             (
-                "            published_identity = read_backup_identity_fd("
+                "        published_identity = read_backup_identity_fd("
                 "value, package_fd)\n"
             ),
         ),
@@ -2458,22 +2462,15 @@ def test_r36_backup_publication_and_adoption_reject_package_inode_swap(
         assert _run_synthetic_remote_program(tmp_path, "backup", payload)[
             "manifest_match"
         ]
+    last_line = needle.splitlines()[-1]
+    indentation = last_line[: len(last_line) - len(last_line.lstrip())]
     replacement = (
-        needle
-        + ("            " if operation == "backup" else "        ")
-        + "moved = BACKUP.with_name(BACKUP.name + '.swapped')\n"
+        needle + indentation + "moved = BACKUP.with_name(BACKUP.name + '.swapped')\n"
     )
-    indentation = "            " if operation == "backup" else "        "
     replacement += (
         f"{indentation}BACKUP.rename(moved)\n"
         f"{indentation}shutil.copytree(moved, BACKUP)\n"
     )
-    if operation == "reconcile_backup_creation":
-        replacement += (
-            "        source_fd = open_relative_directory(package_fd, "
-            "('integration',))\n"
-        )
-
     failed = _run_synthetic_remote_program(
         tmp_path,
         operation,
@@ -6092,13 +6089,14 @@ def test_r36_backup_publication_crash_has_no_split_identity_state(
     (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
     injection = {
         "before_publish": (
-            "        publish_noreplace(pending, BACKUP)\n",
+            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n",
             "        os._exit(91)\n",
             91,
         ),
         "after_publish": (
-            "        publish_noreplace(pending, BACKUP)\n",
-            "        publish_noreplace(pending, BACKUP)\n        os._exit(92)\n",
+            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n",
+            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n"
+            "        os._exit(92)\n",
             92,
         ),
     }[crash_point]
@@ -6144,8 +6142,8 @@ def test_r36_backup_publication_crash_has_no_split_identity_state(
         ),
         (
             {
-                "def publish_noreplace(source, destination):\n": (
-                    "def publish_noreplace(source, destination):\n"
+                "def publish_noreplace(source, destination, source_fd):\n": (
+                    "def publish_noreplace(source, destination, source_fd):\n"
                     "    raise OSError(5, 'synthetic rename failure')\n"
                 )
             },
@@ -6222,8 +6220,9 @@ def test_r36_published_backup_result_loss_is_read_only_reconcilable(
         "backup",
         payload,
         source_replacements={
-            "        publish_noreplace(pending, BACKUP)\n": (
-                "        publish_noreplace(pending, BACKUP)\n" "        os._exit(92)\n"
+            "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n": (
+                "        package_fd = publish_noreplace(pending, BACKUP, pending_fd)\n"
+                "        os._exit(92)\n"
             )
         },
         expected_crash_code=92,
