@@ -215,7 +215,12 @@ BASELINE
 full PR #41 restoration proof, in one durable lifecycle generation. Successful
 PR #41 restoration after any aborted or ambiguous research step terminates as
 `RESTORED_AFTER_ABORT`. A restoration-stage failure terminates as
-`RESTORE_FAILED`; neither recovery outcome asserts research success.
+`RESTORE_FAILED`. If recovery begins before candidate installation reached a
+submission-possible phase, run the state-neutral current-source inspection
+before staging PR #41. Exact PR #41 terminates as `ABORTED_AT_BASELINE` without
+transfer, installation, or restart; any other or indeterminate result keeps the
+existing PR #41 recovery path. None of these recovery outcomes asserts research
+success.
 
 The controller owns one versioned durable continuity journal at a fixed,
 repository-owned location under the shared Git metadata directory. No caller
@@ -248,6 +253,9 @@ durable, transition committed, ambiguity, and reconciliation. It retains
 lifecycle/source generations, exact PR #45 and PR #41 authorities,
 research-success and recovery flags, consumed actions, helper/restart
 tombstones, Core-check attempts, nonce state, and sanitized evidence identities.
+An operation that becomes ambiguous before a typed result also retains only a
+fixed failure stage and generic class; exception text and private paths are not
+journal data.
 It never stores a target, token, raw response, PTY data, issue object, or device
 identifier. Opening an unfinished post-mutation journal yields
 `RECOVERY_REQUIRED`; research and candidate entrypoints are hidden on that

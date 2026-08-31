@@ -1002,11 +1002,23 @@ def _synthetic_r30_source_authorities(
         access,
         "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS",
         not request.node.name.startswith(
-            ("test_r33_", "test_r35_reconstruction_", "test_r36_")
+            (
+                "test_r33_",
+                "test_r35_reconstruction_",
+                "test_r36_",
+                "test_r44_",
+            )
         ),
     )
     if not request.node.name.startswith(
-        ("test_r30_", "test_r32_", "test_r33_", "test_r35_", "test_r36_")
+        (
+            "test_r30_",
+            "test_r32_",
+            "test_r33_",
+            "test_r35_",
+            "test_r36_",
+            "test_r44_",
+        )
     ):
         return
     for state_name in ("CANDIDATE", "RESTORE"):
@@ -2682,6 +2694,21 @@ class _R32ScriptedBroker:
         if getattr(self, "_durable_lifecycle_test", False) is True:
             self._pending_capability = capability
 
+    def _consume_source_inspection_capability(self, capability: object) -> None:
+        binding = self._controller_binding
+        if (
+            type(capability) is not access._SourceInspectionCapability
+            or binding is None
+            or capability.controller is not binding[0]
+            or capability.issuer is not binding[1].identity
+            or capability.session_generation is not binding[3]
+            or self._session_generation is not binding[3]
+            or not any(capability is issued for issued in binding[1].issued)
+            or any(capability is consumed for consumed in binding[1].consumed)
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_INSPECTION_CAPABILITY_INVALID")
+        binding[1].consumed.append(capability)
+
     def queue(self, name: str, *responses: object) -> None:
         self.responses.setdefault(name, []).extend(responses)
 
@@ -2828,6 +2855,37 @@ class _R32ScriptedBroker:
             manifest.state,
             access.SourceInventoryResult(count, count, True, 0, 0),
         )
+
+    def _inspect_current_source(
+        self,
+        candidate_manifest: access.SourceManifest,
+        restore_manifest: access.SourceManifest,
+        *,
+        _capability: object = None,
+    ) -> access.CurrentSourceInventoryResult:
+        assert candidate_manifest.state is access.SourceState.CANDIDATE
+        assert restore_manifest.state is access.SourceState.RESTORE
+        self._consume_source_inspection_capability(_capability)
+        self.calls.append(("current_source_inventory", None))
+        queued = self.responses.get("current_source_inventory", [])
+        value = (
+            queued.pop(0)
+            if queued
+            else access.CurrentSourceInventoryResult(
+                access.CurrentSourceClassification.EXACT_PR41,
+                access.SourceInventoryResult(
+                    len(restore_manifest.entries),
+                    len(restore_manifest.entries),
+                    True,
+                    0,
+                    0,
+                ),
+            )
+        )
+        if isinstance(value, BaseException):
+            raise value
+        assert isinstance(value, access.CurrentSourceInventoryResult)
+        return value
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
@@ -3141,6 +3199,7 @@ def _r32_unbound_real_broker() -> access.PrivateInteractiveSessionBroker:
     broker._max_capture_bytes = 4096
     broker._controller_binding = None
     broker._PrivateInteractiveSessionBroker__wire_issuer = object()
+    broker._PrivateInteractiveSessionBroker__inspection_token = object()
     return broker
 
 
@@ -3735,6 +3794,7 @@ def test_r32_c4_exact_success_state_sequence() -> None:
         "POST_RESTORE_REPAIRS_PASS",
         "COMPLETE_NORMAL",
         "RESTORED_AFTER_ABORT",
+        "ABORTED_AT_BASELINE",
     )
 
 
@@ -5139,7 +5199,9 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         def record_dispatch_started(self, _action: access.LifecycleAction) -> None:
             self.phases.append("dispatch_started")
 
-        def record_ambiguous(self, _action: access.LifecycleAction) -> None:
+        def record_ambiguous(
+            self, _action: access.LifecycleAction, *_diagnostic: object
+        ) -> None:
             self.phases.append("ambiguous")
 
         def record_result(
@@ -6897,6 +6959,308 @@ def test_r36_controller_adopts_published_backup_after_lost_result() -> None:
         "backup_creation_reconcile"
     ]
     reconstructed.close()
+
+
+def _r44_backup_ambiguity() -> tuple[object, _R32ScriptedBroker, object, object]:
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    broker.queue(
+        "backup",
+        access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="BACKUP_VERIFICATION"):
+        controller.create_backup(restore.manifest)
+    controller.close()
+    reconstructed, reconstructed_broker = _r33_controller()
+    assert reconstructed.state is access.LifecycleState.RECOVERY_REQUIRED
+    return reconstructed, reconstructed_broker, candidate, restore
+
+
+def test_r44_pre_source_abort_exact_pr41_skips_restore_tail() -> None:
+    controller, broker, candidate, restore = _r44_backup_ambiguity()
+
+    result = controller.resolve_pre_source_abort(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert controller.state is access.LifecycleState.ABORTED_AT_BASELINE
+    names = [name for name, _ in broker.calls]
+    assert names == ["current_source_inventory"]
+    assert names.count("transfer") == 0
+    assert names.count("install_restore") == 0
+    assert names.count("restart") == 0
+    assert not controller._permits[access.LifecycleAction.RESTORE_TRANSFER].consumed
+
+
+def test_r44_pre_source_abort_non_pr41_keeps_restore_reachable() -> None:
+    controller, broker, candidate, restore = _r44_backup_ambiguity()
+    broker.queue(
+        "current_source_inventory",
+        access.CurrentSourceInventoryResult(access.CurrentSourceClassification.OTHER),
+    )
+
+    result = controller.resolve_pre_source_abort(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.OTHER
+    assert controller.state is access.LifecycleState.RECOVERY_REQUIRED
+    assert not controller._permits[access.LifecycleAction.RESTORE_TRANSFER].consumed
+    controller.stage_restore(restore)
+    assert controller.state is access.LifecycleState.RESTORE_STAGED
+    assert [name for name, _ in broker.calls] == [
+        "current_source_inventory",
+        "transfer",
+    ]
+    controller.close()
+
+
+def test_r44_terminal_source_inventory_is_byte_neutral() -> None:
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 3, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    broker.queue(
+        "transfer",
+        access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.stage_restore(restore)
+    controller.close()
+
+    terminal, terminal_broker = _r33_controller()
+    assert terminal.state is access.LifecycleState.RESTORE_FAILED
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    before_bytes = journal_path.read_bytes()
+    before_record = json.loads(before_bytes)
+    before_permits = {
+        action: permit.consumed for action, permit in terminal._permits.items()
+    }
+    lifecycle_generation = terminal._journal.lifecycle_generation
+
+    result = terminal.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert isinstance(result, access.CurrentSourceInventoryResult)
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert journal_path.read_bytes() == before_bytes
+    assert terminal._journal._record == before_record
+    assert terminal._journal.lifecycle_generation == lifecycle_generation
+    assert {
+        action: permit.consumed for action, permit in terminal._permits.items()
+    } == before_permits
+    assert [name for name, _ in terminal_broker.calls] == ["current_source_inventory"]
+    terminal.close()
+
+
+@pytest.mark.parametrize(
+    ("classification", "exact_states", "failure", "expected_calls"),
+    (
+        (access.CurrentSourceClassification.EXACT_PR41, (True,), None, 1),
+        (access.CurrentSourceClassification.EXACT_PR45, (False, True), None, 2),
+        (access.CurrentSourceClassification.OTHER, (False, False), None, 2),
+        (
+            access.CurrentSourceClassification.INDETERMINATE,
+            (),
+            access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT"),
+            1,
+        ),
+    ),
+)
+def test_r44_real_current_source_inventory_has_four_bounded_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    classification: access.CurrentSourceClassification,
+    exact_states: tuple[bool, ...],
+    failure: BaseException | None,
+    expected_calls: int,
+) -> None:
+    broker = _r32_unbound_real_broker()
+    controller = access.FullPreflightLifecycleController(broker)
+    candidate, restore = _r32_bundles()
+    calls = 0
+
+    def execute(*_args: object, **_kwargs: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        if failure is not None:
+            raise failure
+        manifest = restore.manifest if calls == 1 else candidate.manifest
+        exact = exact_states[calls - 1]
+        count = len(manifest.entries)
+        return json.dumps(
+            {
+                "expected_count": count,
+                "observed_count": count if exact else count - 1,
+                "manifest_match": exact,
+                "unexpected_count": 0,
+                "missing_count": 0 if exact else 1,
+            }
+        ).encode("ascii")
+
+    monkeypatch.setattr(
+        broker,
+        "_PrivateInteractiveSessionBroker__execute_bounded_operation",
+        execute,
+    )
+
+    result = controller.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is classification
+    assert calls == expected_calls
+    assert (result.evidence is not None) == (
+        classification
+        in {
+            access.CurrentSourceClassification.EXACT_PR41,
+            access.CurrentSourceClassification.EXACT_PR45,
+        }
+    )
+    controller.close()
+
+
+def _r44_controller_at_backup(
+    broker: access.PrivateInteractiveSessionBroker,
+) -> access.FullPreflightLifecycleController:
+    controller = access.FullPreflightLifecycleController(broker)
+    journal = controller._journal
+    assert journal is not None
+    source_generation = journal.source_generation
+    action = access.LifecycleAction.INITIAL_REPAIRS
+    journal.record_intent(action, source_generation=source_generation, nonce=None)
+    journal.record_dispatch_started(action)
+    evidence_generation = journal.record_result(
+        action,
+        lifecycle_generation=journal.lifecycle_generation,
+        source_generation=source_generation,
+        session_generation="1" * 32,
+        issuance_identity="2" * 32,
+        audit_instance=None,
+        nonce=None,
+    )
+    journal.transition(
+        access.LifecycleState.INITIAL_REPAIRS_PASS,
+        action=action,
+        source_generation=source_generation,
+        evidence_generation=evidence_generation,
+    )
+    return controller
+
+
+@pytest.mark.parametrize(
+    ("failure_location", "expected_stage"),
+    (
+        ("control", access.DispatchFailureStage.CONTROL_PROGRAM),
+        ("payload", access.DispatchFailureStage.PAYLOAD),
+    ),
+)
+def test_r44_transfer_write_failure_records_bounded_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_location: str,
+    expected_stage: access.DispatchFailureStage,
+) -> None:
+    broker = _r32_unbound_real_broker()
+    controller = _r44_controller_at_backup(broker)
+    _candidate, restore = _r32_bundles()
+    program_chunks = (
+        len(base64.b64encode(access._REMOTE_CONTROL_PROGRAM.encode("utf-8")))
+        + access._TRANSFER_CHUNK_SIZE
+        - 1
+    ) // access._TRANSFER_CHUNK_SIZE
+    failure_write = 1 if failure_location == "control" else program_chunks + 3
+    writes = 0
+
+    def write(_packet: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == failure_write:
+            raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED")
+
+    monkeypatch.setattr(broker, "_PrivateInteractiveSessionBroker__write_wire", write)
+    monkeypatch.setattr(broker, "_read_until", lambda *_args, **_kwargs: b"")
+
+    with pytest.raises(access.LifecycleControllerError, match="BACKUP_VERIFICATION"):
+        controller.create_backup(restore.manifest)
+
+    operation = controller._journal._record["operations"][-1]
+    assert operation["phase"] == "ambiguous"
+    assert operation["failure_stage"] == expected_stage.value
+    assert operation["failure_class"] == access.DispatchFailureClass.CHILD_EXIT.value
+    controller.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_location", "expected_stage", "expected_class"),
+    (
+        (
+            "wait",
+            access.DispatchFailureStage.RESPONSE_WAIT,
+            access.DispatchFailureClass.TIMEOUT,
+        ),
+        (
+            "parse",
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.DispatchFailureClass.FRAMING,
+        ),
+    ),
+)
+def test_r44_response_failure_records_bounded_stage_and_class(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_location: str,
+    expected_stage: access.DispatchFailureStage,
+    expected_class: access.DispatchFailureClass,
+) -> None:
+    broker = _r32_unbound_real_broker()
+    controller = _r44_controller_at_backup(broker)
+    _candidate, restore = _r32_bundles()
+    if failure_location == "wait":
+        reads = 0
+
+        def read(*_args: object, **_kwargs: object) -> bytes:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+            return b""
+
+        monkeypatch.setattr(
+            broker,
+            "_PrivateInteractiveSessionBroker__write_wire",
+            lambda _packet: None,
+        )
+        monkeypatch.setattr(broker, "_read_until", read)
+    else:
+        monkeypatch.setattr(
+            broker,
+            "_PrivateInteractiveSessionBroker__execute_bounded_operation",
+            lambda *_args, **_kwargs: b"synthetic malformed response",
+        )
+
+    with pytest.raises(access.LifecycleControllerError, match="BACKUP_VERIFICATION"):
+        controller.create_backup(restore.manifest)
+
+    operation = controller._journal._record["operations"][-1]
+    assert operation["failure_stage"] == expected_stage.value
+    assert operation["failure_class"] == expected_class.value
+    controller.close()
+
+
+def test_r44_raw_callback_exception_text_is_not_persisted() -> None:
+    controller, broker = _r33_controller()
+    _candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    raw_text = "synthetic private callback path /not/persisted"
+    broker.queue("backup", RuntimeError(raw_text))
+
+    with pytest.raises(RuntimeError, match="not/persisted"):
+        controller.create_backup(restore.manifest)
+
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    persisted = journal_path.read_text(encoding="ascii")
+    operation = controller._journal._record["operations"][-1]
+    assert raw_text not in persisted
+    assert operation["failure_stage"] == access.DispatchFailureStage.CALLBACK.value
+    assert operation["failure_class"] == access.DispatchFailureClass.CALLBACK.value
+    controller.close()
 
 
 def test_r36_d_m6_open_root_fd_remains_authority_after_path_swap(

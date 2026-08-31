@@ -113,11 +113,44 @@ class BrokerFailure(StrEnum):
     TIMEOUT = "TIMEOUT"
 
 
+class DispatchFailureStage(StrEnum):
+    """Bounded stage reached before a typed operation result was durable."""
+
+    CONTROL_PROGRAM = "CONTROL_PROGRAM"
+    PAYLOAD = "PAYLOAD"
+    RESPONSE_WAIT = "RESPONSE_WAIT"
+    RESPONSE_PARSE = "RESPONSE_PARSE"
+    RESULT_VALIDATION = "RESULT_VALIDATION"
+    CALLBACK = "CALLBACK"
+    UNKNOWN = "UNKNOWN"
+
+
+class DispatchFailureClass(StrEnum):
+    """Sanitized generic cause retained for an ambiguous dispatch."""
+
+    TIMEOUT = "timeout"
+    CHILD_EXIT = "child_exit"
+    FRAMING = "framing"
+    SCHEMA = "schema"
+    CALLBACK = "callback"
+    IO = "io"
+    UNKNOWN = "unknown"
+
+
 class SourceState(StrEnum):
     """The two exact repository authorities accepted by the control plane."""
 
     CANDIDATE = "candidate"
     RESTORE = "restore"
+
+
+class CurrentSourceClassification(StrEnum):
+    """Bounded comparison against the two repository-owned manifests."""
+
+    EXACT_PR41 = "EXACT_PR41"
+    EXACT_PR45 = "EXACT_PR45"
+    OTHER = "OTHER"
+    INDETERMINATE = "INDETERMINATE"
 
 
 class BoundedOperation(StrEnum):
@@ -227,6 +260,7 @@ class LifecycleState(StrEnum):
     COMPLETE_NORMAL = "COMPLETE_NORMAL"
     COMPLETE = "COMPLETE_NORMAL"
     RESTORED_AFTER_ABORT = "RESTORED_AFTER_ABORT"
+    ABORTED_AT_BASELINE = "ABORTED_AT_BASELINE"
     RESTORE_FAILED = "RESTORE_FAILED"
     MANUAL_RECOVERY_REQUIRED = "MANUAL_RECOVERY_REQUIRED"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
@@ -596,6 +630,7 @@ _ROLLBACK_REBIND_ACTIONS = frozenset(
 
 _ROLLBACK_BROKER_ADAPTERS = (
     "_register_lifecycle_controller",
+    "_inspect_current_source",
     "_transfer_source_bundle",
     "_install_staged_restore",
     "_verify_source_inventory",
@@ -613,6 +648,48 @@ _ROLLBACK_BROKER_ADAPTERS = (
 
 class SessionBrokerError(RuntimeError):
     """A failure that intentionally never includes captured PTY bytes."""
+
+
+class _DispatchFailure(SessionBrokerError):
+    """A sanitized bounded dispatch failure with no exception text."""
+
+    def __init__(
+        self, stage: DispatchFailureStage, failure_class: DispatchFailureClass
+    ) -> None:
+        super().__init__("PRIVATE_INTERACTIVE_SESSION_DISPATCH_FAILED")
+        self.stage = stage
+        self.failure_class = failure_class
+
+
+def _bounded_dispatch_failure(
+    stage: DispatchFailureStage, error: BaseException
+) -> _DispatchFailure:
+    """Discard exception text and retain only one fixed diagnostic class."""
+    if isinstance(error, _DispatchFailure):
+        return error
+    if isinstance(error, SessionBrokerError):
+        error_code = (
+            error.args[0]
+            if len(error.args) == 1 and isinstance(error.args[0], str)
+            else None
+        )
+        failure_class = {
+            "PRIVATE_INTERACTIVE_SESSION_TIMEOUT": DispatchFailureClass.TIMEOUT,
+            "PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED": (
+                DispatchFailureClass.CHILD_EXIT
+            ),
+            "PRIVATE_INTERACTIVE_SESSION_OUTPUT_LIMIT": DispatchFailureClass.FRAMING,
+            "PRIVATE_INTERACTIVE_SESSION_PROTOCOL": DispatchFailureClass.FRAMING,
+        }.get(error_code)
+        if failure_class is None:
+            failure_class = DispatchFailureClass.UNKNOWN
+    elif isinstance(error, (SourceBundleError, TypeError, ValueError)):
+        failure_class = DispatchFailureClass.SCHEMA
+    elif isinstance(error, OSError):
+        failure_class = DispatchFailureClass.IO
+    else:
+        failure_class = DispatchFailureClass.UNKNOWN
+    return _DispatchFailure(stage, failure_class)
 
 
 class SourceBundleError(ValueError):
@@ -662,6 +739,16 @@ class _LifecycleCapability:
     action: LifecycleAction
     issuance_identity: object
     backup_identity: object = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceInspectionCapability:
+    """One broker-bound read capability outside lifecycle operation permits."""
+
+    controller: object
+    issuer: object
+    session_generation: object
+    issuance_identity: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -831,6 +918,27 @@ class SourceInventoryResult:
     manifest_match: bool
     unexpected_count: int
     missing_count: int
+
+
+@dataclass(frozen=True)
+class CurrentSourceInventoryResult:
+    classification: CurrentSourceClassification
+    evidence: SourceInventoryResult | None = None
+
+
+def _source_inventory_exact(result: object, expected_count: int) -> bool:
+    return (
+        isinstance(result, SourceInventoryResult)
+        and _exact_non_bool_int(result.expected_count)
+        and result.expected_count == expected_count
+        and _exact_non_bool_int(result.observed_count)
+        and result.observed_count == expected_count
+        and result.manifest_match is True
+        and _exact_non_bool_int(result.unexpected_count)
+        and result.unexpected_count == 0
+        and _exact_non_bool_int(result.missing_count)
+        and result.missing_count == 0
+    )
 
 
 @dataclass(frozen=True)
@@ -1636,6 +1744,7 @@ class _DurableLifecycleJournal:
         terminal_values = {
             LifecycleState.COMPLETE_NORMAL.value,
             LifecycleState.RESTORED_AFTER_ABORT.value,
+            LifecycleState.ABORTED_AT_BASELINE.value,
             LifecycleState.RESTORE_FAILED.value,
             LifecycleState.MANUAL_RECOVERY_REQUIRED.value,
         }
@@ -1818,6 +1927,7 @@ class _DurableLifecycleJournal:
                         invalid = invalid or next_state not in {
                             LifecycleState.ROLLBACK_REQUIRED,
                             LifecycleState.RECOVERY_REQUIRED,
+                            LifecycleState.ABORTED_AT_BASELINE,
                             LifecycleState.RESTORE_FAILED,
                         }
                     else:
@@ -1838,15 +1948,22 @@ class _DurableLifecycleJournal:
         if type(operations) is list:
             seen: set[str] = set()
             for operation in operations:
+                operation_keys = set(operation) if type(operation) is dict else set()
+                base_operation_keys = {
+                    "action",
+                    "phase",
+                    "source_generation",
+                    "nonce",
+                }
                 invalid = (
                     invalid
                     or type(operation) is not dict
-                    or set(operation)
-                    != {
-                        "action",
-                        "phase",
-                        "source_generation",
-                        "nonce",
+                    or operation_keys
+                    not in {
+                        frozenset(base_operation_keys),
+                        frozenset(
+                            base_operation_keys | {"failure_stage", "failure_class"}
+                        ),
                     }
                 )
                 if type(operation) is dict:
@@ -1871,6 +1988,16 @@ class _DurableLifecycleJournal:
                             or _NONCE.fullmatch(operation_nonce) is None
                         )
                     )
+                    has_failure = "failure_stage" in operation
+                    invalid = invalid or has_failure != ("failure_class" in operation)
+                    if has_failure:
+                        invalid = invalid or operation.get("phase") != "ambiguous"
+                        invalid = invalid or operation.get("failure_stage") not in {
+                            item.value for item in DispatchFailureStage
+                        }
+                        invalid = invalid or operation.get("failure_class") not in {
+                            item.value for item in DispatchFailureClass
+                        }
             if type(record.get("consumed_operations")) is list:
                 invalid = invalid or seen != set(record["consumed_operations"])
             evidence_actions: list[object] = []
@@ -2161,6 +2288,27 @@ class _DurableLifecycleJournal:
     def transitions(self) -> tuple[dict[str, object], ...]:
         return tuple(copy.deepcopy(self._record["transitions"]))
 
+    @property
+    def source_mutation_may_have_occurred(self) -> bool:
+        submission_possible = {
+            "dispatch_started",
+            "result_durable",
+            "transition_committed",
+            "ambiguous",
+            "reconciled",
+        }
+        source_mutating_actions = {
+            LifecycleAction.CANDIDATE_INSTALL.value,
+            LifecycleAction.RESTORE_INSTALL.value,
+            LifecycleAction.BACKUP_FALLBACK.value,
+            LifecycleAction.BACKUP_FALLBACK_RECONCILE.value,
+        }
+        return any(
+            operation["action"] in source_mutating_actions
+            and operation["phase"] in submission_possible
+            for operation in self._record["operations"]
+        )
+
     def record_intent(
         self,
         action: LifecycleAction,
@@ -2239,6 +2387,9 @@ class _DurableLifecycleJournal:
             if len(matches) != 1:
                 raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
             matches[0]["phase"] = phase
+            if phase != "ambiguous":
+                matches[0].pop("failure_stage", None)
+                matches[0].pop("failure_class", None)
             if action in {
                 LifecycleAction.BACKUP_FALLBACK,
                 LifecycleAction.BACKUP_FALLBACK_RECONCILE,
@@ -2266,7 +2417,12 @@ class _DurableLifecycleJournal:
     def record_dispatch_started(self, action: LifecycleAction) -> None:
         self._set_operation_phase(action, "dispatch_started")
 
-    def record_ambiguous(self, action: LifecycleAction) -> None:
+    def record_ambiguous(
+        self,
+        action: LifecycleAction,
+        stage: DispatchFailureStage = DispatchFailureStage.UNKNOWN,
+        failure_class: DispatchFailureClass = DispatchFailureClass.UNKNOWN,
+    ) -> None:
         def mutate(record: dict[str, object]) -> None:
             matches = [
                 operation
@@ -2276,6 +2432,8 @@ class _DurableLifecycleJournal:
             if len(matches) != 1:
                 raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
             matches[0]["phase"] = "ambiguous"
+            matches[0]["failure_stage"] = stage.value
+            matches[0]["failure_class"] = failure_class.value
             record["ambiguous_operation"] = action.value
             record["recovery_mode"] = True
             record["rollback_mode"] = True
@@ -5049,6 +5207,7 @@ class PrivateInteractiveSessionBroker:
         self._backup_restore_attempted = False
         self._controller_binding: _ControllerBinding | None = None
         self.__wire_issuer = object()
+        self.__inspection_token = object()
 
     def __repr__(self) -> str:
         """Never render the wrapper path, target, argv, or captured output."""
@@ -5155,6 +5314,29 @@ class PrivateInteractiveSessionBroker:
         ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+        return capability
+
+    def _require_source_inspection_capability(
+        self, capability: object, *, consume: bool = False
+    ) -> _SourceInspectionCapability:
+        binding = self._controller_binding
+        if (
+            type(capability) is not _SourceInspectionCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.session_generation is not binding.session_generation
+            or capability.issuance_identity is None
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_INSPECTION_CAPABILITY_INVALID"
             ) from None
         if consume:
             binding.issuer.consumed.append(capability)
@@ -5362,15 +5544,28 @@ class PrivateInteractiveSessionBroker:
         *,
         detail: str = "fixed",
         _capability: object = None,
+        _inspection_token: object = None,
     ) -> bytes:
         """Run one enum operation with bounded chunks and exact private frames."""
         if not isinstance(operation, BoundedOperation):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        self._require_capability(
-            _capability, _BOUNDED_OPERATION_ACTIONS[operation], consume=True
+        neutral_inspection = (
+            operation is BoundedOperation.SOURCE_INVENTORY
+            and _inspection_token is not None
+            and _inspection_token
+            is getattr(
+                self,
+                "_PrivateInteractiveSessionBroker__inspection_token",
+                None,
+            )
+            and _capability is None
         )
+        if not neutral_inspection:
+            self._require_capability(
+                _capability, _BOUNDED_OPERATION_ACTIONS[operation], consume=True
+            )
         if self._state is not BrokerState.SESSION_ACTIVE:
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE") from None
         if not isinstance(value, dict) or not re.fullmatch(r"[a-z0-9_]+", detail):
@@ -5388,7 +5583,6 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        self._ensure_echo_disabled()
         start_payload, start_frame = self._new_frame("OPERATION_START")
         end_payload, end_frame = self._new_frame("OPERATION_END")
         program_bytes = _REMOTE_CONTROL_PROGRAM.encode("utf-8")
@@ -5418,29 +5612,44 @@ class PrivateInteractiveSessionBroker:
             f"python3 -c {shlex.quote(bootstrap)} {operation.value}; "
             f"{self._frame_printf(end_payload)}\n"
         )
-        self.__write_wire(
-            _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
-        )
-        self._read_until(start_frame)
-        self.__write_wire(
-            _PrivateWirePacket(
-                (str(len(program_chunks)) + "\n").encode("ascii"),
-                self.__wire_issuer,
-            )
-        )
-        for chunk in program_chunks:
+        try:
+            self._ensure_echo_disabled()
             self.__write_wire(
-                _PrivateWirePacket((chunk + "\n").encode("ascii"), self.__wire_issuer)
+                _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
             )
-        self.__write_wire(
-            _PrivateWirePacket(
-                (str(len(chunks)) + "\n").encode("ascii"), self.__wire_issuer
-            )
-        )
-        for chunk in chunks:
+            self._read_until(start_frame)
             self.__write_wire(
-                _PrivateWirePacket((chunk + "\n").encode("ascii"), self.__wire_issuer)
+                _PrivateWirePacket(
+                    (str(len(program_chunks)) + "\n").encode("ascii"),
+                    self.__wire_issuer,
+                )
             )
+            for chunk in program_chunks:
+                self.__write_wire(
+                    _PrivateWirePacket(
+                        (chunk + "\n").encode("ascii"), self.__wire_issuer
+                    )
+                )
+        except SessionBrokerError as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.CONTROL_PROGRAM, error
+            ) from None
+        try:
+            self.__write_wire(
+                _PrivateWirePacket(
+                    (str(len(chunks)) + "\n").encode("ascii"), self.__wire_issuer
+                )
+            )
+            for chunk in chunks:
+                self.__write_wire(
+                    _PrivateWirePacket(
+                        (chunk + "\n").encode("ascii"), self.__wire_issuer
+                    )
+                )
+        except SessionBrokerError as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.PAYLOAD, error
+            ) from None
         deadlines = {
             BoundedOperation.TRANSFER: 90.0,
             BoundedOperation.INSTALL: 90.0,
@@ -5449,10 +5658,17 @@ class PrivateInteractiveSessionBroker:
             BoundedOperation.CORE_READINESS: 130.0,
             BoundedOperation.PHASE_A_HELPER: 200.0,
         }
-        return self._read_until(
-            end_frame,
-            timeout_seconds=max(self._timeout_seconds, deadlines.get(operation, 40.0)),
-        )
+        try:
+            return self._read_until(
+                end_frame,
+                timeout_seconds=max(
+                    self._timeout_seconds, deadlines.get(operation, 40.0)
+                ),
+            )
+        except SessionBrokerError as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_WAIT, error
+            ) from None
 
     @staticmethod
     def _simple_result(
@@ -5495,7 +5711,12 @@ class PrivateInteractiveSessionBroker:
             _backup_context_payload(manifest, capability),
             _capability=_capability,
         )
-        result = _parse_backup_result(output)
+        try:
+            result = _parse_backup_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
         return _bind_evidence_origin(result, capability)
 
     def _reconcile_private_backup_creation(
@@ -5528,11 +5749,16 @@ class PrivateInteractiveSessionBroker:
             detail=bundle.state.value,
             _capability=_capability,
         )
-        result = self._simple_result(
-            output,
-            TransferResult,
-            ("success", "file_count", "manifest_match", "regular_files_only"),
-        )
+        try:
+            result = self._simple_result(
+                output,
+                TransferResult,
+                ("success", "file_count", "manifest_match", "regular_files_only"),
+            )
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
         return _bind_evidence_origin(result, capability)
 
     def _install_staged_source(
@@ -5586,6 +5812,55 @@ class PrivateInteractiveSessionBroker:
         )
         result = _parse_source_inventory_result(_exact_payload(output))
         return _bind_evidence_origin(result, capability)
+
+    def _inspect_current_source(
+        self,
+        candidate_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+        *,
+        _capability: object = None,
+    ) -> CurrentSourceInventoryResult:
+        self._require_source_inspection_capability(_capability, consume=True)
+        if (
+            not isinstance(candidate_manifest, SourceManifest)
+            or candidate_manifest.state is not SourceState.CANDIDATE
+            or not isinstance(restore_manifest, SourceManifest)
+            or restore_manifest.state is not SourceState.RESTORE
+        ):
+            raise SourceBundleError("SOURCE_MANIFEST_INVALID") from None
+
+        def inspect(manifest: SourceManifest) -> SourceInventoryResult:
+            output = self.__execute_bounded_operation(
+                BoundedOperation.SOURCE_INVENTORY,
+                {"manifest": _manifest_payload(manifest)},
+                detail=manifest.state.value,
+                _inspection_token=self.__inspection_token,
+            )
+            try:
+                return _parse_source_inventory_result(_exact_payload(output))
+            except (SessionBrokerError, TypeError, ValueError) as error:
+                raise _bounded_dispatch_failure(
+                    DispatchFailureStage.RESPONSE_PARSE, error
+                ) from None
+
+        try:
+            restore_result = inspect(restore_manifest)
+            if _source_inventory_exact(restore_result, len(restore_manifest.entries)):
+                return CurrentSourceInventoryResult(
+                    CurrentSourceClassification.EXACT_PR41, restore_result
+                )
+            candidate_result = inspect(candidate_manifest)
+            if _source_inventory_exact(
+                candidate_result, len(candidate_manifest.entries)
+            ):
+                return CurrentSourceInventoryResult(
+                    CurrentSourceClassification.EXACT_PR45, candidate_result
+                )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE
+            )
+        return CurrentSourceInventoryResult(CurrentSourceClassification.OTHER)
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
@@ -6055,6 +6330,7 @@ class FullPreflightLifecycleController:
         self._restore_core_check: CoreCheckResult | None = None
         self._removal_restart: RestartResult | None = None
         self._restart_dispatched: set[SourceState] = set()
+        self._pre_source_recovery_inspected = False
         self._restore_readiness: CoreReadinessResult | None = None
         self._restore_services: ServiceInventoryResult | None = None
         self._restore_repairs: RepairsEvidence | None = None
@@ -6279,9 +6555,15 @@ class FullPreflightLifecycleController:
             self._journal.record_dispatch_started(action)
         try:
             result = callback(capability)
-        except BaseException:
+        except BaseException as error:
             if self._journal is not None:
-                self._journal.record_ambiguous(action)
+                if isinstance(error, _DispatchFailure):
+                    failure_stage = error.stage
+                    failure_class = error.failure_class
+                else:
+                    failure_stage = DispatchFailureStage.CALLBACK
+                    failure_class = DispatchFailureClass.CALLBACK
+                self._journal.record_ambiguous(action, failure_stage, failure_class)
                 if action is LifecycleAction.BACKUP_FALLBACK_RECONCILE and getattr(
                     self._journal, "fallback_reconciliation_resumable", False
                 ):
@@ -6404,18 +6686,74 @@ class FullPreflightLifecycleController:
 
     @staticmethod
     def _inventory_pass(result: object, expected_count: int) -> bool:
-        return (
-            isinstance(result, SourceInventoryResult)
-            and _exact_non_bool_int(result.expected_count)
-            and result.expected_count == expected_count
-            and _exact_non_bool_int(result.observed_count)
-            and result.observed_count == expected_count
-            and result.manifest_match is True
-            and _exact_non_bool_int(result.unexpected_count)
-            and result.unexpected_count == 0
-            and _exact_non_bool_int(result.missing_count)
-            and result.missing_count == 0
+        return _source_inventory_exact(result, expected_count)
+
+    def inspect_current_source(
+        self,
+        candidate_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+    ) -> CurrentSourceInventoryResult:
+        self._assert_session_binding()
+        try:
+            validate_source_manifest(candidate_manifest)
+            validate_source_manifest(restore_manifest)
+        except (SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
+        if (
+            candidate_manifest.state is not SourceState.CANDIDATE
+            or restore_manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("SOURCE_INSPECTION_FAILED") from None
+        capability = _SourceInspectionCapability(
+            self,
+            self._capability_issuer.identity,
+            self._session_generation,
+            secrets.token_hex(16),
         )
+        self._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._inspect_current_source(
+                candidate_manifest,
+                restore_manifest,
+                _capability=capability,
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE
+            )
+        if not isinstance(result, CurrentSourceInventoryResult):
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE
+            )
+        return result
+
+    def resolve_pre_source_abort(
+        self,
+        candidate_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+    ) -> CurrentSourceInventoryResult:
+        self._require_state(
+            LifecycleState.ROLLBACK_REQUIRED, LifecycleState.RECOVERY_REQUIRED
+        )
+        if self._journal is None or self._journal.source_mutation_may_have_occurred:
+            raise LifecycleControllerError(
+                "PRE_SOURCE_RECOVERY_DECISION_INVALID"
+            ) from None
+        result = self.inspect_current_source(candidate_manifest, restore_manifest)
+        if result.classification is CurrentSourceClassification.EXACT_PR41:
+            self._journal.transition(
+                LifecycleState.ABORTED_AT_BASELINE,
+                action=None,
+                source_generation=self._journal._record["pr41_restore"]["generation"],
+                evidence_generation=None,
+                recovery=True,
+                terminal=True,
+            )
+            self._state = LifecycleState.ABORTED_AT_BASELINE
+            self._journal.close()
+        else:
+            self._pre_source_recovery_inspected = True
+        return result
 
     @staticmethod
     def _readiness_pass(result: object) -> bool:
@@ -6510,8 +6848,9 @@ class FullPreflightLifecycleController:
                 and re.fullmatch(r"[0-9a-f]{32}", result.backup_generation) is not None
                 and re.fullmatch(r"[0-9a-f]{64}", result.backup_digest) is not None
             ):
-                raise SessionBrokerError(
-                    "PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+                raise _DispatchFailure(
+                    DispatchFailureStage.RESULT_VALIDATION,
+                    DispatchFailureClass.SCHEMA,
                 ) from None
             return result
 
@@ -6998,6 +7337,13 @@ class FullPreflightLifecycleController:
             LifecycleState.ROLLBACK_REQUIRED,
             LifecycleState.RECOVERY_REQUIRED,
         )
+        if (
+            self._journal is not None
+            and self._journal.recovery_mode
+            and not self._journal.source_mutation_may_have_occurred
+            and not self._pre_source_recovery_inspected
+        ):
+            raise LifecycleControllerError("PRE_SOURCE_INVENTORY_REQUIRED") from None
         if (
             not isinstance(bundle, SourceBundle)
             or bundle.state is not SourceState.RESTORE
