@@ -2427,6 +2427,107 @@ def test_r36_fallback_rejects_live_parent_swap_before_durable_sync(
     )
 
 
+@pytest.mark.parametrize(
+    ("operation", "needle"),
+    (
+        (
+            "backup",
+            (
+                "            published_identity = read_backup_identity_fd("
+                "value, package_fd)\n"
+            ),
+        ),
+        (
+            "reconcile_backup_creation",
+            (
+                "        identity = read_backup_identity_fd(value, package_fd)\n"
+                "        source_fd = open_relative_directory(package_fd, "
+                "('integration',))\n"
+            ),
+        ),
+    ),
+)
+def test_r36_backup_publication_and_adoption_reject_package_inode_swap(
+    operation: str, needle: str, tmp_path: Path
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    payload = _r36_backup_payload()
+    if operation == "reconcile_backup_creation":
+        assert _run_synthetic_remote_program(tmp_path, "backup", payload)[
+            "manifest_match"
+        ]
+    replacement = (
+        needle
+        + ("            " if operation == "backup" else "        ")
+        + "moved = BACKUP.with_name(BACKUP.name + '.swapped')\n"
+    )
+    indentation = "            " if operation == "backup" else "        "
+    replacement += (
+        f"{indentation}BACKUP.rename(moved)\n"
+        f"{indentation}shutil.copytree(moved, BACKUP)\n"
+    )
+    if operation == "reconcile_backup_creation":
+        replacement += (
+            "        source_fd = open_relative_directory(package_fd, "
+            "('integration',))\n"
+        )
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        operation,
+        payload,
+        source_replacements={needle: replacement},
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+
+
+def test_r36_fallback_post_marker_swap_downgrades_reconciliation(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    payload = _r36_backup_payload()
+    assert _run_synthetic_remote_program(tmp_path, "backup", payload)["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path, "transfer", access._bundle_payload(candidate)
+    )["manifest_match"]
+    assert _run_synthetic_remote_program(
+        tmp_path,
+        "install",
+        {"manifest": access._manifest_payload(candidate.manifest)},
+    )["manifest_match"]
+
+    failed = _run_synthetic_remote_program(
+        tmp_path,
+        "restore_backup",
+        payload,
+        source_replacements={
+            "            write_fallback_phase('reconciled', identity)\n"
+            "            try:\n": (
+                "            write_fallback_phase('reconciled', identity)\n"
+                "            moved = INTEGRATION.with_name("
+                "INTEGRATION.name + '.swapped')\n"
+                "            INTEGRATION.rename(moved)\n"
+                "            shutil.copytree(moved, INTEGRATION)\n"
+                "            try:\n"
+            )
+        },
+    )
+
+    assert failed == {"error_class": "OPERATION_FAILED"}
+    marker = tmp_path / ".ha_tuya_ble_r36_backup.consumed"
+    assert json.loads(marker.read_text(encoding="ascii"))["phase"] == (
+        "possibly_applied"
+    )
+
+
 def test_r33_s_controller_uses_distinct_fallback_reconciliation_permit() -> None:
     controller, broker = _r33_controller()
     candidate, restore = _r32_bundles()
@@ -6256,6 +6357,76 @@ def test_r36_failed_lock_admission_releases_stable_root_owner(
     lock.unlink()
     descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
+    journal = access._DurableLifecycleJournal()
+    journal.close()
+
+
+def test_r36_constructor_cleanup_closes_root_when_unlock_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "lifecycle"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "synthetic-target"
+    target.write_text("synthetic\n", encoding="ascii")
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    journal_path.symlink_to(target)
+    real_flock = access.fcntl.flock
+
+    def interrupt_unlock(descriptor: int, operation: int) -> None:
+        if operation == access.fcntl.LOCK_UN:
+            raise InterruptedError("synthetic unlock interruption")
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(access.fcntl, "flock", interrupt_unlock)
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+
+    monkeypatch.setattr(access.fcntl, "flock", real_flock)
+    journal_path.unlink()
+    journal = access._DurableLifecycleJournal()
+    journal.close()
+
+
+@pytest.mark.parametrize("critical_name", ("lock", "anchor"))
+def test_r36_regular_open_closes_descriptor_when_fstat_fails(
+    critical_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "lifecycle"
+    root.mkdir(mode=0o700)
+    expected_name = access._LIFECYCLE_LOCK_NAME
+    cleanup_path: Path | None = None
+    if critical_name == "anchor":
+        cleanup_path = access._lifecycle_anchor_path(root)
+        cleanup_path.write_text("{}", encoding="ascii")
+        cleanup_path.chmod(0o600)
+        expected_name = cleanup_path.name
+    real_open = access.os.open
+    real_fstat = access.os.fstat
+    opened: list[int] = []
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        if path == expected_name:
+            opened.append(descriptor)
+        return descriptor
+
+    def fail_target_fstat(descriptor: int) -> os.stat_result:
+        if opened and descriptor == opened[-1]:
+            raise OSError(access.errno.EIO, "synthetic fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(access.os, "open", track_open)
+    monkeypatch.setattr(access.os, "fstat", fail_target_fstat)
+    with pytest.raises(access.LifecycleControllerError):
+        access._DurableLifecycleJournal()
+
+    assert opened
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        real_fstat(opened[-1])
+    monkeypatch.setattr(access.os, "open", real_open)
+    monkeypatch.setattr(access.os, "fstat", real_fstat)
+    if cleanup_path is not None:
+        cleanup_path.unlink()
     journal = access._DurableLifecycleJournal()
     journal.close()
 

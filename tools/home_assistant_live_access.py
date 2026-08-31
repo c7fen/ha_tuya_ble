@@ -1223,7 +1223,10 @@ class _DurableLifecycleJournal:
                 self._advance_anchor_revision(record["revision"])
             self._record = record
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except OSError as cleanup_error:
+                _ = cleanup_error
             raise
 
     @staticmethod
@@ -1289,6 +1292,7 @@ class _DurableLifecycleJournal:
     def _open_parent_regular(self, name: str, flags: int, mode: int = 0o600) -> int:
         if self._parent_fd is None or Path(name).name != name:
             raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+        descriptor: int | None = None
         try:
             descriptor = os.open(
                 name,
@@ -1298,8 +1302,12 @@ class _DurableLifecycleJournal:
             )
             metadata = os.fstat(descriptor)
         except FileNotFoundError:
+            if descriptor is not None:
+                os.close(descriptor)
             raise
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
             raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
         if not self._safe_stat(metadata, mode=0o600, directory=False):
             os.close(descriptor)
@@ -1311,6 +1319,7 @@ class _DurableLifecycleJournal:
         close_on_exec = getattr(os, "O_CLOEXEC", 0)
         if self._root_fd is None or Path(name).name != name:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        descriptor: int | None = None
         try:
             descriptor = os.open(
                 name,
@@ -1320,8 +1329,12 @@ class _DurableLifecycleJournal:
             )
             metadata = os.fstat(descriptor)
         except FileNotFoundError:
+            if descriptor is not None:
+                os.close(descriptor)
             raise
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
         if not self._safe_stat(metadata, mode=0o600, directory=False):
             os.close(descriptor)
@@ -2487,19 +2500,32 @@ class _DurableLifecycleJournal:
         self._closed = True
         descriptor = self._lock_fd
         self._lock_fd = None
+        failures: list[OSError] = []
         if descriptor is not None:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
+            except OSError as error:
+                failures.append(error)
+            try:
                 os.close(descriptor)
+            except OSError as error:
+                failures.append(error)
         root_descriptor = self._root_fd
         self._root_fd = None
         if root_descriptor is not None:
-            os.close(root_descriptor)
+            try:
+                os.close(root_descriptor)
+            except OSError as error:
+                failures.append(error)
         parent_descriptor = self._parent_fd
         self._parent_fd = None
         if parent_descriptor is not None:
-            os.close(parent_descriptor)
+            try:
+                os.close(parent_descriptor)
+            except OSError as error:
+                failures.append(error)
+        if failures:
+            raise failures[0]
 
 
 def _source_path_allowed(path: object, state: SourceState) -> bool:
@@ -4002,7 +4028,9 @@ def publish_noreplace(source, destination):
         raise OSError(errno.ENOSYS, 'atomic_noreplace')
     function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     function.restype = ctypes.c_int
-    descriptor = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if ROOT_FD is None:
+        raise ValueError('root')
+    descriptor = os.dup(ROOT_FD)
     try:
         if function(
             descriptor,
@@ -4018,7 +4046,7 @@ def publish_noreplace(source, destination):
 
 def backup(value):
     expected = validate_backup_context(value)
-    if BACKUP.exists() or BACKUP_CONSUMED.exists():
+    if root_relative_exists(BACKUP) or root_relative_exists(BACKUP_CONSUMED):
         raise ValueError('backup_exists')
     before = inventory_targets()
     if before != expected:
@@ -4066,11 +4094,19 @@ def backup(value):
         publish_noreplace(pending, BACKUP)
         sync_root()
         pending = None
-        if (
-            read_backup_identity(value) != metadata
-            or inventory_deployment(BACKUP / 'integration') != expected
-        ):
-            raise ValueError('backup_publication')
+        package_fd = open_root_relative(BACKUP)
+        source_fd = None
+        try:
+            published_identity = read_backup_identity_fd(value, package_fd)
+            source_fd = open_relative_directory(package_fd, ('integration',))
+            published = inventory_deployment_fd(source_fd)
+            assert_root_relative_identity(BACKUP, package_fd)
+            if published_identity != metadata or published != expected:
+                raise ValueError('backup_publication')
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+            os.close(package_fd)
         return {
             'success': True,
             'file_count': len(after),
@@ -4088,16 +4124,25 @@ def backup(value):
 
 def reconcile_backup_creation(value):
     expected = validate_backup_context(value)
-    identity = read_backup_identity(value)
-    packaged = inventory_deployment(BACKUP / 'integration')
-    observed_identity = inventory_identity(packaged)
-    if (
-        packaged != expected
-        or inventory_targets() != expected
-        or observed_identity['file_count'] != identity['file_count']
-        or observed_identity['manifest_identity'] != identity['manifest_identity']
-    ):
-        raise ValueError('backup_reconciliation')
+    package_fd = open_root_relative(BACKUP)
+    source_fd = None
+    try:
+        identity = read_backup_identity_fd(value, package_fd)
+        source_fd = open_relative_directory(package_fd, ('integration',))
+        packaged = inventory_deployment_fd(source_fd)
+        observed_identity = inventory_identity(packaged)
+        if (
+            packaged != expected
+            or inventory_targets() != expected
+            or observed_identity['file_count'] != identity['file_count']
+            or observed_identity['manifest_identity'] != identity['manifest_identity']
+        ):
+            raise ValueError('backup_reconciliation')
+        assert_root_relative_identity(BACKUP, package_fd)
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        os.close(package_fd)
     return {
         'success': True,
         'file_count': identity['file_count'],
@@ -4521,6 +4566,12 @@ def restore_backup(value):
             assert_root_relative_identity(INTEGRATION, installed_fd)
             assert_root_relative_identity(BACKUP, package_fd)
             write_fallback_phase('reconciled', identity)
+            try:
+                assert_root_relative_identity(INTEGRATION, installed_fd)
+                assert_root_relative_identity(BACKUP, package_fd)
+            except BaseException:
+                write_fallback_phase('possibly_applied', identity)
+                raise
         finally:
             remove(pending)
     finally:
