@@ -1552,7 +1552,7 @@ def _run_synthetic_remote_program(
         access._source_manifest_digest(restore.entries),
     )
     for original, replacement in (source_replacements or {}).items():
-        assert original in source
+        assert source.count(original) == 1
         source = source.replace(original, replacement)
     encoded = base64.b64encode(
         json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -1580,6 +1580,24 @@ def _run_synthetic_remote_program(
     result = json.loads(completed.stdout)
     assert isinstance(result, dict)
     return result
+
+
+def _remote_definition_namespace(
+    tmp_path: Path, source_replacements: dict[str, str] | None = None
+) -> dict[str, object]:
+    source = access._REMOTE_CONTROL_PROGRAM.replace(
+        "ROOT = Path('/config')", f"ROOT = Path({str(tmp_path)!r})"
+    )
+    for original, replacement in (source_replacements or {}).items():
+        assert source.count(original) == 1
+        source = source.replace(original, replacement)
+    definitions, marker, _runtime = source.partition("ROOT_FD = os.open(")
+    assert marker
+    namespace: dict[str, object] = {"__name__": "synthetic_r40_remote"}
+    exec(  # noqa: S102 - execute the synthetic remote definitions under test.
+        compile(definitions, "<synthetic-r40-definitions>", "exec"), namespace
+    )
+    return namespace
 
 
 def test_r30_remote_program_synthetic_atomic_install_and_restore(
@@ -2368,7 +2386,26 @@ def test_r36_fallback_rejects_backup_package_path_swap_before_exchange(
         "restore_backup",
         payload,
         source_replacements={
+            "def restore_backup(value):\n"
+            "    expected_manifest_value = validate_backup_context(value)\n"
+            "    if root_relative_exists(BACKUP_CONSUMED) or root_relative_exists(\n"
+            "        RESTORE_CONSUMED\n"
+            "    ):\n"
+            "        raise ValueError('backup_consumed')\n"
+            "    package_fd = open_root_relative(BACKUP)\n"
+            "    source_fd = pending_fd = installed_fd = None\n"
+            "    try:\n"
             "        identity = read_backup_identity_fd(value, package_fd)\n": (
+                "def restore_backup(value):\n"
+                "    expected_manifest_value = validate_backup_context(value)\n"
+                "    if root_relative_exists(BACKUP_CONSUMED) or "
+                "root_relative_exists(\n"
+                "        RESTORE_CONSUMED\n"
+                "    ):\n"
+                "        raise ValueError('backup_consumed')\n"
+                "    package_fd = open_root_relative(BACKUP)\n"
+                "    source_fd = pending_fd = installed_fd = None\n"
+                "    try:\n"
                 "        identity = read_backup_identity_fd(value, package_fd)\n"
                 "        moved = BACKUP.with_name(BACKUP.name + '.swapped')\n"
                 "        BACKUP.rename(moved)\n"
@@ -2444,6 +2481,11 @@ def test_r36_fallback_rejects_live_parent_swap_before_durable_sync(
         (
             "reconcile_backup_creation",
             (
+                "def reconcile_backup_creation(value):\n"
+                "    expected = validate_backup_context(value)\n"
+                "    package_fd = open_root_relative(BACKUP)\n"
+                "    source_fd = None\n"
+                "    try:\n"
                 "        identity = read_backup_identity_fd(value, package_fd)\n"
                 "        source_fd = open_relative_directory(package_fd, "
                 "('integration',))\n"
@@ -6133,13 +6175,15 @@ def test_r36_backup_rejects_pending_swap_after_bound_recursive_fsync(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        synced_inodes = sync_directory_fd(pending_fd)\n"
-            "        if read_backup_identity_fd(value, pending_fd) != metadata:\n": (
-                "        synced_inodes = sync_directory_fd(pending_fd)\n"
+            "        synced_inodes, synced_root = sync_backup_package_fd(\n"
+            "            pending_fd, staged_fd, retained_files\n"
+            "        )\n": (
+                "        synced_inodes, synced_root = sync_backup_package_fd(\n"
+                "            pending_fd, staged_fd, retained_files\n"
+                "        )\n"
                 "        moved = pending.with_name(pending.name + '.swapped')\n"
                 "        pending.rename(moved)\n"
                 "        shutil.copytree(moved, pending)\n"
-                "        if read_backup_identity_fd(value, pending_fd) != metadata:\n"
             )
         },
     )
@@ -6160,19 +6204,87 @@ def test_r36_backup_rejects_child_swap_after_bound_recursive_fsync(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        synced_inodes = sync_directory_fd(pending_fd)\n"
-            "        if read_backup_identity_fd(value, pending_fd) != metadata:\n": (
-                "        synced_inodes = sync_directory_fd(pending_fd)\n"
+            "        synced_inodes, synced_root = sync_backup_package_fd(\n"
+            "            pending_fd, staged_fd, retained_files\n"
+            "        )\n": (
+                "        synced_inodes, synced_root = sync_backup_package_fd(\n"
+                "            pending_fd, staged_fd, retained_files\n"
+                "        )\n"
                 "        child = pending / 'integration'\n"
                 "        moved = pending / 'integration.swapped'\n"
                 "        child.rename(moved)\n"
                 "        shutil.copytree(moved, child)\n"
-                "        if read_backup_identity_fd(value, pending_fd) != metadata:\n"
             )
         },
     )
 
     assert failed == {"error_class": "OPERATION_FAILED"}
+
+
+def _sync_written_file_accepts_discontinuity(
+    namespace: dict[str, object], tmp_path: Path, alteration: str
+) -> bool:
+    real_os = namespace["os"]
+    content = b"synthetic retained child\n"
+    path = tmp_path / f"retained-child-{alteration}"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(descriptor, content)
+
+    class FstatMutation:
+        def __init__(self) -> None:
+            self.after_fsync = False
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_os, name)
+
+        def fsync(self, target: int) -> None:
+            real_os.fsync(target)
+            if target == descriptor:
+                self.after_fsync = True
+
+        def fstat(self, target: int) -> object:
+            metadata = real_os.fstat(target)
+            if target != descriptor or not self.after_fsync:
+                return metadata
+            values = {
+                name: getattr(metadata, name)
+                for name in (
+                    "st_mode",
+                    "st_nlink",
+                    "st_dev",
+                    "st_ino",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+            }
+            if alteration == "identity":
+                values["st_ino"] += 1
+            else:
+                values["st_size"] += 1
+            return type("SyntheticStat", (), values)()
+
+    namespace["os"] = FstatMutation()
+    try:
+        try:
+            namespace["sync_written_file"](
+                descriptor, len(content), hashlib.sha256(content).hexdigest()
+            )
+        except ValueError:
+            return False
+        return True
+    finally:
+        namespace["os"] = real_os
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("alteration", ("identity", "state"))
+def test_r40_original_fd_pre_post_fsync_guard_rejects_discontinuity(
+    alteration: str, tmp_path: Path
+) -> None:
+    namespace = _remote_definition_namespace(tmp_path)
+
+    assert not _sync_written_file_accepts_discontinuity(namespace, tmp_path, alteration)
 
 
 def test_r40_red_1_backup_rejects_byte_identical_written_child_inode_swap(
@@ -6187,9 +6299,15 @@ def test_r40_red_1_backup_rejects_byte_identical_written_child_inode_swap(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+            "        copy_deployment_fd(\n"
+            "            live_fd, staged_fd, expected, retained_files, "
+            "('integration',)\n"
+            "        )\n"
             "        after = inventory_deployment_fd(staged_fd)\n": (
-                "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
+                "        copy_deployment_fd(\n"
+                "            live_fd, staged_fd, expected, retained_files, "
+                "('integration',)\n"
+                "        )\n"
                 "        child = pending / 'integration' / '__init__.py'\n"
                 "        replacement = pending / 'synthetic-byte-identical-child'\n"
                 "        replacement.write_bytes(child.read_bytes())\n"
@@ -6203,7 +6321,7 @@ def test_r40_red_1_backup_rejects_byte_identical_written_child_inode_swap(
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
-def test_r40_red_2_backup_rejects_written_child_state_change_during_fsync(
+def test_r40_red_2_backup_rejects_size_change_after_written_child_fsync(
     tmp_path: Path,
 ) -> None:
     integration = tmp_path / "custom_components" / "tuya_ble"
@@ -6211,37 +6329,27 @@ def test_r40_red_2_backup_rejects_written_child_state_change_during_fsync(
     content = b"synthetic integration source\n"
     (integration / "__init__.py").write_bytes(content)
     mutation = (
-        "                original_fsync = os.fsync\n"
-        "                def mutate_during_fsync(target):\n"
-        "                    original_fsync(target)\n"
-        f"                    replacement = {content!r}\n"
-        "                    os.ftruncate(target, 0)\n"
-        "                    os.lseek(target, 0, os.SEEK_SET)\n"
-        "                    offset = 0\n"
-        "                    while offset < len(replacement):\n"
-        "                        written = os.write(target, replacement[offset:])\n"
-        "                        if written <= 0:\n"
-        "                            raise OSError(errno.EIO, 'short_write')\n"
-        "                        offset += written\n"
-        "                os.fsync = mutate_during_fsync\n"
-        "                try:\n"
-        "                    os.fsync(destination_file)\n"
-        "                finally:\n"
-        "                    os.fsync = original_fsync\n"
+        "    os.fsync(descriptor)\n"
+        f"    if expected_size == {len(content)}:\n"
+        "        if os.write(descriptor, b'x') != 1:\n"
+        "            raise OSError(errno.EIO, 'short_write')\n"
+        "    after = os.fstat(descriptor)\n"
     )
 
     result = _run_synthetic_remote_program(
         tmp_path,
         "backup",
         _r36_backup_payload(),
-        source_replacements={"                os.fsync(destination_file)\n": mutation},
+        source_replacements={
+            "    os.fsync(descriptor)\n" "    after = os.fstat(descriptor)\n": mutation
+        },
     )
 
     assert result == {"error_class": "OPERATION_FAILED"}
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
-def test_r40_red_3_backup_rejects_package_root_swap_before_durability(
+def test_r40_red_3_backup_rejects_package_root_churn_after_fsync(
     tmp_path: Path,
 ) -> None:
     integration = tmp_path / "custom_components" / "tuya_ble"
@@ -6253,13 +6361,19 @@ def test_r40_red_3_backup_rejects_package_root_swap_before_durability(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        pending_fd = open_root_relative(pending)\n"
-            "        os.mkdir('integration', mode=0o700, dir_fd=pending_fd)\n": (
-                "        pending_fd = open_root_relative(pending)\n"
-                "        moved = pending.with_name(pending.name + '.root-swapped')\n"
-                "        pending.rename(moved)\n"
-                "        shutil.copytree(moved, pending)\n"
-                "        os.mkdir('integration', mode=0o700, dir_fd=pending_fd)\n"
+            "            sync_backup_directory(descriptor, not logical)\n"
+            "            after = os.fstat(descriptor)\n": (
+                "            sync_backup_directory(descriptor, not logical)\n"
+                "            if not logical:\n"
+                "                os.rename(\n"
+                "                    'integration', 'integration.transient',\n"
+                "                    src_dir_fd=descriptor, dst_dir_fd=descriptor,\n"
+                "                )\n"
+                "                os.rename(\n"
+                "                    'integration.transient', 'integration',\n"
+                "                    src_dir_fd=descriptor, dst_dir_fd=descriptor,\n"
+                "                )\n"
+                "            after = os.fstat(descriptor)\n"
             )
         },
     )
@@ -6268,7 +6382,7 @@ def test_r40_red_3_backup_rejects_package_root_swap_before_durability(
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
 
 
-def test_r40_red_4_backup_rejects_written_child_name_replaced_by_symlink(
+def test_r40_backup_rejects_package_root_state_change_before_publication(
     tmp_path: Path,
 ) -> None:
     integration = tmp_path / "custom_components" / "tuya_ble"
@@ -6280,20 +6394,365 @@ def test_r40_red_4_backup_rejects_written_child_name_replaced_by_symlink(
         "backup",
         _r36_backup_payload(),
         source_replacements={
-            "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
-            "        after = inventory_deployment_fd(staged_fd)\n": (
-                "        copy_deployment_fd(live_fd, staged_fd, expected)\n"
-                "        child = pending / 'integration' / '__init__.py'\n"
-                "        moved = child.with_name('__init__.py.displaced')\n"
-                "        child.rename(moved)\n"
-                "        child.symlink_to(moved.name)\n"
-                "        after = inventory_deployment_fd(staged_fd)\n"
+            "        assert_root_relative_record(pending, pending_fd, synced_root)\n": (
+                "        root_state = os.fstat(pending_fd)\n"
+                "        os.utime(\n"
+                "            pending_fd,\n"
+                "            ns=(root_state.st_atime_ns, root_state.st_mtime_ns + 1),\n"
+                "        )\n"
+                "        assert_root_relative_record("
+                "pending, pending_fd, synced_root)\n"
             )
         },
     )
 
     assert result == {"error_class": "OPERATION_FAILED"}
     assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_package_root_fsync_failure_never_publishes(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "def sync_backup_directory(descriptor, is_package_root):\n": (
+                "def sync_backup_directory(descriptor, is_package_root):\n"
+                "    if is_package_root:\n"
+                "        raise OSError(errno.EIO, 'synthetic package root fsync')\n"
+            )
+        },
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_red_4_backup_rejects_transient_symlink_at_child_entry_check(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements={
+            "            synced = sync_written_file(descriptor, size, digest)\n"
+            "            entry = os.stat(\n": (
+                "            synced = sync_written_file(descriptor, size, digest)\n"
+                "            if logical == ('integration', '__init__.py'):\n"
+                "                os.rename(\n"
+                "                    logical[-1], '__init__.py.displaced',\n"
+                "                    src_dir_fd=parent, dst_dir_fd=parent,\n"
+                "                )\n"
+                "                os.symlink(\n"
+                "                    '__init__.py.displaced', logical[-1], "
+                "dir_fd=parent\n"
+                "                )\n"
+                "            entry = os.stat(\n"
+            ),
+            "            observed['/'.join(logical)] = synced\n": (
+                "            if logical == ('integration', '__init__.py'):\n"
+                "                os.unlink(logical[-1], dir_fd=parent)\n"
+                "                os.rename(\n"
+                "                    '__init__.py.displaced', logical[-1],\n"
+                "                    src_dir_fd=parent, dst_dir_fd=parent,\n"
+                "                )\n"
+                "            observed['/'.join(logical)] = synced\n"
+            ),
+        },
+    )
+
+    assert result == {"error_class": "OPERATION_FAILED"}
+    assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+
+
+def test_r40_backup_publishes_and_reloads_multiple_nested_regular_children(
+    tmp_path: Path,
+) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    nested = integration / "synthetic_nested"
+    nested.mkdir(parents=True)
+    files = {
+        "integration/__init__.py": b"synthetic integration source\n",
+        "integration/synthetic_nested/one.py": b"synthetic nested one\n",
+        "integration/synthetic_nested/two.py": b"synthetic nested two\n",
+    }
+    for logical, content in files.items():
+        relative = logical.removeprefix("integration/")
+        destination = integration / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    entries = tuple(
+        access.SourceManifestEntry(
+            logical, len(content), hashlib.sha256(content).hexdigest()
+        )
+        for logical, content in sorted(files.items())
+    )
+    manifest = access.SourceManifest(access.SourceState.RESTORE, entries)
+    payload = _r36_backup_payload()
+    payload["manifest"] = access._manifest_payload(manifest)
+    default_digest = access._source_manifest_digest(_r30_manifest("RESTORE").entries)
+    exact_digest = access._source_manifest_digest(entries)
+
+    created = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        payload,
+        source_replacements={default_digest: exact_digest},
+    )
+    reloaded = _run_synthetic_remote_program(
+        tmp_path,
+        "reconcile_backup_creation",
+        payload,
+        source_replacements={default_digest: exact_digest},
+    )
+
+    assert created["success"] is True
+    assert created["file_count"] == len(files)
+    assert reloaded["success"] is True
+    assert reloaded["file_count"] == len(files)
+    package = tmp_path / ".ha_tuya_ble_r36_backup"
+    assert package.is_dir()
+    assert not list(tmp_path.glob(".ha_tuya_ble_r36_backup.pending-*"))
+    assert {
+        path.relative_to(package / "integration").as_posix(): path.read_bytes()
+        for path in (package / "integration").rglob("*")
+        if path.is_file()
+    } == {
+        logical.removeprefix("integration/"): content
+        for logical, content in files.items()
+    }
+
+
+_R40_INODE_MUTATIONS = {
+    "I-M1": "remove original-FD pre/post inode identity comparison",
+    "I-M2": "fsync a pathname reopen instead of the original write FD",
+    "I-M3": "substitute the original FD for the child entry lookup",
+    "I-M4": "adopt a byte-identical replacement inode",
+    "I-M5": "skip package-root record verification before publication",
+    "I-M6": "remove the package-root directory fsync",
+    "I-M7": "follow a symlink during final child-entry lookup",
+    "I-M8": "ignore required post-fsync state mismatch",
+}
+
+
+def _r40_backup_call_swap() -> tuple[str, str]:
+    needle = (
+        "        copy_deployment_fd(\n"
+        "            live_fd, staged_fd, expected, retained_files, "
+        "('integration',)\n"
+        "        )\n"
+        "        after = inventory_deployment_fd(staged_fd)\n"
+    )
+    replacement = (
+        "        copy_deployment_fd(\n"
+        "            live_fd, staged_fd, expected, retained_files, "
+        "('integration',)\n"
+        "        )\n"
+        "        child = pending / 'integration' / '__init__.py'\n"
+        "        replacement = pending / 'synthetic-byte-identical-child'\n"
+        "        replacement.write_bytes(child.read_bytes())\n"
+        "        os.replace(replacement, child)\n"
+        "        after = inventory_deployment_fd(staged_fd)\n"
+    )
+    return needle, replacement
+
+
+def _r40_transient_entry_attack(*, symlink: bool, adopt: bool) -> dict[str, str]:
+    before = (
+        "            synced = sync_written_file(descriptor, size, digest)\n"
+        "            entry = os.stat(\n"
+    )
+    injected = (
+        "            synced = sync_written_file(descriptor, size, digest)\n"
+        "            if logical == ('integration', '__init__.py'):\n"
+        "                os.rename(\n"
+        "                    logical[-1], '__init__.py.displaced',\n"
+        "                    src_dir_fd=parent, dst_dir_fd=parent,\n"
+        "                )\n"
+    )
+    if symlink:
+        injected += (
+            "                os.symlink(\n"
+            "                    '__init__.py.displaced', logical[-1], "
+            "dir_fd=parent\n"
+            "                )\n"
+        )
+    else:
+        injected += (
+            "                replacement = os.open(\n"
+            "                    logical[-1],\n"
+            "                    os.O_RDWR | os.O_CREAT | os.O_EXCL | "
+            "os.O_NOFOLLOW,\n"
+            "                    0o600, dir_fd=parent,\n"
+            "                )\n"
+            "                payload = b'synthetic integration source\\n'\n"
+            "                offset = 0\n"
+            "                while offset < len(payload):\n"
+            "                    written = os.write(replacement, payload[offset:])\n"
+            "                    if written <= 0:\n"
+            "                        raise OSError(errno.EIO, 'short_write')\n"
+            "                    offset += written\n"
+            "                os.close(replacement)\n"
+        )
+    injected += "            entry = os.stat(\n"
+    after = "            observed['/'.join(logical)] = synced\n"
+    if adopt:
+        cleanup = (
+            "            if logical == ('integration', '__init__.py'):\n"
+            "                os.unlink('__init__.py.displaced', dir_fd=parent)\n"
+            "            observed['/'.join(logical)] = synced\n"
+        )
+    else:
+        cleanup = (
+            "            if logical == ('integration', '__init__.py'):\n"
+            "                os.unlink(logical[-1], dir_fd=parent)\n"
+            "                os.rename(\n"
+            "                    '__init__.py.displaced', logical[-1],\n"
+            "                    src_dir_fd=parent, dst_dir_fd=parent,\n"
+            "                )\n"
+            "            observed['/'.join(logical)] = synced\n"
+        )
+    return {before: injected, after: cleanup}
+
+
+@pytest.mark.parametrize("mutant", tuple(_R40_INODE_MUTATIONS))
+def test_r40_i_m1_to_i_m8_source_mutations_are_detected(
+    mutant: str, tmp_path: Path
+) -> None:
+    """Execute each weakened source object and prove its focused detector trips."""
+    assert _R40_INODE_MUTATIONS[mutant]
+    if mutant in {"I-M1", "I-M8"}:
+        guard = {
+            "I-M1": (
+                "        or inode_identity(before, 'regular') "
+                "!= inode_identity(after, 'regular')\n"
+            ),
+            "I-M8": (
+                "        or inode_identity(before, 'regular') "
+                "!= inode_identity(after, 'regular')\n"
+                "        or inode_state(before) != inode_state(after)\n"
+            ),
+        }[mutant]
+        replacement = (
+            "        or inode_identity(before, 'regular') "
+            "!= inode_identity(after, 'regular')\n"
+            "        or False\n"
+            if mutant == "I-M8"
+            else "        or False\n"
+        )
+        namespace = _remote_definition_namespace(tmp_path, {guard: replacement})
+        alteration = "identity" if mutant == "I-M1" else "state"
+        assert _sync_written_file_accepts_discontinuity(namespace, tmp_path, alteration)
+        return
+
+    replacements: dict[str, str] = {}
+    if mutant == "I-M2":
+        replacements[
+            "            synced = sync_written_file(descriptor, size, digest)\n"
+        ] = (
+            "            reopened = os.open(\n"
+            "                logical[-1], os.O_RDWR | os.O_NOFOLLOW, "
+            "dir_fd=parent\n"
+            "            )\n"
+            "            try:\n"
+            "                synced = sync_written_file(reopened, size, digest)\n"
+            "            finally:\n"
+            "                os.close(reopened)\n"
+        )
+        needle, attack = _r40_backup_call_swap()
+        replacements[needle] = attack
+    elif mutant == "I-M3":
+        replacements.update(_r40_transient_entry_attack(symlink=False, adopt=False))
+        replacements[
+            "            entry = os.stat(\n"
+            "                logical[-1], dir_fd=parent, follow_symlinks=False\n"
+            "            )\n"
+        ] = "            entry = os.fstat(descriptor)\n"
+    elif mutant == "I-M4":
+        replacements[
+            "            if (\n"
+            "                not stat.S_ISREG(entry.st_mode)\n"
+            "                or entry.st_nlink != 1\n"
+            "                or inode_record(entry, 'regular') != synced\n"
+            "            ):\n"
+            "                raise ValueError('regular')\n"
+        ] = (
+            "            if (\n"
+            "                not stat.S_ISREG(entry.st_mode)\n"
+            "                or entry.st_nlink != 1\n"
+            "            ):\n"
+            "                raise ValueError('regular')\n"
+            "            if inode_record(entry, 'regular') != synced:\n"
+            "                synced = inode_record(entry, 'regular')\n"
+        )
+        replacements.update(_r40_transient_entry_attack(symlink=False, adopt=True))
+    elif mutant == "I-M5":
+        replacements[
+            "        if (\n"
+            "            inode_record(os.fstat(descriptor), 'directory') != expected\n"
+        ] = (
+            "        if False and (\n"
+            "            inode_record(os.fstat(descriptor), 'directory') != expected\n"
+        )
+        replacements[
+            "        assert_root_relative_record(pending, pending_fd, synced_root)\n"
+        ] = (
+            "        root_state = os.fstat(pending_fd)\n"
+            "        os.utime(\n"
+            "            pending_fd,\n"
+            "            ns=(root_state.st_atime_ns, root_state.st_mtime_ns + 1),\n"
+            "        )\n"
+            "        assert_root_relative_record(pending, pending_fd, synced_root)\n"
+        )
+    elif mutant == "I-M6":
+        replacements["            sync_backup_directory(descriptor, not logical)\n"] = (
+            "            if logical:\n"
+            "                sync_backup_directory(descriptor, False)\n"
+        )
+        replacements["def sync_backup_directory(descriptor, is_package_root):\n"] = (
+            "def sync_backup_directory(descriptor, is_package_root):\n"
+            "    if is_package_root:\n"
+            "        raise OSError(errno.EIO, 'synthetic package root fsync')\n"
+        )
+    else:
+        replacements[
+            "            entry = os.stat(\n"
+            "                logical[-1], dir_fd=parent, follow_symlinks=False\n"
+            "            )\n"
+        ] = (
+            "            entry = os.stat(\n"
+            "                logical[-1], dir_fd=parent, follow_symlinks=True\n"
+            "            )\n"
+        )
+        replacements.update(_r40_transient_entry_attack(symlink=True, adopt=False))
+
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "backup",
+        _r36_backup_payload(),
+        source_replacements=replacements,
+    )
+
+    if mutant in {"I-M3", "I-M7"}:
+        assert result == {"error_class": "OPERATION_FAILED"}
+        assert not (tmp_path / ".ha_tuya_ble_r36_backup").exists()
+    else:
+        assert result["success"] is True
+        assert (tmp_path / ".ha_tuya_ble_r36_backup").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -6301,9 +6760,9 @@ def test_r40_red_4_backup_rejects_written_child_name_replaced_by_symlink(
     (
         (
             {
-                "        synced_inodes = sync_directory_fd(pending_fd)\n": (
-                    "        raise OSError(5, 'synthetic file fsync')\n"
-                )
+                "        synced_inodes, synced_root = sync_backup_package_fd(\n"
+                "            pending_fd, staged_fd, retained_files\n"
+                "        )\n": ("        raise OSError(5, 'synthetic file fsync')\n")
             },
             False,
         ),

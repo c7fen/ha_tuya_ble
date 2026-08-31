@@ -3672,7 +3672,9 @@ def open_relative_directory(descriptor, parts, create=False):
         os.close(current)
         raise
 
-def copy_deployment_fd(source_fd, destination_fd, expected):
+def copy_deployment_fd(
+    source_fd, destination_fd, expected, retained_files=None, destination_prefix=()
+):
     for logical in sorted(expected):
         prefix, relative = logical.split('/', 1)
         parts = PurePosixPath(relative).parts
@@ -3692,7 +3694,7 @@ def copy_deployment_fd(source_fd, destination_fd, expected):
             try:
                 destination_file = os.open(
                     parts[-1],
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600,
                     dir_fd=destination_parent,
                 )
@@ -3716,8 +3718,6 @@ def copy_deployment_fd(source_fd, destination_fd, expected):
                         if written <= 0:
                             raise OSError(errno.EIO, 'short_write')
                         offset += written
-                os.fchmod(destination_file, 0o600)
-                os.fsync(destination_file)
                 after = os.fstat(source_file)
                 if (
                     after.st_dev != source_metadata.st_dev
@@ -3726,13 +3726,29 @@ def copy_deployment_fd(source_fd, destination_fd, expected):
                     or (size, digest.hexdigest()) != expected[logical]
                 ):
                     raise ValueError('manifest')
+                os.fchmod(destination_file, 0o600)
+                if retained_files is None:
+                    sync_written_file(
+                        destination_file, expected[logical][0], expected[logical][1]
+                    )
+                else:
+                    retained_files.append((
+                        destination_prefix + parts,
+                        destination_file,
+                        destination_parent,
+                        expected[logical][0],
+                        expected[logical][1],
+                    ))
+                    destination_file = None
+                    destination_parent = None
             finally:
                 os.close(source_file)
                 if destination_file is not None:
                     os.close(destination_file)
         finally:
             os.close(source_parent)
-            os.close(destination_parent)
+            if destination_parent is not None:
+                os.close(destination_parent)
 
 def copy_deployment(source, destination, expected):
     source_fd = open_root_relative(source)
@@ -3989,6 +4005,184 @@ def inode_record(metadata, kind):
         metadata.st_mtime_ns, metadata.st_ctime_ns,
     )
 
+def inode_identity(metadata, kind):
+    return kind, metadata.st_dev, metadata.st_ino
+
+def inode_state(metadata):
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+
+def sync_written_file(descriptor, expected_size, expected_digest):
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_size != expected_size
+    ):
+        raise ValueError('regular')
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    validated = os.fstat(descriptor)
+    if (
+        inode_record(opened, 'regular') != inode_record(validated, 'regular')
+        or size != expected_size
+        or digest.hexdigest() != expected_digest
+    ):
+        raise ValueError('regular')
+    before = os.fstat(descriptor)
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or inode_identity(before, 'regular') != inode_identity(after, 'regular')
+        or inode_state(before) != inode_state(after)
+    ):
+        raise ValueError('regular')
+    return inode_record(after, 'regular')
+
+def sync_backup_directory(descriptor, is_package_root):
+    if not isinstance(is_package_root, bool):
+        raise ValueError('directory')
+    os.fsync(descriptor)
+
+def open_backup_directories(package_fd):
+    directories = {(): os.dup(package_fd)}
+    regular_files = set()
+    try:
+        pending = [()]
+        while pending:
+            relative = pending.pop()
+            descriptor = directories[relative]
+            for name in sorted(os.listdir(descriptor)):
+                metadata = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False
+                )
+                logical = relative + (name,)
+                if stat.S_ISDIR(metadata.st_mode):
+                    child = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    opened = os.fstat(child)
+                    if (
+                        opened.st_dev != metadata.st_dev
+                        or opened.st_ino != metadata.st_ino
+                        or not stat.S_ISDIR(opened.st_mode)
+                    ):
+                        os.close(child)
+                        raise ValueError('directory')
+                    directories[logical] = child
+                    pending.append(logical)
+                elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                    regular_files.add(logical)
+                else:
+                    raise ValueError('regular')
+        return directories, regular_files
+    except BaseException:
+        for descriptor in directories.values():
+            os.close(descriptor)
+        raise
+
+def sync_backup_package_fd(package_fd, integration_fd, retained_files):
+    directories, regular_files = open_backup_directories(package_fd)
+    try:
+        package_identity = os.fstat(package_fd)
+        opened_package_identity = os.fstat(directories[()])
+        integration_identity = os.fstat(integration_fd)
+        opened_integration_identity = os.fstat(directories[('integration',)])
+        if (
+            package_identity.st_dev != opened_package_identity.st_dev
+            or package_identity.st_ino != opened_package_identity.st_ino
+            or not stat.S_ISDIR(package_identity.st_mode)
+            or integration_identity.st_dev != opened_integration_identity.st_dev
+            or integration_identity.st_ino != opened_integration_identity.st_ino
+            or not stat.S_ISDIR(integration_identity.st_mode)
+        ):
+            raise ValueError('directory')
+        retained = {}
+        for logical, descriptor, parent, size, digest in retained_files:
+            if logical in retained:
+                raise ValueError('regular')
+            retained[logical] = (descriptor, parent, size, digest)
+        if set(retained) != regular_files:
+            raise ValueError('regular')
+        observed = {}
+        for logical in sorted(retained):
+            descriptor, parent, size, digest = retained[logical]
+            expected_parent = os.fstat(directories[logical[:-1]])
+            retained_parent = os.fstat(parent)
+            if (
+                expected_parent.st_dev != retained_parent.st_dev
+                or expected_parent.st_ino != retained_parent.st_ino
+                or not stat.S_ISDIR(retained_parent.st_mode)
+            ):
+                raise ValueError('directory')
+            synced = sync_written_file(descriptor, size, digest)
+            entry = os.stat(
+                logical[-1], dir_fd=parent, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_nlink != 1
+                or inode_record(entry, 'regular') != synced
+            ):
+                raise ValueError('regular')
+            observed['/'.join(logical)] = synced
+        root_record = None
+        for logical in sorted(directories, key=len, reverse=True):
+            descriptor = directories[logical]
+            before = os.fstat(descriptor)
+            if not stat.S_ISDIR(before.st_mode):
+                raise ValueError('directory')
+            sync_backup_directory(descriptor, not logical)
+            after = os.fstat(descriptor)
+            if (
+                inode_identity(before, 'directory')
+                != inode_identity(after, 'directory')
+                or inode_state(before) != inode_state(after)
+            ):
+                raise ValueError('directory')
+            record = inode_record(after, 'directory')
+            if logical:
+                entry = os.stat(
+                    logical[-1],
+                    dir_fd=directories[logical[:-1]],
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(entry.st_mode)
+                    or inode_record(entry, 'directory') != record
+                ):
+                    raise ValueError('directory')
+                observed['/'.join(logical)] = record
+            else:
+                root_record = record
+        if root_record is None:
+            raise ValueError('directory')
+        return observed, root_record
+    finally:
+        for descriptor in directories.values():
+            os.close(descriptor)
+
+def assert_root_relative_record(path, descriptor, expected):
+    current = open_root_relative(path)
+    try:
+        if (
+            inode_record(os.fstat(descriptor), 'directory') != expected
+            or inode_record(os.fstat(current), 'directory') != expected
+        ):
+            raise ValueError('directory')
+    finally:
+        os.close(current)
+
 def sync_directory_fd(descriptor, relative=()):
     observed = {}
     for name in sorted(os.listdir(descriptor)):
@@ -4155,12 +4349,15 @@ def backup(value):
     pending = BACKUP.with_name(BACKUP.name + '.pending-' + os.urandom(16).hex())
     pending.mkdir(mode=0o700)
     pending_fd = live_fd = staged_fd = package_fd = source_fd = None
+    retained_files = []
     try:
         pending_fd = open_root_relative(pending)
         os.mkdir('integration', mode=0o700, dir_fd=pending_fd)
         live_fd = open_root_relative(INTEGRATION)
         staged_fd = open_relative_directory(pending_fd, ('integration',))
-        copy_deployment_fd(live_fd, staged_fd, expected)
+        copy_deployment_fd(
+            live_fd, staged_fd, expected, retained_files, ('integration',)
+        )
         after = inventory_deployment_fd(staged_fd)
         if before != after or after != expected:
             raise ValueError('backup_manifest')
@@ -4177,25 +4374,40 @@ def backup(value):
         }
         metadata['backup_digest'] = backup_digest(metadata)
         payload = json.dumps(metadata, sort_keys=True, separators=(',', ':')).encode('ascii')
-        descriptor = os.open(
-            BACKUP_METADATA_NAME,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=pending_fd,
-        )
+        descriptor = parent = None
         try:
+            descriptor = os.open(
+                BACKUP_METADATA_NAME,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=pending_fd,
+            )
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])
                 if written <= 0:
                     raise OSError(errno.EIO, 'short_write')
                 offset += written
-            os.fsync(descriptor)
+            parent = os.dup(pending_fd)
+            retained_files.append((
+                (BACKUP_METADATA_NAME,), descriptor, parent, len(payload),
+                hashlib.sha256(payload).hexdigest(),
+            ))
+            descriptor = parent = None
         finally:
-            os.close(descriptor)
-        synced_inodes = sync_directory_fd(pending_fd)
-        if read_backup_identity_fd(value, pending_fd) != metadata:
+            if descriptor is not None:
+                os.close(descriptor)
+            if parent is not None:
+                os.close(parent)
+        synced_inodes, synced_root = sync_backup_package_fd(
+            pending_fd, staged_fd, retained_files
+        )
+        if (
+            read_backup_identity_fd(value, pending_fd) != metadata
+            or directory_inode_snapshot(pending_fd) != synced_inodes
+        ):
             raise ValueError('backup_identity')
+        assert_root_relative_record(pending, pending_fd, synced_root)
         package_fd = publish_noreplace(pending, BACKUP, pending_fd)
         sync_root()
         pending = None
@@ -4221,18 +4433,24 @@ def backup(value):
             'backup_digest': metadata['backup_digest'],
         }
     finally:
-        if source_fd is not None:
-            os.close(source_fd)
-        if package_fd is not None:
-            os.close(package_fd)
-        if staged_fd is not None:
-            os.close(staged_fd)
-        if live_fd is not None:
-            os.close(live_fd)
-        if pending_fd is not None:
-            os.close(pending_fd)
-        if pending is not None:
-            remove(pending)
+        descriptors = [source_fd, package_fd]
+        for _logical, descriptor, parent, _size, _digest in retained_files:
+            descriptors.extend((descriptor, parent))
+        descriptors.extend((staged_fd, live_fd, pending_fd))
+        close_error = None
+        for descriptor in descriptors:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+        try:
+            if pending is not None:
+                remove(pending)
+        finally:
+            if close_error is not None:
+                raise close_error
 
 def reconcile_backup_creation(value):
     expected = validate_backup_context(value)
