@@ -1022,6 +1022,7 @@ def _synthetic_r30_source_authorities(
             "test_r44_",
             "test_r47_",
             "test_r50_",
+            "test_r53_",
         )
     ):
         return
@@ -1596,6 +1597,225 @@ def _run_synthetic_remote_program(
     result = json.loads(completed.stdout)
     assert isinstance(result, dict)
     return result
+
+
+def _r53_local_pty_source_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    root_exists: bool,
+    operation: access.BoundedOperation = access.BoundedOperation.SOURCE_INVENTORY,
+    result_emission: str | None = None,
+    invalid_deployment: bool = False,
+) -> object:
+    replacement_bin = tmp_path / "bin"
+    replacement_bin.mkdir()
+    replacement_bash = replacement_bin / "bash"
+    replacement_bash.write_text(
+        "#!/bin/sh\nexec /bin/bash --noprofile --norc -il\n", encoding="ascii"
+    )
+    replacement_bash.chmod(0o700)
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(
+        f"#!/bin/sh\nPATH={replacement_bin}:/usr/bin:/bin\nexport PATH\n"
+        "exec /bin/bash --noprofile --norc -i\n",
+        encoding="ascii",
+    )
+    wrapper.chmod(0o700)
+    monkeypatch.setattr(
+        access,
+        "validate_private_wrapper",
+        lambda _path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
+    )
+
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    root = tmp_path if root_exists else tmp_path / "missing-config-root"
+    if root_exists:
+        integration_root = root / "custom_components" / "tuya_ble"
+        for source_file in candidate.files:
+            relative = Path(source_file.relative_path)
+            if relative.parts[0] == "integration":
+                destination = integration_root.joinpath(*relative.parts[1:])
+            else:
+                destination = integration_root / ".phase_a_tools" / relative.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source_file.content)
+        if invalid_deployment:
+            (integration_root / "synthetic-invalid-entry").symlink_to("__init__.py")
+    remote_program = access._REMOTE_CONTROL_PROGRAM.replace(
+        "ROOT = Path('/config')", f"ROOT = Path({str(root)!r})"
+    )
+    remote_program = remote_program.replace(
+        "4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e",
+        access._source_manifest_digest(candidate.manifest.entries),
+    ).replace(
+        "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
+        access._source_manifest_digest(_r30_manifest("RESTORE").entries),
+    )
+    if result_emission is not None:
+        original_emission = (
+            "print(json.dumps(result, separators=(',', ':'), sort_keys=True), "
+            "flush=True)"
+        )
+        assert remote_program.count(original_emission) == 1
+        remote_program = remote_program.replace(original_emission, result_emission)
+    monkeypatch.setattr(access, "_REMOTE_CONTROL_PROGRAM", remote_program)
+
+    broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=2.0)
+    controller = None
+    try:
+        assert broker.open() is access.BrokerState.SESSION_ACTIVE
+        if operation is access.BoundedOperation.SOURCE_INVENTORY:
+            controller = access.FullPreflightLifecycleController(broker)
+            result = controller.inspect_current_source(
+                candidate.manifest, _r30_manifest("RESTORE")
+            )
+        elif operation is access.BoundedOperation.BACKUP:
+            result = broker._create_private_backup(
+                _r30_manifest("RESTORE"),
+                _capability=_r32_controller_minted_capability(
+                    broker, access.LifecycleAction.BACKUP
+                ),
+            )
+        elif operation is access.BoundedOperation.TRANSFER:
+            result = broker._transfer_source_bundle(
+                candidate,
+                _capability=_r32_controller_minted_capability(
+                    broker, access.LifecycleAction.CANDIDATE_TRANSFER
+                ),
+            )
+        else:
+            raise AssertionError("unsupported synthetic R53 operation")
+    finally:
+        if controller is not None:
+            controller.close()
+        broker.close()
+    return result
+
+
+def test_r53_real_control_program_source_inventory_crosses_local_pty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The exact source-inventory program crosses the production PTY framing path."""
+    result = _r53_local_pty_source_inspection(monkeypatch, tmp_path, root_exists=True)
+
+    assert result == access.CurrentSourceInventoryResult(
+        access.CurrentSourceClassification.EXACT_PR45,
+        access.SourceInventoryResult(3, 3, True, 0, 0),
+    )
+
+
+def test_r53_remote_startup_failure_is_not_malformed_framing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = _r53_local_pty_source_inspection(monkeypatch, tmp_path, root_exists=False)
+
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert result.failure_class.value == "remote_operation"
+
+
+def test_r53_exact_remote_error_result_is_not_malformed_framing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result = _r53_local_pty_source_inspection(
+        monkeypatch, tmp_path, root_exists=True, invalid_deployment=True
+    )
+
+    assert isinstance(result, access.CurrentSourceInventoryResult)
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert result.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
+
+
+@pytest.mark.parametrize(
+    "result_emission",
+    (
+        (
+            "print('SYNTHETIC_PREFIX', end='', flush=True)\n"
+            "print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)"
+        ),
+        (
+            "print(json.dumps(result, separators=(',', ':'), sort_keys=True), "
+            "end='', flush=True)\nprint('SYNTHETIC_SUFFIX', flush=True)"
+        ),
+        (
+            "print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)\n"
+            "print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)"
+        ),
+        (
+            'print(\'{"expected_count":1,"expected_count":1,\''
+            '\'"manifest_match":true,"missing_count":0,\''
+            '\'"observed_count":1,"unexpected_count":0}\', flush=True)'
+        ),
+    ),
+    ids=("prefix", "suffix", "multiple", "duplicate-member"),
+)
+def test_r53_malformed_source_inventory_payload_remains_framing_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result_emission: str,
+) -> None:
+    result = _r53_local_pty_source_inspection(
+        monkeypatch,
+        tmp_path,
+        root_exists=True,
+        result_emission=result_emission,
+    )
+
+    assert isinstance(result, access.CurrentSourceInventoryResult)
+    assert result.classification is access.CurrentSourceClassification.INDETERMINATE
+    assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert result.failure_class is access.DispatchFailureClass.FRAMING
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (access.BoundedOperation.BACKUP, access.BoundedOperation.TRANSFER),
+)
+def test_r53_shared_operations_classify_startup_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: access.BoundedOperation,
+) -> None:
+    with pytest.raises(access._DispatchFailure) as raised:
+        _r53_local_pty_source_inspection(
+            monkeypatch, tmp_path, root_exists=False, operation=operation
+        )
+
+    assert raised.value.stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert raised.value.failure_class.value == "remote_operation"
+
+
+def test_r47_r53_retained_exact_pr41_inspection_is_state_neutral() -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before_journal = journal_path.read_bytes()
+    before_anchor = anchor_path.read_bytes()
+    before_root_entries = set(root.iterdir())
+    inspection_broker = _r47_inspection_broker()
+    inspector = access.RetainedTerminalLifecycleInspector(inspection_broker)
+    before_metadata = inspector.metadata
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert result.failure_stage is None
+    assert result.failure_class is None
+    assert inspector.metadata == before_metadata
+    assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
+    assert journal_path.read_bytes() == before_journal
+    assert anchor_path.read_bytes() == before_anchor
+    assert set(root.iterdir()) == before_root_entries
+    assert [name for name, _ in inspection_broker.calls] == ["current_source_inventory"]
+    inspector.close()
 
 
 def _remote_definition_namespace(
@@ -7350,9 +7570,7 @@ def test_r50_current_source_inventory_preserves_bounded_failure(
     if failure_location == "control":
 
         def write(_packet: object) -> None:
-            raise access.SessionBrokerError(
-                "PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED"
-            )
+            raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_CHILD_EXITED")
 
         monkeypatch.setattr(
             broker, "_PrivateInteractiveSessionBroker__write_wire", write
@@ -7365,9 +7583,7 @@ def test_r50_current_source_inventory_preserves_bounded_failure(
             nonlocal reads
             reads += 1
             if reads == 2:
-                raise access.SessionBrokerError(
-                    "PRIVATE_INTERACTIVE_SESSION_TIMEOUT"
-                )
+                raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
             return b""
 
         monkeypatch.setattr(

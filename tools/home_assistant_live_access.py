@@ -131,6 +131,7 @@ class DispatchFailureClass(StrEnum):
     TIMEOUT = "timeout"
     CHILD_EXIT = "child_exit"
     FRAMING = "framing"
+    REMOTE_OPERATION = "remote_operation"
     SCHEMA = "schema"
     CALLBACK = "callback"
     IO = "io"
@@ -680,6 +681,9 @@ def _bounded_dispatch_failure(
             ),
             "PRIVATE_INTERACTIVE_SESSION_OUTPUT_LIMIT": DispatchFailureClass.FRAMING,
             "PRIVATE_INTERACTIVE_SESSION_PROTOCOL": DispatchFailureClass.FRAMING,
+            "PRIVATE_INTERACTIVE_SESSION_REMOTE_OPERATION_FAILED": (
+                DispatchFailureClass.REMOTE_OPERATION
+            ),
         }.get(error_code)
         if failure_class is None:
             failure_class = DispatchFailureClass.UNKNOWN
@@ -2950,6 +2954,10 @@ def _exact_payload(private_output: bytes) -> dict[str, Any]:
         payload = _strict_json_loads(extracted)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if payload == {"error_class": "OPERATION_FAILED"}:
+        raise SessionBrokerError(
+            "PRIVATE_INTERACTIVE_SESSION_REMOTE_OPERATION_FAILED"
+        ) from None
     if not isinstance(payload, dict) or "error_class" in payload:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     return payload
@@ -5646,15 +5654,18 @@ class PrivateInteractiveSessionBroker:
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
-        bootstrap = (
-            "import base64,hashlib,os,sys;"
-            "count=int(sys.stdin.readline());"
-            "source=''.join(sys.stdin.readline().strip() for _ in range(count));"
-            "raw=base64.b64decode(source,validate=True);"
-            "expected=os.environ.pop('HA_R30_PROGRAM_SHA256');"
-            "assert hashlib.sha256(raw).hexdigest()==expected;"
-            "exec(compile(raw,'<ha-r30-control>','exec'))"
+        bootstrap_body = (
+            "try:\n"
+            " count=int(sys.stdin.readline())\n"
+            " source=''.join(sys.stdin.readline().strip() for _ in range(count))\n"
+            " raw=base64.b64decode(source,validate=True)\n"
+            " expected=os.environ.pop('HA_R30_PROGRAM_SHA256')\n"
+            " assert hashlib.sha256(raw).hexdigest()==expected\n"
+            " exec(compile(raw,'<ha-r30-control>','exec'))\n"
+            "except Exception:\n"
+            ' print(\'{"error_class":"OPERATION_FAILED"}\',flush=True)\n'
         )
+        bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
         command = (
             f"{self._frame_printf(start_payload)}; "
             f"HA_R30_OPERATION={operation.value} HA_R30_DETAIL={detail} "
@@ -5907,9 +5918,7 @@ class PrivateInteractiveSessionBroker:
                     CurrentSourceClassification.EXACT_PR45, candidate_result
                 )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError) as error:
-            failure = _bounded_dispatch_failure(
-                DispatchFailureStage.UNKNOWN, error
-            )
+            failure = _bounded_dispatch_failure(DispatchFailureStage.UNKNOWN, error)
             return CurrentSourceInventoryResult(
                 CurrentSourceClassification.INDETERMINATE,
                 failure_stage=failure.stage,
