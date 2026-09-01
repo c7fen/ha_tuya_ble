@@ -1018,6 +1018,7 @@ def _synthetic_r30_source_authorities(
                 "test_r57_",
                 "test_r59_",
                 "test_r61_",
+                "test_r62_",
             )
         ),
     )
@@ -1037,6 +1038,7 @@ def _synthetic_r30_source_authorities(
             "test_r57_",
             "test_r59_",
             "test_r61_",
+            "test_r62_",
         )
     ):
         return
@@ -10036,3 +10038,68 @@ def test_r58_owned_restore_marker_surviving_partial_retirement_is_retired(
     }
     assert retired == {"classification": "NONE", "retired": True}
     assert not marker.exists()
+
+
+def test_r62_valid_preflight_commits_result_and_transition_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R61 must not stop between durable PREFLIGHT evidence and its transition."""
+    controller, broker = _r33_advance_to_ap0()
+    journal = controller._journal
+    original_transition = journal.transition
+
+    def reject_split_preflight_transition(
+        state: access.LifecycleState,
+        *,
+        action: access.LifecycleAction | None,
+        source_generation: str,
+        evidence_generation: int | None,
+        recovery: bool = False,
+        terminal: bool = False,
+    ) -> None:
+        if action is access.LifecycleAction.PREFLIGHT:
+            raise access.LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID")
+        original_transition(
+            state,
+            action=action,
+            source_generation=source_generation,
+            evidence_generation=evidence_generation,
+            recovery=recovery,
+            terminal=terminal,
+        )
+
+    monkeypatch.setattr(journal, "transition", reject_split_preflight_transition)
+
+    result = controller.run_non_probe_preflight()
+
+    assert result.operation is access.PhaseAOperation.PREFLIGHT
+    assert controller.state is access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED
+    assert journal.action_transition_committed(access.LifecycleAction.PREFLIGHT)
+    assert journal._record["consumed_operations"].count("preflight") == 1
+    assert (
+        len(
+            [
+                identity
+                for identity in journal._record["evidence_identities"]
+                if identity["action"] == "preflight"
+            ]
+        )
+        == 1
+    )
+    assert [name for name, _detail in broker.calls].count("helper") == 3
+    controller.collect_a1()
+    controller.validate_research_final()
+    controller.collect_a2()
+    proof = _r32_complete_restore_tail(controller, _r32_bundles()[1])
+
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.COMPLETE_NORMAL
+    assert [name for name, _detail in broker.calls].count("helper") == 5
+    assert journal._record["consumed_operations"].count("preflight") == 1
+    assert "PROBE" not in access.LifecycleAction.__members__
+    assert "RECEIPT" not in access.LifecycleAction.__members__
+    assert journal._record["restart_tombstones"] == [
+        access.LifecycleAction.ACTIVATION_RESTART.value,
+        access.LifecycleAction.REMOVAL_RESTART.value,
+    ]
+    controller.close()

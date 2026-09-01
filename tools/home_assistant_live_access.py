@@ -2818,6 +2818,7 @@ class _DurableLifecycleJournal:
         audit_instance: str | None,
         nonce: str | None,
         evidence: object = None,
+        transition_state: LifecycleState | None = None,
     ) -> int:
         generation = self._record["evidence_generation"] + 1
 
@@ -2958,6 +2959,30 @@ class _DurableLifecycleJournal:
                         "stage": LifecycleState.BACKUP_VERIFIED.value,
                         "action": action.value,
                         "source_generation": record["source_generation"],
+                        "evidence_generation": generation,
+                    }
+                )
+            if transition_state is not None:
+                if (
+                    action is not LifecycleAction.PREFLIGHT
+                    or transition_state
+                    is not LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED
+                    or LifecycleState(record["stage"])
+                    not in _LIFECYCLE_ACTION_PREDECESSORS[action]
+                    or transition_state not in _LIFECYCLE_ACTION_SUCCESSORS[action]
+                ):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_TRANSITION_INVALID"
+                    ) from None
+                matches[0]["phase"] = "transition_committed"
+                record["stage"] = transition_state.value
+                record["source_generation"] = source_generation
+                record["transitions"].append(
+                    {
+                        "sequence": len(record["transitions"]),
+                        "stage": transition_state.value,
+                        "action": action.value,
+                        "source_generation": source_generation,
                         "evidence_generation": generation,
                     }
                 )
@@ -7816,6 +7841,8 @@ class FullPreflightLifecycleController:
         callback: Callable[[_LifecycleCapability], Any],
         *,
         broker_evidence: bool = True,
+        success_state: LifecycleState | None = None,
+        success_predicate: Callable[[Any], bool] | None = None,
         _dispatch_token: object = None,
     ) -> Any:
         if _dispatch_token is not self.__dispatch_token:
@@ -7823,6 +7850,15 @@ class FullPreflightLifecycleController:
         self._assert_session_binding()
         allowed_predecessors = _LIFECYCLE_ACTION_PREDECESSORS.get(action)
         if allowed_predecessors is None or self.state not in allowed_predecessors:
+            raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
+        if (
+            (success_state is None) != (success_predicate is None)
+            or success_state is not None
+            and (
+                action is not LifecycleAction.PREFLIGHT
+                or success_state not in _LIFECYCLE_ACTION_SUCCESSORS[action]
+            )
+        ):
             raise LifecycleControllerError("LIFECYCLE_TRANSITION_INVALID") from None
         permit = self._permits[action]
         if permit.consumed:
@@ -7892,6 +7928,11 @@ class FullPreflightLifecycleController:
                 ):
                     permit.consumed = False
             raise
+        atomic_success = (
+            success_predicate is not None
+            and success_state is not None
+            and success_predicate(result)
+        )
         if self._journal is not None:
             if not broker_evidence and result is not None:
                 _bind_evidence_origin(result, capability)
@@ -7920,6 +7961,7 @@ class FullPreflightLifecycleController:
                 ),
                 nonce=None if origin is None else origin.nonce,
                 evidence=result,
+                transition_state=success_state if atomic_success else None,
             )
             self._evidence_generations[action] = evidence_generation
             if origin is not None:
@@ -7927,6 +7969,9 @@ class FullPreflightLifecycleController:
                     origin,
                     evidence_generation,
                 )
+        if atomic_success:
+            self._current_source_generation = source_generation
+            self._state = success_state
         return result
 
     def __dispatch_action(
@@ -7935,11 +7980,15 @@ class FullPreflightLifecycleController:
         callback: Callable[[_LifecycleCapability], Any],
         *,
         broker_evidence: bool = True,
+        success_state: LifecycleState | None = None,
+        success_predicate: Callable[[Any], bool] | None = None,
     ) -> Any:
         return self._dispatch(
             action,
             callback,
             broker_evidence=broker_evidence,
+            success_state=success_state,
+            success_predicate=success_predicate,
             _dispatch_token=self.__dispatch_token,
         )
 
@@ -8525,6 +8574,19 @@ class FullPreflightLifecycleController:
         self._require_state(LifecycleState.AP0_COLLECTED)
         nonce = secrets.token_hex(16)
         self._preflight_nonce = nonce
+
+        def valid_preflight(result: object) -> bool:
+            return (
+                isinstance(result, PhaseAResult)
+                and result.operation is PhaseAOperation.PREFLIGHT
+                and result.nonce == nonce
+                and result.exit_code == 0
+                and result.outcome == "preflight_ok"
+                and result.preflight == PreflightResponse("preflight_ok", 1, nonce)
+                and result.receipt is None
+                and result.audit is None
+            )
+
         try:
             result = self.__dispatch_action(
                 LifecycleAction.PREFLIGHT,
@@ -8533,24 +8595,14 @@ class FullPreflightLifecycleController:
                     nonce=nonce,
                     _capability=capability,
                 ),
+                success_state=LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED,
+                success_predicate=valid_preflight,
             )
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
-        if (
-            not isinstance(result, PhaseAResult)
-            or result.operation is not PhaseAOperation.PREFLIGHT
-            or result.nonce != nonce
-            or result.exit_code != 0
-            or result.outcome != "preflight_ok"
-            or result.preflight != PreflightResponse("preflight_ok", 1, nonce)
-            or result.receipt is not None
-            or result.audit is not None
-        ):
+        if not valid_preflight(result):
             self._rollback()
         self._preflight_result = result
-        self._advance(
-            LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED, LifecycleAction.PREFLIGHT
-        )
         return result
 
     def collect_a1(self) -> AuditSnapshot:
