@@ -241,6 +241,21 @@ class PriorBackupClassification(StrEnum):
     OTHER_OR_INDETERMINATE = "OTHER_OR_INDETERMINATE"
 
 
+class LifecycleAnchorFormat(StrEnum):
+    """Exact durable anchor layouts retained by the Issue-37 lifecycle."""
+
+    V1_DEVICE_BOUND = "V1_DEVICE_BOUND"
+    V2_STABLE_ROOT = "V2_STABLE_ROOT"
+
+
+class LifecycleAnchorClassification(StrEnum):
+    """Bounded identity result for one structurally valid lifecycle anchor."""
+
+    EXACT = "EXACT"
+    DEVICE_DRIFT_ONLY = "DEVICE_DRIFT_ONLY"
+    INVALID = "INVALID"
+
+
 class RetainedBackupAction(StrEnum):
     """The two exact backup-continuity operations available to an inspector."""
 
@@ -1140,6 +1155,21 @@ class PriorBackupContinuityResult:
 
 
 @dataclass(frozen=True)
+class LifecycleAnchorMigrationResult:
+    """Sanitized proof of one completed V1-to-V2 anchor migration."""
+
+    migrated: bool
+    anchor_format: LifecycleAnchorFormat
+    journal_changed: bool
+    journal_revision_changed: bool
+    terminal_changed: bool
+    lifecycle_generation_changed: bool
+    backup_identity_changed: bool
+    anchor_revision_changed: bool
+    reread_valid: bool
+
+
+@dataclass(frozen=True)
 class RestartResult:
     dispatch_outcome: RestartDispatchOutcome
     http_status: int | None
@@ -1442,6 +1472,20 @@ class _DurableLifecycleJournal:
         }
     )
     _V1_PRE_R59_TOP_LEVEL_KEYS = _TOP_LEVEL_KEYS - {"restart_results"}
+    _V1_ANCHOR_FIELDS = frozenset(
+        {
+            "schema_version",
+            "state_root_generation",
+            "state_root_device",
+            "state_root_inode",
+            "original_lifecycle_generation",
+            "pr41_commit",
+            "pr41_tree",
+            "baseline_backup_identity",
+            "root_revision",
+        }
+    )
+    _V2_ANCHOR_FIELDS = _V1_ANCHOR_FIELDS - {"state_root_device"}
     _RISKY_ACTIONS = frozenset(
         {
             LifecycleAction.BACKUP.value,
@@ -1463,7 +1507,12 @@ class _DurableLifecycleJournal:
         }
     )
 
-    def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        _retained_terminal_inspection: bool = False,
+        _retained_anchor_continuity: bool = False,
+    ) -> None:
         self._directory = _fixed_lifecycle_state_root()
         self._anchor_name = _lifecycle_anchor_path(self._directory).name
         self._parent_fd: int | None = None
@@ -1492,7 +1541,24 @@ class _DurableLifecycleJournal:
             elif anchor is None:
                 raise LifecycleControllerError("LIFECYCLE_ANCHOR_MISSING") from None
             else:
-                self._validate_anchor(anchor, record)
+                anchor_classification = self._classify_anchor(anchor, record)
+                if _retained_anchor_continuity:
+                    if anchor_classification is LifecycleAnchorClassification.INVALID:
+                        raise LifecycleControllerError(
+                            "LIFECYCLE_ANCHOR_INVALID"
+                        ) from None
+                    if anchor_classification is not (
+                        LifecycleAnchorClassification.DEVICE_DRIFT_ONLY
+                    ):
+                        raise LifecycleControllerError(
+                            "LIFECYCLE_ANCHOR_DEVICE_DRIFT_REQUIRED"
+                        ) from None
+                    if record["active"] is True:
+                        raise LifecycleControllerError(
+                            "LIFECYCLE_ANCHOR_DEVICE_DRIFT_ACTIVE_UNSUPPORTED"
+                        ) from None
+                else:
+                    self._validate_anchor(anchor, record)
                 if (
                     _retained_terminal_inspection
                     and self._journal_format is LifecycleJournalFormat.V1_PRE_R59
@@ -1501,8 +1567,15 @@ class _DurableLifecycleJournal:
                     raise LifecycleControllerError(
                         "LIFECYCLE_JOURNAL_REVISION_INVALID"
                     ) from None
-                self._reconcile_anchor_revision(anchor, record)
+                if not _retained_anchor_continuity:
+                    self._reconcile_anchor_revision(anchor, record)
             self._anchor = anchor if anchor is not None else self._read_anchor()
+            self._anchor_format = self._anchor_format_of(self._anchor)
+            self._anchor_classification = (
+                LifecycleAnchorClassification.DEVICE_DRIFT_ONLY
+                if _retained_anchor_continuity
+                else LifecycleAnchorClassification.EXACT
+            )
             self._record = record
             if _retained_terminal_inspection and record["active"] is True:
                 raise LifecycleControllerError("LIFECYCLE_TERMINAL_REQUIRED") from None
@@ -1594,6 +1667,13 @@ class _DurableLifecycleJournal:
     @classmethod
     def open_retained_terminal(cls) -> Self:
         return cls(_retained_terminal_inspection=True)
+
+    @classmethod
+    def open_retained_anchor_continuity(cls) -> Self:
+        return cls(
+            _retained_terminal_inspection=True,
+            _retained_anchor_continuity=True,
+        )
 
     @staticmethod
     def _token() -> str:
@@ -1786,9 +1866,8 @@ class _DurableLifecycleJournal:
             raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
         root_metadata = os.fstat(self._root_fd)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "state_root_generation": self._token(),
-            "state_root_device": root_metadata.st_dev,
             "state_root_inode": root_metadata.st_ino,
             "original_lifecycle_generation": record["lifecycle_generation"],
             "pr41_commit": PR41_RESTORE_COMMIT,
@@ -1797,32 +1876,29 @@ class _DurableLifecycleJournal:
             "root_revision": 0,
         }
 
-    def _validate_anchor(
+    @classmethod
+    def _anchor_format_of(cls, anchor: dict[str, object]) -> LifecycleAnchorFormat:
+        if anchor.get("schema_version") == 1 and set(anchor) == cls._V1_ANCHOR_FIELDS:
+            return LifecycleAnchorFormat.V1_DEVICE_BOUND
+        if anchor.get("schema_version") == 2 and set(anchor) == cls._V2_ANCHOR_FIELDS:
+            return LifecycleAnchorFormat.V2_STABLE_ROOT
+        raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+
+    def _classify_anchor(
         self, anchor: dict[str, object], record: dict[str, object]
-    ) -> None:
+    ) -> LifecycleAnchorClassification:
         if self._root_fd is None:
-            raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
+            return LifecycleAnchorClassification.INVALID
         root_metadata = os.fstat(self._root_fd)
         token = re.compile(r"[0-9a-f]{32}\Z")
-        valid = (
-            set(anchor)
-            == {
-                "schema_version",
-                "state_root_generation",
-                "state_root_device",
-                "state_root_inode",
-                "original_lifecycle_generation",
-                "pr41_commit",
-                "pr41_tree",
-                "baseline_backup_identity",
-                "root_revision",
-            }
-            and anchor.get("schema_version") == 1
-            and isinstance(anchor.get("state_root_generation"), str)
+        try:
+            anchor_format = self._anchor_format_of(anchor)
+        except LifecycleControllerError:
+            return LifecycleAnchorClassification.INVALID
+        common_valid = (
+            isinstance(anchor.get("state_root_generation"), str)
             and token.fullmatch(anchor.get("state_root_generation", "")) is not None
-            and _exact_non_bool_int(anchor.get("state_root_device"), minimum=1)
             and _exact_non_bool_int(anchor.get("state_root_inode"), minimum=1)
-            and anchor.get("state_root_device") == root_metadata.st_dev
             and anchor.get("state_root_inode") == root_metadata.st_ino
             and anchor.get("original_lifecycle_generation")
             == record.get("lifecycle_generation")
@@ -1838,7 +1914,26 @@ class _DurableLifecycleJournal:
             )
             and _exact_non_bool_int(anchor.get("root_revision"), maximum=10_000_000)
         )
-        if not valid:
+        if not common_valid:
+            return LifecycleAnchorClassification.INVALID
+        if anchor_format is LifecycleAnchorFormat.V2_STABLE_ROOT:
+            return LifecycleAnchorClassification.EXACT
+        if not _exact_non_bool_int(anchor.get("state_root_device"), minimum=1):
+            return LifecycleAnchorClassification.INVALID
+        if anchor.get("state_root_device") == root_metadata.st_dev:
+            return LifecycleAnchorClassification.EXACT
+        if anchor.get("root_revision") == record.get("revision") and anchor.get(
+            "baseline_backup_identity"
+        ) == record.get("baseline_backup_identity"):
+            return LifecycleAnchorClassification.DEVICE_DRIFT_ONLY
+        return LifecycleAnchorClassification.INVALID
+
+    def _validate_anchor(
+        self, anchor: dict[str, object], record: dict[str, object]
+    ) -> None:
+        if self._classify_anchor(anchor, record) is not (
+            LifecycleAnchorClassification.EXACT
+        ):
             raise LifecycleControllerError("LIFECYCLE_ANCHOR_INVALID") from None
 
     def _write_anchor(
@@ -1945,6 +2040,75 @@ class _DurableLifecycleJournal:
             candidate["baseline_backup_identity"] = copy.deepcopy(backup_identity)
         self._write_anchor(candidate, replace_existing=True)
         self._anchor = candidate
+
+    def migrate_device_drift_anchor(self) -> LifecycleAnchorMigrationResult:
+        """Replace one proven device-drift-only V1 anchor with exact V2."""
+        if (
+            self._closed
+            or self._anchor_classification
+            is not LifecycleAnchorClassification.DEVICE_DRIFT_ONLY
+            or self._anchor_format is not LifecycleAnchorFormat.V1_DEVICE_BOUND
+            or self._record["active"] is not False
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_ANCHOR_MIGRATION_NOT_AUTHORIZED"
+            ) from None
+        before_anchor = copy.deepcopy(self._anchor)
+        before_record = copy.deepcopy(self._record)
+        candidate = copy.deepcopy(before_anchor)
+        candidate["schema_version"] = 2
+        del candidate["state_root_device"]
+        try:
+            self._write_anchor(candidate, replace_existing=True)
+        except LifecycleControllerError:
+            try:
+                observed = self._read_anchor()
+            except LifecycleControllerError:
+                raise LifecycleControllerError(
+                    "LIFECYCLE_ANCHOR_MIGRATION_INDETERMINATE"
+                ) from None
+            if observed == before_anchor:
+                raise LifecycleControllerError(
+                    "LIFECYCLE_ANCHOR_MIGRATION_FAILED_OLD_ANCHOR_INTACT"
+                ) from None
+            raise LifecycleControllerError(
+                "LIFECYCLE_ANCHOR_MIGRATION_INDETERMINATE"
+            ) from None
+        observed = self._read_anchor()
+        if (
+            observed != candidate
+            or self._classify_anchor(observed, self._record)
+            is not LifecycleAnchorClassification.EXACT
+            or self._anchor_format_of(observed)
+            is not LifecycleAnchorFormat.V2_STABLE_ROOT
+        ):
+            raise LifecycleControllerError(
+                "LIFECYCLE_ANCHOR_MIGRATION_INDETERMINATE"
+            ) from None
+        self._anchor = observed
+        self._anchor_format = LifecycleAnchorFormat.V2_STABLE_ROOT
+        self._anchor_classification = LifecycleAnchorClassification.EXACT
+        return LifecycleAnchorMigrationResult(
+            migrated=True,
+            anchor_format=self._anchor_format,
+            journal_changed=self._record != before_record,
+            journal_revision_changed=(
+                self._record["revision"] != before_record["revision"]
+            ),
+            terminal_changed=self._record["terminal"] != before_record["terminal"],
+            lifecycle_generation_changed=(
+                self._record["lifecycle_generation"]
+                != before_record["lifecycle_generation"]
+            ),
+            backup_identity_changed=(
+                self._record["baseline_backup_identity"]
+                != before_record["baseline_backup_identity"]
+            ),
+            anchor_revision_changed=(
+                observed["root_revision"] != before_anchor["root_revision"]
+            ),
+            reread_valid=True,
+        )
 
     def _new_record(self) -> dict[str, object]:
         lifecycle = self._token()
@@ -2567,6 +2731,10 @@ class _DurableLifecycleJournal:
     @property
     def journal_format(self) -> LifecycleJournalFormat:
         return self._journal_format
+
+    @property
+    def anchor_format(self) -> LifecycleAnchorFormat:
+        return self._anchor_format
 
     @property
     def state(self) -> LifecycleState:
@@ -6285,6 +6453,7 @@ class PrivateInteractiveSessionBroker:
             or controller.__class__
             not in {
                 FullPreflightLifecycleController,
+                RetainedAnchorContinuityInspector,
                 RetainedTerminalLifecycleInspector,
             }
         ):
@@ -6299,6 +6468,31 @@ class PrivateInteractiveSessionBroker:
             session_generation,
         )
         return issuer
+
+    def _release_retained_anchor_continuity_inspector(
+        self,
+        controller: object,
+        issuer: object,
+        session_generation: object,
+    ) -> None:
+        """Release only a completed restricted continuity-inspector binding."""
+        binding = self._controller_binding
+        if (
+            controller.__class__ is not RetainedAnchorContinuityInspector
+            or binding is None
+            or binding.controller is not controller
+            or binding.issuer is not issuer
+            or binding.session_generation is not session_generation
+            or self._session_generation is not session_generation
+            or any(
+                not any(capability is consumed for consumed in binding.issuer.consumed)
+                for capability in binding.issuer.issued
+            )
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_CONTROLLER_RELEASE_INVALID"
+            ) from None
+        self._controller_binding = None
 
     def _require_capability(
         self,
@@ -7358,6 +7552,130 @@ class RetainedTerminalMetadata:
     lifecycle_generation: str
 
 
+@dataclass(frozen=True, slots=True)
+class RetainedAnchorContinuityMetadata:
+    """Sanitized identity of one retained device-drift continuity case."""
+
+    state: LifecycleState
+    revision: int
+    journal_format: LifecycleJournalFormat
+    anchor_format: LifecycleAnchorFormat
+    classification: LifecycleAnchorClassification
+
+
+class RetainedAnchorContinuityInspector:
+    """Restricted one-shot migration handle for a retained drifted V1 anchor."""
+
+    def __init__(self, broker: Any) -> None:
+        if (
+            getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(broker, "_session_generation", None) is None
+            or not callable(getattr(broker, "_register_lifecycle_controller", None))
+            or not callable(
+                getattr(
+                    broker,
+                    "_release_retained_anchor_continuity_inspector",
+                    None,
+                )
+            )
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        self._broker = broker
+        self._session_generation = broker._session_generation
+        self._source_inspection_attempted = False
+        self._source_proven = False
+        self._migration_attempted = False
+        self._closed = False
+        self._journal = _DurableLifecycleJournal.open_retained_anchor_continuity()
+        try:
+            self._capability_issuer = broker._register_lifecycle_controller(
+                self,
+                self._journal.lifecycle_generation,
+                self._session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if type(self._capability_issuer) is not _CapabilityIssuer:
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+
+    @property
+    def metadata(self) -> RetainedAnchorContinuityMetadata:
+        return RetainedAnchorContinuityMetadata(
+            state=self._journal.state,
+            revision=self._journal._record["revision"],
+            journal_format=self._journal.journal_format,
+            anchor_format=self._journal.anchor_format,
+            classification=self._journal._anchor_classification,
+        )
+
+    def _assert_session_binding(self) -> None:
+        if (
+            self._closed
+            or getattr(self._broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(self._broker, "_session_generation", None)
+            is not self._session_generation
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_CHANGED") from None
+
+    def inspect_current_source(
+        self,
+        candidate_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+    ) -> CurrentSourceInventoryResult:
+        if self._source_inspection_attempted:
+            raise LifecycleControllerError(
+                "SOURCE_INSPECTION_ALREADY_ATTEMPTED"
+            ) from None
+        self._source_inspection_attempted = True
+        result = _inspect_current_source(self, candidate_manifest, restore_manifest)
+        evidence = result.evidence
+        self._source_proven = (
+            result.classification is CurrentSourceClassification.EXACT_PR41
+            and result.root_profile is RemoteRootProfile.HOMEASSISTANT_CONFIG
+            and _source_inventory_exact(evidence, len(restore_manifest.entries))
+            and evidence is not None
+            and evidence.content_mismatch_count == 0
+            and evidence.managed_manifest_identity
+            == _source_manifest_digest(restore_manifest.entries)
+        )
+        return result
+
+    def migrate_anchor(self) -> LifecycleAnchorMigrationResult:
+        self._assert_session_binding()
+        if self._migration_attempted or not self._source_proven:
+            raise LifecycleControllerError(
+                "LIFECYCLE_ANCHOR_MIGRATION_NOT_AUTHORIZED"
+            ) from None
+        self._migration_attempted = True
+        return self._journal.migrate_device_drift_anchor()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        release_error: SessionBrokerError | None = None
+        try:
+            self._broker._release_retained_anchor_continuity_inspector(
+                self,
+                self._capability_issuer,
+                self._session_generation,
+            )
+        except SessionBrokerError as error:
+            release_error = error
+        finally:
+            self._journal.close()
+        if release_error is not None:
+            raise LifecycleControllerError("LIFECYCLE_SESSION_RELEASE_FAILED") from None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 class RetainedTerminalLifecycleInspector:
     """Inspection-only handle for one retained terminal lifecycle."""
 
@@ -7400,6 +7718,11 @@ class RetainedTerminalLifecycleInspector:
     def journal_format(self) -> LifecycleJournalFormat:
         """Return the recognized retained format without changing durable state."""
         return self._journal.journal_format
+
+    @property
+    def anchor_format(self) -> LifecycleAnchorFormat:
+        """Return the exact retained anchor format without durable mutation."""
+        return self._journal.anchor_format
 
     def _assert_session_binding(self) -> None:
         if (

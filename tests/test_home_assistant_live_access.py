@@ -13,6 +13,7 @@ import os
 import pty
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -1019,6 +1020,7 @@ def _synthetic_r30_source_authorities(
                 "test_r59_",
                 "test_r61_",
                 "test_r62_",
+                "test_r62c_",
             )
         ),
     )
@@ -1039,6 +1041,7 @@ def _synthetic_r30_source_authorities(
             "test_r59_",
             "test_r61_",
             "test_r62_",
+            "test_r62c_",
         )
     ):
         return
@@ -4136,6 +4139,28 @@ class _R32ScriptedBroker:
             session_generation,
         )
         return issuer
+
+    def _release_retained_anchor_continuity_inspector(
+        self,
+        controller: object,
+        issuer: object,
+        session_generation: object,
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            controller.__class__ is not access.RetainedAnchorContinuityInspector
+            or binding is None
+            or binding[0] is not controller
+            or binding[1] is not issuer
+            or binding[3] is not session_generation
+            or self._session_generation is not session_generation
+            or any(
+                not any(capability is consumed for consumed in binding[1].consumed)
+                for capability in binding[1].issued
+            )
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_CONTROLLER_RELEASE_INVALID")
+        self._controller_binding = None
 
     def _consume_capability(
         self,
@@ -10099,6 +10124,355 @@ def test_r62_valid_preflight_commits_result_and_transition_atomically(
     assert "PROBE" not in access.LifecycleAction.__members__
     assert "RECEIPT" not in access.LifecycleAction.__members__
     assert journal._record["restart_tombstones"] == [
+        access.LifecycleAction.ACTIVATION_RESTART.value,
+        access.LifecycleAction.REMOVAL_RESTART.value,
+    ]
+    controller.close()
+
+
+def _r62c_retained_restored_after_abort_v1(
+    *, device_drift: bool = True
+) -> tuple[access.SourceBundle, access.SourceBundle, Path, Path]:
+    """Build the exact retained R61 terminal shape with an explicit V1 anchor."""
+    controller, broker = _r33_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    broker.queue("install_candidate", access.InstallResult(False, 3, 0, False))
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.install_candidate(candidate.manifest)
+    proof = _r32_complete_restore_tail(controller, restore)
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.RESTORED_AFTER_ABORT
+    controller.close()
+
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    assert anchor["schema_version"] == 2
+    anchor["schema_version"] = 1
+    current_device = root.stat().st_dev
+    anchor["state_root_device"] = current_device + 1 if device_drift else current_device
+    anchor_path.write_text(
+        json.dumps(anchor, sort_keys=True, separators=(",", ":")), encoding="ascii"
+    )
+    anchor_path.chmod(0o600)
+    return candidate, restore, journal_path, anchor_path
+
+
+def _r62c_exact_pr41_inventory(
+    restore: access.SourceBundle,
+) -> access.CurrentSourceInventoryResult:
+    count = len(restore.manifest.entries)
+    return access.CurrentSourceInventoryResult(
+        access.CurrentSourceClassification.EXACT_PR41,
+        access.SourceInventoryResult(
+            count,
+            count,
+            True,
+            0,
+            0,
+            access.RemoteRootProfile.HOMEASSISTANT_CONFIG,
+            0,
+            0,
+            access._source_manifest_digest(restore.manifest.entries),
+        ),
+    )
+
+
+def test_r62c_a1_parent_contract_normal_path_rejects_device_only_drift() -> None:
+    _candidate, _restore, journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+
+    with pytest.raises(access.LifecycleControllerError, match="ANCHOR_INVALID"):
+        access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+
+
+def test_r62c_a2_a3_drift_classification_and_exact_v1_compatibility() -> None:
+    _candidate, _restore, journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    drift = access.RetainedAnchorContinuityInspector(_r47_inspection_broker())
+
+    assert drift.metadata.anchor_format is access.LifecycleAnchorFormat.V1_DEVICE_BOUND
+    assert drift.metadata.classification is (
+        access.LifecycleAnchorClassification.DEVICE_DRIFT_ONLY
+    )
+    drift.close()
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+
+    exact_anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    exact_anchor["state_root_device"] = access._LIFECYCLE_STATE_ROOT.stat().st_dev
+    anchor_path.write_text(json.dumps(exact_anchor, sort_keys=True), encoding="ascii")
+    exact_before = anchor_path.read_bytes()
+    exact = access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+    assert exact.anchor_format is access.LifecycleAnchorFormat.V1_DEVICE_BOUND
+    exact.close()
+    assert anchor_path.read_bytes() == exact_before
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda anchor, record: anchor.__setitem__(
+            "state_root_inode", anchor["state_root_inode"] + 1
+        ),
+        lambda anchor, record: anchor.__setitem__(
+            "original_lifecycle_generation", "0" * 32
+        ),
+        lambda anchor, record: anchor.__setitem__("pr41_commit", "0" * 40),
+        lambda anchor, record: anchor.__setitem__(
+            "root_revision", anchor["root_revision"] + 2
+        ),
+        lambda anchor, record: anchor["baseline_backup_identity"].__setitem__(
+            "backup_digest", "e" * 64
+        ),
+    ),
+    ids=("inode", "lifecycle", "pr41", "revision", "backup"),
+)
+def test_r62c_a4_to_a8_second_mismatch_is_invalid(mutate: object) -> None:
+    _candidate, _restore, _journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    record = json.loads(
+        (access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert callable(mutate)
+    mutate(anchor, record)
+    anchor_path.write_text(json.dumps(anchor, sort_keys=True), encoding="ascii")
+
+    with pytest.raises(access.LifecycleControllerError, match="ANCHOR_INVALID"):
+        access.RetainedAnchorContinuityInspector(_r47_inspection_broker())
+
+
+def test_r62c_a9_active_device_drift_is_not_adopted() -> None:
+    controller, _broker = _r33_controller()
+    controller.close()
+    root = access._LIFECYCLE_STATE_ROOT
+    anchor_path = access._lifecycle_anchor_path(root)
+    anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    anchor["schema_version"] = 1
+    anchor["state_root_device"] = root.stat().st_dev + 1
+    anchor_path.write_text(json.dumps(anchor, sort_keys=True), encoding="ascii")
+    broker = _r47_inspection_broker()
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="DEVICE_DRIFT_ACTIVE_UNSUPPORTED"
+    ):
+        access.RetainedAnchorContinuityInspector(broker)
+
+    assert broker.calls == []
+
+
+@pytest.mark.parametrize(
+    "classification",
+    (
+        access.CurrentSourceClassification.EXACT_PR45,
+        access.CurrentSourceClassification.OTHER,
+        access.CurrentSourceClassification.INDETERMINATE,
+    ),
+)
+def test_r62c_a10_to_a13_migration_requires_one_exact_pr41_proof(
+    classification: access.CurrentSourceClassification,
+) -> None:
+    candidate, restore, journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    broker = _r47_inspection_broker()
+    inspector = access.RetainedAnchorContinuityInspector(broker)
+    with pytest.raises(
+        access.LifecycleControllerError, match="MIGRATION_NOT_AUTHORIZED"
+    ):
+        inspector.migrate_anchor()
+    broker.queue(
+        "current_source_inventory",
+        access.CurrentSourceInventoryResult(classification),
+    )
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="MIGRATION_NOT_AUTHORIZED"
+    ):
+        inspector.migrate_anchor()
+
+    assert result.classification is classification
+    assert [name for name, _ in broker.calls] == ["current_source_inventory"]
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
+
+
+def test_r62c_a14_to_a24_exact_one_shot_atomic_migration_and_normal_reopen() -> None:
+    candidate, restore, journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    before_journal = journal_path.read_bytes()
+    before_anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    broker = _r47_inspection_broker()
+    broker.queue("current_source_inventory", _r62c_exact_pr41_inventory(restore))
+    inspector = access.RetainedAnchorContinuityInspector(broker)
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+    migration = inspector.migrate_anchor()
+    migrated = json.loads(anchor_path.read_text(encoding="ascii"))
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert migration == access.LifecycleAnchorMigrationResult(
+        True,
+        access.LifecycleAnchorFormat.V2_STABLE_ROOT,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+    )
+    assert set(migrated) == access._DurableLifecycleJournal._V2_ANCHOR_FIELDS
+    assert migrated["schema_version"] == 2
+    assert "state_root_device" not in migrated
+    for key in access._DurableLifecycleJournal._V2_ANCHOR_FIELDS - {"schema_version"}:
+        assert migrated[key] == before_anchor[key]
+    assert journal_path.read_bytes() == before_journal
+    assert stat.S_IMODE(anchor_path.stat().st_mode) == 0o600
+    assert not any(
+        path.name.startswith(".anchor-") for path in anchor_path.parent.iterdir()
+    )
+    with pytest.raises(
+        access.LifecycleControllerError, match="MIGRATION_NOT_AUTHORIZED"
+    ):
+        inspector.migrate_anchor()
+    inspector.close()
+
+    normal = access.RetainedTerminalLifecycleInspector(broker)
+    assert normal.anchor_format is access.LifecycleAnchorFormat.V2_STABLE_ROOT
+    assert normal.journal_format is access.LifecycleJournalFormat.V2_CURRENT
+    assert normal.metadata.state is access.LifecycleState.RESTORED_AFTER_ABORT
+    normal.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda anchor: anchor.__setitem__(
+            "state_root_inode", anchor["state_root_inode"] + 1
+        ),
+        lambda anchor: anchor.__setitem__("unexpected", True),
+        lambda anchor: anchor.__setitem__("schema_version", 99),
+    ),
+    ids=("inode", "extra", "unknown-schema"),
+)
+def test_r62c_a21_to_a23_v2_remains_strict(mutate: object) -> None:
+    _candidate, _restore, _journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1(device_drift=False)
+    )
+    anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    anchor["schema_version"] = 2
+    anchor.pop("state_root_device")
+    assert callable(mutate)
+    mutate(anchor)
+    anchor_path.write_text(json.dumps(anchor, sort_keys=True), encoding="ascii")
+
+    with pytest.raises(access.LifecycleControllerError, match="ANCHOR_INVALID"):
+        access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+
+
+def test_r62c_a25_to_a28_migrated_retirement_and_fresh_v2_anchor() -> None:
+    candidate, restore, _journal_path, anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    broker = _r47_inspection_broker()
+    broker.queue("current_source_inventory", _r62c_exact_pr41_inventory(restore))
+    continuity = access.RetainedAnchorContinuityInspector(broker)
+    continuity.inspect_current_source(candidate.manifest, restore.manifest)
+    continuity.migrate_anchor()
+    continuity.close()
+
+    retained = access.RetainedTerminalLifecycleInspector(broker)
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        retained.retire_terminal()
+    retained.inspect_current_source(candidate.manifest, restore.manifest)
+    assert retained.inspect_prior_backup(restore.manifest).classification is (
+        access.PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE
+    )
+    assert retained.retire_owned_prior_backup(restore.manifest) == (
+        access.PriorBackupContinuityResult(
+            access.PriorBackupClassification.NONE, retired=True
+        )
+    )
+    retained.retire_terminal()
+    retained.close()
+
+    fresh = access.FullPreflightLifecycleController(_r47_inspection_broker())
+    fresh_anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    assert fresh._journal.anchor_format is access.LifecycleAnchorFormat.V2_STABLE_ROOT
+    assert set(fresh_anchor) == access._DurableLifecycleJournal._V2_ANCHOR_FIELDS
+    assert "state_root_device" not in fresh_anchor
+    fresh.close()
+
+
+def test_r62c_a30_full_migrated_terminal_to_complete_normal_path() -> None:
+    candidate, restore, _journal_path, _anchor_path = (
+        _r62c_retained_restored_after_abort_v1()
+    )
+    retained_broker = _r47_inspection_broker()
+    retained_broker.queue(
+        "current_source_inventory", _r62c_exact_pr41_inventory(restore)
+    )
+    continuity = access.RetainedAnchorContinuityInspector(retained_broker)
+    continuity.inspect_current_source(candidate.manifest, restore.manifest)
+    continuity.migrate_anchor()
+    continuity.close()
+    retained = access.RetainedTerminalLifecycleInspector(retained_broker)
+    retained.inspect_current_source(candidate.manifest, restore.manifest)
+    retained.inspect_prior_backup(restore.manifest)
+    retained.retire_owned_prior_backup(restore.manifest)
+    retained.retire_terminal()
+    retained.close()
+
+    controller, broker = _r33_controller()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    controller.install_candidate(candidate.manifest)
+    controller.verify_candidate_inventory(candidate.manifest)
+    controller.check_candidate_core()
+    controller.restart_for_candidate()
+    controller.await_candidate_readiness()
+    controller.verify_research_services_present()
+    controller.admit_post_activation_repairs()
+    controller.collect_a0()
+    controller.run_p0()
+    controller.collect_ap0()
+    controller.run_non_probe_preflight()
+    controller.collect_a1()
+    controller.validate_research_final()
+    controller.collect_a2()
+    proof = _r32_complete_restore_tail(controller, restore)
+
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.COMPLETE_NORMAL
+    assert (
+        controller._journal.anchor_format is access.LifecycleAnchorFormat.V2_STABLE_ROOT
+    )
+    assert controller._journal._record["consumed_operations"].count("preflight") == 1
+    assert [name for name, _ in broker.calls].count("restart") == 2
+    assert [name for name, _ in broker.calls].count("helper") == 5
+    assert "PROBE" not in access.LifecycleAction.__members__
+    assert "RECEIPT" not in access.LifecycleAction.__members__
+    assert controller._journal._record["restart_tombstones"] == [
         access.LifecycleAction.ACTIVATION_RESTART.value,
         access.LifecycleAction.REMOVAL_RESTART.value,
     ]
