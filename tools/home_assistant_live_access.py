@@ -5230,6 +5230,13 @@ def retained_backup_continuity(value):
         or restore_consumed_present and not restore_marker_owned
         or not restore_marker_valid
     )
+    if not package_present and restore_consumed_present:
+        if not other_present and restore_marker_owned and restore_marker_valid:
+            return {
+                'classification': 'OWNED_BY_RETAINED_LIFECYCLE',
+                'retired': False,
+            }
+        return {'classification': 'OTHER_OR_INDETERMINATE', 'retired': False}
     if not package_present and not other_present:
         return {'classification': 'NONE', 'retired': False}
     if not package_present or other_present:

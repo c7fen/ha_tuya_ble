@@ -9440,3 +9440,29 @@ def test_r58_committed_restore_marker_is_retired_with_owned_backup(
     }
     assert retired == {"classification": "NONE", "retired": True}
     assert not marker.exists()
+
+
+def test_r58_owned_restore_marker_surviving_partial_retirement_is_retired(
+    tmp_path: Path,
+) -> None:
+    retained_context = _r58_create_remote_backup(tmp_path)
+    retained_context["restore_marker_owned"] = True
+    marker = tmp_path / ".ha_tuya_ble_r30_restore.consumed"
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    marker.chmod(0o600)
+    shutil.rmtree(tmp_path / ".ha_tuya_ble_r36_backup")
+
+    inspected = _run_synthetic_remote_program(
+        tmp_path, "inspect_retained_backup", retained_context
+    )
+    retired = _run_synthetic_remote_program(
+        tmp_path, "retire_retained_backup", retained_context
+    )
+
+    assert inspected == {
+        "classification": "OWNED_BY_RETAINED_LIFECYCLE",
+        "retired": False,
+    }
+    assert retired == {"classification": "NONE", "retired": True}
+    assert not marker.exists()
