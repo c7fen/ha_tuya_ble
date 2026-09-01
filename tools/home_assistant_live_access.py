@@ -197,6 +197,29 @@ class CurrentSourceClassification(StrEnum):
     INDETERMINATE = "INDETERMINATE"
 
 
+class CoreCheckResponseContract(StrEnum):
+    """The exact bounded Supervisor Core-check response profile."""
+
+    CURRENT_RESULT_OK = "CURRENT_RESULT_OK"
+    ERROR = "ERROR"
+    INVALID = "INVALID"
+
+
+class PriorBackupClassification(StrEnum):
+    """Ownership classification for retained lifecycle remote backup state."""
+
+    NONE = "NONE"
+    OWNED_BY_RETAINED_LIFECYCLE = "OWNED_BY_RETAINED_LIFECYCLE"
+    OTHER_OR_INDETERMINATE = "OTHER_OR_INDETERMINATE"
+
+
+class RetainedBackupAction(StrEnum):
+    """The two exact backup-continuity operations available to an inspector."""
+
+    INSPECT = "inspect"
+    RETIRE = "retire"
+
+
 class BoundedOperation(StrEnum):
     """Every operation the private remote dispatcher can represent."""
 
@@ -213,6 +236,8 @@ class BoundedOperation(StrEnum):
     RESTORE_BACKUP = "restore_backup"
     RECONCILE_BACKUP = "reconcile_backup"
     RECONCILE_BACKUP_CREATION = "reconcile_backup_creation"
+    INSPECT_RETAINED_BACKUP = "inspect_retained_backup"
+    RETIRE_RETAINED_BACKUP = "retire_retained_backup"
 
 
 class PhaseAOperation(StrEnum):
@@ -651,6 +676,8 @@ _BOUNDED_OPERATION_ACTIONS = {
     BoundedOperation.RECONCILE_BACKUP: frozenset(
         {LifecycleAction.BACKUP_FALLBACK_RECONCILE}
     ),
+    BoundedOperation.INSPECT_RETAINED_BACKUP: frozenset(),
+    BoundedOperation.RETIRE_RETAINED_BACKUP: frozenset(),
 }
 
 
@@ -822,6 +849,21 @@ class _SourceInspectionCapability:
     issuer: object
     session_generation: object
     issuance_identity: object
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedBackupCapability:
+    """One exact retained-terminal backup inspection or retirement permit."""
+
+    controller: object
+    issuer: object
+    lifecycle_generation: object
+    source_generation: object
+    session_generation: object
+    issuance_identity: object
+    action: RetainedBackupAction
+    backup_identity: object = field(repr=False)
+    restore_marker_owned: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1039,6 +1081,14 @@ class CoreCheckResult:
     result: str | None
     check_passed: bool
     error_class: str | None
+    response_contract: CoreCheckResponseContract = CoreCheckResponseContract.INVALID
+    legacy_check_passed_present: bool = False
+
+
+@dataclass(frozen=True)
+class PriorBackupContinuityResult:
+    classification: PriorBackupClassification
+    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -3056,6 +3106,40 @@ def _backup_context_payload(
     return payload
 
 
+def _retained_backup_context_payload(
+    manifest: SourceManifest, capability: _RetainedBackupCapability
+) -> dict[str, object]:
+    if manifest.state is not SourceState.RESTORE:
+        raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+    validate_source_manifest(manifest)
+    identity = capability.backup_identity
+    if not (
+        type(identity) is dict
+        and identity.get("lifecycle_generation") == str(capability.lifecycle_generation)
+        and identity.get("source_generation") == str(capability.source_generation)
+        and all(
+            isinstance(identity.get(name), str)
+            and re.fullmatch(pattern, identity[name]) is not None
+            for name, pattern in (
+                ("backup_generation", r"[0-9a-f]{32}"),
+                ("manifest_identity", r"[0-9a-f]{64}"),
+                ("backup_digest", r"[0-9a-f]{64}"),
+            )
+        )
+    ):
+        raise SourceBundleError("BACKUP_IDENTITY_REQUIRED") from None
+    return {
+        "lifecycle_generation": str(capability.lifecycle_generation),
+        "source_generation": str(capability.source_generation),
+        "source_state": "PR41_BASELINE",
+        "manifest": _manifest_payload(manifest),
+        "backup_generation": identity["backup_generation"],
+        "manifest_identity": identity["manifest_identity"],
+        "backup_digest": identity["backup_digest"],
+        "restore_marker_owned": capability.restore_marker_owned,
+    }
+
+
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Build one JSON object while rejecting duplicate member names."""
     value: dict[str, Any] = {}
@@ -3239,21 +3323,28 @@ def _parse_source_inventory_result(payload: object) -> SourceInventoryResult:
 def _parse_core_check_result(value: object, *, attempt_ordinal: int) -> CoreCheckResult:
     if attempt_ordinal not in {1, 2}:
         raise SessionBrokerError("CORE_CHECK_ATTEMPT_INVALID") from None
-    invalid = CoreCheckResult(attempt_ordinal, None, None, False, "INVALID_RESPONSE")
+    legacy_field_present = isinstance(value, dict) and "check_passed" in value
+    invalid = CoreCheckResult(
+        attempt_ordinal,
+        None,
+        None,
+        False,
+        "INVALID_RESPONSE",
+        CoreCheckResponseContract.INVALID,
+        legacy_field_present,
+    )
     if not isinstance(value, dict) or not set(value).issubset(
         {"http_status", "result", "check_passed", "error_class"}
     ):
         return invalid
     status = value.get("http_status")
     result = value.get("result")
-    passed = value.get("check_passed")
     error_class = value.get("error_class")
     if (
         type(status) is not int
         or not isinstance(result, str)
-        or "check_passed" in value
-        and type(passed) is not bool
-        or error_class is not None
+        or legacy_field_present
+        or "error_class" in value
         and (
             not isinstance(error_class, str)
             or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error_class) is None
@@ -3261,10 +3352,15 @@ def _parse_core_check_result(value: object, *, attempt_ordinal: int) -> CoreChec
     ):
         return invalid
     exact_pass = (
-        200 <= status < 300
+        set(value) == {"http_status", "result"}
+        and 200 <= status < 300
         and result == "ok"
-        and passed is True
         and error_class is None
+    )
+    contract = (
+        CoreCheckResponseContract.CURRENT_RESULT_OK
+        if exact_pass
+        else CoreCheckResponseContract.ERROR
     )
     return CoreCheckResult(
         attempt_ordinal,
@@ -3272,6 +3368,8 @@ def _parse_core_check_result(value: object, *, attempt_ordinal: int) -> CoreChec
         result,
         exact_pass,
         None if exact_pass else error_class or "CHECK_FAILED",
+        contract,
+        False,
     )
 
 
@@ -5086,6 +5184,94 @@ def reconcile_backup_creation(value):
         'backup_digest': identity['backup_digest'],
     }
 
+def retained_backup_continuity(value):
+    if not isinstance(value, dict) or type(value.get('restore_marker_owned')) is not bool:
+        raise ValueError('backup_context')
+    context = dict(value)
+    restore_marker_owned = context.pop('restore_marker_owned')
+    expected = validate_backup_context(context)
+    package_present = root_relative_exists(BACKUP)
+    backup_consumed_present = root_relative_exists(BACKUP_CONSUMED)
+    restore_consumed_present = root_relative_exists(RESTORE_CONSUMED)
+    stale_stage_present = root_relative_exists(STAGE) or any(
+        name.startswith(BACKUP.name + '.pending-')
+        or name.startswith(STAGE.name + '.pending')
+        or name.startswith('.ha_tuya_ble_r36_restore-')
+        for name in os.listdir(ROOT_FD)
+    )
+    restore_marker_valid = not restore_consumed_present
+    if restore_consumed_present and restore_marker_owned:
+        marker_parent = marker_fd = None
+        try:
+            marker_parent = open_root_relative(RESTORE_CONSUMED.parent)
+            marker_fd = os.open(
+                RESTORE_CONSUMED.name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=marker_parent,
+            )
+            marker = os.fstat(marker_fd)
+            restore_marker_valid = (
+                stat.S_ISREG(marker.st_mode)
+                and marker.st_uid == os.getuid()
+                and marker.st_nlink == 1
+                and marker.st_mode & 0o777 == 0o600
+                and marker.st_size == 0
+            )
+        except OSError:
+            restore_marker_valid = False
+        finally:
+            if marker_fd is not None:
+                os.close(marker_fd)
+            if marker_parent is not None:
+                os.close(marker_parent)
+    other_present = (
+        backup_consumed_present
+        or stale_stage_present
+        or restore_consumed_present and not restore_marker_owned
+        or not restore_marker_valid
+    )
+    if not package_present and not other_present:
+        return {'classification': 'NONE', 'retired': False}
+    if not package_present or other_present:
+        return {'classification': 'OTHER_OR_INDETERMINATE', 'retired': False}
+    package_fd = source_fd = None
+    try:
+        package_fd = open_root_relative(BACKUP)
+        identity = read_backup_identity_fd(value, package_fd)
+        source_fd = open_relative_directory(package_fd, ('integration',))
+        packaged = inventory_deployment_fd(source_fd)
+        observed_identity = inventory_identity(packaged)
+        if (
+            packaged != expected
+            or observed_identity['file_count'] != identity['file_count']
+            or observed_identity['manifest_identity'] != identity['manifest_identity']
+        ):
+            raise ValueError('backup_identity')
+        assert_root_relative_identity(BACKUP, package_fd)
+    except Exception:
+        return {'classification': 'OTHER_OR_INDETERMINATE', 'retired': False}
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if package_fd is not None:
+            os.close(package_fd)
+    return {'classification': 'OWNED_BY_RETAINED_LIFECYCLE', 'retired': False}
+
+def retire_retained_backup(value):
+    result = retained_backup_continuity(value)
+    if result['classification'] != 'OWNED_BY_RETAINED_LIFECYCLE':
+        return result
+    remove(BACKUP)
+    if value['restore_marker_owned'] and root_relative_exists(RESTORE_CONSUMED):
+        remove(RESTORE_CONSUMED)
+    sync_root()
+    if any(
+        root_relative_exists(path)
+        for path in (BACKUP, BACKUP_CONSUMED, RESTORE_CONSUMED, STAGE)
+    ):
+        raise ValueError('private_state')
+    return {'classification': 'NONE', 'retired': True}
+
 def transfer(value):
     state, expected = expected_manifest(value)
     files = value['files']
@@ -5294,17 +5480,39 @@ def request_json(url, method='GET', timeout=30):
 def core_check():
     try:
         status, body = request_json('http://supervisor/core/check', 'POST')
-        result = body.get('result') if isinstance(body, dict) else None
-        authoritative = body.get('check_passed') if isinstance(body, dict) else None
-        authoritative_field = (
-            {'check_passed': authoritative}
-            if isinstance(body, dict) and 'check_passed' in body
-            else {}
-        )
+        if (
+            not isinstance(body, dict)
+            or set(body) != {'result', 'data'}
+            or body.get('result') != 'ok'
+            or body.get('data') != {}
+        ):
+            return {
+                'http_status': status,
+                'result': body.get('result') if isinstance(body, dict) else 'error',
+                **(
+                    {'check_passed': body['check_passed']}
+                    if isinstance(body, dict) and 'check_passed' in body
+                    else {}
+                ),
+                'error_class': 'INVALID_RESPONSE',
+            }
         return {
             'http_status': status,
-            'result': result,
-            **authoritative_field,
+            'result': 'ok',
+        }
+    except urllib.error.HTTPError as error:
+        try:
+            body_bytes = error.read(1024 * 1024 + 1)
+            if len(body_bytes) > 1024 * 1024:
+                raise ValueError('response_size')
+            body = decode_json(body_bytes)
+            result = body.get('result') if isinstance(body, dict) else None
+        except Exception:
+            result = None
+        return {
+            'http_status': error.code,
+            'result': result if isinstance(result, str) else 'error',
+            'error_class': 'CHECK_REJECTED',
         }
     except Exception:
         return {
@@ -5577,6 +5785,10 @@ else:
                 result = backup(value)
             elif operation == 'reconcile_backup_creation':
                 result = reconcile_backup_creation(value)
+            elif operation == 'inspect_retained_backup':
+                result = retained_backup_continuity(value)
+            elif operation == 'retire_retained_backup':
+                result = retire_retained_backup(value)
             elif operation == 'transfer':
                 result = transfer(value)
             elif operation == 'install':
@@ -5804,6 +6016,37 @@ class PrivateInteractiveSessionBroker:
             binding.issuer.consumed.append(capability)
         return capability
 
+    def _require_retained_backup_capability(
+        self,
+        capability: object,
+        action: RetainedBackupAction,
+        *,
+        consume: bool = False,
+    ) -> _RetainedBackupCapability:
+        binding = self._controller_binding
+        if (
+            type(capability) is not _RetainedBackupCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.lifecycle_generation is not binding.lifecycle_generation
+            or capability.source_generation is None
+            or capability.session_generation is not binding.session_generation
+            or capability.issuance_identity is None
+            or capability.action is not action
+            or type(capability.backup_identity) is not dict
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_BACKUP_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+        return capability
+
     def __write_wire(self, packet: _PrivateWirePacket) -> None:
         if (
             type(packet) is not _PrivateWirePacket
@@ -6014,7 +6257,12 @@ class PrivateInteractiveSessionBroker:
                 "PRIVATE_INTERACTIVE_SESSION_OPERATION_INVALID"
             ) from None
         neutral_inspection = (
-            operation is BoundedOperation.SOURCE_INVENTORY
+            operation
+            in {
+                BoundedOperation.SOURCE_INVENTORY,
+                BoundedOperation.INSPECT_RETAINED_BACKUP,
+                BoundedOperation.RETIRE_RETAINED_BACKUP,
+            }
             and _inspection_token is not None
             and _inspection_token
             is getattr(
@@ -6334,6 +6582,53 @@ class PrivateInteractiveSessionBroker:
         return CurrentSourceInventoryResult(
             CurrentSourceClassification.OTHER, candidate_result
         )
+
+    def _retained_backup_operation(
+        self,
+        manifest: SourceManifest,
+        action: RetainedBackupAction,
+        *,
+        _capability: object = None,
+    ) -> PriorBackupContinuityResult:
+        capability = self._require_retained_backup_capability(
+            _capability, action, consume=True
+        )
+        operation = {
+            RetainedBackupAction.INSPECT: BoundedOperation.INSPECT_RETAINED_BACKUP,
+            RetainedBackupAction.RETIRE: BoundedOperation.RETIRE_RETAINED_BACKUP,
+        }[action]
+        output = self.__execute_bounded_operation(
+            operation,
+            _retained_backup_context_payload(manifest, capability),
+            detail=manifest.state.value,
+            _inspection_token=self.__inspection_token,
+        )
+        try:
+            payload = _exact_payload(output)
+            if not isinstance(payload, dict) or set(payload) != {
+                "classification",
+                "retired",
+            }:
+                raise ValueError
+            result = PriorBackupContinuityResult(
+                PriorBackupClassification(payload["classification"]),
+                _bool(payload["retired"]),
+            )
+            if (
+                action is RetainedBackupAction.INSPECT
+                and result.retired is not False
+                or action is RetainedBackupAction.RETIRE
+                and (
+                    result.classification is not PriorBackupClassification.NONE
+                    or result.retired is not True
+                )
+            ):
+                raise ValueError
+            return result
+        except (KeyError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
@@ -6739,6 +7034,8 @@ class RetainedTerminalLifecycleInspector:
         self._broker = broker
         self._session_generation = broker._session_generation
         self._source_classification: CurrentSourceClassification | None = None
+        self._prior_backup_classification: PriorBackupClassification | None = None
+        self._backup_retirement_attempted = False
         self._retired = False
         self._journal = _DurableLifecycleJournal.open_retained_terminal()
         try:
@@ -6781,11 +7078,96 @@ class RetainedTerminalLifecycleInspector:
         self._source_classification = result.classification
         return result
 
+    def _retained_backup_capability(
+        self, action: RetainedBackupAction
+    ) -> _RetainedBackupCapability:
+        self._assert_session_binding()
+        identity = self._journal.baseline_backup_identity
+        if (
+            self._retired
+            or self._source_classification is not CurrentSourceClassification.EXACT_PR41
+            or type(identity) is not dict
+        ):
+            raise LifecycleControllerError(
+                "PRIOR_BACKUP_CONTINUITY_NOT_AUTHORIZED"
+            ) from None
+        capability = _RetainedBackupCapability(
+            self,
+            self._capability_issuer.identity,
+            self._journal.lifecycle_generation,
+            identity["source_generation"],
+            self._session_generation,
+            secrets.token_hex(16),
+            action,
+            identity,
+            self._journal.action_transition_committed(LifecycleAction.RESTORE_INSTALL),
+        )
+        self._capability_issuer.issued.append(capability)
+        return capability
+
+    def inspect_prior_backup(
+        self, restore_manifest: SourceManifest
+    ) -> PriorBackupContinuityResult:
+        if self._prior_backup_classification is not None:
+            raise LifecycleControllerError("PRIOR_BACKUP_ALREADY_INSPECTED") from None
+        capability = self._retained_backup_capability(RetainedBackupAction.INSPECT)
+        try:
+            result = self._broker._retained_backup_operation(
+                restore_manifest,
+                RetainedBackupAction.INSPECT,
+                _capability=capability,
+            )
+            if (
+                not isinstance(result, PriorBackupContinuityResult)
+                or result.retired is not False
+            ):
+                raise TypeError
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            result = PriorBackupContinuityResult(
+                PriorBackupClassification.OTHER_OR_INDETERMINATE
+            )
+        self._prior_backup_classification = result.classification
+        return result
+
+    def retire_owned_prior_backup(
+        self, restore_manifest: SourceManifest
+    ) -> PriorBackupContinuityResult:
+        if (
+            self._backup_retirement_attempted
+            or self._prior_backup_classification
+            is not PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE
+        ):
+            raise LifecycleControllerError(
+                "PRIOR_BACKUP_RETIREMENT_NOT_AUTHORIZED"
+            ) from None
+        self._backup_retirement_attempted = True
+        capability = self._retained_backup_capability(RetainedBackupAction.RETIRE)
+        try:
+            result = self._broker._retained_backup_operation(
+                restore_manifest,
+                RetainedBackupAction.RETIRE,
+                _capability=capability,
+            )
+            if (
+                not isinstance(result, PriorBackupContinuityResult)
+                or result.classification is not PriorBackupClassification.NONE
+                or result.retired is not True
+            ):
+                raise TypeError
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._prior_backup_classification = (
+                PriorBackupClassification.OTHER_OR_INDETERMINATE
+            )
+            raise LifecycleControllerError("PRIOR_BACKUP_RETIREMENT_FAILED") from None
+        self._prior_backup_classification = result.classification
+        return result
+
     def retire_terminal(self) -> None:
         self._assert_session_binding()
         if (
             self._retired
             or self._source_classification is not CurrentSourceClassification.EXACT_PR41
+            or self._prior_backup_classification is not PriorBackupClassification.NONE
         ):
             raise LifecycleControllerError(
                 "LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED"

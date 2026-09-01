@@ -1079,6 +1079,8 @@ def test_r30_no_generic_command_api_and_exact_operation_allowlist() -> None:
         "restore_backup",
         "reconcile_backup",
         "reconcile_backup_creation",
+        "inspect_retained_backup",
+        "retire_retained_backup",
     }
     public_callables = {
         name
@@ -1278,11 +1280,18 @@ def test_r30_core_check_malformed_or_error_never_passes(payload: object) -> None
 def test_r30_core_check_exact_success_contract() -> None:
     """A 2xx JSON result=ok is the only accepted Core-check proof."""
     result = access._parse_core_check_result(
-        {"http_status": 200, "result": "ok", "check_passed": True},
+        {"http_status": 200, "result": "ok"},
         attempt_ordinal=2,
     )
 
-    assert result == access.CoreCheckResult(2, 200, "ok", True, None)
+    assert result == access.CoreCheckResult(
+        2,
+        200,
+        "ok",
+        True,
+        None,
+        access.CoreCheckResponseContract.CURRENT_RESULT_OK,
+    )
 
 
 def test_r30_restart_operation_has_no_retry_loop() -> None:
@@ -2843,7 +2852,7 @@ responses = {
     "transfer": {"success": True, "file_count": 3, "manifest_match": True, "regular_files_only": True},
     "install": {"installation_success": True, "expected_file_count": 3, "installed_file_count": 3, "manifest_match": True},
     "source_inventory": {"expected_count": 3, "observed_managed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "content_mismatch_count": 0, "runtime_cache_file_count": 0, "managed_manifest_identity": "__RESTORE_DIGEST__", "root_profile": "DIRECT_CONFIG"},
-    "core_check": {"http_status": 200, "result": "ok", "check_passed": True},
+    "core_check": {"http_status": 200, "result": "ok"},
     "core_readiness": {"core_reachable": True, "core_running": True, "integration_loaded": True, "timed_out": False},
 }
 
@@ -3824,6 +3833,25 @@ class _R32ScriptedBroker:
             raise access.SessionBrokerError("SYNTHETIC_INSPECTION_CAPABILITY_INVALID")
         binding[1].consumed.append(capability)
 
+    def _consume_retained_backup_capability(
+        self, capability: object, action: access.RetainedBackupAction
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            type(capability) is not access._RetainedBackupCapability
+            or binding is None
+            or capability.controller is not binding[0]
+            or capability.issuer is not binding[1].identity
+            or capability.lifecycle_generation is not binding[2]
+            or capability.session_generation is not binding[3]
+            or capability.action is not action
+            or not any(capability is issued for issued in binding[1].issued)
+            or any(capability is consumed for consumed in binding[1].consumed)
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_BACKUP_CAPABILITY_INVALID")
+        binding[1].consumed.append(capability)
+        self._pending_capability = capability
+
     def queue(self, name: str, *responses: object) -> None:
         self.responses.setdefault(name, []).extend(responses)
 
@@ -4001,6 +4029,29 @@ class _R32ScriptedBroker:
             raise value
         assert isinstance(value, access.CurrentSourceInventoryResult)
         return value
+
+    def _retained_backup_operation(
+        self,
+        manifest: access.SourceManifest,
+        action: access.RetainedBackupAction,
+        *,
+        _capability: object = None,
+    ) -> access.PriorBackupContinuityResult:
+        assert manifest.state is access.SourceState.RESTORE
+        self._consume_retained_backup_capability(_capability, action)
+        return self._next(
+            "prior_backup",
+            action,
+            (
+                access.PriorBackupContinuityResult(
+                    access.PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE
+                )
+                if action is access.RetainedBackupAction.INSPECT
+                else access.PriorBackupContinuityResult(
+                    access.PriorBackupClassification.NONE, retired=True
+                )
+            ),
+        )
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
@@ -4650,9 +4701,9 @@ def _r32_complete_restore_tail(
 @pytest.mark.parametrize(
     ("case", "payload", "expected"),
     (
-        ("C1-M1", {"http_status": 200, "result": "ok", "check_passed": True}, True),
+        ("C1-M1", {"http_status": 200, "result": "ok", "check_passed": True}, False),
         ("C1-M2", {"http_status": 200, "result": "ok", "check_passed": False}, False),
-        ("C1-M3", {"http_status": 200, "result": "ok"}, False),
+        ("C1-M3", {"http_status": 200, "result": "ok"}, True),
         ("C1-M4", {"http_status": 200, "result": "ok", "check_passed": None}, False),
         ("C1-M5", {"http_status": 200, "result": "ok", "check_passed": 1}, False),
         ("C1-M6", {"http_status": 200, "result": "ok", "check_passed": "true"}, False),
@@ -4669,17 +4720,16 @@ def test_r32_c1_m1_to_m9_authoritative_core_check_matrix(
     assert result.check_passed is expected, case
 
 
-def test_r32_c1_m10_remote_core_check_never_synthesizes_authoritative_body_field() -> (
-    None
-):
+def test_r58_remote_core_check_validates_current_supervisor_envelope() -> None:
     source = access._REMOTE_CONTROL_PROGRAM
     core_check = source[
         source.index("def core_check") : source.index("def restart_core")
     ]
 
-    assert "authoritative = body.get('check_passed')" in core_check
-    assert "'check_passed': authoritative" in core_check
-    assert "passed = 200 <= status < 300 and result == 'ok'" not in core_check
+    assert "set(body) != {'result', 'data'}" in core_check
+    assert "body.get('result') != 'ok'" in core_check
+    assert "body.get('data') != {}" in core_check
+    assert "except urllib.error.HTTPError as error" in core_check
 
 
 def test_r32_core_check_completed_generic_error_is_typed_fail_not_protocol(
@@ -4701,7 +4751,14 @@ def test_r32_core_check_completed_generic_error_is_typed_fail_not_protocol(
         ),
     )
 
-    assert result == access.CoreCheckResult(1, 0, "error", False, "REQUEST_FAILED")
+    assert result == access.CoreCheckResult(
+        1,
+        0,
+        "error",
+        False,
+        "REQUEST_FAILED",
+        access.CoreCheckResponseContract.ERROR,
+    )
 
 
 def test_r32_core_check_specialized_payload_rejects_non_allowlisted_fields() -> None:
@@ -8267,6 +8324,16 @@ def test_r47_terminal_retirement_after_exact_pr41_allows_fresh_lifecycle() -> No
     result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
     assert result.classification is access.CurrentSourceClassification.EXACT_PR41
 
+    prior = inspector.inspect_prior_backup(restore.manifest)
+    assert (
+        prior.classification
+        is access.PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE
+    )
+    retired = inspector.retire_owned_prior_backup(restore.manifest)
+    assert retired == access.PriorBackupContinuityResult(
+        access.PriorBackupClassification.NONE, retired=True
+    )
+
     inspector.retire_terminal()
 
     assert not journal_path.exists()
@@ -9218,3 +9285,158 @@ def test_r36_combined_ledger_detector_inventory_is_complete() -> None:
         function_name = detector.partition("[")[0]
         assert function_name in globals(), detector
         assert callable(globals()[function_name]), detector
+
+
+def test_r58_parent_rejects_current_supervisor_success_for_candidate() -> None:
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    broker.queue(
+        "core_check",
+        access._parse_core_check_result(
+            {"http_status": 200, "result": "ok"}, attempt_ordinal=1
+        ),
+    )
+
+    result = controller.check_candidate_core()
+
+    assert result.check_passed is True
+    assert controller.state is access.LifecycleState.CANDIDATE_CORE_CHECKED
+    assert [detail for name, detail in broker.calls if name == "core_check"] == [1]
+
+
+def test_r58_parent_reproduces_candidate_and_restore_double_failure() -> None:
+    current_success = access._parse_core_check_result(
+        {"http_status": 200, "result": "ok"}, attempt_ordinal=1
+    )
+    candidate, candidate_broker = _r32_controller()
+    candidate._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    candidate_broker.queue("core_check", current_success)
+
+    candidate.check_candidate_core()
+
+    restored, restore_broker = _r32_controller()
+    restored._state = access.LifecycleState.RESTORE_INVENTORY_VERIFIED
+    restore_broker.queue(
+        "core_check",
+        access._parse_core_check_result(
+            {"http_status": 200, "result": "ok"}, attempt_ordinal=1
+        ),
+    )
+
+    restore_result = restored.check_restore_core()
+
+    assert candidate.state is access.LifecycleState.CANDIDATE_CORE_CHECKED
+    assert restore_result.check_passed is True
+    assert restored.state is access.LifecycleState.RESTORE_CORE_CHECKED
+    assert [
+        detail for name, detail in candidate_broker.calls if name == "core_check"
+    ] == [1]
+    assert [
+        detail for name, detail in restore_broker.calls if name == "core_check"
+    ] == [1]
+
+
+def _r58_create_remote_backup(tmp_path: Path) -> dict[str, object]:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    context = _r36_backup_payload()
+    created = _run_synthetic_remote_program(tmp_path, "backup", context)
+    assert created["success"] is True
+    return {
+        **context,
+        "backup_generation": created["backup_generation"],
+        "manifest_identity": created["manifest_identity"],
+        "backup_digest": created["backup_digest"],
+        "restore_marker_owned": False,
+    }
+
+
+def test_r58_owned_retained_backup_is_retired_and_fresh_backup_can_be_created(
+    tmp_path: Path,
+) -> None:
+    retained_context = _r58_create_remote_backup(tmp_path)
+
+    inspected = _run_synthetic_remote_program(
+        tmp_path, "inspect_retained_backup", retained_context
+    )
+    retired = _run_synthetic_remote_program(
+        tmp_path, "retire_retained_backup", retained_context
+    )
+    fresh_context = _r36_backup_payload(
+        lifecycle_generation="c" * 32, source_generation="d" * 32
+    )
+    fresh = _run_synthetic_remote_program(tmp_path, "backup", fresh_context)
+
+    assert inspected == {
+        "classification": "OWNED_BY_RETAINED_LIFECYCLE",
+        "retired": False,
+    }
+    assert retired == {"classification": "NONE", "retired": True}
+    assert fresh["success"] is True
+    assert fresh["lifecycle_generation"] == "c" * 32
+    assert fresh["backup_generation"] != retained_context["backup_generation"]
+
+
+def test_r58_foreign_or_indeterminate_backup_cannot_be_retired(tmp_path: Path) -> None:
+    retained_context = _r58_create_remote_backup(tmp_path)
+    foreign_context = dict(retained_context)
+    foreign_context["lifecycle_generation"] = "e" * 32
+
+    inspected = _run_synthetic_remote_program(
+        tmp_path, "inspect_retained_backup", foreign_context
+    )
+    retired = _run_synthetic_remote_program(
+        tmp_path, "retire_retained_backup", foreign_context
+    )
+
+    assert inspected == {
+        "classification": "OTHER_OR_INDETERMINATE",
+        "retired": False,
+    }
+    assert retired == inspected
+    assert (tmp_path / ".ha_tuya_ble_r36_backup").is_dir()
+
+
+def test_r58_absent_retained_backup_is_classified_none(tmp_path: Path) -> None:
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    context = {
+        **_r36_backup_payload(),
+        "backup_generation": "c" * 32,
+        "manifest_identity": access._source_manifest_digest(
+            _r30_manifest("RESTORE").entries
+        ),
+        "backup_digest": "d" * 64,
+        "restore_marker_owned": False,
+    }
+
+    result = _run_synthetic_remote_program(tmp_path, "inspect_retained_backup", context)
+
+    assert result == {"classification": "NONE", "retired": False}
+
+
+def test_r58_committed_restore_marker_is_retired_with_owned_backup(
+    tmp_path: Path,
+) -> None:
+    retained_context = _r58_create_remote_backup(tmp_path)
+    retained_context["restore_marker_owned"] = True
+    marker = tmp_path / ".ha_tuya_ble_r30_restore.consumed"
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    marker.chmod(0o600)
+
+    inspected = _run_synthetic_remote_program(
+        tmp_path, "inspect_retained_backup", retained_context
+    )
+    retired = _run_synthetic_remote_program(
+        tmp_path, "retire_retained_backup", retained_context
+    )
+
+    assert inspected == {
+        "classification": "OWNED_BY_RETAINED_LIFECYCLE",
+        "retired": False,
+    }
+    assert retired == {"classification": "NONE", "retired": True}
+    assert not marker.exists()

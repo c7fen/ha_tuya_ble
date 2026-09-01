@@ -236,7 +236,11 @@ anchor is inconsistent state. Terminal journals and their anchors are retained.
 
 For a retained terminal, open the explicit terminal inspection handle and run
 the state-neutral current-source inventory. Only an `EXACT_PR41` result may be
-followed by explicit terminal retirement; then close the handle and create a
+followed by the retained-backup continuity check. That check reports only
+`NONE`, `OWNED_BY_RETAINED_LIFECYCLE`, or `OTHER_OR_INDETERMINATE`. An exact
+owned package may be retired once through the inspector-only operation; foreign
+or indeterminate state cannot be changed. Terminal retirement additionally
+requires a resulting `NONE` classification. Then close the handle and create a
 fresh lifecycle later. For `EXACT_PR45`, `OTHER`, or `INDETERMINATE`, retain the
 terminal rather than retiring it merely to start over.
 When retained-terminal current-source inspection returns `INDETERMINATE`, report
@@ -332,18 +336,20 @@ succeeds but its response is lost, a separate read-only reconciliation
 operation verifies and adopts that exact package; creation is never replayed or
 allowed to replace it.
 
-Core check uses exactly `POST http://supervisor/core/check`. The remote adapter
-preserves the authoritative response body's `check_passed` value; it never
-synthesizes that field from HTTP status or `result`. Success requires a
-completed request, 2xx status, JSON object, exact string `result == "ok"`, and
-exact boolean `check_passed is true`, and no error condition. Parser and
-controller boundaries both reject integer `1`, strings, null, and arbitrary
-truthy objects. A completed FAIL or transport ambiguity is terminal for that
+Core check uses exactly `POST http://supervisor/core/check`. Authoritative
+Supervisor source and endpoint tests define the current success response as a
+2xx standard API envelope with exact string `result == "ok"` and empty `data`;
+the endpoint returns no `check_passed` member. The remote adapter validates that
+exact envelope and exposes only the bounded status/result projection. No
+supported historical Supervisor endpoint contract with a top-level
+`check_passed` member exists, so its presence is invalid rather than a legacy
+success profile. A completed FAIL or transport ambiguity is terminal for that
 attempt; the controller never reconnects or retries it. The durable journal
-records attempt state, so reconstruction cannot reset the budget. A completed generic `error_class` response is a
-typed Core-check FAIL, not transport ambiguity. Restart uses the fixed
-Supervisor Core restart endpoint, has no retry loop, and the broker rejects a
-second submission for the same activated source state before PTY I/O.
+records attempt state, so reconstruction cannot reset the budget. A completed
+generic `error_class` response is a typed Core-check FAIL, not transport
+ambiguity. Restart uses the fixed Supervisor Core restart endpoint, has no retry
+loop, and the broker rejects a second submission for the same activated source
+state before PTY I/O.
 Readiness polling is bounded and verifies Core reachability, the running API,
 and `tuya_ble` in Core's loaded component set. Temporary service presence or
 absence remains a separate exact-count aggregate gate; result booleans alone
