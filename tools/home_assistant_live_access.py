@@ -205,6 +205,34 @@ class CoreCheckResponseContract(StrEnum):
     INVALID = "INVALID"
 
 
+class RestartDispatchOutcome(StrEnum):
+    """Bounded result of one non-replayable Supervisor restart dispatch."""
+
+    DEFINITELY_NOT_DISPATCHED = "DEFINITELY_NOT_DISPATCHED"
+    RESPONSE_ACCEPTED = "RESPONSE_ACCEPTED"
+    RESPONSE_REJECTED = "RESPONSE_REJECTED"
+    DISPATCHED_RESPONSE_UNKNOWN = "DISPATCHED_RESPONSE_UNKNOWN"
+
+
+class RestartFailureReason(StrEnum):
+    """Fixed, non-sensitive restart transport diagnostic."""
+
+    CONNECT_FAILED = "CONNECT_FAILED"
+    SEND_FAILED = "SEND_FAILED"
+    RESPONSE_TIMEOUT = "RESPONSE_TIMEOUT"
+    RESPONSE_CLOSED = "RESPONSE_CLOSED"
+    HTTP_REJECTED = "HTTP_REJECTED"
+    INVALID_RESPONSE = "INVALID_RESPONSE"
+
+
+# Keep the broker's frame deadline outside the restart-specific response wait.
+# The 16-minute reconciliation window covers Supervisor's documented 10-minute
+# API-response and 15-minute RUNNING windows without extending other calls.
+RESTART_TRANSPORT_RESPONSE_DEADLINE_SECONDS = 45.0
+RESTART_OPERATION_RESPONSE_DEADLINE_SECONDS = 50.0
+RESTART_RECONCILIATION_DEADLINE_SECONDS = 16.0 * 60.0
+
+
 class PriorBackupClassification(StrEnum):
     """Ownership classification for retained lifecycle remote backup state."""
 
@@ -560,6 +588,26 @@ _NORMAL_LIFECYCLE_HISTORY = (
     LifecycleState.PR41_READY,
     LifecycleState.RESEARCH_SERVICES_ABSENT,
     LifecycleState.POST_RESTORE_REPAIRS_PASS,
+)
+
+_CANDIDATE_RESTARTED_STAGES = frozenset(
+    {
+        LifecycleState.ACTIVATION_RESTART_CONSUMED,
+        LifecycleState.CANDIDATE_READY,
+        LifecycleState.RESEARCH_SERVICES_PRESENT,
+        LifecycleState.POST_ACTIVATION_REPAIRS_PASS,
+        LifecycleState.A0_COLLECTED,
+        LifecycleState.P0_COMPLETED,
+        LifecycleState.AP0_COLLECTED,
+        LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED,
+        LifecycleState.A1_COLLECTED,
+        LifecycleState.RESEARCH_FINAL_VALIDATED,
+        LifecycleState.A2_COLLECTED,
+    }
+)
+
+_RECONSTRUCTABLE_CANDIDATE_RESTART_STAGES = frozenset(
+    {LifecycleState.ACTIVATION_RESTART_CONSUMED}
 )
 
 _RECONSTRUCTABLE_RESTORE_STAGES = frozenset(
@@ -1093,8 +1141,21 @@ class PriorBackupContinuityResult:
 
 @dataclass(frozen=True)
 class RestartResult:
-    submitted: bool
-    accepted: bool
+    dispatch_outcome: RestartDispatchOutcome
+    http_status: int | None
+    failure_reason: RestartFailureReason | None
+
+    @property
+    def response_accepted(self) -> bool:
+        """Return whether a complete successful Supervisor response arrived."""
+        return self.dispatch_outcome is RestartDispatchOutcome.RESPONSE_ACCEPTED
+
+    @property
+    def dispatched_response_unknown(self) -> bool:
+        """Return whether a complete POST was sent without a final response."""
+        return (
+            self.dispatch_outcome is RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN
+        )
 
 
 @dataclass(frozen=True)
@@ -1219,9 +1280,8 @@ class FinalRestoreProof:
     research_files_absent: bool
     core_check_passed: bool
     restart_consumed: bool
-    restart_dispatched: bool
-    restart_submitted: bool
-    restart_accepted: bool
+    restart_dispatch_acceptable: bool
+    restart_effect_proven: bool
     core_reachable: bool
     core_running: bool
     integration_loaded: bool
@@ -1241,9 +1301,8 @@ class FinalRestoreProof:
                 self.research_files_absent,
                 self.core_check_passed,
                 self.restart_consumed,
-                self.restart_dispatched,
-                self.restart_submitted,
-                self.restart_accepted,
+                self.restart_dispatch_acceptable,
+                self.restart_effect_proven,
                 self.core_reachable,
                 self.core_running,
                 self.integration_loaded,
@@ -1361,6 +1420,7 @@ class _DurableLifecycleJournal:
             "consumed_operations",
             "helper_tombstones",
             "restart_tombstones",
+            "restart_results",
             "core_check_attempts",
             "ambiguous_operation",
             "known_nonce",
@@ -1442,8 +1502,6 @@ class _DurableLifecycleJournal:
                         "LIFECYCLE_PREPARATION_ABANDONED"
                     ) from None
                 record = copy.deepcopy(record)
-                record["recovery_mode"] = True
-                record["rollback_mode"] = True
                 incomplete_restore = any(
                     operation["action"]
                     in {action.value for action in _RESTORE_SOURCE_ACTIONS}
@@ -1451,6 +1509,23 @@ class _DurableLifecycleJournal:
                     for operation in record["operations"]
                 )
                 stage = LifecycleState(record["stage"])
+                candidate_restart = record["restart_results"].get(
+                    LifecycleAction.ACTIVATION_RESTART.value
+                )
+                try:
+                    candidate_restart_resumable = (
+                        stage in _RECONSTRUCTABLE_CANDIDATE_RESTART_STAGES
+                        and _parse_restart_result(candidate_restart).dispatch_outcome
+                        in {
+                            RestartDispatchOutcome.RESPONSE_ACCEPTED,
+                            RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+                        }
+                    )
+                except SessionBrokerError:
+                    candidate_restart_resumable = False
+                if not candidate_restart_resumable:
+                    record["recovery_mode"] = True
+                    record["rollback_mode"] = True
                 if incomplete_restore:
                     restore_generation = record["pr41_restore"]["generation"]
                     record["active"] = False
@@ -1466,7 +1541,10 @@ class _DurableLifecycleJournal:
                             "evidence_generation": None,
                         }
                     )
-                elif stage not in _RECONSTRUCTABLE_RESTORE_STAGES:
+                elif stage not in _RECONSTRUCTABLE_RESTORE_STAGES and not (
+                    stage in _RECONSTRUCTABLE_CANDIDATE_RESTART_STAGES
+                    and candidate_restart_resumable
+                ):
                     record["stage"] = LifecycleState.RECOVERY_REQUIRED.value
                     record["transitions"].append(
                         {
@@ -1870,6 +1948,7 @@ class _DurableLifecycleJournal:
             "consumed_operations": [],
             "helper_tombstones": [],
             "restart_tombstones": [],
+            "restart_results": {},
             "core_check_attempts": {"candidate": [], "restore": []},
             "ambiguous_operation": None,
             "known_nonce": None,
@@ -1945,6 +2024,18 @@ class _DurableLifecycleJournal:
             if type(value) is list:
                 invalid = invalid or len(value) != len(set(value))
                 invalid = invalid or any(item not in actions for item in value)
+        restart_results = record.get("restart_results")
+        invalid = invalid or type(restart_results) is not dict
+        if type(restart_results) is dict:
+            for action, value in restart_results.items():
+                invalid = invalid or action not in {
+                    LifecycleAction.ACTIVATION_RESTART.value,
+                    LifecycleAction.REMOVAL_RESTART.value,
+                }
+                try:
+                    _parse_restart_result(value)
+                except SessionBrokerError:
+                    invalid = True
         core = record.get("core_check_attempts")
         invalid = invalid or type(core) is not dict
         if type(core) is dict:
@@ -2100,6 +2191,10 @@ class _DurableLifecycleJournal:
             "ambiguous",
             "reconciled",
         }
+        restart_actions = {
+            LifecycleAction.ACTIVATION_RESTART.value,
+            LifecycleAction.REMOVAL_RESTART.value,
+        }
         if type(operations) is list:
             seen: set[str] = set()
             for operation in operations:
@@ -2193,6 +2288,16 @@ class _DurableLifecycleJournal:
                 in {"result_durable", "transition_committed", "reconciled"}
             ]
             invalid = invalid or evidence_actions != result_actions
+            if type(restart_results) is dict:
+                expected_restart_results = {
+                    operation["action"]
+                    for operation in operations
+                    if type(operation) is dict
+                    and operation.get("action") in restart_actions
+                    and operation.get("phase")
+                    in {"result_durable", "transition_committed", "reconciled"}
+                }
+                invalid = invalid or set(restart_results) != expected_restart_results
         helper_actions = {
             LifecycleAction.A0.value,
             LifecycleAction.P0.value,
@@ -2200,10 +2305,6 @@ class _DurableLifecycleJournal:
             LifecycleAction.PREFLIGHT.value,
             LifecycleAction.A1.value,
             LifecycleAction.A2.value,
-        }
-        restart_actions = {
-            LifecycleAction.ACTIVATION_RESTART.value,
-            LifecycleAction.REMOVAL_RESTART.value,
         }
         consumed_values = record.get("consumed_operations")
         if type(consumed_values) is list:
@@ -2757,6 +2858,23 @@ class _DurableLifecycleJournal:
                     "nonce": nonce,
                 }
             )
+            if action in {
+                LifecycleAction.ACTIVATION_RESTART,
+                LifecycleAction.REMOVAL_RESTART,
+            }:
+                if not isinstance(evidence, RestartResult):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_RESTART_RESULT_INVALID"
+                    ) from None
+                record["restart_results"][action.value] = {
+                    "dispatch_outcome": evidence.dispatch_outcome.value,
+                    "http_status": evidence.http_status,
+                    "failure_reason": (
+                        None
+                        if evidence.failure_reason is None
+                        else evidence.failure_reason.value
+                    ),
+                }
             if (
                 action
                 in {
@@ -2803,6 +2921,21 @@ class _DurableLifecycleJournal:
 
         self._commit(mutate)
         return generation
+
+    def restart_result(self, action: LifecycleAction) -> RestartResult | None:
+        """Return the durable bounded restart report for a consumed action."""
+        if action not in {
+            LifecycleAction.ACTIVATION_RESTART,
+            LifecycleAction.REMOVAL_RESTART,
+        }:
+            raise LifecycleControllerError("LIFECYCLE_RESTART_RESULT_INVALID") from None
+        value = self._record["restart_results"].get(action.value)
+        if value is None:
+            return None
+        try:
+            return _parse_restart_result(value)
+        except SessionBrokerError:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
 
     def transition(
         self,
@@ -3259,6 +3392,14 @@ def _exact_core_check_payload(private_output: bytes) -> dict[str, Any]:
     return payload
 
 
+def _exact_restart_payload(private_output: bytes) -> dict[str, Any]:
+    """Decode only the bounded restart dispatch report."""
+    payload = _exact_payload(private_output)
+    if set(payload) != {"dispatch_outcome", "http_status", "failure_reason"}:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return payload
+
+
 def _bool(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError
@@ -3371,6 +3512,47 @@ def _parse_core_check_result(value: object, *, attempt_ordinal: int) -> CoreChec
         contract,
         False,
     )
+
+
+def _parse_restart_result(value: object) -> RestartResult:
+    """Validate the complete, private-data-free restart dispatch contract."""
+    try:
+        if not isinstance(value, dict) or set(value) != {
+            "dispatch_outcome",
+            "http_status",
+            "failure_reason",
+        }:
+            raise ValueError
+        outcome = RestartDispatchOutcome(value["dispatch_outcome"])
+        status = value["http_status"]
+        reason = value["failure_reason"]
+        if status is not None and (type(status) is not int or not 100 <= status <= 599):
+            raise ValueError
+        if reason is not None:
+            reason = RestartFailureReason(reason)
+        result = RestartResult(outcome, status, reason)
+    except (KeyError, TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if result.response_accepted:
+        valid = 200 <= (result.http_status or 0) < 300 and result.failure_reason is None
+    elif outcome is RestartDispatchOutcome.RESPONSE_REJECTED:
+        valid = result.http_status is not None and result.failure_reason in {
+            RestartFailureReason.HTTP_REJECTED,
+            RestartFailureReason.INVALID_RESPONSE,
+        }
+    elif outcome is RestartDispatchOutcome.DEFINITELY_NOT_DISPATCHED:
+        valid = result.http_status is None and result.failure_reason in {
+            RestartFailureReason.CONNECT_FAILED,
+            RestartFailureReason.SEND_FAILED,
+        }
+    else:
+        valid = result.http_status is None and result.failure_reason in {
+            RestartFailureReason.RESPONSE_TIMEOUT,
+            RestartFailureReason.RESPONSE_CLOSED,
+        }
+    if not valid:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return result
 
 
 def _parse_service_inventory_result(payload: object) -> ServiceInventoryResult:
@@ -3818,6 +4000,8 @@ import shutil
 import stat
 import sys
 import time
+import http.client
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -3851,6 +4035,14 @@ COUNTERS = {
     'datapoint_protocol_packets', 'other_packets', 'reconnect_schedules',
     'disconnects',
 }
+
+# Supervisor keeps the restart request open while Docker restarts Core and it
+# observes Core return to RUNNING.  R59 bounds only the response wait here;
+# after that the controller reconciles from the runtime evidence below.
+RESTART_RESPONSE_TIMEOUT_SECONDS = 45
+# Supervisor permits up to 10 minutes before its API appears and then up to 15
+# minutes for RUNNING.  Keep reconciliation compatible with that contract.
+RESTART_READINESS_TIMEOUT_SECONDS = 16 * 60
 
 REMOTE_SCOPES = {
     'BOOTSTRAP', 'ROOT', 'REQUEST', 'SOURCE_INVENTORY', 'BACKUP', 'TRANSFER',
@@ -5529,11 +5721,80 @@ def core_check():
         }
 
 def restart_core():
+    connection = http.client.HTTPConnection(
+        'supervisor', timeout=RESTART_RESPONSE_TIMEOUT_SECONDS
+    )
     try:
-        status, _ = request_json('http://supervisor/core/restart', 'POST')
-        return {'submitted': True, 'accepted': 200 <= status < 300}
-    except Exception:
-        return {'submitted': False, 'accepted': False}
+        connection.connect()
+    except (OSError, http.client.HTTPException):
+        return {
+            'dispatch_outcome': 'DEFINITELY_NOT_DISPATCHED',
+            'http_status': None,
+            'failure_reason': 'CONNECT_FAILED',
+        }
+    try:
+        connection.putrequest('POST', '/core/restart', skip_host=True)
+        connection.putheader('Host', 'supervisor')
+        for name, value in headers().items():
+            connection.putheader(name, value)
+        connection.putheader('Content-Length', '0')
+        connection.endheaders()
+    except (OSError, http.client.HTTPException):
+        connection.close()
+        return {
+            'dispatch_outcome': 'DEFINITELY_NOT_DISPATCHED',
+            'http_status': None,
+            'failure_reason': 'SEND_FAILED',
+        }
+    try:
+        response = connection.getresponse()
+        status = response.status
+        body = response.read(1024 * 1024 + 1)
+        if len(body) > 1024 * 1024:
+            raise ValueError('response_size')
+        decoded = decode_json(body)
+    except socket.timeout:
+        return {
+            'dispatch_outcome': 'DISPATCHED_RESPONSE_UNKNOWN',
+            'http_status': None,
+            'failure_reason': 'RESPONSE_TIMEOUT',
+        }
+    except (OSError, http.client.HTTPException):
+        return {
+            'dispatch_outcome': 'DISPATCHED_RESPONSE_UNKNOWN',
+            'http_status': None,
+            'failure_reason': 'RESPONSE_CLOSED',
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {
+            'dispatch_outcome': 'RESPONSE_REJECTED',
+            'http_status': status if 'status' in locals() else None,
+            'failure_reason': 'INVALID_RESPONSE',
+        }
+    finally:
+        connection.close()
+    if not 200 <= status < 300:
+        return {
+            'dispatch_outcome': 'RESPONSE_REJECTED',
+            'http_status': status,
+            'failure_reason': 'HTTP_REJECTED',
+        }
+    if not (
+        isinstance(decoded, dict)
+        and set(decoded) == {'result', 'data'}
+        and decoded.get('result') == 'ok'
+        and decoded.get('data') == {}
+    ):
+        return {
+            'dispatch_outcome': 'RESPONSE_REJECTED',
+            'http_status': status,
+            'failure_reason': 'INVALID_RESPONSE',
+        }
+    return {
+        'dispatch_outcome': 'RESPONSE_ACCEPTED',
+        'http_status': status,
+        'failure_reason': None,
+    }
 
 def service_names():
     status, body = request_json('http://supervisor/core/api/services')
@@ -5559,7 +5820,7 @@ def service_inventory(expectation):
     }
 
 def readiness():
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + RESTART_READINESS_TIMEOUT_SECONDS
     reachable = running = loaded = False
     while time.monotonic() < deadline:
         try:
@@ -6376,7 +6637,8 @@ class PrivateInteractiveSessionBroker:
             BoundedOperation.INSTALL: 90.0,
             BoundedOperation.RESTORE: 90.0,
             BoundedOperation.CORE_CHECK: 40.0,
-            BoundedOperation.CORE_READINESS: 130.0,
+            BoundedOperation.RESTART_CORE: RESTART_OPERATION_RESPONSE_DEADLINE_SECONDS,
+            BoundedOperation.CORE_READINESS: RESTART_RECONCILIATION_DEADLINE_SECONDS,
             BoundedOperation.PHASE_A_HELPER: 200.0,
         }
         try:
@@ -6405,8 +6667,6 @@ class PrivateInteractiveSessionBroker:
             "manifest_match",
             "regular_files_only",
             "installation_success",
-            "submitted",
-            "accepted",
             "core_reachable",
             "core_running",
             "integration_loaded",
@@ -6681,7 +6941,7 @@ class PrivateInteractiveSessionBroker:
         output = self.__execute_bounded_operation(
             BoundedOperation.RESTART_CORE, {}, _capability=_capability
         )
-        result = self._simple_result(output, RestartResult, ("submitted", "accepted"))
+        result = _parse_restart_result(_exact_restart_payload(output))
         return _bind_evidence_origin(result, capability)
 
     def _wait_for_core_readiness(
@@ -7282,6 +7542,9 @@ class FullPreflightLifecycleController:
             and type(broker) is PrivateInteractiveSessionBroker
         ):
             reconstructed_stage = self._journal.state
+            if reconstructed_stage in _CANDIDATE_RESTARTED_STAGES:
+                broker._active_source_state = SourceState.CANDIDATE
+                broker._restarted_states.add(SourceState.CANDIDATE)
             if reconstructed_stage in _RESTORE_ACTIVE_SOURCE_STAGES:
                 broker._active_source_state = SourceState.RESTORE
             if reconstructed_stage in _RESTORE_RESTARTED_STAGES:
@@ -7323,6 +7586,11 @@ class FullPreflightLifecycleController:
         self._preflight_nonce: str | None = None
         self._restore_inventory: SourceInventoryResult | None = None
         self._restore_core_check: CoreCheckResult | None = None
+        self._activation_restart: RestartResult | None = (
+            None
+            if self._journal is None
+            else self._journal.restart_result(LifecycleAction.ACTIVATION_RESTART)
+        )
         self._removal_restart: RestartResult | None = None
         self._restart_dispatched: set[SourceState] = set()
         self._pre_source_recovery_inspected = False
@@ -8015,8 +8283,11 @@ class FullPreflightLifecycleController:
             self._rollback()
         if not (
             isinstance(result, RestartResult)
-            and result.submitted is True
-            and result.accepted is True
+            and result.dispatch_outcome
+            in {
+                RestartDispatchOutcome.RESPONSE_ACCEPTED,
+                RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            }
         ):
             self._rollback()
         return result
@@ -8026,6 +8297,7 @@ class FullPreflightLifecycleController:
         result = self._restart(
             SourceState.CANDIDATE, LifecycleAction.ACTIVATION_RESTART
         )
+        self._activation_restart = result
         self._advance(
             LifecycleState.ACTIVATION_RESTART_CONSUMED,
             LifecycleAction.ACTIVATION_RESTART,
@@ -8477,7 +8749,11 @@ class FullPreflightLifecycleController:
     def _final_restore_proof(self) -> FinalRestoreProof:
         inventory = self._restore_inventory
         core = self._restore_core_check
-        restart = self._removal_restart
+        restart = self._removal_restart or (
+            None
+            if self._journal is None
+            else self._journal.restart_result(LifecycleAction.REMOVAL_RESTART)
+        )
         readiness = self._restore_readiness
         services = self._restore_services
         repairs = self._restore_repairs
@@ -8488,9 +8764,6 @@ class FullPreflightLifecycleController:
         core_committed = self._durable_action_committed(
             LifecycleAction.RESTORE_CORE_CHECK_1
         ) or self._durable_action_committed(LifecycleAction.RESTORE_CORE_CHECK_2)
-        restart_committed = self._durable_action_committed(
-            LifecycleAction.REMOVAL_RESTART
-        )
         readiness_committed = self._durable_action_committed(
             LifecycleAction.RESTORE_READINESS
         )
@@ -8500,61 +8773,68 @@ class FullPreflightLifecycleController:
         repairs_committed = self._durable_action_committed(
             LifecycleAction.POST_RESTORE_REPAIRS
         )
+        source_manifest_match = inventory_committed or (
+            inventory is not None
+            and self._restore_manifest is not None
+            and self._inventory_pass(inventory, len(self._restore_manifest.entries))
+        )
+        research_files_absent = inventory_committed or (
+            inventory is not None
+            and inventory.unexpected_count == 0
+            and inventory.missing_count == 0
+        )
+        core_reachable = readiness_committed or (
+            readiness is not None and readiness.core_reachable is True
+        )
+        core_running = readiness_committed or (
+            readiness is not None and readiness.core_running is True
+        )
+        integration_loaded = readiness_committed or (
+            readiness is not None and readiness.integration_loaded is True
+        )
+        core_not_timed_out = readiness_committed or (
+            readiness is not None and readiness.timed_out is False
+        )
+        research_services_absent = services_committed or self._services_absent_pass(
+            services
+        )
+        restart_dispatch_acceptable = isinstance(
+            restart, RestartResult
+        ) and restart.dispatch_outcome in {
+            RestartDispatchOutcome.RESPONSE_ACCEPTED,
+            RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+        }
+        restart_effect_proven = (
+            restart_dispatch_acceptable
+            and isinstance(restart, RestartResult)
+            and (
+                restart.response_accepted
+                or (
+                    restart.dispatched_response_unknown
+                    and source_manifest_match
+                    and research_files_absent
+                    and core_reachable
+                    and core_running
+                    and integration_loaded
+                    and core_not_timed_out
+                    and research_services_absent
+                )
+            )
+        )
         return FinalRestoreProof(
-            source_manifest_match=(
-                inventory_committed
-                or (
-                    inventory is not None
-                    and self._restore_manifest is not None
-                    and self._inventory_pass(
-                        inventory, len(self._restore_manifest.entries)
-                    )
-                )
-            ),
-            research_files_absent=(
-                inventory_committed
-                or (
-                    inventory is not None
-                    and inventory.unexpected_count == 0
-                    and inventory.missing_count == 0
-                )
-            ),
+            source_manifest_match=source_manifest_match,
+            research_files_absent=research_files_absent,
             core_check_passed=(
                 core_committed or (core is not None and core.check_passed)
             ),
             restart_consumed=restart_permit.consumed,
-            restart_dispatched=(
-                restart_committed or SourceState.RESTORE in self._restart_dispatched
-            ),
-            restart_submitted=(
-                restart_committed or restart is not None and restart.submitted is True
-            ),
-            restart_accepted=(
-                restart_committed or restart is not None and restart.accepted is True
-            ),
-            core_reachable=(
-                readiness_committed
-                or readiness is not None
-                and readiness.core_reachable is True
-            ),
-            core_running=(
-                readiness_committed
-                or readiness is not None
-                and readiness.core_running is True
-            ),
-            integration_loaded=(
-                readiness_committed
-                or readiness is not None
-                and readiness.integration_loaded is True
-            ),
-            core_not_timed_out=(
-                readiness_committed
-                or readiness is not None
-                and readiness.timed_out is False
-            ),
-            research_services_absent=(
-                services_committed or self._services_absent_pass(services)
-            ),
+            restart_dispatch_acceptable=restart_dispatch_acceptable,
+            restart_effect_proven=restart_effect_proven,
+            core_reachable=core_reachable,
+            core_running=core_running,
+            integration_loaded=integration_loaded,
+            core_not_timed_out=core_not_timed_out,
+            research_services_absent=research_services_absent,
             repairs_shape_valid=(
                 repairs_committed or repairs is not None and repairs.shape_valid is True
             ),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import http.client
 import inspect
 import io
 import json
@@ -14,12 +15,15 @@ import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import FrozenInstanceError, asdict, replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import pytest_socket
 
 from tools import home_assistant_live_access as access
 
@@ -1010,6 +1014,7 @@ def _synthetic_r30_source_authorities(
                 "test_r47_",
                 "test_r50_",
                 "test_r57_",
+                "test_r59_",
             )
         ),
     )
@@ -1027,6 +1032,7 @@ def _synthetic_r30_source_authorities(
             "test_r55_",
             "test_r56_",
             "test_r57_",
+            "test_r59_",
         )
     ):
         return
@@ -1317,7 +1323,10 @@ def test_r30_restart_replay_rejected_before_second_remote_write(
 
     def execute(operation: object, _value: object, *, _capability: object) -> bytes:
         calls.append(operation)
-        return b'{"submitted":true,"accepted":true}'
+        return (
+            b'{"dispatch_outcome":"RESPONSE_ACCEPTED","http_status":200,'
+            b'"failure_reason":null}'
+        )
 
     monkeypatch.setattr(
         broker, "_PrivateInteractiveSessionBroker__execute_bounded_operation", execute
@@ -1326,7 +1335,7 @@ def test_r30_restart_replay_rejected_before_second_remote_write(
         broker, access.LifecycleAction.ACTIVATION_RESTART
     )
 
-    assert broker._restart_core(_capability=capability).accepted is True
+    assert broker._restart_core(_capability=capability).response_accepted is True
     with pytest.raises(access.SessionBrokerError, match="ALREADY_SUBMITTED"):
         broker._restart_core(_capability=capability)
     assert calls == [access.BoundedOperation.RESTART_CORE]
@@ -1532,7 +1541,6 @@ def test_r30_remote_program_contains_fixed_endpoints_and_no_probe_dispatch() -> 
     source = access._REMOTE_CONTROL_PROGRAM
 
     assert "http://supervisor/core/check" in source
-    assert "http://supervisor/core/restart" in source
     assert "phase_a_status_probe_helper.py" in source
     assert "operation == 'probe'" not in source
     assert '"probe"' not in source
@@ -1548,13 +1556,289 @@ def test_r30_remote_program_contains_fixed_endpoints_and_no_probe_dispatch() -> 
     assert "'probe'" not in helper_source
     restart_start = source.index("def restart_core")
     restart_end = source.index("def service_names")
-    assert (
-        source[restart_start:restart_end].count(
-            "request_json('http://supervisor/core/restart', 'POST')"
-        )
-        == 1
-    )
+    restart_source = source[restart_start:restart_end]
+    assert restart_source.count("http.client.HTTPConnection") == 1
+    assert "connection.connect()" in restart_source
+    assert "connection.endheaders()" in restart_source
+    assert "connection.getresponse()" in restart_source
     compile(source, "<synthetic-r30-remote-program>", "exec")
+
+
+def _r59_remote_program(source: str) -> str:
+    """Extract the embedded remote control program without its CLI dispatch."""
+    if source.lstrip().startswith("import base64"):
+        return source[: source.index("operation = sys.argv[1]")]
+    tree = ast.parse(source)
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_REMOTE_CONTROL_PROGRAM"
+            for target in node.targets
+        )
+    )
+    program = ast.literal_eval(assignment.value)
+    assert isinstance(program, str)
+    return program[: program.index("operation = sys.argv[1]")]
+
+
+def _r59_delayed_restart_server() -> (
+    tuple[ThreadingHTTPServer, threading.Event, threading.Event]
+):
+    """Serve one complete POST while deliberately withholding its response."""
+    received = threading.Event()
+    release = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            assert self.path == "/core/restart"
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.set()
+            release.wait(2)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"result":"ok","data":{}}')
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, received, release
+
+
+def test_r59_parent_red_and_response_loss_dispatch_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1/R2: a full parent POST can time out only after it was dispatched."""
+    pytest_socket.enable_socket()
+    server, received, release = _r59_delayed_restart_server()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "synthetic-r59-token")
+    parent_source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "557ac0bc83a52ac70344e85233603984de1c1ae0:tools/home_assistant_live_access.py",
+        ],
+        text=True,
+    )
+    parent_program = (
+        _r59_remote_program(parent_source)
+        .replace("http://supervisor", endpoint)
+        .replace("timeout=30", "timeout=0.05")
+    )
+    parent_namespace: dict[str, object] = {"__name__": "r59_parent_repro"}
+    try:
+        exec(  # noqa: S102 - execute the pinned parent transport in this test only
+            compile(parent_program, "<r59-exact-parent>", "exec"), parent_namespace
+        )
+        assert parent_namespace["restart_core"]() == {
+            "submitted": False,
+            "accepted": False,
+        }
+        assert received.wait(1)
+
+        current_namespace: dict[str, object] = {"__name__": "r59_candidate_repro"}
+        exec(  # noqa: S102 - execute the candidate embedded transport in isolation
+            compile(
+                _r59_remote_program(access._REMOTE_CONTROL_PROGRAM),
+                "<r59-candidate>",
+                "exec",
+            ),
+            current_namespace,
+        )
+        current_namespace["RESTART_RESPONSE_TIMEOUT_SECONDS"] = 0.05
+        original_connection = http.client.HTTPConnection
+        current_namespace["http"].client.HTTPConnection = (  # type: ignore[index,union-attr]
+            lambda _host, timeout=None: original_connection(
+                "127.0.0.1", server.server_port, timeout=timeout
+            )
+        )
+        try:
+            assert current_namespace["restart_core"]() == {
+                "dispatch_outcome": "DISPATCHED_RESPONSE_UNKNOWN",
+                "http_status": None,
+                "failure_reason": "RESPONSE_TIMEOUT",
+            }
+        finally:
+            current_namespace["http"].client.HTTPConnection = original_connection  # type: ignore[index,union-attr]
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        pytest_socket.disable_socket()
+
+
+@pytest.mark.parametrize(
+    ("payload", "outcome"),
+    (
+        (
+            {
+                "dispatch_outcome": "RESPONSE_ACCEPTED",
+                "http_status": 200,
+                "failure_reason": None,
+            },
+            access.RestartDispatchOutcome.RESPONSE_ACCEPTED,
+        ),
+        (
+            {
+                "dispatch_outcome": "RESPONSE_REJECTED",
+                "http_status": 503,
+                "failure_reason": "HTTP_REJECTED",
+            },
+            access.RestartDispatchOutcome.RESPONSE_REJECTED,
+        ),
+        (
+            {
+                "dispatch_outcome": "DEFINITELY_NOT_DISPATCHED",
+                "http_status": None,
+                "failure_reason": "CONNECT_FAILED",
+            },
+            access.RestartDispatchOutcome.DEFINITELY_NOT_DISPATCHED,
+        ),
+        (
+            {
+                "dispatch_outcome": "DISPATCHED_RESPONSE_UNKNOWN",
+                "http_status": None,
+                "failure_reason": "RESPONSE_CLOSED",
+            },
+            access.RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+        ),
+    ),
+)
+def test_r59_restart_results_are_fixed_and_private_data_free(
+    payload: dict[str, object], outcome: access.RestartDispatchOutcome
+) -> None:
+    """R3-R8/R18: each transport class has one bounded representation."""
+    result = access._parse_restart_result(payload)
+
+    assert result.dispatch_outcome is outcome
+    assert "exception" not in repr(result).lower()
+    assert "token" not in repr(result).lower()
+
+
+def test_r59_restart_outer_deadline_contains_transport_deadline() -> None:
+    """R9: the broker cannot cut off the inner dispatch classification."""
+    assert (
+        access.RESTART_OPERATION_RESPONSE_DEADLINE_SECONDS
+        > access.RESTART_TRANSPORT_RESPONSE_DEADLINE_SECONDS
+    )
+    assert (
+        access.RESTART_RECONCILIATION_DEADLINE_SECONDS
+        > access.RESTART_OPERATION_RESPONSE_DEADLINE_SECONDS
+    )
+
+
+def test_r59_candidate_response_unknown_reconciles_only_from_runtime_evidence() -> None:
+    """R10-R12: a lost response advances only through readiness and services."""
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    broker.queue(
+        "restart",
+        access.RestartResult(
+            access.RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            None,
+            access.RestartFailureReason.RESPONSE_TIMEOUT,
+        ),
+    )
+
+    result = controller.restart_for_candidate()
+    assert result.dispatched_response_unknown
+    controller.await_candidate_readiness()
+    controller.verify_research_services_present()
+
+    assert controller.state is access.LifecycleState.RESEARCH_SERVICES_PRESENT
+    assert [name for name, _ in broker.calls].count("restart") == 1
+
+
+def test_r59_candidate_response_unknown_without_services_enters_restore() -> None:
+    """R12: transport ambiguity cannot substitute for runtime PR45 evidence."""
+    controller, broker = _r32_controller()
+    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    broker.queue(
+        "restart",
+        access.RestartResult(
+            access.RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            None,
+            access.RestartFailureReason.RESPONSE_CLOSED,
+        ),
+    )
+    broker.queue(
+        "services",
+        access.ServiceInventoryResult(4, 0, False, 0, 0, True),
+    )
+
+    controller.restart_for_candidate()
+    controller.await_candidate_readiness()
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.verify_research_services_present()
+
+    assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
+    assert [name for name, _ in broker.calls].count("restart") == 1
+
+
+def test_r59_restore_response_unknown_requires_effect_proof() -> None:
+    """R14-R16: accepted and reconciled restore effects both retain strict proof."""
+    controller, broker = _r32_controller()
+    _candidate, restore = _r32_bundles()
+    controller._state = access.LifecycleState.PR41_RESTORED
+    controller._restore_manifest = restore.manifest
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    broker.queue(
+        "restart",
+        access.RestartResult(
+            access.RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            None,
+            access.RestartFailureReason.RESPONSE_TIMEOUT,
+        ),
+    )
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_research_services_absent()
+    controller.admit_post_restore_repairs()
+
+    proof = controller.complete()
+
+    assert proof.restart_dispatch_acceptable is True
+    assert proof.restart_effect_proven is True
+    assert proof.complete is True
+
+
+def test_r59_reconstructed_response_unknown_restart_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R13/P: durable dispatch metadata resumes readiness with the permit spent."""
+    monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path / "lifecycle")
+    first, first_broker = _r33_advance_to_candidate_core()
+    first_broker.queue(
+        "restart",
+        access.RestartResult(
+            access.RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            None,
+            access.RestartFailureReason.RESPONSE_TIMEOUT,
+        ),
+    )
+    first.restart_for_candidate()
+    first.close()
+
+    second, second_broker = _r33_controller()
+    assert second.state is access.LifecycleState.ACTIVATION_RESTART_CONSUMED
+    assert second._permits[access.LifecycleAction.ACTIVATION_RESTART].consumed
+    second.await_candidate_readiness()
+    with pytest.raises(
+        access.LifecycleControllerError, match="(?:PERMIT_CONSUMED|TRANSITION_INVALID)"
+    ):
+        second.restart_for_candidate()
+
+    assert [name for name, _ in first_broker.calls].count("restart") == 1
+    assert [name for name, _ in second_broker.calls].count("restart") == 0
 
 
 def test_r30_private_backup_restore_is_fixed_and_typed() -> None:
@@ -2882,7 +3166,11 @@ for line in sys.stdin:
         emit(values[0])
         if operation == "restart_core":
             restart_count += 1
-            response = {"submitted": True, "accepted": True}
+            response = {
+                "dispatch_outcome": "RESPONSE_ACCEPTED",
+                "http_status": 200,
+                "failure_reason": None,
+            }
         elif operation == "service_inventory":
             absent = "expected_absent" in line
             response = {
@@ -3005,7 +3293,7 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
     ).check_passed
     assert broker._restart_core(
         _capability=capability(access.LifecycleAction.ACTIVATION_RESTART)
-    ).accepted
+    ).response_accepted
     assert broker._wait_for_core_readiness(
         _capability=capability(access.LifecycleAction.CANDIDATE_READINESS)
     ).integration_loaded
@@ -3066,7 +3354,7 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
     ).check_passed
     assert broker._restart_core(
         _capability=capability(access.LifecycleAction.REMOVAL_RESTART)
-    ).accepted
+    ).response_accepted
     assert broker._wait_for_core_readiness(
         _capability=capability(access.LifecycleAction.RESTORE_READINESS)
     ).integration_loaded
@@ -3123,7 +3411,10 @@ def test_r30_restart_allowance_consumed_on_every_first_dispatch(
         calls += 1
         if failure_mode == "exception":
             raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
-        return b'{"submitted":false,"accepted":false}'
+        return (
+            b'{"dispatch_outcome":"DEFINITELY_NOT_DISPATCHED",'
+            b'"http_status":null,"failure_reason":"CONNECT_FAILED"}'
+        )
 
     monkeypatch.setattr(
         broker, "_PrivateInteractiveSessionBroker__execute_bounded_operation", execute
@@ -3136,7 +3427,10 @@ def test_r30_restart_allowance_consumed_on_every_first_dispatch(
         with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
             broker._restart_core(_capability=capability)
     else:
-        assert broker._restart_core(_capability=capability).submitted is False
+        assert (
+            broker._restart_core(_capability=capability).dispatch_outcome
+            is access.RestartDispatchOutcome.DEFINITELY_NOT_DISPATCHED
+        )
     with pytest.raises(access.SessionBrokerError, match="ALREADY_SUBMITTED"):
         broker._restart_core(_capability=capability)
     assert calls == 1
@@ -4075,7 +4369,13 @@ class _R32ScriptedBroker:
             access.LifecycleAction.ACTIVATION_RESTART,
             access.LifecycleAction.REMOVAL_RESTART,
         )
-        return self._next("restart", None, access.RestartResult(True, True))
+        return self._next(
+            "restart",
+            None,
+            access.RestartResult(
+                access.RestartDispatchOutcome.RESPONSE_ACCEPTED, 200, None
+            ),
+        )
 
     def _wait_for_core_readiness(
         self, *, _capability: object = None
@@ -4817,7 +5117,9 @@ def test_r32_c2_m1_to_m5_helper_permit_is_consumed_before_every_dispatch_outcome
     controller._state = access.LifecycleState.AP0_COLLECTED
     call_count = len(broker.calls)
 
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+    with pytest.raises(
+        access.LifecycleControllerError, match="(?:PERMIT_CONSUMED|TRANSITION_INVALID)"
+    ):
         controller.run_non_probe_preflight()
     assert len(broker.calls) == call_count, case
 
@@ -5048,9 +5350,8 @@ _R32_FINAL_PROOF_VALUES = {
     "research_files_absent": True,
     "core_check_passed": True,
     "restart_consumed": True,
-    "restart_dispatched": True,
-    "restart_submitted": True,
-    "restart_accepted": True,
+    "restart_dispatch_acceptable": True,
+    "restart_effect_proven": True,
     "core_reachable": True,
     "core_running": True,
     "integration_loaded": True,
@@ -5463,8 +5764,10 @@ def test_r33_red_new_controller_cannot_refresh_restart_permit() -> None:
     first.close()
 
     second, second_broker = _r33_controller()
-    assert second.state is access.LifecycleState.RECOVERY_REQUIRED
-    with pytest.raises(AttributeError, match="RECOVERY_ONLY"):
+    assert second.state is access.LifecycleState.ACTIVATION_RESTART_CONSUMED
+    with pytest.raises(
+        access.LifecycleControllerError, match="(?:PERMIT_CONSUMED|TRANSITION_INVALID)"
+    ):
         second.restart_for_candidate()
 
     assert [name for name, _ in first_broker.calls].count("restart") == 1
@@ -6530,6 +6833,17 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
         elif action in access._PR41_BOUND_ACTIONS:
             source = journal._record["pr41_restore"]["generation"]
         nonce = "a" * 16 if action is access.LifecycleAction.PREFLIGHT else None
+        evidence = (
+            access.RestartResult(
+                access.RestartDispatchOutcome.RESPONSE_ACCEPTED, 200, None
+            )
+            if action
+            in {
+                access.LifecycleAction.ACTIVATION_RESTART,
+                access.LifecycleAction.REMOVAL_RESTART,
+            }
+            else None
+        )
         journal.record_intent(action, source_generation=source, nonce=nonce)
         journal.record_dispatch_started(action)
         generation = journal.record_result(
@@ -6540,6 +6854,7 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
             issuance_identity=hashlib.sha256(action.value.encode()).hexdigest()[:32],
             audit_instance=None,
             nonce=nonce,
+            evidence=evidence,
         )
         journal.transition(
             successor,
@@ -6626,7 +6941,19 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
                     else (
                         access.FallbackReconciliationResult("reconciled", True, True, 1)
                         if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
-                        else None
+                        else (
+                            access.RestartResult(
+                                access.RestartDispatchOutcome.RESPONSE_ACCEPTED,
+                                200,
+                                None,
+                            )
+                            if action
+                            in {
+                                access.LifecycleAction.ACTIVATION_RESTART,
+                                access.LifecycleAction.REMOVAL_RESTART,
+                            }
+                            else None
+                        )
                     )
                 )
                 journal.record_result(
