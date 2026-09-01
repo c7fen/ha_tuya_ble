@@ -1024,6 +1024,7 @@ def _synthetic_r30_source_authorities(
             "test_r50_",
             "test_r53_",
             "test_r55_",
+            "test_r56_",
         )
     ):
         return
@@ -1228,6 +1229,7 @@ def test_r30_source_inventory_mismatch_is_not_success() -> None:
             "manifest_match": False,
             "unexpected_count": 1,
             "missing_count": 1,
+            "root_profile": "DIRECT_CONFIG",
         }
     )
 
@@ -1243,6 +1245,7 @@ def test_r30_source_inventory_mismatch_is_not_success() -> None:
                 "manifest_match": True,
                 "unexpected_count": 0,
                 "missing_count": 1,
+                "root_profile": "DIRECT_CONFIG",
             }
         )
 
@@ -1608,6 +1611,39 @@ def _assert_remote_failure(result: object) -> None:
     assert access.RemoteFailureReason(result["error_reason"])
 
 
+_REMOTE_ROOT_CANDIDATES = """ROOT_CANDIDATES = (
+    ('DIRECT_CONFIG', ROOT),
+    ('HOMEASSISTANT_CONFIG', Path('/homeassistant')),
+    ('SUPERVISOR_HOMEASSISTANT', Path('/mnt/data/supervisor/homeassistant')),
+)"""
+
+
+def _remote_root_candidates(
+    candidates: tuple[tuple[str, Path], ...],
+) -> dict[str, str]:
+    rendered = (
+        "ROOT_CANDIDATES = (\n"
+        + "".join(
+            f"    ({profile!r}, Path({str(path)!r})),\n" for profile, path in candidates
+        )
+        + ")"
+    )
+    return {_REMOTE_ROOT_CANDIDATES: rendered}
+
+
+def _write_remote_source(root: Path, bundle: access.SourceBundle) -> None:
+    integration = root / "custom_components" / "tuya_ble"
+    for source_file in bundle.files:
+        relative = Path(source_file.relative_path)
+        destination = (
+            integration.joinpath(*relative.parts[1:])
+            if relative.parts[0] == "integration"
+            else integration / ".phase_a_tools" / relative.name
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source_file.content)
+
+
 def _r53_local_pty_source_inspection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1616,6 +1652,7 @@ def _r53_local_pty_source_inspection(
     operation: access.BoundedOperation = access.BoundedOperation.SOURCE_INVENTORY,
     result_emission: str | None = None,
     invalid_deployment: bool = False,
+    installed_state: access.SourceState | None = access.SourceState.CANDIDATE,
     source_replacements: dict[str, str] | None = None,
 ) -> object:
     replacement_bin = tmp_path / "bin"
@@ -1641,17 +1678,24 @@ def _r53_local_pty_source_inspection(
     candidate = access.build_source_bundle(
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
     root = tmp_path if root_exists else tmp_path / "missing-config-root"
     if root_exists:
+        if installed_state is access.SourceState.CANDIDATE:
+            _write_remote_source(root, candidate)
+        elif installed_state is access.SourceState.RESTORE:
+            _write_remote_source(root, restore)
+        else:
+            integration_root = root / "custom_components" / "tuya_ble"
+            integration_root.mkdir(parents=True)
+            (integration_root / "synthetic.py").write_text(
+                "synthetic other\n", encoding="ascii"
+            )
         integration_root = root / "custom_components" / "tuya_ble"
-        for source_file in candidate.files:
-            relative = Path(source_file.relative_path)
-            if relative.parts[0] == "integration":
-                destination = integration_root.joinpath(*relative.parts[1:])
-            else:
-                destination = integration_root / ".phase_a_tools" / relative.name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source_file.content)
         if invalid_deployment:
             (integration_root / "synthetic-invalid-entry").symlink_to("__init__.py")
     remote_program = access._REMOTE_CONTROL_PROGRAM.replace(
@@ -1683,7 +1727,7 @@ def _r53_local_pty_source_inspection(
         if operation is access.BoundedOperation.SOURCE_INVENTORY:
             controller = access.FullPreflightLifecycleController(broker)
             result = controller.inspect_current_source(
-                candidate.manifest, _r30_manifest("RESTORE")
+                candidate.manifest, restore.manifest
             )
         elif operation is access.BoundedOperation.BACKUP:
             result = broker._create_private_backup(
@@ -1717,7 +1761,9 @@ def test_r55_successful_source_inventory_has_no_failure_metadata(
 
     assert result == access.CurrentSourceInventoryResult(
         access.CurrentSourceClassification.EXACT_PR45,
-        access.SourceInventoryResult(3, 3, True, 0, 0),
+        access.SourceInventoryResult(
+            3, 3, True, 0, 0, access.RemoteRootProfile.DIRECT_CONFIG
+        ),
     )
     assert result.remote_failure_scope is None
     assert result.remote_failure_reason is None
@@ -1744,10 +1790,11 @@ def test_r55_root_failure_has_bounded_remote_diagnosis(
     assert result.failure_stage is access.DispatchFailureStage.RESPONSE_PARSE
     assert result.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
     assert result.remote_failure_scope is access.RemoteFailureScope.ROOT
-    assert result.remote_failure_reason is access.RemoteFailureReason.ROOT
+    assert result.remote_failure_reason is access.RemoteFailureReason.ROOT_UNRESOLVED
 
 
 def test_r55_malformed_request_has_bounded_remote_diagnosis(tmp_path: Path) -> None:
+    (tmp_path / "custom_components").mkdir()
     source = access._REMOTE_CONTROL_PROGRAM.replace(
         "ROOT = Path('/config')", f"ROOT = Path({str(tmp_path)!r})"
     )
@@ -1773,6 +1820,7 @@ def test_r55_malformed_request_has_bounded_remote_diagnosis(tmp_path: Path) -> N
 def test_r55_manifest_authority_failure_has_bounded_remote_diagnosis(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "custom_components").mkdir()
     payload = {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))}
     payload["manifest"]["authority_commit"] = "0" * 40
 
@@ -1799,6 +1847,266 @@ def test_r55_source_inventory_file_shape_failure_has_bounded_diagnosis(
     assert result.failure_class is access.DispatchFailureClass.REMOTE_OPERATION
     assert result.remote_failure_scope is access.RemoteFailureScope.SOURCE_INVENTORY
     assert result.remote_failure_reason is access.RemoteFailureReason.REGULAR_FILE
+
+
+@pytest.mark.parametrize(
+    ("profile", "path_name"),
+    (
+        ("DIRECT_CONFIG", "config"),
+        ("HOMEASSISTANT_CONFIG", "homeassistant"),
+        ("SUPERVISOR_HOMEASSISTANT", "supervisor-homeassistant"),
+    ),
+)
+def test_r56_supported_root_profiles_resolve_exactly(
+    tmp_path: Path,
+    profile: str,
+    path_name: str,
+) -> None:
+    root = tmp_path / path_name
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, restore)
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(restore.manifest)},
+        source_replacements=_remote_root_candidates(((profile, root),)),
+    )
+
+    assert result["root_profile"] == profile
+    assert result["manifest_match"] is True
+
+
+def test_r56_no_supported_root_is_bounded_unresolved(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))},
+        source_replacements=_remote_root_candidates((("DIRECT_CONFIG", missing),)),
+    )
+
+    assert result == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "ROOT",
+        "error_reason": "ROOT_UNRESOLVED",
+    }
+
+
+def test_r56_multiple_supported_roots_are_bounded_ambiguous(tmp_path: Path) -> None:
+    first = tmp_path / "config"
+    second = tmp_path / "homeassistant"
+    (first / "custom_components").mkdir(parents=True)
+    (second / "custom_components").mkdir(parents=True)
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))},
+        source_replacements=_remote_root_candidates(
+            (("DIRECT_CONFIG", first), ("HOMEASSISTANT_CONFIG", second))
+        ),
+    )
+
+    assert result == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "ROOT",
+        "error_reason": "ROOT_AMBIGUOUS",
+    }
+
+
+def test_r56_symlink_root_candidate_is_bounded_invalid(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / "custom_components").mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))},
+        source_replacements=_remote_root_candidates((("DIRECT_CONFIG", linked),)),
+    )
+
+    assert result == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "ROOT",
+        "error_reason": "ROOT_INVALID",
+    }
+
+
+def test_r56_existing_false_positive_root_is_not_accepted(tmp_path: Path) -> None:
+    false_root = tmp_path / "not-home-assistant"
+    false_root.mkdir()
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))},
+        source_replacements=_remote_root_candidates((("DIRECT_CONFIG", false_root),)),
+    )
+
+    assert result["error_reason"] == "ROOT_UNRESOLVED"
+    assert str(false_root) not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_profile", "expected_match"),
+    (
+        (access.SourceState.RESTORE, "HOMEASSISTANT_CONFIG", True),
+        (access.SourceState.CANDIDATE, "HOMEASSISTANT_CONFIG", True),
+    ),
+)
+def test_r56_exact_sources_inventory_through_resolved_root(
+    tmp_path: Path,
+    state: access.SourceState,
+    expected_profile: str,
+    expected_match: bool,
+) -> None:
+    root = tmp_path / "homeassistant"
+    label = "RESTORE" if state is access.SourceState.RESTORE else "CANDIDATE"
+    bundle = access.build_source_bundle(
+        state,
+        _r30_files(label),
+        _r30_manifest(label),
+    )
+    _write_remote_source(root, bundle)
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates(((expected_profile, root),)),
+    )
+
+    assert result["root_profile"] == expected_profile
+    assert result["manifest_match"] is expected_match
+
+
+def test_r56_other_source_inventory_through_resolved_root(tmp_path: Path) -> None:
+    root = tmp_path / "homeassistant"
+    integration = root / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "synthetic.py").write_text("synthetic other\n", encoding="ascii")
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(_r30_manifest("RESTORE"))},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["root_profile"] == "HOMEASSISTANT_CONFIG"
+    assert result["manifest_match"] is False
+
+
+@pytest.mark.parametrize(
+    ("installed_state", "classification"),
+    (
+        (
+            access.SourceState.RESTORE,
+            access.CurrentSourceClassification.EXACT_PR41,
+        ),
+        (
+            access.SourceState.CANDIDATE,
+            access.CurrentSourceClassification.EXACT_PR45,
+        ),
+        (None, access.CurrentSourceClassification.OTHER),
+    ),
+)
+def test_r56_resolved_root_inventory_crosses_production_pty_as_typed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    installed_state: access.SourceState | None,
+    classification: access.CurrentSourceClassification,
+) -> None:
+    result = _r53_local_pty_source_inspection(
+        monkeypatch,
+        tmp_path,
+        root_exists=True,
+        installed_state=installed_state,
+        source_replacements=_remote_root_candidates(
+            (("HOMEASSISTANT_CONFIG", tmp_path),)
+        ),
+    )
+
+    assert result.classification is classification
+    if classification is access.CurrentSourceClassification.OTHER:
+        assert result.evidence is not None
+        assert result.root_profile is access.RemoteRootProfile.HOMEASSISTANT_CONFIG
+    else:
+        assert result.root_profile is access.RemoteRootProfile.HOMEASSISTANT_CONFIG
+
+
+def test_r56_shared_mutations_use_only_the_resolved_root(tmp_path: Path) -> None:
+    unused = tmp_path / "config"
+    unused.mkdir()
+    root = tmp_path / "homeassistant"
+    integration = root / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    candidate = access.build_source_bundle(
+        access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
+    )
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    replacements = _remote_root_candidates((("HOMEASSISTANT_CONFIG", root),))
+
+    backup = _run_synthetic_remote_program(
+        unused, "backup", _r36_backup_payload(), source_replacements=replacements
+    )
+    transfer = _run_synthetic_remote_program(
+        unused,
+        "transfer",
+        access._bundle_payload(candidate),
+        source_replacements=replacements,
+    )
+    install = _run_synthetic_remote_program(
+        unused,
+        "install",
+        {"manifest": access._manifest_payload(candidate.manifest)},
+        source_replacements=replacements,
+    )
+    restore_transfer = _run_synthetic_remote_program(
+        unused,
+        "transfer",
+        access._bundle_payload(restore),
+        source_replacements=replacements,
+    )
+    restored = _run_synthetic_remote_program(
+        unused,
+        "restore",
+        {"manifest": access._manifest_payload(restore.manifest)},
+        source_replacements=replacements,
+    )
+
+    assert all(
+        result["manifest_match"] is True
+        for result in (backup, transfer, install, restore_transfer, restored)
+    )
+    assert (root / ".ha_tuya_ble_r36_backup").is_dir()
+    assert not any(path.name.startswith(".ha_tuya_ble_r") for path in unused.iterdir())
+
+
+def test_r56_historical_root_root_result_stays_bounded_and_path_free() -> None:
+    payload = (
+        b'{"error_class":"OPERATION_FAILED","error_scope":"ROOT","error_reason":"ROOT"}'
+    )
+
+    with pytest.raises(access._RemoteOperationFailure) as raised:
+        access._exact_payload(payload)
+
+    assert raised.value.scope is access.RemoteFailureScope.ROOT
+    assert raised.value.reason is access.RemoteFailureReason.ROOT
+    assert "/" not in repr(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -2100,7 +2408,7 @@ responses = {
     },
     "transfer": {"success": True, "file_count": 3, "manifest_match": True, "regular_files_only": True},
     "install": {"installation_success": True, "expected_file_count": 3, "installed_file_count": 3, "manifest_match": True},
-    "source_inventory": {"expected_count": 3, "observed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0},
+    "source_inventory": {"expected_count": 3, "observed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "root_profile": "DIRECT_CONFIG"},
     "core_check": {"http_status": 200, "result": "ok", "check_passed": True},
     "core_readiness": {"core_reachable": True, "core_running": True, "integration_loaded": True, "timed_out": False},
 }
@@ -2178,7 +2486,7 @@ for line in sys.stdin:
         elif operation == "install":
             response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
         elif operation == "source_inventory":
-            response = {"expected_count": expected_count, "observed_count": expected_count, "manifest_match": True, "unexpected_count": 0, "missing_count": 0}
+            response = {"expected_count": expected_count, "observed_count": expected_count, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "root_profile": "DIRECT_CONFIG"}
         elif operation == "restore":
             response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
         else:
@@ -7658,6 +7966,7 @@ def test_r44_real_current_source_inventory_has_four_bounded_outcomes(
                 "manifest_match": exact,
                 "unexpected_count": 0,
                 "missing_count": 0 if exact else 1,
+                "root_profile": "DIRECT_CONFIG",
             }
         ).encode("ascii")
 
@@ -7676,6 +7985,7 @@ def test_r44_real_current_source_inventory_has_four_bounded_outcomes(
         in {
             access.CurrentSourceClassification.EXACT_PR41,
             access.CurrentSourceClassification.EXACT_PR45,
+            access.CurrentSourceClassification.OTHER,
         }
     )
     if classification is access.CurrentSourceClassification.INDETERMINATE:

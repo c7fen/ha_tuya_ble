@@ -158,6 +158,9 @@ class RemoteFailureReason(StrEnum):
     """Fixed remote rejection or failure reason with no private detail."""
 
     ROOT = "ROOT"
+    ROOT_UNRESOLVED = "ROOT_UNRESOLVED"
+    ROOT_AMBIGUOUS = "ROOT_AMBIGUOUS"
+    ROOT_INVALID = "ROOT_INVALID"
     PAYLOAD = "PAYLOAD"
     AUTHORITY = "AUTHORITY"
     MANIFEST = "MANIFEST"
@@ -168,6 +171,14 @@ class RemoteFailureReason(StrEnum):
     PRIVATE_STATE = "PRIVATE_STATE"
     VALIDATION = "VALIDATION"
     UNKNOWN = "UNKNOWN"
+
+
+class RemoteRootProfile(StrEnum):
+    """Fixed reviewed Home Assistant configuration-root presentations."""
+
+    DIRECT_CONFIG = "DIRECT_CONFIG"
+    HOMEASSISTANT_CONFIG = "HOMEASSISTANT_CONFIG"
+    SUPERVISOR_HOMEASSISTANT = "SUPERVISOR_HOMEASSISTANT"
 
 
 class SourceState(StrEnum):
@@ -980,6 +991,7 @@ class SourceInventoryResult:
     manifest_match: bool
     unexpected_count: int
     missing_count: int
+    root_profile: RemoteRootProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -990,6 +1002,11 @@ class CurrentSourceInventoryResult:
     failure_class: DispatchFailureClass | None = None
     remote_failure_scope: RemoteFailureScope | None = None
     remote_failure_reason: RemoteFailureReason | None = None
+
+    @property
+    def root_profile(self) -> RemoteRootProfile | None:
+        """Return the bounded resolved profile for a successful inspection."""
+        return self.evidence.root_profile if self.evidence is not None else None
 
 
 def _source_inventory_exact(result: object, expected_count: int) -> bool:
@@ -3170,6 +3187,7 @@ def _parse_source_inventory_result(payload: object) -> SourceInventoryResult:
             "manifest_match",
             "unexpected_count",
             "missing_count",
+            "root_profile",
         }:
             raise ValueError
         expected_count = _count(payload["expected_count"])
@@ -3189,6 +3207,7 @@ def _parse_source_inventory_result(payload: object) -> SourceInventoryResult:
             manifest_match,
             unexpected_count,
             missing_count,
+            RemoteRootProfile(payload["root_profile"]),
         )
     except (KeyError, TypeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
@@ -3683,6 +3702,12 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 ROOT = Path('/config')
+ROOT_CANDIDATES = (
+    ('DIRECT_CONFIG', ROOT),
+    ('HOMEASSISTANT_CONFIG', Path('/homeassistant')),
+    ('SUPERVISOR_HOMEASSISTANT', Path('/mnt/data/supervisor/homeassistant')),
+)
+ROOT_PROFILE = None
 ROOT_FD = None
 INTEGRATION = ROOT / 'custom_components' / 'tuya_ble'
 HELPER = INTEGRATION / '.phase_a_tools'
@@ -3711,11 +3736,15 @@ REMOTE_SCOPES = {
     'INSTALL', 'RESTORE', 'CORE', 'PHASE_A', 'OTHER',
 }
 REMOTE_REASONS = {
-    'ROOT', 'PAYLOAD', 'AUTHORITY', 'MANIFEST', 'PATH', 'DIRECTORY',
-    'REGULAR_FILE', 'FILESYSTEM', 'PRIVATE_STATE', 'VALIDATION', 'UNKNOWN',
+    'ROOT', 'ROOT_UNRESOLVED', 'ROOT_AMBIGUOUS', 'ROOT_INVALID', 'PAYLOAD',
+    'AUTHORITY', 'MANIFEST', 'PATH', 'DIRECTORY', 'REGULAR_FILE', 'FILESYSTEM',
+    'PRIVATE_STATE', 'VALIDATION', 'UNKNOWN',
 }
 REMOTE_REASON_BY_TOKEN = {
     'root': 'ROOT',
+    'root_unresolved': 'ROOT_UNRESOLVED',
+    'root_ambiguous': 'ROOT_AMBIGUOUS',
+    'root_invalid': 'ROOT_INVALID',
     'authority': 'AUTHORITY',
     'manifest': 'MANIFEST',
     'fingerprint': 'MANIFEST',
@@ -3789,6 +3818,96 @@ def receive():
     if not isinstance(value, dict):
         raise ValueError('payload')
     return value
+
+def bind_root(profile, path, descriptor):
+    global ROOT, ROOT_PROFILE, ROOT_FD, INTEGRATION, HELPER, STAGE
+    global BACKUP, BACKUP_CONSUMED, RESTORE_CONSUMED
+    ROOT = path
+    ROOT_PROFILE = profile
+    ROOT_FD = descriptor
+    INTEGRATION = ROOT / 'custom_components' / 'tuya_ble'
+    HELPER = INTEGRATION / '.phase_a_tools'
+    STAGE = ROOT / '.ha_tuya_ble_r30_stage'
+    BACKUP = ROOT / '.ha_tuya_ble_r36_backup'
+    BACKUP_CONSUMED = ROOT / '.ha_tuya_ble_r36_backup.consumed'
+    RESTORE_CONSUMED = ROOT / '.ha_tuya_ble_r30_restore.consumed'
+
+def inspect_root_candidate(path):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return 'absent', None
+    except OSError:
+        return 'invalid', None
+    if not stat.S_ISDIR(metadata.st_mode):
+        return 'invalid', None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return 'invalid', None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            return 'invalid', None
+        try:
+            structure = os.stat(
+                'custom_components', dir_fd=descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return 'unsupported', None
+        except OSError:
+            return 'invalid', None
+        if not stat.S_ISDIR(structure.st_mode):
+            return 'invalid', None
+        try:
+            structure_fd = os.open(
+                'custom_components',
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+        except OSError:
+            return 'invalid', None
+        try:
+            opened_structure = os.fstat(structure_fd)
+            if (
+                not stat.S_ISDIR(opened_structure.st_mode)
+                or opened_structure.st_dev != structure.st_dev
+                or opened_structure.st_ino != structure.st_ino
+            ):
+                return 'invalid', None
+        finally:
+            os.close(structure_fd)
+        result = descriptor
+        descriptor = None
+        return 'valid', result
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+def resolve_root():
+    valid = []
+    invalid = False
+    for profile, path in ROOT_CANDIDATES:
+        status, descriptor = inspect_root_candidate(path)
+        if status == 'valid':
+            valid.append((profile, path, descriptor))
+        elif status == 'invalid':
+            invalid = True
+    if len(valid) != 1:
+        for _profile, _path, descriptor in valid:
+            os.close(descriptor)
+        if len(valid) > 1:
+            raise ValueError('root_ambiguous')
+        if invalid:
+            raise ValueError('root_invalid')
+        raise ValueError('root_unresolved')
+    profile, path, descriptor = valid[0]
+    bind_root(profile, path, descriptor)
+    return profile
 
 def safe_path(value, state):
     if not isinstance(value, str) or not value or '\\' in value:
@@ -5342,12 +5461,11 @@ def reconcile_backup(value):
 
 operation = sys.argv[1]
 try:
-    ROOT_FD = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    root_metadata = os.fstat(ROOT_FD)
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise ValueError('root')
+    resolve_root()
+except ValueError as error:
+    result = remote_error('ROOT', operation_reason(error))
 except Exception:
-    result = remote_error('ROOT', 'ROOT')
+    result = remote_error('ROOT', 'ROOT_INVALID')
 else:
     try:
         value = receive()
@@ -5366,6 +5484,7 @@ else:
             elif operation == 'source_inventory':
                 _, expected = expected_manifest(value)
                 result = inventory_result(expected, inventory_targets())
+                result['root_profile'] = ROOT_PROFILE
             elif operation == 'core_check':
                 result = core_check()
             elif operation == 'restart_core':
@@ -6105,7 +6224,9 @@ class PrivateInteractiveSessionBroker:
                 remote_failure_scope=failure.remote_failure_scope,
                 remote_failure_reason=failure.remote_failure_reason,
             )
-        return CurrentSourceInventoryResult(CurrentSourceClassification.OTHER)
+        return CurrentSourceInventoryResult(
+            CurrentSourceClassification.OTHER, candidate_result
+        )
 
     def _check_core(
         self, attempt_ordinal: int, *, _capability: object = None
