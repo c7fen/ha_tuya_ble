@@ -5117,9 +5117,7 @@ def test_r32_c2_m1_to_m5_helper_permit_is_consumed_before_every_dispatch_outcome
     controller._state = access.LifecycleState.AP0_COLLECTED
     call_count = len(broker.calls)
 
-    with pytest.raises(
-        access.LifecycleControllerError, match="(?:PERMIT_CONSUMED|TRANSITION_INVALID)"
-    ):
+    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
         controller.run_non_probe_preflight()
     assert len(broker.calls) == call_count, case
 
