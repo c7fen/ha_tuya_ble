@@ -987,11 +987,19 @@ class FallbackReconciliationResult:
 @dataclass(frozen=True)
 class SourceInventoryResult:
     expected_count: int
-    observed_count: int
+    observed_managed_count: int
     manifest_match: bool
     unexpected_count: int
     missing_count: int
     root_profile: RemoteRootProfile | None = None
+    content_mismatch_count: int = 0
+    runtime_cache_file_count: int = 0
+    managed_manifest_identity: str = ""
+
+    @property
+    def observed_count(self) -> int:
+        """Retain the pre-R57 aggregate name for local callers."""
+        return self.observed_managed_count
 
 
 @dataclass(frozen=True)
@@ -3183,31 +3191,46 @@ def _parse_source_inventory_result(payload: object) -> SourceInventoryResult:
     try:
         if not isinstance(payload, dict) or set(payload) != {
             "expected_count",
-            "observed_count",
+            "observed_managed_count",
             "manifest_match",
             "unexpected_count",
             "missing_count",
+            "content_mismatch_count",
+            "runtime_cache_file_count",
+            "managed_manifest_identity",
             "root_profile",
         }:
             raise ValueError
         expected_count = _count(payload["expected_count"])
-        observed_count = _count(payload["observed_count"])
+        observed_managed_count = _count(payload["observed_managed_count"])
         manifest_match = _bool(payload["manifest_match"])
         unexpected_count = _count(payload["unexpected_count"])
         missing_count = _count(payload["missing_count"])
+        content_mismatch_count = _count(payload["content_mismatch_count"])
+        runtime_cache_file_count = _count(payload["runtime_cache_file_count"])
+        managed_manifest_identity = payload["managed_manifest_identity"]
+        if (
+            not isinstance(managed_manifest_identity, str)
+            or re.fullmatch(r"[0-9a-f]{64}", managed_manifest_identity) is None
+        ):
+            raise ValueError
         if manifest_match != (
-            expected_count == observed_count
+            expected_count == observed_managed_count
             and unexpected_count == 0
             and missing_count == 0
+            and content_mismatch_count == 0
         ):
             raise ValueError
         return SourceInventoryResult(
             expected_count,
-            observed_count,
+            observed_managed_count,
             manifest_match,
             unexpected_count,
             missing_count,
             RemoteRootProfile(payload["root_profile"]),
+            content_mismatch_count,
+            runtime_cache_file_count,
+            managed_manifest_identity,
         )
     except (KeyError, TypeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
@@ -4044,7 +4067,35 @@ def assert_root_relative_identity(path, descriptor):
     finally:
         os.close(current)
 
-def inventory_fd(descriptor, prefix, excluded_top=None, relative=()):
+def count_runtime_cache_files_fd(descriptor):
+    count = 0
+    for name in sorted(os.listdir(descriptor)):
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise ValueError('directory')
+                count += count_runtime_cache_files_fd(child)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode):
+            count += 1
+    return count
+
+def inventory_fd(
+    descriptor, prefix, excluded_top=None, relative=(),
+    runtime_cache_counter=None, managed_directories=None
+):
     observed = {}
     for name in sorted(os.listdir(descriptor)):
         if not relative and name == excluded_top:
@@ -4065,9 +4116,20 @@ def inventory_fd(descriptor, prefix, excluded_top=None, relative=()):
                     or not stat.S_ISDIR(opened.st_mode)
                 ):
                     raise ValueError('directory')
-                observed.update(
-                    inventory_fd(child, prefix, excluded_top, logical_parts)
-                )
+                if name == '__pycache__':
+                    if runtime_cache_counter is not None:
+                        runtime_cache_counter[0] += count_runtime_cache_files_fd(child)
+                else:
+                    if managed_directories is not None:
+                        managed_directories.add(
+                            prefix + '/' + PurePosixPath(*logical_parts).as_posix()
+                        )
+                    observed.update(
+                        inventory_fd(
+                            child, prefix, excluded_top, logical_parts,
+                            runtime_cache_counter, managed_directories
+                        )
+                    )
             finally:
                 os.close(child)
         elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
@@ -4114,25 +4176,39 @@ def inventory_root(root, prefix, excluded_top=None):
     finally:
         os.close(descriptor)
 
-def inventory_deployment_fd(descriptor):
-    observed = inventory_fd(descriptor, 'integration', '.phase_a_tools')
+def inventory_deployment_fd(
+    descriptor, runtime_cache_counter=None, managed_directories=None
+):
+    observed = inventory_fd(
+        descriptor, 'integration', '.phase_a_tools', (),
+        runtime_cache_counter, managed_directories
+    )
     try:
         helper = open_relative_directory(descriptor, ('.phase_a_tools',))
     except FileNotFoundError:
         return observed
     try:
-        observed.update(inventory_fd(helper, 'helper'))
+        if managed_directories is not None:
+            managed_directories.add('helper')
+        observed.update(
+            inventory_fd(
+                helper, 'helper', None, (),
+                runtime_cache_counter, managed_directories
+            )
+        )
     finally:
         os.close(helper)
     return observed
 
-def inventory_targets():
+def inventory_targets(runtime_cache_counter=None, managed_directories=None):
     try:
         descriptor = open_root_relative(INTEGRATION)
     except FileNotFoundError:
         return {}
     try:
-        observed = inventory_deployment_fd(descriptor)
+        observed = inventory_deployment_fd(
+            descriptor, runtime_cache_counter, managed_directories
+        )
         assert_root_relative_identity(INTEGRATION, descriptor)
         return observed
     finally:
@@ -4266,13 +4342,37 @@ def inventory_stage():
         **inventory_root(STAGE / 'helper', 'helper'),
     }
 
-def inventory_result(expected, observed):
+def expected_directories(expected):
+    directories = set()
+    for logical in expected:
+        parts = PurePosixPath(logical).parts
+        if parts[0] == 'helper':
+            directories.add('helper')
+        for length in range(2, len(parts)):
+            directories.add(PurePosixPath(*parts[:length]).as_posix())
+    return directories
+
+def inventory_result(
+    expected, observed, runtime_cache_file_count=0, observed_directories=()
+):
+    unexpected_files = set(observed) - set(expected)
+    unexpected_directories = set(observed_directories) - expected_directories(expected)
+    common = set(expected) & set(observed)
+    content_mismatch_count = sum(
+        expected[path] != observed[path] for path in common
+    )
+    identity = inventory_identity(observed)
     return {
         'expected_count': len(expected),
-        'observed_count': len(observed),
-        'manifest_match': expected == observed,
-        'unexpected_count': len(set(observed) - set(expected)),
+        'observed_managed_count': len(observed),
+        'manifest_match': (
+            expected == observed and not unexpected_directories
+        ),
+        'unexpected_count': len(unexpected_files) + len(unexpected_directories),
         'missing_count': len(set(expected) - set(observed)),
+        'content_mismatch_count': content_mismatch_count,
+        'runtime_cache_file_count': runtime_cache_file_count,
+        'managed_manifest_identity': identity['manifest_identity'],
     }
 
 def inventory_identity(observed):
@@ -5483,7 +5583,14 @@ else:
                 result = activate(value)
             elif operation == 'source_inventory':
                 _, expected = expected_manifest(value)
-                result = inventory_result(expected, inventory_targets())
+                runtime_cache_counter = [0]
+                managed_directories = set()
+                observed = inventory_targets(
+                    runtime_cache_counter, managed_directories
+                )
+                result = inventory_result(
+                    expected, observed, runtime_cache_counter[0], managed_directories
+                )
                 result['root_profile'] = ROOT_PROFILE
             elif operation == 'core_check':
                 result = core_check()

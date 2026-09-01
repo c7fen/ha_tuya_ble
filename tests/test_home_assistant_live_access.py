@@ -1009,6 +1009,7 @@ def _synthetic_r30_source_authorities(
                 "test_r44_",
                 "test_r47_",
                 "test_r50_",
+                "test_r57_",
             )
         ),
     )
@@ -1025,6 +1026,7 @@ def _synthetic_r30_source_authorities(
             "test_r53_",
             "test_r55_",
             "test_r56_",
+            "test_r57_",
         )
     ):
         return
@@ -1225,10 +1227,13 @@ def test_r30_source_inventory_mismatch_is_not_success() -> None:
     result = access._parse_source_inventory_result(
         {
             "expected_count": 3,
-            "observed_count": 3,
+            "observed_managed_count": 3,
             "manifest_match": False,
             "unexpected_count": 1,
             "missing_count": 1,
+            "content_mismatch_count": 0,
+            "runtime_cache_file_count": 0,
+            "managed_manifest_identity": "a" * 64,
             "root_profile": "DIRECT_CONFIG",
         }
     )
@@ -1241,10 +1246,13 @@ def test_r30_source_inventory_mismatch_is_not_success() -> None:
         access._parse_source_inventory_result(
             {
                 "expected_count": 3,
-                "observed_count": 2,
+                "observed_managed_count": 2,
                 "manifest_match": True,
                 "unexpected_count": 0,
                 "missing_count": 1,
+                "content_mismatch_count": 0,
+                "runtime_cache_file_count": 0,
+                "managed_manifest_identity": "a" * 64,
                 "root_profile": "DIRECT_CONFIG",
             }
         )
@@ -1654,6 +1662,7 @@ def _r53_local_pty_source_inspection(
     invalid_deployment: bool = False,
     installed_state: access.SourceState | None = access.SourceState.CANDIDATE,
     source_replacements: dict[str, str] | None = None,
+    runtime_cache_paths: tuple[Path, ...] = (),
 ) -> object:
     replacement_bin = tmp_path / "bin"
     replacement_bin.mkdir()
@@ -1696,6 +1705,10 @@ def _r53_local_pty_source_inspection(
                 "synthetic other\n", encoding="ascii"
             )
         integration_root = root / "custom_components" / "tuya_ble"
+        for relative in runtime_cache_paths:
+            cache = integration_root / relative
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(b"\xa7\r\r\n\x00synthetic-runtime-bytecode\x00")
         if invalid_deployment:
             (integration_root / "synthetic-invalid-entry").symlink_to("__init__.py")
     remote_program = access._REMOTE_CONTROL_PROGRAM.replace(
@@ -1762,7 +1775,15 @@ def test_r55_successful_source_inventory_has_no_failure_metadata(
     assert result == access.CurrentSourceInventoryResult(
         access.CurrentSourceClassification.EXACT_PR45,
         access.SourceInventoryResult(
-            3, 3, True, 0, 0, access.RemoteRootProfile.DIRECT_CONFIG
+            3,
+            3,
+            True,
+            0,
+            0,
+            access.RemoteRootProfile.DIRECT_CONFIG,
+            managed_manifest_identity=access._source_manifest_digest(
+                _r30_manifest().entries
+            ),
         ),
     )
     assert result.remote_failure_scope is None
@@ -2003,6 +2024,419 @@ def test_r56_other_source_inventory_through_resolved_root(tmp_path: Path) -> Non
 
     assert result["root_profile"] == "HOMEASSISTANT_CONFIG"
     assert result["manifest_match"] is False
+
+
+@pytest.mark.parametrize(
+    ("state", "cache_relative"),
+    (
+        (access.SourceState.RESTORE, None),
+        (access.SourceState.RESTORE, Path("__pycache__") / "__init__.cpython-314.pyc"),
+        (
+            access.SourceState.CANDIDATE,
+            Path("__pycache__") / "__init__.cpython-314.pyc",
+        ),
+        (
+            access.SourceState.CANDIDATE,
+            Path(".phase_a_tools")
+            / "__pycache__"
+            / "phase_a_status_probe_lib.cpython-314.pyc",
+        ),
+    ),
+)
+def test_r57_exact_source_inventory_ignores_runtime_bytecode_cache(
+    tmp_path: Path,
+    state: access.SourceState,
+    cache_relative: Path | None,
+) -> None:
+    root = tmp_path / "homeassistant"
+    label = "RESTORE" if state is access.SourceState.RESTORE else "CANDIDATE"
+    bundle = access.build_source_bundle(
+        state,
+        _r30_files(label),
+        _r30_manifest(label),
+    )
+    _write_remote_source(root, bundle)
+    if cache_relative is not None:
+        cache = root / "custom_components" / "tuya_ble" / cache_relative
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(b"\xa7\r\r\n\x00synthetic-runtime-bytecode\x00")
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["root_profile"] == "HOMEASSISTANT_CONFIG"
+    assert result["manifest_match"] is True
+    assert result["runtime_cache_file_count"] == (cache_relative is not None)
+
+
+def test_r57_exact_pr41_ignores_cache_nested_below_managed_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "homeassistant"
+    files = {
+        "integration/__init__.py": b"synthetic integration source\n",
+        "integration/nested/module.py": b"synthetic nested source\n",
+    }
+    entries = tuple(
+        access.SourceManifestEntry(
+            logical, len(content), hashlib.sha256(content).hexdigest()
+        )
+        for logical, content in sorted(files.items())
+    )
+    manifest = access.SourceManifest(access.SourceState.RESTORE, entries)
+    bundle = access.SourceBundle(
+        access.SourceState.RESTORE,
+        tuple(
+            access.SourceBundleFile(logical, content)
+            for logical, content in sorted(files.items())
+        ),
+        manifest,
+    )
+    _write_remote_source(root, bundle)
+    cache = (
+        root
+        / "custom_components"
+        / "tuya_ble"
+        / "nested"
+        / "__pycache__"
+        / "module.cpython-314.pyc"
+    )
+    cache.parent.mkdir()
+    cache.write_bytes(b"synthetic runtime bytecode")
+    default_digest = access._source_manifest_digest(_r30_manifest("RESTORE").entries)
+    replacements = _remote_root_candidates((("HOMEASSISTANT_CONFIG", root),))
+    replacements[default_digest] = access._source_manifest_digest(entries)
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(manifest)},
+        source_replacements=replacements,
+    )
+
+    assert result["manifest_match"] is True
+    assert result["runtime_cache_file_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "extra_relative",
+    (
+        Path("extra.py"),
+        Path("extra.pyc"),
+        Path("unknown") / "extra.json",
+    ),
+)
+def test_r57_non_cache_extras_remain_unexpected(
+    tmp_path: Path, extra_relative: Path
+) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    extra = root / "custom_components" / "tuya_ble" / extra_relative
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_bytes(b"synthetic non-cache extra\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["manifest_match"] is False
+    assert result["unexpected_count"] > 0
+
+
+def test_r57_unknown_empty_directory_remains_unexpected(tmp_path: Path) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    (root / "custom_components" / "tuya_ble" / "unknown-empty").mkdir()
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["manifest_match"] is False
+    assert result["unexpected_count"] == 1
+
+
+def test_r57_unexpected_empty_helper_namespace_remains_other(tmp_path: Path) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    (root / "custom_components" / "tuya_ble" / ".phase_a_tools").mkdir()
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["manifest_match"] is False
+    assert result["unexpected_count"] == 1
+
+
+def test_r57_modified_managed_source_reports_only_aggregate_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    managed = root / "custom_components" / "tuya_ble" / "__init__.py"
+    managed.write_bytes(b"synthetic modified managed source\n")
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["manifest_match"] is False
+    assert result["content_mismatch_count"] == 1
+    assert "__init__.py" not in json.dumps(result)
+
+
+def test_r57_missing_managed_source_reports_only_aggregate_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    (root / "custom_components" / "tuya_ble" / "__init__.py").unlink()
+
+    result = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        {"manifest": access._manifest_payload(bundle.manifest)},
+        source_replacements=_remote_root_candidates((("HOMEASSISTANT_CONFIG", root),)),
+    )
+
+    assert result["manifest_match"] is False
+    assert result["missing_count"] == 1
+    assert "__init__.py" not in json.dumps(result)
+
+
+def test_r57_cache_diagnostics_are_count_only_and_identity_stable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "homeassistant"
+    bundle = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(root, bundle)
+    replacements = _remote_root_candidates((("HOMEASSISTANT_CONFIG", root),))
+    payload = {"manifest": access._manifest_payload(bundle.manifest)}
+    before = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        payload,
+        source_replacements=replacements,
+    )
+    for relative in (
+        Path("__pycache__") / "one.cpython-314.pyc",
+        Path("nested") / "__pycache__" / "two.cpython-314.pyc",
+        Path("nested") / "__pycache__" / "deeper" / "three.pyc",
+    ):
+        cache = root / "custom_components" / "tuya_ble" / relative
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(b"synthetic cache bytes")
+    after = _run_synthetic_remote_program(
+        tmp_path / "unused-direct-root",
+        "source_inventory",
+        payload,
+        source_replacements=replacements,
+    )
+
+    assert after["runtime_cache_file_count"] == 3
+    assert after["managed_manifest_identity"] == before["managed_manifest_identity"]
+    assert after["managed_manifest_identity"] == access._source_manifest_digest(
+        bundle.manifest.entries
+    )
+    retained = json.dumps(after, sort_keys=True)
+    assert "__pycache__" not in retained
+    assert ".pyc" not in retained
+
+
+@pytest.mark.parametrize(
+    ("installed_state", "classification", "runtime_cache_paths"),
+    (
+        (
+            access.SourceState.RESTORE,
+            access.CurrentSourceClassification.EXACT_PR41,
+            (
+                Path("__pycache__") / "__init__.cpython-314.pyc",
+                Path("__pycache__") / "nested" / "module.cpython-314.pyc",
+            ),
+        ),
+        (
+            access.SourceState.CANDIDATE,
+            access.CurrentSourceClassification.EXACT_PR45,
+            (
+                Path("__pycache__") / "__init__.cpython-314.pyc",
+                Path(".phase_a_tools") / "__pycache__" / "helper.cpython-314.pyc",
+            ),
+        ),
+    ),
+)
+def test_r57_production_pty_classifies_managed_source_with_runtime_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    installed_state: access.SourceState,
+    classification: access.CurrentSourceClassification,
+    runtime_cache_paths: tuple[Path, ...],
+) -> None:
+    result = _r53_local_pty_source_inspection(
+        monkeypatch,
+        tmp_path,
+        root_exists=True,
+        installed_state=installed_state,
+        runtime_cache_paths=runtime_cache_paths,
+    )
+
+    assert result.classification is classification
+    assert result.evidence is not None
+    assert result.evidence.runtime_cache_file_count == 2
+    assert result.evidence.managed_manifest_identity == access._source_manifest_digest(
+        _r30_manifest(
+            "RESTORE" if installed_state is access.SourceState.RESTORE else "CANDIDATE"
+        ).entries
+    )
+
+
+def test_r57_backup_verification_excludes_runtime_cache(tmp_path: Path) -> None:
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    _write_remote_source(tmp_path, restore)
+    cache = (
+        tmp_path
+        / "custom_components"
+        / "tuya_ble"
+        / "__pycache__"
+        / "__init__.cpython-314.pyc"
+    )
+    cache.parent.mkdir()
+    cache.write_bytes(b"synthetic runtime bytecode")
+
+    result = _run_synthetic_remote_program(tmp_path, "backup", _r36_backup_payload())
+
+    assert result["success"] is True
+    assert result["file_count"] == len(restore.manifest.entries)
+    package = tmp_path / ".ha_tuya_ble_r36_backup" / "integration"
+    assert not (package / "__pycache__").exists()
+
+
+def test_r57_retained_terminal_exact_pr41_diagnostics_remain_state_neutral() -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    broker = _r47_inspection_broker()
+    broker.queue(
+        "current_source_inventory",
+        access.CurrentSourceInventoryResult(
+            access.CurrentSourceClassification.EXACT_PR41,
+            access.SourceInventoryResult(
+                len(restore.manifest.entries),
+                len(restore.manifest.entries),
+                True,
+                0,
+                0,
+                content_mismatch_count=0,
+                runtime_cache_file_count=2,
+                managed_manifest_identity=access._source_manifest_digest(
+                    restore.manifest.entries
+                ),
+            ),
+        ),
+    )
+    inspector = access.RetainedTerminalLifecycleInspector(broker)
+    before_metadata = inspector.metadata
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert result.evidence is not None
+    assert result.evidence.runtime_cache_file_count == 2
+    assert inspector.metadata == before_metadata
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
+
+
+def test_r57_retained_terminal_other_diagnostics_cannot_authorize_retirement() -> None:
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    broker = _r47_inspection_broker()
+    broker.queue(
+        "current_source_inventory",
+        access.CurrentSourceInventoryResult(
+            access.CurrentSourceClassification.OTHER,
+            access.SourceInventoryResult(
+                len(candidate.manifest.entries),
+                len(candidate.manifest.entries),
+                False,
+                0,
+                0,
+                content_mismatch_count=1,
+                runtime_cache_file_count=1,
+                managed_manifest_identity="f" * 64,
+            ),
+        ),
+    )
+    inspector = access.RetainedTerminalLifecycleInspector(broker)
+    before_metadata = inspector.metadata
+
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_terminal()
+
+    assert result.classification is access.CurrentSourceClassification.OTHER
+    assert result.evidence is not None
+    assert result.evidence.content_mismatch_count == 1
+    assert inspector.metadata == before_metadata
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
 
 
 @pytest.mark.parametrize(
@@ -2408,7 +2842,7 @@ responses = {
     },
     "transfer": {"success": True, "file_count": 3, "manifest_match": True, "regular_files_only": True},
     "install": {"installation_success": True, "expected_file_count": 3, "installed_file_count": 3, "manifest_match": True},
-    "source_inventory": {"expected_count": 3, "observed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "root_profile": "DIRECT_CONFIG"},
+    "source_inventory": {"expected_count": 3, "observed_managed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "content_mismatch_count": 0, "runtime_cache_file_count": 0, "managed_manifest_identity": "__RESTORE_DIGEST__", "root_profile": "DIRECT_CONFIG"},
     "core_check": {"http_status": 200, "result": "ok", "check_passed": True},
     "core_readiness": {"core_reachable": True, "core_running": True, "integration_loaded": True, "timed_out": False},
 }
@@ -2486,7 +2920,7 @@ for line in sys.stdin:
         elif operation == "install":
             response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
         elif operation == "source_inventory":
-            response = {"expected_count": expected_count, "observed_count": expected_count, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "root_profile": "DIRECT_CONFIG"}
+            response = {"expected_count": expected_count, "observed_managed_count": expected_count, "manifest_match": True, "unexpected_count": 0, "missing_count": 0, "content_mismatch_count": 0, "runtime_cache_file_count": 0, "managed_manifest_identity": "__RESTORE_DIGEST__", "root_profile": "DIRECT_CONFIG"}
         elif operation == "restore":
             response = {"installation_success": True, "expected_file_count": expected_count, "installed_file_count": expected_count, "manifest_match": True}
         else:
@@ -7962,10 +8396,13 @@ def test_r44_real_current_source_inventory_has_four_bounded_outcomes(
         return json.dumps(
             {
                 "expected_count": count,
-                "observed_count": count if exact else count - 1,
+                "observed_managed_count": count if exact else count - 1,
                 "manifest_match": exact,
                 "unexpected_count": 0,
                 "missing_count": 0 if exact else 1,
+                "content_mismatch_count": 0,
+                "runtime_cache_file_count": 0,
+                "managed_manifest_identity": "a" * 64,
                 "root_profile": "DIRECT_CONFIG",
             }
         ).encode("ascii")
