@@ -18,6 +18,8 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, asdict, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1583,8 +1585,9 @@ def _r59_remote_program(source: str) -> str:
     return program[: program.index("operation = sys.argv[1]")]
 
 
+@contextmanager
 def _r59_delayed_restart_server() -> (
-    tuple[ThreadingHTTPServer, threading.Event, threading.Event]
+    Generator[tuple[ThreadingHTTPServer, threading.Event, threading.Event]]
 ):
     """Serve one complete POST while deliberately withholding its response."""
     received = threading.Event()
@@ -1608,70 +1611,111 @@ def _r59_delayed_restart_server() -> (
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, received, release
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, received, release
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
 
 
-def test_r59_parent_red_and_response_loss_dispatch_reconciliation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """R1/R2: a full parent POST can time out only after it was dispatched."""
-    pytest_socket.enable_socket()
-    server, received, release = _r59_delayed_restart_server()
-    endpoint = f"http://127.0.0.1:{server.server_port}"
-    monkeypatch.setenv("SUPERVISOR_TOKEN", "synthetic-r59-token")
-    parent_source = subprocess.check_output(
+def _r59_exact_parent_source() -> str | None:
+    """Return the pinned RED baseline only when this checkout contains it."""
+    result = subprocess.run(
         [
             "git",
             "show",
             "557ac0bc83a52ac70344e85233603984de1c1ae0:tools/home_assistant_live_access.py",
         ],
+        capture_output=True,
+        check=False,
         text=True,
     )
-    parent_program = (
-        _r59_remote_program(parent_source)
-        .replace("http://supervisor", endpoint)
-        .replace("timeout=30", "timeout=0.05")
-    )
-    parent_namespace: dict[str, object] = {"__name__": "r59_parent_repro"}
-    try:
-        exec(  # noqa: S102 - execute the pinned parent transport in this test only
-            compile(parent_program, "<r59-exact-parent>", "exec"), parent_namespace
-        )
-        assert parent_namespace["restart_core"]() == {
-            "submitted": False,
-            "accepted": False,
-        }
-        assert received.wait(1)
+    return result.stdout if result.returncode == 0 else None
 
-        current_namespace: dict[str, object] = {"__name__": "r59_candidate_repro"}
-        exec(  # noqa: S102 - execute the candidate embedded transport in isolation
-            compile(
-                _r59_remote_program(access._REMOTE_CONTROL_PROGRAM),
-                "<r59-candidate>",
-                "exec",
-            ),
-            current_namespace,
-        )
-        current_namespace["RESTART_RESPONSE_TIMEOUT_SECONDS"] = 0.05
-        original_connection = http.client.HTTPConnection
-        current_namespace["http"].client.HTTPConnection = (  # type: ignore[index,union-attr]
-            lambda _host, timeout=None: original_connection(
-                "127.0.0.1", server.server_port, timeout=timeout
+
+def test_r59_response_loss_dispatch_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2: a current full POST can time out only after it was dispatched."""
+    pytest_socket.enable_socket()
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "synthetic-r59-token")
+    try:
+        with _r59_delayed_restart_server() as (server, received, _release):
+            current_namespace: dict[str, object] = {"__name__": "r59_candidate_repro"}
+            exec(  # noqa: S102 - execute the candidate embedded transport in isolation
+                compile(
+                    _r59_remote_program(access._REMOTE_CONTROL_PROGRAM),
+                    "<r59-candidate>",
+                    "exec",
+                ),
+                current_namespace,
             )
-        )
-        try:
-            assert current_namespace["restart_core"]() == {
-                "dispatch_outcome": "DISPATCHED_RESPONSE_UNKNOWN",
-                "http_status": None,
-                "failure_reason": "RESPONSE_TIMEOUT",
-            }
-        finally:
-            current_namespace["http"].client.HTTPConnection = original_connection  # type: ignore[index,union-attr]
+            current_namespace["RESTART_RESPONSE_TIMEOUT_SECONDS"] = 0.05
+            original_connection = http.client.HTTPConnection
+            current_namespace["http"].client.HTTPConnection = (  # type: ignore[index,union-attr]
+                lambda _host, timeout=None: original_connection(
+                    "127.0.0.1", server.server_port, timeout=timeout
+                )
+            )
+            try:
+                assert current_namespace["restart_core"]() == {
+                    "dispatch_outcome": "DISPATCHED_RESPONSE_UNKNOWN",
+                    "http_status": None,
+                    "failure_reason": "RESPONSE_TIMEOUT",
+                }
+                assert received.wait(1)
+            finally:
+                current_namespace["http"].client.HTTPConnection = original_connection  # type: ignore[index,union-attr]
     finally:
-        release.set()
-        server.shutdown()
-        server.server_close()
+        pytest_socket.disable_socket()
+
+
+def test_r59_parent_red_and_response_loss_dispatch_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1: preserve the exact parent RED reproduction when history is present."""
+    parent_source = _r59_exact_parent_source()
+    if parent_source is None:
+        pytest.skip("R59 exact historical parent is unavailable in this checkout")
+
+    pytest_socket.enable_socket()
+    try:
+        with _r59_delayed_restart_server() as (server, received, _release):
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+            monkeypatch.setenv("SUPERVISOR_TOKEN", "synthetic-r59-token")
+            parent_program = (
+                _r59_remote_program(parent_source)
+                .replace("http://supervisor", endpoint)
+                .replace("timeout=30", "timeout=0.05")
+            )
+            parent_namespace: dict[str, object] = {"__name__": "r59_parent_repro"}
+            exec(  # noqa: S102 - execute the pinned parent transport in this test only
+                compile(parent_program, "<r59-exact-parent>", "exec"), parent_namespace
+            )
+            assert parent_namespace["restart_core"]() == {
+                "submitted": False,
+                "accepted": False,
+            }
+            assert received.wait(1)
+    finally:
+        pytest_socket.disable_socket()
+
+
+def test_r60_delayed_restart_server_cleanup_on_error() -> None:
+    """The synthetic server is closed even when its owning test raises."""
+    pytest_socket.enable_socket()
+    try:
+        with (
+            pytest.raises(RuntimeError, match="synthetic-r60-error"),
+            _r59_delayed_restart_server(),
+        ):
+            raise RuntimeError("synthetic-r60-error")
+    finally:
         pytest_socket.disable_socket()
 
 
