@@ -1017,6 +1017,7 @@ def _synthetic_r30_source_authorities(
                 "test_r50_",
                 "test_r57_",
                 "test_r59_",
+                "test_r61_",
             )
         ),
     )
@@ -1035,6 +1036,7 @@ def _synthetic_r30_source_authorities(
             "test_r56_",
             "test_r57_",
             "test_r59_",
+            "test_r61_",
         )
     ):
         return
@@ -8793,6 +8795,205 @@ def test_r47_active_lifecycle_cannot_open_terminal_retirement() -> None:
         access.LifecycleControllerError, match="LIFECYCLE_TERMINAL_REQUIRED"
     ):
         access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+
+
+def _r61_pre_r59_restore_failed() -> tuple[object, object, Path, Path]:
+    """Construct the retained R58 layout directly from its known field contract."""
+    candidate, restore = _r47_retained_restore_failed()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+    record["schema_version"] = 1
+    record.pop("restart_results")
+    assert set(record) == access._DurableLifecycleJournal._V1_PRE_R59_TOP_LEVEL_KEYS
+    journal_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="ascii"
+    )
+    return candidate, restore, journal_path, anchor_path
+
+
+def test_r61_j1_j2_exact_pre_r59_terminal_is_the_only_missing_member(
+    tmp_path: Path,
+) -> None:
+    """J1/J2: the R60 failure is the absent R59-only member, not corruption."""
+    _candidate, _restore, journal_path, _anchor_path = _r61_pre_r59_restore_failed()
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+
+    assert record["schema_version"] == 1
+    assert "restart_results" not in record
+    assert access._DurableLifecycleJournal._validate_record(record) is (
+        access.LifecycleJournalFormat.V1_PRE_R59
+    )
+    assert tmp_path / "lifecycle" == access._LIFECYCLE_STATE_ROOT
+
+
+def test_r61_j3_j6_legacy_terminal_open_is_neutral_and_requires_pr41_proof() -> None:
+    """J3--J6: recognized legacy terminals remain inspectable but gated."""
+    candidate, restore, journal_path, anchor_path = _r61_pre_r59_restore_failed()
+    before = (journal_path.read_bytes(), anchor_path.read_bytes())
+    inspector = access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+
+    assert inspector.journal_format is access.LifecycleJournalFormat.V1_PRE_R59
+    assert inspector.metadata.state is access.LifecycleState.RESTORE_FAILED
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="LIFECYCLE_TERMINAL_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_terminal()
+    result = inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+    assert (journal_path.read_bytes(), anchor_path.read_bytes()) == before
+    inspector.close()
+
+
+def test_r61_j7_to_j10_legacy_backup_and_terminal_retirement_keep_existing_gates() -> (
+    None
+):
+    """J7--J10: only exact owned backup can be retired before terminal closure."""
+    candidate, restore, journal_path, anchor_path = _r61_pre_r59_restore_failed()
+    inspector = access.RetainedTerminalLifecycleInspector(_r47_inspection_broker())
+    inspector.inspect_current_source(candidate.manifest, restore.manifest)
+
+    assert inspector.inspect_prior_backup(restore.manifest).classification is (
+        access.PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE
+    )
+    assert inspector.retire_owned_prior_backup(restore.manifest) == (
+        access.PriorBackupContinuityResult(access.PriorBackupClassification.NONE, True)
+    )
+    inspector.retire_terminal()
+
+    assert not journal_path.exists()
+    assert not anchor_path.exists()
+    inspector.close()
+
+
+def test_r61_j9_foreign_legacy_backup_remains_non_retirable() -> None:
+    """J9: legacy recognition does not relax backup ownership."""
+    candidate, restore, _journal_path, _anchor_path = _r61_pre_r59_restore_failed()
+    broker = _r47_inspection_broker()
+    inspector = access.RetainedTerminalLifecycleInspector(broker)
+    inspector.inspect_current_source(candidate.manifest, restore.manifest)
+    broker.queue(
+        "prior_backup",
+        access.PriorBackupContinuityResult(
+            access.PriorBackupClassification.OTHER_OR_INDETERMINATE
+        ),
+    )
+
+    assert inspector.inspect_prior_backup(restore.manifest).classification is (
+        access.PriorBackupClassification.OTHER_OR_INDETERMINATE
+    )
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="PRIOR_BACKUP_RETIREMENT_NOT_AUTHORIZED",
+    ):
+        inspector.retire_owned_prior_backup(restore.manifest)
+    inspector.close()
+
+
+def test_r61_j11_j12_new_lifecycle_writes_and_reconstructs_v2() -> None:
+    """J11/J12: new records use the current explicit format without downgrade."""
+    controller, _broker = _r33_controller()
+    _candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.close()
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+
+    assert json.loads(journal_path.read_text(encoding="ascii"))["schema_version"] == 2
+    reconstructed, _reconstructed_broker = _r33_controller()
+    assert (
+        reconstructed._journal.journal_format
+        is access.LifecycleJournalFormat.V2_CURRENT
+    )
+    assert reconstructed.state is access.LifecycleState.RECOVERY_REQUIRED
+    reconstructed.close()
+
+
+def test_r61_j13_j14_transitional_r59_remains_readable_and_strict() -> None:
+    """J13/J14: exact R59 shape remains readable; malformed results do not."""
+    controller, _broker = _r33_advance_to_candidate_core()
+    controller.restart_for_candidate()
+    controller.close()
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+    record["schema_version"] = 1
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+
+    journal = access._DurableLifecycleJournal()
+    assert journal.journal_format is access.LifecycleJournalFormat.V1_R59_TRANSITIONAL
+    journal.close()
+    record["restart_results"]["activation_restart"]["http_status"] = True
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+
+
+def test_r61_j15_active_pre_r59_restart_history_is_recognized_but_not_resumed() -> None:
+    """J15: absence never becomes an invented R59 restart outcome."""
+    controller, _broker = _r33_advance_to_candidate_core()
+    controller.restart_for_candidate()
+    controller.close()
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+    record["schema_version"] = 1
+    record.pop("restart_results")
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="LIFECYCLE_LEGACY_ACTIVE_UNSUPPORTED"
+    ):
+        access._DurableLifecycleJournal()
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate"),
+    (
+        ("J16", lambda record: record.__setitem__("unexpected", True)),
+        ("J17", lambda record: record.__setitem__("schema_version", 99)),
+        ("J18", lambda record: record.pop("restart_results")),
+    ),
+)
+def test_r61_j16_to_j18_unknown_or_incomplete_format_remains_invalid(
+    name: str, mutate: object
+) -> None:
+    """J16--J18: only the three explicitly recognized layouts are valid."""
+    controller, _broker = _r33_controller()
+    controller.close()
+    journal_path = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+    assert callable(mutate)
+    mutate(record)
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+    assert name.startswith("J")
+
+
+def test_r61_j19_j20_malformed_v2_restart_and_anchor_mismatch_are_blocking() -> None:
+    """J19/J20: current restart semantics and the anchor binding remain strict."""
+    controller, _broker = _r33_advance_to_candidate_core()
+    controller.restart_for_candidate()
+    controller.close()
+    root = access._LIFECYCLE_STATE_ROOT
+    journal_path = root / access._LIFECYCLE_JOURNAL_NAME
+    anchor_path = access._lifecycle_anchor_path(root)
+    record = json.loads(journal_path.read_text(encoding="ascii"))
+    record["restart_results"]["activation_restart"]["failure_reason"] = "invalid"
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+    with pytest.raises(access.LifecycleControllerError, match="JOURNAL_INVALID"):
+        access._DurableLifecycleJournal()
+
+    record["restart_results"]["activation_restart"]["failure_reason"] = None
+    journal_path.write_text(json.dumps(record, sort_keys=True), encoding="ascii")
+    anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+    anchor["original_lifecycle_generation"] = "0" * 32
+    anchor_path.write_text(json.dumps(anchor, sort_keys=True), encoding="ascii")
+    with pytest.raises(access.LifecycleControllerError, match="ANCHOR_INVALID"):
+        access._DurableLifecycleJournal()
 
 
 @pytest.mark.parametrize(

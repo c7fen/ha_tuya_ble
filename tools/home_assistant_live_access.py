@@ -48,7 +48,7 @@ _MAX_SOURCE_FILES = 512
 _TRANSFER_CHUNK_SIZE = 2048
 _FRAME_START = b"\x1e"
 _FRAME_END = b"\x1f"
-_LIFECYCLE_JOURNAL_SCHEMA = 1
+_LIFECYCLE_JOURNAL_SCHEMA = 2
 _MAX_LIFECYCLE_JOURNAL_BYTES = 128 * 1024
 _LIFECYCLE_STATE_ROOT: Path | None = None
 _LIFECYCLE_ANCHOR_NAME = "anchor.json"
@@ -1158,6 +1158,14 @@ class RestartResult:
         )
 
 
+class LifecycleJournalFormat(StrEnum):
+    """Exact persisted journal layouts retained by the Issue-37 lifecycle."""
+
+    V1_PRE_R59 = "V1_PRE_R59"
+    V1_R59_TRANSITIONAL = "V1_R59_TRANSITIONAL"
+    V2_CURRENT = "V2_CURRENT"
+
+
 @dataclass(frozen=True)
 class CoreReadinessResult:
     core_reachable: bool
@@ -1433,6 +1441,7 @@ class _DurableLifecycleJournal:
             "baseline_backup_identity",
         }
     )
+    _V1_PRE_R59_TOP_LEVEL_KEYS = _TOP_LEVEL_KEYS - {"restart_results"}
     _RISKY_ACTIONS = frozenset(
         {
             LifecycleAction.BACKUP.value,
@@ -1484,11 +1493,27 @@ class _DurableLifecycleJournal:
                 raise LifecycleControllerError("LIFECYCLE_ANCHOR_MISSING") from None
             else:
                 self._validate_anchor(anchor, record)
+                if (
+                    _retained_terminal_inspection
+                    and self._journal_format is LifecycleJournalFormat.V1_PRE_R59
+                    and anchor["root_revision"] != record["revision"]
+                ):
+                    raise LifecycleControllerError(
+                        "LIFECYCLE_JOURNAL_REVISION_INVALID"
+                    ) from None
                 self._reconcile_anchor_revision(anchor, record)
             self._anchor = anchor if anchor is not None else self._read_anchor()
             self._record = record
             if _retained_terminal_inspection and record["active"] is True:
                 raise LifecycleControllerError("LIFECYCLE_TERMINAL_REQUIRED") from None
+            if (
+                not _retained_terminal_inspection
+                and self._journal_format is LifecycleJournalFormat.V1_PRE_R59
+                and record["active"] is True
+            ):
+                raise LifecycleControllerError(
+                    "LIFECYCLE_LEGACY_ACTIVE_UNSUPPORTED"
+                ) from None
             if (
                 not _retained_terminal_inspection
                 and not newly_created
@@ -1729,7 +1754,7 @@ class _DurableLifecycleJournal:
         finally:
             os.close(descriptor)
         record = _strict_json_object(b"".join(chunks))
-        self._validate_record(record)
+        self._journal_format = self._validate_record(record)
         return record
 
     def _read_anchor(self) -> dict[str, object] | None:
@@ -1970,8 +1995,19 @@ class _DurableLifecycleJournal:
         }
 
     @classmethod
-    def _validate_record(cls, record: dict[str, object]) -> None:
-        invalid = set(record) != cls._TOP_LEVEL_KEYS
+    def _validate_record(cls, record: dict[str, object]) -> LifecycleJournalFormat:
+        if (
+            record.get("schema_version") == 1
+            and set(record) == cls._V1_PRE_R59_TOP_LEVEL_KEYS
+        ):
+            journal_format = LifecycleJournalFormat.V1_PRE_R59
+        elif record.get("schema_version") == 1 and set(record) == cls._TOP_LEVEL_KEYS:
+            journal_format = LifecycleJournalFormat.V1_R59_TRANSITIONAL
+        elif record.get("schema_version") == 2 and set(record) == cls._TOP_LEVEL_KEYS:
+            journal_format = LifecycleJournalFormat.V2_CURRENT
+        else:
+            raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        invalid = False
         token = re.compile(r"[0-9a-f]{32}\Z")
         states = {item.value for item in LifecycleState}
         actions = {item.value for item in LifecycleAction}
@@ -1982,7 +2018,6 @@ class _DurableLifecycleJournal:
             LifecycleState.RESTORE_FAILED.value,
             LifecycleState.MANUAL_RECOVERY_REQUIRED.value,
         }
-        invalid = invalid or record.get("schema_version") != _LIFECYCLE_JOURNAL_SCHEMA
         invalid = invalid or not _exact_non_bool_int(
             record.get("revision"), maximum=10_000_000
         )
@@ -2025,7 +2060,10 @@ class _DurableLifecycleJournal:
                 invalid = invalid or len(value) != len(set(value))
                 invalid = invalid or any(item not in actions for item in value)
         restart_results = record.get("restart_results")
-        invalid = invalid or type(restart_results) is not dict
+        if journal_format is LifecycleJournalFormat.V1_PRE_R59:
+            invalid = invalid or restart_results is not None
+        else:
+            invalid = invalid or type(restart_results) is not dict
         if type(restart_results) is dict:
             for action, value in restart_results.items():
                 invalid = invalid or action not in {
@@ -2288,7 +2326,7 @@ class _DurableLifecycleJournal:
                 in {"result_durable", "transition_committed", "reconciled"}
             ]
             invalid = invalid or evidence_actions != result_actions
-            if type(restart_results) is dict:
+            if journal_format is not LifecycleJournalFormat.V1_PRE_R59:
                 expected_restart_results = {
                     operation["action"]
                     for operation in operations
@@ -2384,6 +2422,7 @@ class _DurableLifecycleJournal:
                 invalid = invalid or position != len(_NORMAL_LIFECYCLE_HISTORY)
         if invalid:
             raise LifecycleControllerError("LIFECYCLE_JOURNAL_INVALID") from None
+        return journal_format
 
     def _write_record(self, record: dict[str, object]) -> None:
         current = getattr(self, "_record", None)
@@ -2391,7 +2430,7 @@ class _DurableLifecycleJournal:
             raise LifecycleControllerError(
                 "LIFECYCLE_JOURNAL_REVISION_INVALID"
             ) from None
-        self._validate_record(record)
+        self._journal_format = self._validate_record(record)
         payload = json.dumps(
             record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode("ascii")
@@ -2524,6 +2563,10 @@ class _DurableLifecycleJournal:
     def baseline_backup_identity(self) -> dict[str, object] | None:
         value = self._record["baseline_backup_identity"]
         return None if value is None else copy.deepcopy(value)
+
+    @property
+    def journal_format(self) -> LifecycleJournalFormat:
+        return self._journal_format
 
     @property
     def state(self) -> LifecycleState:
@@ -2929,6 +2972,8 @@ class _DurableLifecycleJournal:
             LifecycleAction.REMOVAL_RESTART,
         }:
             raise LifecycleControllerError("LIFECYCLE_RESTART_RESULT_INVALID") from None
+        if self._journal_format is LifecycleJournalFormat.V1_PRE_R59:
+            return None
         value = self._record["restart_results"].get(action.value)
         if value is None:
             return None
@@ -7325,6 +7370,11 @@ class RetainedTerminalLifecycleInspector:
             self._journal._record["revision"],
             self._journal.lifecycle_generation,
         )
+
+    @property
+    def journal_format(self) -> LifecycleJournalFormat:
+        """Return the recognized retained format without changing durable state."""
+        return self._journal.journal_format
 
     def _assert_session_binding(self) -> None:
         if (
