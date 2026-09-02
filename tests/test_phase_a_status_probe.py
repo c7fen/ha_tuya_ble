@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from bleak.backends.device import BLEDevice
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import SupportsResponse
+from homeassistant.core import HomeAssistant, SupportsResponse
 from voluptuous import Invalid
 
 from custom_components import tuya_ble as integration
@@ -347,6 +347,28 @@ async def test_preflight_is_response_only_and_performs_no_device_io():
     assert await _async_handle_phase_a_status_probe_preflight(
         hass, SimpleNamespace(data={})
     ) == {"result": "preflight_ok", "protocol_version": 1}
+
+
+async def test_registered_preflight_service_awaits_response_handler(
+    hass: HomeAssistant,
+) -> None:
+    """The real service registry awaits PREFLIGHT and returns its response."""
+    nonce = "d" * 16
+    async_register_phase_a_status_probe(hass)
+
+    result = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT,
+        {ATTR_NONCE: nonce},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert result == {
+        "result": "preflight_ok",
+        "protocol_version": 1,
+        "nonce": nonce,
+    }
 
 
 @pytest.mark.asyncio
