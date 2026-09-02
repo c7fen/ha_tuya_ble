@@ -1,17 +1,18 @@
-"""Sanitized local HTTP helper for the temporary Issue-37 research services.
+"""Standalone sanitized HTTP helper for the temporary Issue-37 research tool.
 
-This module is deliberately repository-owned so the BLE-free preflight and
-real probe use the same request, REST-wrapper extraction, response validation,
-and evidence-writing path. It contains no binding lookup, token, target, or
-device identifier storage.
+This module deliberately depends only on the Python standard library. It
+contains no integration import, binding lookup, token storage, target storage,
+or device identifier storage.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 import urllib.error
 import urllib.request
@@ -22,7 +23,10 @@ from pathlib import Path
 from typing import Any
 
 _NONCE_RE = re.compile(r"[0-9a-f]{16,32}\Z")
+_EVIDENCE_LABEL_RE = re.compile(r"[A-Z][A-Z0-9_-]{0,31}\Z")
 _MAX_EVENTS = 64
+SUPERVISOR_CORE_ENDPOINT = "http://supervisor/core"
+DEFAULT_EVIDENCE_ROOT = Path("/var/lib/phase-a-status-probe")
 
 
 class HelperOperation(str, Enum):
@@ -52,6 +56,7 @@ class HelperResult:
     outcome: str
     response: dict[str, Any] | None = None
     nonce: str | None = None
+    http_status: int | None = None
 
 
 def generate_nonce() -> str:
@@ -390,12 +395,43 @@ def service_response_from_wrapper(
 def write_sanitized_evidence(path: Path, response: dict[str, Any]) -> None:
     """Atomically write an already-sanitized response; raw wrappers are never stored."""
     encoded = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as pending:
-        pending.write(encoded)
-        pending.flush()
-        pending_name = Path(pending.name)
-    pending_name.replace(path)
-    os.chmod(path, 0o600)
+    pending_name: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as pending:
+            os.chmod(pending.name, 0o600)
+            pending.write(encoded)
+            pending.flush()
+            pending_name = Path(pending.name)
+        pending_name.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if pending_name is not None:
+            pending_name.unlink(missing_ok=True)
+
+
+def _private_evidence_root(root: Path) -> Path:
+    """Create or repair the one private evidence directory before a write."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise OSError("evidence_root")
+    if stat.S_IMODE(root.stat().st_mode) != 0o700:
+        os.chmod(root, 0o700)
+    if stat.S_IMODE(root.stat().st_mode) != 0o700:
+        raise OSError("evidence_root_mode")
+    return root
+
+
+def write_labeled_evidence(
+    root: Path,
+    operation: HelperOperation,
+    label: str,
+    response: dict[str, Any],
+) -> None:
+    """Write a response under a strict, non-sensitive evidence label."""
+    if not _EVIDENCE_LABEL_RE.fullmatch(label):
+        raise ValueError("evidence_label")
+    path = _private_evidence_root(root) / f"{operation.value}-{label}.json"
+    write_sanitized_evidence(path, response)
 
 
 def _path_for(operation: HelperOperation) -> str:
@@ -479,7 +515,25 @@ def invoke_service(
     try:
         with opener(request, timeout=timeout) as http_response:
             wrapper = json.load(http_response)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+    except urllib.error.HTTPError as error:
+        http_status = error.code
+        if (
+            not isinstance(http_status, int)
+            or isinstance(http_status, bool)
+            or not 400 <= http_status <= 599
+        ):
+            return HelperResult(
+                HelperExit.SCHEMA_PRIVACY_FAILURE,
+                "schema_invalid",
+                nonce=submitted_nonce,
+            )
+        return HelperResult(
+            HelperExit.SERVICE_REJECTED,
+            "http_rejected",
+            nonce=submitted_nonce,
+            http_status=http_status,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
         return HelperResult(
             HelperExit.AMBIGUOUS_POST_SUBMISSION,
             "transport_ambiguous",
@@ -508,3 +562,92 @@ def invoke_service(
     exit_code = _service_exit(operation, response)
     outcome = response.get("result", "receipt")
     return HelperResult(exit_code, outcome, response, submitted_nonce)
+
+
+class _SanitizedArgumentParser(argparse.ArgumentParser):
+    """Turn expected command-line mistakes into the helper outcome boundary."""
+
+    def error(self, message: str) -> None:
+        raise ValueError(message)
+
+
+def _result_json(result: HelperResult, *, evidence_written: bool = False) -> str:
+    """Render only the documented minimal, non-sensitive CLI projection."""
+    rendered: dict[str, str | bool | int] = {"outcome": result.outcome}
+    if result.nonce is not None:
+        rendered["nonce"] = result.nonce
+    if result.http_status is not None:
+        rendered["http_status"] = result.http_status
+    if evidence_written:
+        rendered["evidence_written"] = True
+    return json.dumps(rendered, separators=(",", ":"))
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+    endpoint: str = SUPERVISOR_CORE_ENDPOINT,
+    evidence_root: Path = DEFAULT_EVIDENCE_ROOT,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> int:
+    """Run the production CLI without exposing endpoint or evidence paths."""
+    result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
+    evidence_written = False
+    parser = _SanitizedArgumentParser(add_help=False)
+    parser.add_argument("operation", choices=[item.value for item in HelperOperation])
+    parser.add_argument("--nonce")
+    parser.add_argument(
+        "--mode", choices=("cold", "cold_then_retained"), default="cold"
+    )
+    parser.add_argument("--evidence-label")
+    try:
+        args = parser.parse_args(argv)
+        operation = HelperOperation(args.operation)
+        if args.evidence_label is not None and not _EVIDENCE_LABEL_RE.fullmatch(
+            args.evidence_label
+        ):
+            raise ValueError("evidence_label")
+        payload: dict[str, str] = {}
+        if args.nonce is not None:
+            payload[
+                (
+                    "nonce"
+                    if operation is not HelperOperation.PROBE
+                    else "invocation_nonce"
+                )
+            ] = args.nonce
+        environment = os.environ if environ is None else environ
+        if operation is HelperOperation.PROBE:
+            config_entry_id = environment.get("PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID")
+            if config_entry_id:
+                payload["config_entry_id"] = config_entry_id
+            payload["mode"] = args.mode
+        token = environment.get("SUPERVISOR_TOKEN")
+        if not token:
+            result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
+        else:
+            result = invoke_service(
+                operation,
+                endpoint,
+                payload,
+                {"Authorization": f"Bearer {token}"},
+                opener=opener,
+            )
+        if result.response is not None and args.evidence_label is not None:
+            write_labeled_evidence(
+                evidence_root, operation, args.evidence_label, result.response
+            )
+            evidence_written = True
+    except (TypeError, ValueError):
+        result = HelperResult(HelperExit.DEFINITELY_NOT_SUBMITTED, "not_submitted")
+        evidence_written = False
+    except OSError:
+        result = HelperResult(
+            HelperExit.SCHEMA_PRIVACY_FAILURE,
+            "evidence_write_failed",
+            nonce=result.nonce,
+        )
+        evidence_written = False
+    print(_result_json(result, evidence_written=evidence_written))
+    return int(result.exit_code)

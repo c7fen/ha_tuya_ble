@@ -618,6 +618,9 @@ def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
     async def handler(call: ServiceCall) -> dict[str, Any]:
         return await _async_handle_phase_a_status_probe(hass, call)
 
+    async def preflight_handler(call: ServiceCall) -> dict[str, Any]:
+        return await _async_handle_phase_a_status_probe_preflight(hass, call)
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_PHASE_A_STATUS_PROBE,
@@ -628,7 +631,7 @@ def async_register_phase_a_status_probe(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN,
         SERVICE_PHASE_A_STATUS_PROBE_PREFLIGHT,
-        lambda call: _async_handle_phase_a_status_probe_preflight(hass, call),
+        preflight_handler,
         schema=PREFLIGHT_SERVICE_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )

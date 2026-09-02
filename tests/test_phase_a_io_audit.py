@@ -569,7 +569,7 @@ def test_startup_activity_has_an_audit_epoch_before_later_service_registration()
 def test_helper_accepts_only_the_audit_schema_and_never_persists_wrapper_fields() -> (
     None
 ):
-    from custom_components.tuya_ble.phase_a_probe_helper import (
+    from scripts.phase_a_status_probe_lib import (
         HelperOperation,
         sanitize_service_response,
     )
