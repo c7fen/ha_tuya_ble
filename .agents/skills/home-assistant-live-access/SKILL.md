@@ -181,6 +181,17 @@ write token. Supported controller calls, direct broker calls without a minted
 capability, and private dispatch calls from a wrong state all enforce the
 bounded contract before PTY output.
 
+The normal lifecycle progression continues to use
+`FullPreflightLifecycleController`, and `PROBE` remains outside
+`LifecycleAction` and its successor/predecessor graph. Only after the same
+controller has durably reached `A2_COLLECTED` may it issue one dedicated
+`RemotePhaseAInventorySession`. That session exposes only the fixed Phase-A
+inventory sequence and owns its target selection, modes, nonces, receipt
+reconciliation, audits, and request budgets internally. It is not a generic
+helper or command interface. Do not invoke the broker or its private research
+adapter directly. Close the research session after its one run, then continue
+the unchanged PR #41 restoration path through the normal lifecycle controller.
+
 The exact success sequence is:
 
 ```text

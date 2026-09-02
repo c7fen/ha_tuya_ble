@@ -291,6 +291,12 @@ class PhaseAOperation(StrEnum):
     RECEIPT = "receipt"
 
 
+class ResearchOperation(StrEnum):
+    """The sole operation available to the dedicated Phase-A research session."""
+
+    RUN_FIXED_INVENTORY = "run_fixed_inventory"
+
+
 class PreflightFailureReason(StrEnum):
     """Fixed reportable reasons for one typed non-success PREFLIGHT result."""
 
@@ -634,7 +640,10 @@ _CANDIDATE_RESTARTED_STAGES = frozenset(
 )
 
 _RECONSTRUCTABLE_CANDIDATE_RESTART_STAGES = frozenset(
-    {LifecycleState.ACTIVATION_RESTART_CONSUMED}
+    {
+        LifecycleState.ACTIVATION_RESTART_CONSUMED,
+        LifecycleState.A2_COLLECTED,
+    }
 )
 
 _RECONSTRUCTABLE_RESTORE_STAGES = frozenset(
@@ -960,6 +969,32 @@ class _RetainedBackupCapability:
     action: RetainedBackupAction
     backup_identity: object = field(repr=False)
     restore_marker_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RemotePhaseAInventoryPermit:
+    """One controller-issued opening permit outside LifecycleAction."""
+
+    controller: object = field(repr=False)
+    issuer: object = field(repr=False)
+    lifecycle_generation: object = field(repr=False)
+    source_generation: object = field(repr=False)
+    session_generation: object = field(repr=False)
+    issuance_identity: object = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _RemotePhaseAResearchCapability:
+    """One session-bound capability for the fixed remote inventory run."""
+
+    controller: object = field(repr=False)
+    research_session: object = field(repr=False)
+    issuer: object = field(repr=False)
+    lifecycle_generation: object = field(repr=False)
+    source_generation: object = field(repr=False)
+    session_generation: object = field(repr=False)
+    operation: ResearchOperation
+    issuance_identity: object = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,6 +1352,64 @@ class PhaseAResult:
     receipt: ReceiptResponse | None = None
     audit: AuditSnapshot | None = None
     http_status: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePhaseASlotSummary:
+    """One public, identifier-free logical research-slot summary."""
+
+    label: str
+    mode: str
+    request_count: int
+    cold_result: str | None
+    retained_result: str | None
+    same_session_retained: bool
+    normal_release_observed: bool
+    automatic_reconnect_observed: bool
+    observation_overflow: bool
+    receipt_used: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePhaseADPInventory:
+    """Value-free aggregate metadata for one datapoint identifier."""
+
+    dp_id: int
+    cold_reported_count: int
+    cold_eligible_count: int
+    retained_reported_count: int
+    retained_eligible_count: int
+    type_set: tuple[str, ...]
+    encoded_length_set: tuple[int, ...]
+    classification: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePhaseAInventoryResult:
+    """The complete sanitized result of the single fixed remote research run."""
+
+    outcome: str
+    eligible_s1_count: int
+    selected: bool
+    same_private_target: bool
+    completed_probe_slots: int
+    cold_request_count: int
+    retained_request_count: int
+    total_device_status_requests: int
+    cold_ack_success_count: int
+    retained_ack_success_count: int
+    failure_count: int
+    timeout_count: int
+    receipt_lookup_count: int
+    ambiguity_count: int
+    normal_release_count: int
+    same_session_retained_count: int
+    automatic_reconnect_count: int
+    observation_overflow_count: int
+    protocol_datapoint_write_delta: int
+    protocol_datapoint_packet_delta: int
+    slots: tuple[RemotePhaseASlotSummary, ...]
+    dp_inventory: tuple[RemotePhaseADPInventory, ...]
 
 
 @dataclass
@@ -4100,6 +4193,305 @@ def compare_audit_snapshots(
     )
 
 
+def _parse_remote_phase_a_inventory_result(
+    private_output: bytes,
+) -> RemotePhaseAInventoryResult:
+    """Parse only the fixed identifier-free research aggregate."""
+    payload = _exact_payload(private_output)
+    scalar_keys = {
+        "outcome",
+        "eligible_s1_count",
+        "selected",
+        "same_private_target",
+        "completed_probe_slots",
+        "cold_request_count",
+        "retained_request_count",
+        "total_device_status_requests",
+        "cold_ack_success_count",
+        "retained_ack_success_count",
+        "failure_count",
+        "timeout_count",
+        "receipt_lookup_count",
+        "ambiguity_count",
+        "normal_release_count",
+        "same_session_retained_count",
+        "automatic_reconnect_count",
+        "observation_overflow_count",
+        "protocol_datapoint_write_delta",
+        "protocol_datapoint_packet_delta",
+        "slots",
+        "dp_inventory",
+    }
+    if not isinstance(payload, dict) or set(payload) != scalar_keys:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    outcomes = {
+        "complete",
+        "sample_incomplete",
+        "probe_ambiguous",
+        "protocol_write_gate_failed",
+        "target_resolution_unsupported",
+    }
+    if payload["outcome"] not in outcomes:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    bool_keys = {"selected", "same_private_target"}
+    count_keys = scalar_keys - bool_keys - {"outcome", "slots", "dp_inventory"}
+    try:
+        counts = {key: _count(payload[key]) for key in count_keys}
+        booleans = {key: _bool(payload[key]) for key in bool_keys}
+    except (TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if (
+        counts["completed_probe_slots"] > 10
+        or counts["cold_request_count"] > 10
+        or counts["retained_request_count"] > 5
+        or counts["total_device_status_requests"] > 15
+        or counts["total_device_status_requests"]
+        != counts["cold_request_count"] + counts["retained_request_count"]
+        or counts["receipt_lookup_count"] > 30
+        or not isinstance(payload["slots"], list)
+        or len(payload["slots"]) > 10
+        or not isinstance(payload["dp_inventory"], list)
+        or len(payload["dp_inventory"]) > 256
+        or counts["cold_ack_success_count"] > counts["cold_request_count"]
+        or counts["retained_ack_success_count"] > counts["retained_request_count"]
+        or counts["receipt_lookup_count"] > counts["ambiguity_count"] * 3
+        or counts["normal_release_count"] > len(payload["slots"])
+        or counts["same_session_retained_count"] > counts["retained_request_count"]
+        or counts["automatic_reconnect_count"] > len(payload["slots"])
+        or counts["observation_overflow_count"] > len(payload["slots"])
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    slot_keys = {
+        "label",
+        "mode",
+        "request_count",
+        "cold_result",
+        "retained_result",
+        "same_session_retained",
+        "normal_release_observed",
+        "automatic_reconnect_observed",
+        "observation_overflow",
+        "receipt_used",
+    }
+    slots: list[RemotePhaseASlotSummary] = []
+    request_results = {
+        "ack_success",
+        "update_failed",
+        "ack_failed",
+        "ack_missing",
+        "session_not_retained",
+    }
+    for index, value in enumerate(payload["slots"], 1):
+        expected_label = f"R{index:02d}"
+        expected_mode = "cold_then_retained" if index <= 5 else "cold"
+        if (
+            not isinstance(value, dict)
+            or set(value) != slot_keys
+            or value["label"] != expected_label
+            or value["mode"] != expected_mode
+            or value["cold_result"] is not None
+            and value["cold_result"] not in request_results
+            or value["retained_result"] is not None
+            and value["retained_result"] not in request_results
+        ):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        try:
+            slots.append(
+                RemotePhaseASlotSummary(
+                    value["label"],
+                    value["mode"],
+                    _count(value["request_count"]),
+                    value["cold_result"],
+                    value["retained_result"],
+                    *(
+                        _bool(value[key])
+                        for key in (
+                            "same_session_retained",
+                            "normal_release_observed",
+                            "automatic_reconnect_observed",
+                            "observation_overflow",
+                            "receipt_used",
+                        )
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        if slots[-1].request_count > (2 if index <= 5 else 1):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        if (
+            (slots[-1].request_count >= 1) != (slots[-1].cold_result is not None)
+            or (slots[-1].request_count >= 2) != (slots[-1].retained_result is not None)
+            or index > 5
+            and slots[-1].same_session_retained
+        ):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    dp_keys = {
+        "dp_id",
+        "cold_reported_count",
+        "cold_eligible_count",
+        "retained_reported_count",
+        "retained_eligible_count",
+        "type_set",
+        "encoded_length_set",
+        "classification",
+    }
+    dp_rows: list[RemotePhaseADPInventory] = []
+    seen_ids: set[int] = set()
+    classifications = {
+        "ALWAYS_REPORTED",
+        "CONDITIONALLY_REPORTED",
+        "NOT_REPORTED",
+        "AMBIGUOUS",
+    }
+    for value in payload["dp_inventory"]:
+        if not isinstance(value, dict) or set(value) != dp_keys:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        try:
+            dp_id = _count(value["dp_id"])
+            cold_reported = _count(value["cold_reported_count"])
+            cold_eligible = _count(value["cold_eligible_count"])
+            retained_reported = _count(value["retained_reported_count"])
+            retained_eligible = _count(value["retained_eligible_count"])
+        except (TypeError, ValueError):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        if (
+            dp_id in seen_ids
+            or dp_id > 255
+            or cold_reported > cold_eligible
+            or cold_eligible > 10
+            or retained_reported > retained_eligible
+            or retained_eligible > 5
+            or value["classification"] not in classifications
+            or not isinstance(value["type_set"], list)
+            or not all(
+                item
+                in {
+                    "DT_RAW",
+                    "DT_BOOL",
+                    "DT_VALUE",
+                    "DT_STRING",
+                    "DT_ENUM",
+                    "DT_BITMAP",
+                }
+                for item in value["type_set"]
+            )
+            or len(set(value["type_set"])) != len(value["type_set"])
+            or not isinstance(value["encoded_length_set"], list)
+            or any(
+                type(item) is not int or item < 0
+                for item in value["encoded_length_set"]
+            )
+            or len(set(value["encoded_length_set"])) != len(value["encoded_length_set"])
+        ):
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+        seen_ids.add(dp_id)
+        dp_rows.append(
+            RemotePhaseADPInventory(
+                dp_id,
+                cold_reported,
+                cold_eligible,
+                retained_reported,
+                retained_eligible,
+                tuple(value["type_set"]),
+                tuple(value["encoded_length_set"]),
+                value["classification"],
+            )
+        )
+    if tuple(row.dp_id for row in dp_rows) != tuple(sorted(seen_ids)):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    minimum_dp_ids = {8, 21, 33, 34, 36, 40, 47}
+    complete = payload["outcome"] == "complete"
+    if (
+        booleans["selected"]
+        and not minimum_dp_ids.issubset(seen_ids)
+        or sum(slot.request_count for slot in slots)
+        > counts["total_device_status_requests"]
+        or complete
+        and (
+            not booleans["selected"]
+            or not booleans["same_private_target"]
+            or counts["eligible_s1_count"] < 1
+            or len(slots) != 10
+            or counts["completed_probe_slots"] != 10
+            or counts["cold_request_count"] != 10
+            or counts["retained_request_count"] != 5
+            or counts["total_device_status_requests"] != 15
+            or counts["ambiguity_count"] != 0
+            or counts["protocol_datapoint_write_delta"] != 0
+            or counts["protocol_datapoint_packet_delta"] != 0
+            or any(
+                slot.request_count != (2 if index <= 5 else 1)
+                for index, slot in enumerate(slots, 1)
+            )
+            or any(row.cold_eligible_count != 10 for row in dp_rows)
+            or any(row.retained_eligible_count != 5 for row in dp_rows)
+        )
+        or payload["outcome"] == "target_resolution_unsupported"
+        and (
+            booleans["selected"]
+            or booleans["same_private_target"]
+            or counts["eligible_s1_count"] != 0
+            or slots
+            or dp_rows
+            or any(counts.values())
+        )
+        or payload["outcome"] == "protocol_write_gate_failed"
+        and counts["protocol_datapoint_write_delta"] == 0
+        and counts["protocol_datapoint_packet_delta"] == 0
+        or payload["outcome"] == "probe_ambiguous"
+        and counts["ambiguity_count"] == 0
+        or payload["outcome"] != "target_resolution_unsupported"
+        and (
+            not booleans["selected"]
+            or not booleans["same_private_target"]
+            or counts["eligible_s1_count"] < 1
+        )
+        or any(
+            (
+                row.classification
+                != (
+                    "ALWAYS_REPORTED"
+                    if row.cold_reported_count + row.retained_reported_count == 15
+                    else (
+                        "NOT_REPORTED"
+                        if row.cold_reported_count + row.retained_reported_count == 0
+                        else "CONDITIONALLY_REPORTED"
+                    )
+                )
+                if complete
+                else row.classification != "AMBIGUOUS"
+            )
+            for row in dp_rows
+        )
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return RemotePhaseAInventoryResult(
+        payload["outcome"],
+        counts["eligible_s1_count"],
+        booleans["selected"],
+        booleans["same_private_target"],
+        counts["completed_probe_slots"],
+        counts["cold_request_count"],
+        counts["retained_request_count"],
+        counts["total_device_status_requests"],
+        counts["cold_ack_success_count"],
+        counts["retained_ack_success_count"],
+        counts["failure_count"],
+        counts["timeout_count"],
+        counts["receipt_lookup_count"],
+        counts["ambiguity_count"],
+        counts["normal_release_count"],
+        counts["same_session_retained_count"],
+        counts["automatic_reconnect_count"],
+        counts["observation_overflow_count"],
+        counts["protocol_datapoint_write_delta"],
+        counts["protocol_datapoint_packet_delta"],
+        tuple(slots),
+        tuple(dp_rows),
+    )
+
+
 @dataclass(frozen=True)
 class DecodedRepairs:
     """Internal strict decode result; invalid shapes never substitute an empty list."""
@@ -4376,6 +4768,7 @@ def operation_scope(operation):
         'core_readiness': 'CORE',
         'service_inventory': 'CORE',
         'phase_a_helper': 'PHASE_A',
+        'remote_phase_a_inventory': 'PHASE_A',
         'restore': 'RESTORE',
         'restore_backup': 'RESTORE',
         'reconcile_backup': 'RESTORE',
@@ -6226,6 +6619,555 @@ def invoke_helper(value):
             result['preflight'] = response
     return result
 
+def research_evidence_path(operation, label):
+    if operation not in {'probe', 'receipt', 'audit'}:
+        raise ValueError('research_operation')
+    if not isinstance(label, str) or not re.fullmatch(r'R63S_[A-Z0-9_]{1,24}', label):
+        raise ValueError('research_label')
+    return EVIDENCE / (operation + '-' + label + '.json')
+
+def read_research_evidence(operation, label):
+    path = research_evidence_path(operation, label)
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > 512 * 1024
+        ):
+            raise ValueError('research_evidence')
+        return decode_json(path.read_bytes())
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+def invoke_research_helper(operation, label, nonce, mode=None, target=None):
+    if operation not in {'probe', 'receipt', 'audit'}:
+        raise ValueError('research_operation')
+    if not isinstance(nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', nonce):
+        raise ValueError('research_nonce')
+    path = research_evidence_path(operation, label)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    command = [
+        sys.executable,
+        '-S',
+        str(HELPER / 'phase_a_status_probe_helper.py'),
+        operation,
+        '--nonce',
+        nonce,
+        '--evidence-label',
+        label,
+    ]
+    environment = os.environ.copy()
+    if operation == 'probe':
+        if mode not in {'cold', 'cold_then_retained'} or not isinstance(target, str):
+            raise ValueError('research_probe')
+        command += ['--mode', mode]
+        environment['PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID'] = target
+    elif mode is not None or target is not None:
+        raise ValueError('research_helper_arguments')
+    runner = __import__('sub' + 'process')
+    try:
+        completed = runner.run(
+            command,
+            capture_output=True,
+            check=False,
+            timeout=190,
+            env=environment,
+        )
+    except runner.TimeoutExpired:
+        return 78, 'transport_ambiguous', None, None
+    if completed.stderr or completed.returncode not in {0, 65, 66, 67, 78}:
+        raise ValueError('research_helper_exit')
+    output = decode_json(completed.stdout)
+    if not isinstance(output, dict) or not isinstance(output.get('outcome'), str):
+        raise ValueError('research_helper_output')
+    evidence = None
+    http_status = None
+    if completed.returncode in {0, 66} and output.get('evidence_written') is True:
+        if set(output) != {'outcome', 'nonce', 'evidence_written'}:
+            raise ValueError('research_helper_output')
+        evidence = read_research_evidence(operation, label)
+    elif completed.returncode == 66 and output.get('outcome') == 'http_rejected':
+        if (
+            set(output) != {'outcome', 'nonce', 'http_status'}
+            or type(output.get('http_status')) is not int
+            or not 400 <= output['http_status'] <= 599
+        ):
+            raise ValueError('research_helper_output')
+        http_status = output['http_status']
+    elif completed.returncode in {67, 78}:
+        if set(output) != {'outcome', 'nonce'}:
+            raise ValueError('research_helper_output')
+    elif completed.returncode == 65:
+        if output != {'outcome': 'not_submitted'}:
+            raise ValueError('research_helper_output')
+    else:
+        raise ValueError('research_helper_output')
+    if completed.returncode != 65 and output.get('nonce') != nonce:
+        raise ValueError('research_helper_nonce')
+    return completed.returncode, output['outcome'], evidence, http_status
+
+def loaded_tuya_entries():
+    status, entries = request_json(
+        'http://supervisor/core/api/config/config_entries/entry?domain=tuya_ble'
+    )
+    if not 200 <= status < 300 or not isinstance(entries, list) or len(entries) > 128:
+        raise ValueError('research_target')
+    result = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError('research_target')
+        entry_id = entry.get('entry_id')
+        if (
+            entry.get('domain') != 'tuya_ble'
+            or not isinstance(entry_id, str)
+            or not re.fullmatch(r'[0-9a-f]{32}', entry_id)
+            or entry_id in seen
+        ):
+            raise ValueError('research_target')
+        seen.add(entry_id)
+        if entry.get('state') != 'loaded':
+            continue
+        result.append(entry_id)
+    return tuple(sorted(result))
+
+def resolve_research_target():
+    loaded = loaded_tuya_entries()
+    eligible = []
+    for entry_id in loaded:
+        status, diagnostics = request_json(
+            'http://supervisor/core/api/diagnostics/config_entry/' + entry_id
+        )
+        if not 200 <= status < 300 or not isinstance(diagnostics, dict):
+            raise ValueError('research_target')
+        data = diagnostics.get('data')
+        if not isinstance(data, dict):
+            raise ValueError('research_target')
+        entry = data.get('entry')
+        options = data.get('options')
+        if not isinstance(entry, dict) or not isinstance(options, dict):
+            raise ValueError('research_target')
+        if entry.get('entry_id') != entry_id:
+            raise ValueError('research_target')
+        if options.get('category') == 'jtmspro' and options.get('product_id') == 'xqeob8h6':
+            eligible.append(entry_id)
+    eligible = tuple(sorted(eligible))
+    if not eligible:
+        return 0, None
+    selected = eligible[0]
+    if selected not in loaded_tuya_entries():
+        raise ValueError('research_target')
+    return len(eligible), selected
+
+def validate_research_audit(value, expected_nonce=None):
+    required = {
+        'result', 'protocol_version', 'audit_instance_token', 'event_ordinal',
+        'history_overflow', 'runtime_ms', 'counters', 'events',
+    }
+    if expected_nonce is not None:
+        required.add('nonce')
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError('research_audit')
+    if (
+        value['result'] != 'audit_snapshot'
+        or value['protocol_version'] != 1
+        or not isinstance(value['audit_instance_token'], str)
+        or not re.fullmatch(r'[0-9a-f]{16,32}', value['audit_instance_token'])
+        or type(value['event_ordinal']) is not int
+        or value['event_ordinal'] < 0
+        or type(value['history_overflow']) is not bool
+        or value['history_overflow']
+        or type(value['runtime_ms']) is not int
+        or value['runtime_ms'] < 0
+        or not isinstance(value['counters'], dict)
+        or set(value['counters']) != COUNTERS
+        or any(type(item) is not int or item < 0 for item in value['counters'].values())
+        or not isinstance(value['events'], list)
+        or len(value['events']) > 128
+        or expected_nonce is not None and value.get('nonce') != expected_nonce
+    ):
+        raise ValueError('research_audit')
+    return value
+
+def validate_research_probe(value, mode, nonce):
+    keys = {
+        'mode', 'result', 'cold_request_attempted', 'retained_request_attempted',
+        'request_count', 'same_session_retained', 'normal_release_observed',
+        'automatic_reconnect_observed', 'observation_overflow', 'duration_ms',
+        'requests', 'events', 'invocation_nonce',
+    }
+    results = {
+        'completed', 'invalid_or_incomplete', 'invalid_input',
+        'precondition_failed', 'probe_already_active', 'duplicate_nonce',
+        'nonce_capacity_reached', 'observation_overflow',
+        'known_service_error', 'service_error',
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value['mode'] != mode
+        or value['result'] not in results
+        or value['invocation_nonce'] != nonce
+        or type(value['request_count']) is not int
+        or not 0 <= value['request_count'] <= (2 if mode == 'cold_then_retained' else 1)
+        or type(value['duration_ms']) is not int
+        or value['duration_ms'] < 0
+        or any(
+            type(value[key]) is not bool
+            for key in (
+                'cold_request_attempted', 'retained_request_attempted',
+                'same_session_retained', 'normal_release_observed',
+                'automatic_reconnect_observed', 'observation_overflow',
+            )
+        )
+        or not isinstance(value['requests'], list)
+        or len(value['requests']) != value['request_count']
+        or not isinstance(value['events'], list)
+        or len(value['events']) > 64
+    ):
+        raise ValueError('research_probe')
+    request_results = {'ack_success', 'update_failed', 'ack_failed', 'ack_missing', 'session_not_retained'}
+    expected_trials = list(range(1, len(value['requests']) + 1))
+    for ordinal, request in enumerate(value['requests'], 1):
+        if (
+            not isinstance(request, dict)
+            or set(request) != {'trial', 'result', 'duration_ms'}
+            or request.get('trial') != ordinal
+            or request.get('result') not in request_results
+            or type(request.get('duration_ms')) is not int
+            or request['duration_ms'] < 0
+        ):
+            raise ValueError('research_probe')
+    del expected_trials
+    event_keys = {
+        'trial', 'observation_ordinal', 'origin', 'kind', 'event_ordinal',
+        'batch_ordinal', 'dp_ids', 'dp_types', 'encoded_value_lengths',
+        'exact_session', 'ack_result', 'ack_phase', 'monotonic_ms',
+    }
+    event_kinds = {
+        'REQUEST_CREATED', 'REQUEST_HANDED_TO_TRANSPORT', 'ACK_SUCCESS',
+        'ACK_FAILURE', 'ACK_TIMEOUT', 'DP_BATCH', 'OBSERVATION_SUPERSEDED',
+        'OBSERVATION_ENDED', 'SESSION_INVALIDATED',
+    }
+    dp_types = {'DT_RAW', 'DT_BOOL', 'DT_VALUE', 'DT_STRING', 'DT_ENUM', 'DT_BITMAP'}
+    for event in value['events']:
+        if (
+            not isinstance(event, dict)
+            or set(event) != event_keys
+            or event.get('origin') not in {'explicit', 'automatic'}
+            or event.get('kind') not in event_kinds
+            or type(event.get('trial')) is not int
+            or event['trial'] not in {1, 2}
+            or type(event.get('observation_ordinal')) is not int
+            or event['observation_ordinal'] < 0
+            or type(event.get('event_ordinal')) is not int
+            or event['event_ordinal'] < 0
+            or event.get('batch_ordinal') is not None
+            and (
+                type(event['batch_ordinal']) is not int
+                or event['batch_ordinal'] < 0
+            )
+            or type(event.get('monotonic_ms')) is not int
+            or event['monotonic_ms'] < 0
+            or type(event.get('exact_session')) is not bool
+            or event.get('ack_result') not in {None, 'success', 'failure', 'timeout'}
+            or event.get('ack_phase') not in {None, 'before_ack', 'after_ack'}
+            or not isinstance(event.get('dp_ids'), list)
+            or not isinstance(event.get('dp_types'), list)
+            or not isinstance(event.get('encoded_value_lengths'), list)
+            or not len(event['dp_ids']) == len(event['dp_types']) == len(event['encoded_value_lengths'])
+            or any(type(item) is not int or item < 0 or item > 255 for item in event['dp_ids'])
+            or any(item not in dp_types for item in event['dp_types'])
+            or any(type(item) is not int or item < 0 for item in event['encoded_value_lengths'])
+        ):
+            raise ValueError('research_probe')
+    if mode == 'cold' and (
+        value['retained_request_attempted'] or value['same_session_retained']
+        or len(value['requests']) > 1
+    ):
+        raise ValueError('research_probe')
+    if value['result'] == 'completed':
+        expected = 2 if mode == 'cold_then_retained' else 1
+        if (
+            value['request_count'] != expected
+            or any(item['result'] != 'ack_success' for item in value['requests'])
+            or not value['normal_release_observed']
+            or value['automatic_reconnect_observed']
+            or value['observation_overflow']
+            or mode == 'cold_then_retained' and not value['same_session_retained']
+        ):
+            raise ValueError('research_probe')
+    return value
+
+def validate_research_receipt(value, nonce):
+    keys = {
+        'nonce', 'known', 'service_entered', 'request_handed_to_transport',
+        'terminal_class', 'response_available',
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get('nonce') != nonce
+        or any(type(value.get(key)) is not bool for key in (
+            'known', 'service_entered', 'request_handed_to_transport',
+            'response_available',
+        ))
+        or value.get('terminal_class') is not None
+        and not isinstance(value.get('terminal_class'), str)
+    ):
+        raise ValueError('research_receipt')
+    return value
+
+def research_audit_after_slot(index, previous):
+    nonce = os.urandom(16).hex()
+    label = 'R63S_A' + str(index).zfill(2)
+    code, outcome, evidence, _status = invoke_research_helper('audit', label, nonce)
+    if code != 0 or outcome != 'audit_snapshot' or evidence is None:
+        raise ValueError('research_audit')
+    current = validate_research_audit(evidence, nonce)
+    if (
+        current['audit_instance_token'] != previous['audit_instance_token']
+        or current['event_ordinal'] < previous['event_ordinal']
+        or any(current['counters'][key] < previous['counters'][key] for key in COUNTERS)
+    ):
+        raise ValueError('research_audit')
+    delta = {
+        key: current['counters'][key] - previous['counters'][key]
+        for key in COUNTERS
+    }
+    return current, delta
+
+def remote_phase_a_inventory(value):
+    if not isinstance(value, dict) or set(value) != {'baseline'}:
+        raise ValueError('research_payload')
+    baseline = validate_research_audit(value['baseline'])
+    eligible_count, selected = resolve_research_target()
+    if selected is None:
+        return {
+            'outcome': 'target_resolution_unsupported', 'eligible_s1_count': 0,
+            'selected': False, 'same_private_target': False,
+            'completed_probe_slots': 0, 'cold_request_count': 0,
+            'retained_request_count': 0, 'total_device_status_requests': 0,
+            'cold_ack_success_count': 0, 'retained_ack_success_count': 0,
+            'failure_count': 0, 'timeout_count': 0, 'receipt_lookup_count': 0,
+            'ambiguity_count': 0, 'normal_release_count': 0,
+            'same_session_retained_count': 0, 'automatic_reconnect_count': 0,
+            'observation_overflow_count': 0,
+            'protocol_datapoint_write_delta': 0,
+            'protocol_datapoint_packet_delta': 0, 'slots': [],
+            'dp_inventory': [],
+        }
+    plan = (
+        ('R01', 'cold_then_retained'), ('R02', 'cold_then_retained'),
+        ('R03', 'cold_then_retained'), ('R04', 'cold_then_retained'),
+        ('R05', 'cold_then_retained'), ('R06', 'cold'), ('R07', 'cold'),
+        ('R08', 'cold'), ('R09', 'cold'), ('R10', 'cold'),
+    )
+    used_nonces = set()
+    previous = baseline
+    slots = []
+    cold_samples = []
+    retained_samples = []
+    dp_types_seen = {}
+    dp_lengths_seen = {}
+    counters = {
+        'completed': 0, 'cold': 0, 'retained': 0, 'cold_ack': 0,
+        'retained_ack': 0, 'failure': 0, 'timeout': 0, 'receipt': 0,
+        'ambiguity': 0, 'release': 0, 'same_session': 0, 'reconnect': 0,
+        'overflow': 0, 'writes': 0, 'packets': 0,
+    }
+    outcome = 'complete'
+    helper_target_checks = 0
+    private_target = selected
+    for index, (slot, mode) in enumerate(plan, 1):
+        if counters['cold'] >= 10 or counters['retained'] >= 5 and mode == 'cold_then_retained':
+            raise ValueError('research_budget')
+        nonce = os.urandom(16).hex()
+        if nonce in used_nonces:
+            raise ValueError('research_nonce')
+        used_nonces.add(nonce)
+        code, helper_outcome, evidence, _status = invoke_research_helper(
+            'probe', 'R63S_' + slot, nonce, mode, private_target
+        )
+        helper_target_checks += 1
+        receipt_used = False
+        receipt_handed = False
+        probe = None
+        stop_after = False
+        if evidence is not None:
+            probe = validate_research_probe(evidence, mode, nonce)
+        elif code == 78 and helper_outcome == 'transport_ambiguous':
+            receipt_used = True
+            counters['ambiguity'] += 1
+            outcome = 'probe_ambiguous'
+            for receipt_index in range(1, 4):
+                receipt_nonce = nonce
+                receipt_code, _receipt_outcome, receipt_evidence, _receipt_status = invoke_research_helper(
+                    'receipt', 'R63S_Q' + str(index).zfill(2) + '_' + str(receipt_index), receipt_nonce
+                )
+                counters['receipt'] += 1
+                if receipt_evidence is not None:
+                    receipt = validate_research_receipt(receipt_evidence, nonce)
+                    receipt_handed = (
+                        receipt_handed or receipt['request_handed_to_transport']
+                    )
+                    if receipt['known'] and (
+                        receipt['response_available']
+                        or receipt['terminal_class'] not in {None, 'entered'}
+                    ):
+                        break
+                elif receipt_code not in {66, 78}:
+                    break
+            stop_after = True
+        else:
+            counters['failure'] += 1
+            outcome = 'sample_incomplete'
+            stop_after = True
+        current, delta = research_audit_after_slot(index, previous)
+        previous = current
+        counters['writes'] += delta['datapoint_write_operations']
+        counters['packets'] += delta['datapoint_protocol_packets']
+        if counters['writes'] or counters['packets']:
+            outcome = 'protocol_write_gate_failed'
+            stop_after = True
+        cold_result = retained_result = None
+        request_count = 0
+        same_session = release = reconnect = overflow = False
+        if probe is not None:
+            request_count = probe['request_count']
+            cold_result = probe['requests'][0]['result'] if request_count >= 1 else None
+            retained_result = probe['requests'][1]['result'] if request_count >= 2 else None
+            same_session = probe['same_session_retained']
+            release = probe['normal_release_observed']
+            reconnect = probe['automatic_reconnect_observed']
+            overflow = probe['observation_overflow']
+            if delta['device_status_requests'] != request_count:
+                outcome = 'sample_incomplete'
+                stop_after = True
+            counters['cold'] += int(request_count >= 1)
+            counters['retained'] += int(request_count >= 2)
+            counters['cold_ack'] += int(cold_result == 'ack_success')
+            counters['retained_ack'] += int(retained_result == 'ack_success')
+            counters['release'] += int(release)
+            counters['same_session'] += int(same_session)
+            counters['reconnect'] += int(reconnect)
+            counters['overflow'] += int(overflow)
+            if probe['result'] == 'completed':
+                counters['completed'] += 1
+                request_sets = {1: set(), 2: set()}
+                for event in probe['events']:
+                    if event['kind'] != 'DP_BATCH' or not event['exact_session']:
+                        continue
+                    trial = event['trial']
+                    for dp_id, dp_type, length in zip(
+                        event['dp_ids'], event['dp_types'], event['encoded_value_lengths']
+                    ):
+                        request_sets[trial].add(dp_id)
+                        dp_types_seen.setdefault(dp_id, set()).add(dp_type)
+                        dp_lengths_seen.setdefault(dp_id, set()).add(length)
+                cold_samples.append(request_sets[1])
+                if mode == 'cold_then_retained':
+                    retained_samples.append(request_sets[2])
+            else:
+                outcome = 'sample_incomplete'
+                counters['failure'] += 1
+                if probe['result'] == 'precondition_failed':
+                    stop_after = True
+            timed_out_trials = {
+                event['trial']
+                for event in probe['events']
+                if event['kind'] == 'ACK_TIMEOUT'
+            }
+            counters['timeout'] += len(timed_out_trials)
+        else:
+            possible_requests = delta['device_status_requests']
+            if receipt_handed and possible_requests == 0:
+                possible_requests = 1
+            per_slot_limit = 2 if mode == 'cold_then_retained' else 1
+            if possible_requests > per_slot_limit:
+                raise ValueError('research_budget')
+            counters['cold'] += int(possible_requests >= 1)
+            counters['retained'] += int(possible_requests >= 2)
+        if (
+            counters['cold'] > 10
+            or counters['retained'] > 5
+            or counters['cold'] + counters['retained'] > 15
+        ):
+            raise ValueError('research_budget')
+        slots.append({
+            'label': slot, 'mode': mode, 'request_count': request_count,
+            'cold_result': cold_result, 'retained_result': retained_result,
+            'same_session_retained': same_session,
+            'normal_release_observed': release,
+            'automatic_reconnect_observed': reconnect,
+            'observation_overflow': overflow, 'receipt_used': receipt_used,
+        })
+        if stop_after:
+            break
+    complete = (
+        len(slots) == 10 and counters['completed'] == 10
+        and counters['cold'] == 10 and counters['retained'] == 5
+        and counters['writes'] == 0 and counters['packets'] == 0
+        and counters['ambiguity'] == 0 and len(cold_samples) == 10
+        and len(retained_samples) == 5 and helper_target_checks == 10
+    )
+    if outcome == 'complete' and not complete:
+        outcome = 'sample_incomplete'
+    all_ids = {8, 21, 33, 34, 36, 40, 47}
+    all_ids.update(dp_types_seen)
+    rows = []
+    for dp_id in sorted(all_ids):
+        cold_reported = sum(dp_id in sample for sample in cold_samples)
+        retained_reported = sum(dp_id in sample for sample in retained_samples)
+        if not complete:
+            classification = 'AMBIGUOUS'
+        else:
+            reported = cold_reported + retained_reported
+            if reported == 15:
+                classification = 'ALWAYS_REPORTED'
+            elif reported == 0:
+                classification = 'NOT_REPORTED'
+            else:
+                classification = 'CONDITIONALLY_REPORTED'
+        rows.append({
+            'dp_id': dp_id, 'cold_reported_count': cold_reported,
+            'cold_eligible_count': len(cold_samples),
+            'retained_reported_count': retained_reported,
+            'retained_eligible_count': len(retained_samples),
+            'type_set': sorted(dp_types_seen.get(dp_id, set())),
+            'encoded_length_set': sorted(dp_lengths_seen.get(dp_id, set())),
+            'classification': classification,
+        })
+    return {
+        'outcome': outcome, 'eligible_s1_count': eligible_count,
+        'selected': True, 'same_private_target': helper_target_checks == len(slots),
+        'completed_probe_slots': counters['completed'],
+        'cold_request_count': counters['cold'],
+        'retained_request_count': counters['retained'],
+        'total_device_status_requests': counters['cold'] + counters['retained'],
+        'cold_ack_success_count': counters['cold_ack'],
+        'retained_ack_success_count': counters['retained_ack'],
+        'failure_count': counters['failure'], 'timeout_count': counters['timeout'],
+        'receipt_lookup_count': counters['receipt'],
+        'ambiguity_count': counters['ambiguity'],
+        'normal_release_count': counters['release'],
+        'same_session_retained_count': counters['same_session'],
+        'automatic_reconnect_count': counters['reconnect'],
+        'observation_overflow_count': counters['overflow'],
+        'protocol_datapoint_write_delta': counters['writes'],
+        'protocol_datapoint_packet_delta': counters['packets'],
+        'slots': slots, 'dp_inventory': rows,
+    }
+
 def restore_backup(value):
     expected_manifest_value = validate_backup_context(value)
     if root_relative_exists(BACKUP_CONSUMED) or root_relative_exists(
@@ -6375,6 +7317,8 @@ else:
                 result = service_inventory(value['expectation'])
             elif operation == 'phase_a_helper':
                 result = invoke_helper(value)
+            elif operation == 'remote_phase_a_inventory':
+                result = remote_phase_a_inventory(value)
             elif operation == 'restore':
                 result = activate(value, restoring=True)
             elif operation == 'restore_backup':
@@ -6598,6 +7542,33 @@ class PrivateInteractiveSessionBroker:
         ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_INSPECTION_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+        return capability
+
+    def _require_research_capability(
+        self, capability: object, *, consume: bool = False
+    ) -> _RemotePhaseAResearchCapability:
+        """Validate the one fixed research-run capability outside LifecycleAction."""
+        binding = self._controller_binding
+        if (
+            type(capability) is not _RemotePhaseAResearchCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.lifecycle_generation is not binding.lifecycle_generation
+            or capability.source_generation is None
+            or capability.session_generation is not binding.session_generation
+            or capability.operation is not ResearchOperation.RUN_FIXED_INVENTORY
+            or capability.issuance_identity is None
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_RESEARCH_CAPABILITY_INVALID"
             ) from None
         if consume:
             binding.issuer.consumed.append(capability)
@@ -6970,6 +7941,132 @@ class PrivateInteractiveSessionBroker:
         except SessionBrokerError as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_WAIT, error
+            ) from None
+
+    def __execute_remote_phase_a_inventory(
+        self,
+        baseline: dict[str, object],
+        *,
+        _capability: object,
+    ) -> bytes:
+        """Run the one fixed research program without an operation/target input."""
+        self._require_research_capability(_capability, consume=True)
+        if self._state is not BrokerState.SESSION_ACTIVE or not isinstance(
+            baseline, dict
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_RESEARCH_INVALID"
+            ) from None
+        encoded_payload = base64.b64encode(
+            json.dumps(
+                {"baseline": baseline}, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).decode("ascii")
+        chunks = tuple(
+            encoded_payload[index : index + _TRANSFER_CHUNK_SIZE]
+            for index in range(0, len(encoded_payload), _TRANSFER_CHUNK_SIZE)
+        )
+        if not chunks or len(chunks) > 8:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_RESEARCH_INVALID"
+            ) from None
+        start_payload, start_frame = self._new_frame("RESEARCH_START")
+        end_payload, end_frame = self._new_frame("RESEARCH_END")
+        program_bytes = _REMOTE_CONTROL_PROGRAM.encode("utf-8")
+        program_digest = hashlib.sha256(program_bytes).hexdigest()
+        encoded_program = base64.b64encode(program_bytes).decode("ascii")
+        program_chunks = tuple(
+            encoded_program[index : index + _TRANSFER_CHUNK_SIZE]
+            for index in range(0, len(encoded_program), _TRANSFER_CHUNK_SIZE)
+        )
+        if not program_chunks or len(program_chunks) > 256:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_RESEARCH_INVALID"
+            ) from None
+        bootstrap_body = (
+            "try:\n"
+            " count=int(sys.stdin.readline())\n"
+            " source=''.join(sys.stdin.readline().strip() for _ in range(count))\n"
+            " raw=base64.b64decode(source,validate=True)\n"
+            " expected=os.environ.pop('HA_R63S_PROGRAM_SHA256')\n"
+            " assert hashlib.sha256(raw).hexdigest()==expected\n"
+            " exec(compile(raw,'<ha-r63s-research>','exec'))\n"
+            "except Exception:\n"
+            ' print(\'{"error_class":"OPERATION_FAILED","error_scope":"BOOTSTRAP",'
+            '"error_reason":"UNKNOWN"}\',flush=True)\n'
+        )
+        bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
+        command = (
+            f"{self._frame_printf(start_payload)}; "
+            "HA_R30_OPERATION=remote_phase_a_inventory HA_R30_DETAIL=fixed "
+            f"HA_R63S_PROGRAM_SHA256={program_digest} "
+            f"python3 -c {shlex.quote(bootstrap)} remote_phase_a_inventory; "
+            f"{self._frame_printf(end_payload)}\n"
+        )
+        try:
+            self._ensure_echo_disabled()
+            self.__write_wire(
+                _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
+            )
+            self._read_until(start_frame)
+            self.__write_wire(
+                _PrivateWirePacket(
+                    (str(len(program_chunks)) + "\n").encode("ascii"),
+                    self.__wire_issuer,
+                )
+            )
+            for chunk in program_chunks:
+                self.__write_wire(
+                    _PrivateWirePacket(
+                        (chunk + "\n").encode("ascii"), self.__wire_issuer
+                    )
+                )
+            self.__write_wire(
+                _PrivateWirePacket(
+                    (str(len(chunks)) + "\n").encode("ascii"), self.__wire_issuer
+                )
+            )
+            for chunk in chunks:
+                self.__write_wire(
+                    _PrivateWirePacket(
+                        (chunk + "\n").encode("ascii"), self.__wire_issuer
+                    )
+                )
+            return self._read_until(end_frame, timeout_seconds=2400.0)
+        except SessionBrokerError as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_WAIT, error
+            ) from None
+
+    def _invoke_remote_phase_a_research(
+        self,
+        baseline: AuditSnapshot,
+        *,
+        _capability: object = None,
+    ) -> RemotePhaseAInventoryResult:
+        """Invoke the fixed research program through its dedicated capability."""
+        if not isinstance(baseline, AuditSnapshot) or baseline.nonce is None:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_RESEARCH_BASELINE_INVALID"
+            ) from None
+        baseline_payload: dict[str, object] = {
+            "result": "audit_snapshot",
+            "protocol_version": baseline.protocol_version,
+            "audit_instance_token": baseline.audit_instance_token,
+            "event_ordinal": baseline.event_ordinal,
+            "history_overflow": baseline.history_overflow,
+            "runtime_ms": baseline.runtime_ms,
+            "counters": dict(baseline.counters),
+            "events": [asdict(event) for event in baseline.events],
+        }
+        try:
+            output = self.__execute_remote_phase_a_inventory(
+                baseline_payload, _capability=_capability
+            )
+            return _parse_remote_phase_a_inventory_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
             ) from None
 
     @staticmethod
@@ -7905,6 +9002,92 @@ class RetainedTerminalLifecycleInspector:
         self.close()
 
 
+_REMOTE_PHASE_A_SESSION_CONSTRUCTOR = object()
+
+
+class RemotePhaseAInventorySession:
+    """One parameter-free, fixed-plan remote Phase-A research session."""
+
+    def __init__(
+        self,
+        controller: object,
+        broker: object,
+        permit: object,
+        baseline: object,
+        *,
+        _constructor: object = None,
+    ) -> None:
+        if (
+            _constructor is not _REMOTE_PHASE_A_SESSION_CONSTRUCTOR
+            or controller.__class__ is not FullPreflightLifecycleController
+            or type(permit) is not _RemotePhaseAInventoryPermit
+            or not isinstance(baseline, AuditSnapshot)
+        ):
+            raise LifecycleControllerError("RESEARCH_SESSION_INVALID") from None
+        self._controller = controller
+        self._broker = broker
+        self._permit = permit
+        self._baseline = baseline
+        self._ran = False
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return (
+            "RemotePhaseAInventorySession("
+            f"ran={self._ran!r}, closed={self._closed!r})"
+        )
+
+    def run_remote_phase_a_inventory(self) -> RemotePhaseAInventoryResult:
+        """Execute the immutable R01-R10 plan exactly once."""
+        if self._closed or self._ran:
+            raise LifecycleControllerError("RESEARCH_SESSION_CONSUMED") from None
+        controller = self._controller
+        permit = self._permit
+        if (
+            controller.state is not LifecycleState.A2_COLLECTED
+            or not getattr(controller, "_research_session_active", False)
+            or permit.controller is not controller
+            or permit.lifecycle_generation is not controller._lifecycle_generation
+            or permit.source_generation is not controller._candidate_source_generation
+            or permit.session_generation is not controller._session_generation
+        ):
+            raise LifecycleControllerError("RESEARCH_SESSION_INVALID") from None
+        self._ran = True
+        capability = _RemotePhaseAResearchCapability(
+            controller,
+            self,
+            permit.issuer,
+            permit.lifecycle_generation,
+            permit.source_generation,
+            permit.session_generation,
+            ResearchOperation.RUN_FIXED_INVENTORY,
+            object(),
+        )
+        controller._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._invoke_remote_phase_a_research(
+                self._baseline, _capability=capability
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError("RESEARCH_RUN_FAILED") from None
+        if not isinstance(result, RemotePhaseAInventoryResult):
+            raise LifecycleControllerError("RESEARCH_RUN_FAILED") from None
+        return result
+
+    def close(self) -> None:
+        """Permanently close the permit and return restore authority to controller."""
+        if self._closed:
+            return
+        self._closed = True
+        self._controller._close_remote_phase_a_inventory_session(self)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
 class FullPreflightLifecycleController:
     """The sole public live-capable, ordered full-preflight control surface."""
 
@@ -8050,6 +9233,9 @@ class FullPreflightLifecycleController:
         self._restore_readiness: CoreReadinessResult | None = None
         self._restore_services: ServiceInventoryResult | None = None
         self._restore_repairs: RepairsEvidence | None = None
+        self._research_session_issued = False
+        self._research_session_active = False
+        self._research_session: RemotePhaseAInventorySession | None = None
 
     @property
     def state(self) -> LifecycleState:
@@ -9087,6 +10273,62 @@ class FullPreflightLifecycleController:
         self._advance(LifecycleState.A2_COLLECTED, LifecycleAction.A2)
         return snapshot
 
+    def open_remote_phase_a_inventory_session(
+        self,
+    ) -> RemotePhaseAInventorySession:
+        """Issue exactly one dedicated research permit after durable A2."""
+        self._require_state(LifecycleState.A2_COLLECTED)
+        self._assert_session_binding()
+        baseline = self._snapshots.get(AuditLabel.A2)
+        candidate_manifest = self._candidate_manifest
+        if (
+            self._research_session_issued
+            or self._research_session_active
+            or not isinstance(baseline, AuditSnapshot)
+            or not isinstance(candidate_manifest, SourceManifest)
+            or candidate_manifest.state is not SourceState.CANDIDATE
+            or _source_manifest_digest(candidate_manifest.entries)
+            != _AUTHORITY_MANIFEST_DIGESTS[SourceState.CANDIDATE.value]
+            or not self._audit_origin_chain_valid(
+                (AuditLabel.A0, AuditLabel.AP0, AuditLabel.A1, AuditLabel.A2)
+            )
+            or baseline.history_overflow
+        ):
+            raise LifecycleControllerError("RESEARCH_SESSION_INVALID") from None
+        permit = _RemotePhaseAInventoryPermit(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._candidate_source_generation,
+            self._session_generation,
+            object(),
+        )
+        self._capability_issuer.issued.append(permit)
+        self._capability_issuer.consumed.append(permit)
+        session = RemotePhaseAInventorySession(
+            self,
+            self._broker,
+            permit,
+            baseline,
+            _constructor=_REMOTE_PHASE_A_SESSION_CONSTRUCTOR,
+        )
+        self._research_session_issued = True
+        self._research_session_active = True
+        self._research_session = session
+        return session
+
+    def _close_remote_phase_a_inventory_session(
+        self, session: RemotePhaseAInventorySession
+    ) -> None:
+        if (
+            not self._research_session_active
+            or self._research_session is not session
+            or session._controller is not self
+        ):
+            raise LifecycleControllerError("RESEARCH_SESSION_INVALID") from None
+        self._research_session_active = False
+        self._research_session = None
+
     def _bind_restore_manifest(self, manifest: SourceManifest) -> None:
         if self._restore_manifest is None:
             if self._journal is None or not self._journal.recovery_mode:
@@ -9107,6 +10349,8 @@ class FullPreflightLifecycleController:
             LifecycleState.ROLLBACK_REQUIRED,
             LifecycleState.RECOVERY_REQUIRED,
         )
+        if self._research_session_active:
+            raise LifecycleControllerError("RESEARCH_SESSION_ACTIVE") from None
         if (
             self._journal is not None
             and self._journal.recovery_mode

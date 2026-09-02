@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import hashlib
 import http.client
 import inspect
@@ -1022,6 +1023,7 @@ def _synthetic_r30_source_authorities(
                 "test_r62_",
                 "test_r62c_",
                 "test_r62f_",
+                "test_r63s_",
             )
         ),
     )
@@ -1044,6 +1046,7 @@ def _synthetic_r30_source_authorities(
             "test_r62_",
             "test_r62c_",
             "test_r62f_",
+            "test_r63s_",
         )
     ):
         return
@@ -1553,7 +1556,8 @@ def test_r30_remote_program_contains_fixed_endpoints_and_no_probe_dispatch() -> 
 
     assert "http://supervisor/core/check" in source
     assert "phase_a_status_probe_helper.py" in source
-    assert "operation == 'probe'" not in source
+    assert "elif operation == 'probe'" not in source
+    assert "elif operation == 'remote_phase_a_inventory'" in source
     assert '"probe"' not in source
     assert "arbitrary" not in source
     assert "renameat2" in source
@@ -1561,7 +1565,7 @@ def test_r30_remote_program_contains_fixed_endpoints_and_no_probe_dispatch() -> 
     assert "api/config" in source
     assert "loaded = bool(SERVICES" not in source
     helper_start = source.index("def invoke_helper")
-    helper_end = source.index("def restore_backup")
+    helper_end = source.index("def research_evidence_path")
     helper_source = source[helper_start:helper_end]
     assert "operation not in {'preflight', 'audit'}" in helper_source
     assert "'probe'" not in helper_source
@@ -7358,7 +7362,9 @@ def test_r35_mutation_contract_guards(mutation: str) -> None:
         assert "_receipt_result" not in source
     elif mutation == "probe_invoked_for_receipt":
         helper = remote[
-            remote.index("def invoke_helper") : remote.index("def restore_backup")
+            remote.index("def invoke_helper") : remote.index(
+                "def research_evidence_path"
+            )
         ]
         assert "'probe'" not in helper
         assert "'receipt'" not in helper
@@ -10133,6 +10139,460 @@ def test_r62_valid_preflight_commits_result_and_transition_atomically(
         access.LifecycleAction.REMOVAL_RESTART.value,
     ]
     controller.close()
+
+
+def _r63s_complete_result() -> access.RemotePhaseAInventoryResult:
+    slots = tuple(
+        access.RemotePhaseASlotSummary(
+            f"R{index:02d}",
+            "cold_then_retained" if index <= 5 else "cold",
+            2 if index <= 5 else 1,
+            "ack_success",
+            "ack_success" if index <= 5 else None,
+            index <= 5,
+            True,
+            False,
+            False,
+            False,
+        )
+        for index in range(1, 11)
+    )
+    rows = tuple(
+        access.RemotePhaseADPInventory(
+            dp_id,
+            10,
+            10,
+            5,
+            5,
+            ("DT_VALUE",),
+            (4,),
+            "ALWAYS_REPORTED",
+        )
+        for dp_id in (8, 21, 33, 34, 36, 40, 47)
+    )
+    return access.RemotePhaseAInventoryResult(
+        "complete",
+        1,
+        True,
+        True,
+        10,
+        10,
+        5,
+        15,
+        10,
+        5,
+        0,
+        0,
+        0,
+        0,
+        10,
+        5,
+        0,
+        0,
+        0,
+        0,
+        slots,
+        rows,
+    )
+
+
+def _r63s_controller_at_a2() -> tuple[object, _R32ScriptedBroker]:
+    controller, broker = _r33_advance_to_ap0()
+    controller.run_non_probe_preflight()
+    controller.collect_a1()
+    controller.validate_research_final()
+    controller.collect_a2()
+    return controller, broker
+
+
+def test_r63s_fixed_research_session_is_state_neutral_and_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, broker = _r63s_controller_at_a2()
+    before = copy.deepcopy(controller._journal._record)
+    expected = _r63s_complete_result()
+    seen: list[object] = []
+
+    def run(
+        baseline: access.AuditSnapshot, *, _capability: object = None
+    ) -> access.RemotePhaseAInventoryResult:
+        assert isinstance(baseline, access.AuditSnapshot)
+        assert type(_capability) is access._RemotePhaseAResearchCapability
+        assert _capability.operation is access.ResearchOperation.RUN_FIXED_INVENTORY
+        assert _capability.controller is controller
+        broker._controller_binding[1].consumed.append(_capability)
+        seen.append(_capability)
+        return expected
+
+    monkeypatch.setattr(broker, "_invoke_remote_phase_a_research", run, raising=False)
+    session = controller.open_remote_phase_a_inventory_session()
+
+    assert repr(session) == "RemotePhaseAInventorySession(ran=False, closed=False)"
+    assert controller.state is access.LifecycleState.A2_COLLECTED
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_ACTIVE"
+    ):
+        controller.stage_restore(_r32_bundles()[1])
+
+    result = session.run_remote_phase_a_inventory()
+
+    assert result == expected
+    assert len(seen) == 1
+    assert controller.state is access.LifecycleState.A2_COLLECTED
+    assert controller._journal._record == before
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_CONSUMED"
+    ):
+        session.run_remote_phase_a_inventory()
+
+    session.close()
+    assert controller._journal._record == before
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_INVALID"
+    ):
+        controller.open_remote_phase_a_inventory_session()
+    proof = _r32_complete_restore_tail(controller, _r32_bundles()[1])
+    assert proof.complete is True
+    assert controller.state is access.LifecycleState.COMPLETE_NORMAL
+    controller.close()
+
+
+def test_r63s_research_session_cannot_open_before_a2_or_be_constructed() -> None:
+    controller, broker = _r33_advance_to_ap0()
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+        controller.open_remote_phase_a_inventory_session()
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_INVALID"
+    ):
+        access.RemotePhaseAInventorySession(controller, broker, object(), object())
+    assert not any(name == "research" for name, _detail in broker.calls)
+    controller.close()
+
+
+def test_r63s_public_surface_and_normal_lifecycle_remain_narrow() -> None:
+    assert "PROBE" not in access.LifecycleAction.__members__
+    assert "PROBE" not in access.PhaseAOperation.__members__
+    assert tuple(access.ResearchOperation) == (
+        access.ResearchOperation.RUN_FIXED_INVENTORY,
+    )
+    signature = inspect.signature(
+        access.RemotePhaseAInventorySession.run_remote_phase_a_inventory
+    )
+    assert tuple(signature.parameters) == ("self",)
+    public = {
+        name
+        for name, value in vars(access.RemotePhaseAInventorySession).items()
+        if callable(value) and not name.startswith("_")
+    }
+    assert public == {"run_remote_phase_a_inventory", "close"}
+    source = inspect.getsource(access.RemotePhaseAInventorySession)
+    for forbidden in (
+        "config_entry_id",
+        "nonce:",
+        "command",
+        "argv",
+        "endpoint",
+        "evidence_path",
+        "send_shell",
+    ):
+        assert forbidden not in source
+
+
+def test_r63s_remote_program_contains_only_fixed_research_plan() -> None:
+    source = access._REMOTE_CONTROL_PROGRAM
+    assert "remote_phase_a_inventory" in source
+    assert "('R01', 'cold_then_retained')" in source
+    assert "('R05', 'cold_then_retained')" in source
+    assert "('R06', 'cold')" in source
+    assert "('R10', 'cold')" in source
+    assert "PHASE_A_STATUS_PROBE_CONFIG_ENTRY_ID" in source
+    assert "jtmspro" in source and "xqeob8h6" in source
+    assert "elif operation == 'probe'" not in source
+    assert "LifecycleAction.PROBE" not in source
+
+
+def test_r63s_result_parser_enforces_budgets_and_rejects_private_extras() -> None:
+    expected = _r63s_complete_result()
+    payload = asdict(expected)
+    payload["slots"] = [dict(item) for item in payload["slots"]]
+    payload["dp_inventory"] = [
+        {
+            **dict(item),
+            "type_set": list(item["type_set"]),
+            "encoded_length_set": list(item["encoded_length_set"]),
+        }
+        for item in payload["dp_inventory"]
+    ]
+    framed = json.dumps(payload, separators=(",", ":")).encode()
+    assert access._parse_remote_phase_a_inventory_result(framed) == expected
+
+    over_budget = copy.deepcopy(payload)
+    over_budget["cold_request_count"] = 11
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_remote_phase_a_inventory_result(json.dumps(over_budget).encode())
+
+    private = copy.deepcopy(payload)
+    private["config_entry_id"] = "synthetic_private_identifier"
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_remote_phase_a_inventory_result(json.dumps(private).encode())
+
+
+def _r63s_embedded_function_source(name: str) -> str:
+    source = access._REMOTE_CONTROL_PROGRAM
+    tree = ast.parse(source)
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == name
+    )
+    return ast.get_source_segment(source, node) or ""
+
+
+def test_r63s_target_resolver_is_exact_deterministic_and_rejects_zero_or_duplicates() -> (
+    None
+):
+    entries = [
+        {"domain": "tuya_ble", "state": "loaded", "entry_id": "b" * 32},
+        {"domain": "tuya_ble", "state": "loaded", "entry_id": "a" * 32},
+    ]
+
+    def request_json(url: str) -> tuple[int, object]:
+        if "diagnostics" in url:
+            entry_id = url.rsplit("/", 1)[-1]
+            return 200, {
+                "data": {
+                    "entry": {"entry_id": entry_id},
+                    "options": {"category": "jtmspro", "product_id": "xqeob8h6"},
+                }
+            }
+        return 200, copy.deepcopy(entries)
+
+    namespace = {"re": __import__("re"), "request_json": request_json}
+    exec(  # noqa: S102 - execute only the reviewed embedded function definition
+        _r63s_embedded_function_source("loaded_tuya_entries"), namespace
+    )
+    exec(  # noqa: S102 - execute only the reviewed embedded function definition
+        _r63s_embedded_function_source("resolve_research_target"), namespace
+    )
+
+    assert namespace["resolve_research_target"]() == (2, "a" * 32)
+    entries[:] = [{"domain": "tuya_ble", "state": "loaded", "entry_id": "c" * 32}]
+    assert namespace["resolve_research_target"]() == (1, "c" * 32)
+    entries[0]["state"] = "not_loaded"
+    assert namespace["resolve_research_target"]() == (0, None)
+    entries[:] = [
+        {"domain": "tuya_ble", "state": "loaded", "entry_id": "d" * 32},
+        {"domain": "tuya_ble", "state": "loaded", "entry_id": "d" * 32},
+    ]
+    with pytest.raises(ValueError, match="research_target"):
+        namespace["loaded_tuya_entries"]()
+
+
+def _r63s_remote_baseline() -> dict[str, object]:
+    return {
+        "result": "audit_snapshot",
+        "protocol_version": 1,
+        "audit_instance_token": "a" * 32,
+        "event_ordinal": 0,
+        "history_overflow": False,
+        "runtime_ms": 1,
+        "counters": {name: 0 for name in access.AUDIT_COUNTER_NAMES},
+        "events": [],
+    }
+
+
+def _r63s_remote_replacements(scenario: str) -> dict[str, str]:
+    source = access._REMOTE_CONTROL_PROGRAM
+    invoke_start = source.index("def invoke_research_helper")
+    invoke_end = source.index("def loaded_tuya_entries")
+    original_invoke = source[invoke_start:invoke_end]
+    original_target = _r63s_embedded_function_source("resolve_research_target")
+    synthetic_invoke = f"""SYN_SCENARIO = {scenario!r}
+SYN_PROBES = 0
+SYN_RECEIPTS = 0
+SYN_STATUS = 0
+SYN_WRITES = 0
+SYN_PACKETS = 0
+SYN_PROBE_NONCE = None
+SYN_TARGET = None
+
+def invoke_research_helper(operation, label, nonce, mode=None, target=None):
+    global SYN_PROBES, SYN_RECEIPTS, SYN_STATUS, SYN_WRITES, SYN_PACKETS
+    global SYN_PROBE_NONCE, SYN_TARGET
+    if operation == 'probe':
+        SYN_PROBES += 1
+        if SYN_TARGET is None:
+            SYN_TARGET = target
+        if target != SYN_TARGET:
+            raise ValueError('research_target')
+        SYN_PROBE_NONCE = nonce
+        if SYN_SCENARIO in {{'ambiguous', 'ambiguous_pending'}} and SYN_PROBES == 1:
+            SYN_STATUS += 1
+            return 78, 'transport_ambiguous', None, None
+        precondition = SYN_SCENARIO == 'precondition' and SYN_PROBES == 1
+        count = 0 if precondition else (2 if mode == 'cold_then_retained' else 1)
+        SYN_STATUS += count
+        if SYN_SCENARIO == 'write' and SYN_PROBES == 1:
+            SYN_WRITES += 1
+        if SYN_SCENARIO == 'packet' and SYN_PROBES == 1:
+            SYN_PACKETS += 1
+        requests = [
+            {{'trial': trial, 'result': 'ack_success', 'duration_ms': trial}}
+            for trial in range(1, count + 1)
+        ]
+        events = [
+            {{
+                'trial': trial, 'observation_ordinal': trial,
+                'origin': 'explicit', 'kind': 'DP_BATCH',
+                'event_ordinal': trial, 'batch_ordinal': 1,
+                'dp_ids': [8, 21], 'dp_types': ['DT_VALUE', 'DT_BOOL'],
+                'encoded_value_lengths': [4, 1], 'exact_session': True,
+                'ack_result': None, 'ack_phase': 'after_ack',
+                'monotonic_ms': trial,
+            }}
+            for trial in range(1, count + 1)
+        ]
+        result = {{
+            'mode': mode,
+            'result': 'precondition_failed' if precondition else 'completed',
+            'cold_request_attempted': count >= 1,
+            'retained_request_attempted': count >= 2,
+            'request_count': count,
+            'same_session_retained': count == 2,
+            'normal_release_observed': count > 0,
+            'automatic_reconnect_observed': False,
+            'observation_overflow': False,
+            'duration_ms': 1,
+            'requests': requests,
+            'events': events,
+            'invocation_nonce': nonce,
+        }}
+        return (66 if precondition else 0), result['result'], result, None
+    if operation == 'receipt':
+        if nonce != SYN_PROBE_NONCE:
+            raise ValueError('research_nonce')
+        SYN_RECEIPTS += 1
+        pending = SYN_SCENARIO == 'ambiguous_pending'
+        receipt = {{
+            'nonce': nonce, 'known': not pending, 'service_entered': not pending,
+            'request_handed_to_transport': True,
+            'terminal_class': None if pending else 'completed',
+            'response_available': False,
+        }}
+        return (66 if pending else 0), 'receipt', receipt, None
+    if operation == 'audit':
+        counters = {{name: 0 for name in COUNTERS}}
+        counters['device_status_requests'] = SYN_STATUS
+        counters['datapoint_write_operations'] = SYN_WRITES
+        counters['datapoint_protocol_packets'] = SYN_PACKETS
+        audit = {{
+            'result': 'audit_snapshot', 'protocol_version': 1,
+            'audit_instance_token': 'a' * 32, 'event_ordinal': SYN_STATUS,
+            'history_overflow': False, 'runtime_ms': SYN_PROBES,
+            'counters': counters, 'events': [], 'nonce': nonce,
+        }}
+        return 0, 'audit_snapshot', audit, None
+    raise ValueError('research_operation')
+
+"""
+    return {
+        original_invoke: synthetic_invoke,
+        original_target: "def resolve_research_target():\n    return 2, 'a' * 32",
+    }
+
+
+@pytest.mark.parametrize(
+    ("scenario", "outcome", "slot_count", "cold", "retained", "receipts"),
+    (
+        ("complete", "complete", 10, 10, 5, 0),
+        ("precondition", "sample_incomplete", 1, 0, 0, 0),
+        ("ambiguous", "probe_ambiguous", 1, 1, 0, 1),
+        ("ambiguous_pending", "probe_ambiguous", 1, 1, 0, 3),
+        ("write", "protocol_write_gate_failed", 1, 1, 1, 0),
+        ("packet", "protocol_write_gate_failed", 1, 1, 1, 0),
+    ),
+)
+def test_r63s_remote_fixed_plan_budgets_stops_and_no_replay(
+    tmp_path: Path,
+    scenario: str,
+    outcome: str,
+    slot_count: int,
+    cold: int,
+    retained: int,
+    receipts: int,
+) -> None:
+    (tmp_path / "custom_components" / "tuya_ble").mkdir(parents=True)
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "remote_phase_a_inventory",
+        {"baseline": _r63s_remote_baseline()},
+        source_replacements=_r63s_remote_replacements(scenario),
+    )
+
+    assert result["outcome"] == outcome
+    assert len(result["slots"]) == slot_count
+    assert result["cold_request_count"] == cold
+    assert result["retained_request_count"] == retained
+    assert result["total_device_status_requests"] == cold + retained
+    assert result["receipt_lookup_count"] == receipts
+    assert result["same_private_target"] is True
+    if scenario == "complete":
+        assert [slot["mode"] for slot in result["slots"]] == [
+            *("cold_then_retained" for _ in range(5)),
+            *("cold" for _ in range(5)),
+        ]
+        assert result["completed_probe_slots"] == 10
+        assert result["cold_ack_success_count"] == 10
+        assert result["retained_ack_success_count"] == 5
+    else:
+        assert result["completed_probe_slots"] <= 1
+
+
+def test_r63s_authority_and_privacy_boundaries_remain_fail_closed() -> None:
+    controller, _broker = _r63s_controller_at_a2()
+    controller._candidate_manifest = None
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_INVALID"
+    ):
+        controller.open_remote_phase_a_inventory_session()
+    controller.close()
+
+    result = _r63s_complete_result()
+    rendered = repr(result)
+    for private_value in (
+        "config_entry_id",
+        "SUPERVISOR_TOKEN",
+        "invocation_nonce",
+        "evidence_path",
+        "raw_payload",
+        "packet_bytes",
+        "motor_moved",
+    ):
+        assert private_value not in rendered
+
+
+def test_r63s_closed_session_allows_same_durable_a2_restore_reconstruction() -> None:
+    controller, broker = _r63s_controller_at_a2()
+    broker._invoke_remote_phase_a_research = lambda *_args, **_kwargs: (
+        _r63s_complete_result()
+    )
+    session = controller.open_remote_phase_a_inventory_session()
+    session.run_remote_phase_a_inventory()
+    session.close()
+    controller.close()
+
+    reconstructed_broker = _R32ScriptedBroker()
+    reconstructed_broker._durable_lifecycle_test = True
+    reconstructed = access.FullPreflightLifecycleController(reconstructed_broker)
+    assert reconstructed.state is access.LifecycleState.A2_COLLECTED
+    with pytest.raises(
+        access.LifecycleControllerError, match="RESEARCH_SESSION_INVALID"
+    ):
+        reconstructed.open_remote_phase_a_inventory_session()
+    proof = _r32_complete_restore_tail(reconstructed, _r32_bundles()[1])
+    assert proof.complete is True
+    assert reconstructed.state is access.LifecycleState.COMPLETE_NORMAL
+    reconstructed.close()
 
 
 def _r62c_retained_restored_after_abort_v1(
