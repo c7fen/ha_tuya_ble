@@ -10829,6 +10829,80 @@ def test_r63t_remote_target_failure_proves_pre_probe_zero_requests(
     assert result["total_device_status_requests"] == 0
 
 
+def test_r63t_target_resolver_accepts_supported_ulid_config_entry_ids() -> None:
+    ulid = "01K2E8Z9N7Q4D6M1B3C5F7G8HJ"
+    entries = [
+        {
+            "domain": "tuya_ble",
+            "state": "loaded",
+            "entry_id": ulid,
+        }
+    ]
+
+    def request_json(url: str) -> tuple[int, object]:
+        if "diagnostics" in url:
+            entry_id = url.rsplit("/", 1)[-1]
+            return 200, {
+                "data": {
+                    "entry": {"entry_id": entry_id},
+                    "options": {
+                        "category": "jtmspro",
+                        "product_id": "xqeob8h6",
+                    },
+                },
+                "issues": [],
+            }
+        return 200, copy.deepcopy(entries)
+
+    namespace = {"re": __import__("re"), "request_json": request_json}
+    exec(  # noqa: S102 - execute only reviewed embedded function definitions
+        _r63s_embedded_function_source("loaded_tuya_entries"), namespace
+    )
+    exec(  # noqa: S102 - execute only reviewed embedded function definitions
+        _r63s_embedded_function_source("resolve_research_target"), namespace
+    )
+
+    assert namespace["resolve_research_target"]() == (1, ulid)
+    entries.append(
+        {
+            "domain": "tuya_ble",
+            "state": "loaded",
+            "entry_id": "a" * 32,
+        }
+    )
+    assert namespace["resolve_research_target"]() == (2, ulid)
+
+
+@pytest.mark.parametrize(
+    "entry_id",
+    (
+        "01K2E8Z9N7Q4D6M1B3C5F7G8H/",
+        "01K2E8Z9N7Q4D6M1B3C5F7G8HI",
+        "01K2E8Z9N7Q4D6M1B3C5F7G8H",
+        "../synthetic-entry",
+    ),
+)
+def test_r63t_target_resolver_rejects_noncanonical_or_unsafe_ids(
+    entry_id: str,
+) -> None:
+    def request_json(_url: str) -> tuple[int, object]:
+        return 200, [
+            {
+                "domain": "tuya_ble",
+                "state": "loaded",
+                "entry_id": entry_id,
+            }
+        ]
+
+    namespace = {"re": __import__("re"), "request_json": request_json}
+    exec(  # noqa: S102 - execute only the reviewed embedded function definition
+        _r63s_embedded_function_source("loaded_tuya_entries"), namespace
+    )
+
+    with pytest.raises(ValueError, match="research_target"):
+        namespace["loaded_tuya_entries"]()
+
+
 def _r62c_retained_restored_after_abort_v1(
     *, device_drift: bool = True
 ) -> tuple[access.SourceBundle, access.SourceBundle, Path, Path]:

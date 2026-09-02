@@ -7015,7 +7015,9 @@ def loaded_tuya_entries():
         if (
             entry.get('domain') != 'tuya_ble'
             or not isinstance(entry_id, str)
-            or not re.fullmatch(r'[0-9a-f]{32}', entry_id)
+            or not re.fullmatch(
+                r'(?:[0-9a-f]{32}|[0-9A-HJKMNP-TV-Z]{26})', entry_id
+            )
             or entry_id in seen
         ):
             raise ValueError('research_target')
