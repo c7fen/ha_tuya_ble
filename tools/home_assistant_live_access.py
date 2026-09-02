@@ -55,12 +55,12 @@ _LIFECYCLE_ANCHOR_NAME = "anchor.json"
 _LIFECYCLE_JOURNAL_NAME = "journal.json"
 _LIFECYCLE_LOCK_NAME = "journal.lock"
 _DISABLE_DURABLE_LIFECYCLE_FOR_TESTS = False
-PR45_CANDIDATE_COMMIT = "aac1ae8447b3a0e87d86d8a08bee6060ff7ed2fb"
-PR45_CANDIDATE_TREE = "0e61a2fbc0abe5ebf17b5bf4fdbde529a23c66f8"
+PR45_CANDIDATE_COMMIT = "835f602cc6a73bf224b5d134b3e0c96021696138"
+PR45_CANDIDATE_TREE = "2e25fc0971fe0dd6ab698b796454f7970be9b257"
 PR41_RESTORE_COMMIT = "4f73a9b008dcb89134bc41001c486f06d6056867"
 PR41_RESTORE_TREE = "463ed8553da01eae591de611e76e45392ad9e7bf"
 _AUTHORITY_MANIFEST_DIGESTS = {
-    "candidate": "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
+    "candidate": "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
     "restore": "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
 }
 _HELPER_FILES = frozenset(
@@ -4531,8 +4531,8 @@ def expected_manifest(value):
     state = manifest['state']
     authorities = {
         'candidate': (
-            'aac1ae8447b3a0e87d86d8a08bee6060ff7ed2fb',
-            '0e61a2fbc0abe5ebf17b5bf4fdbde529a23c66f8',
+            '835f602cc6a73bf224b5d134b3e0c96021696138',
+            '2e25fc0971fe0dd6ab698b796454f7970be9b257',
         ),
         'restore': (
             '4f73a9b008dcb89134bc41001c486f06d6056867',
@@ -4568,7 +4568,7 @@ def expected_manifest(value):
         for path, (size, digest) in sorted(expected.items())
     ).encode()
     fingerprints = {
-        'candidate': '68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4',
+        'candidate': 'c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075',
         'restore': '2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2',
     }
     if hashlib.sha256(canonical).hexdigest() != fingerprints[state]:
@@ -6317,7 +6317,7 @@ def reconcile_backup(value):
     live_matches = live == expected
     if live_matches:
         result_phase = 'reconciled'
-    elif live_identity == '68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4':
+    elif live_identity == 'c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075':
         result_phase = 'reconciled_candidate'
     else:
         result_phase = 'reconciled_unknown'

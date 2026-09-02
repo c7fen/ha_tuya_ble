@@ -1175,7 +1175,7 @@ def test_r30_self_consistent_forged_manifest_rejected_by_git_authority(
     monkeypatch.setitem(
         access._AUTHORITY_MANIFEST_DIGESTS,
         access.SourceState.CANDIDATE.value,
-        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
+        "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
     )
 
     with pytest.raises(access.SourceBundleError, match="AUTHORITY_MISMATCH"):
@@ -1920,7 +1920,7 @@ def _run_synthetic_remote_program(
         "ROOT = Path('/config')", f"ROOT = Path({str(tmp_path)!r})"
     )
     source = source.replace(
-        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
+        "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
         access._source_manifest_digest(candidate.entries),
     ).replace(
         "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
@@ -2061,7 +2061,7 @@ def _r53_local_pty_source_inspection(
         "ROOT = Path('/config')", f"ROOT = Path({str(root)!r})"
     )
     remote_program = remote_program.replace(
-        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
+        "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
         access._source_manifest_digest(candidate.manifest.entries),
     ).replace(
         "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
