@@ -169,6 +169,14 @@ class RemoteFailureReason(StrEnum):
     REGULAR_FILE = "REGULAR_FILE"
     FILESYSTEM = "FILESYSTEM"
     PRIVATE_STATE = "PRIVATE_STATE"
+    RESEARCH_PAYLOAD = "RESEARCH_PAYLOAD"
+    RESEARCH_TARGET = "RESEARCH_TARGET"
+    RESEARCH_HELPER = "RESEARCH_HELPER"
+    RESEARCH_EVIDENCE = "RESEARCH_EVIDENCE"
+    RESEARCH_PROBE = "RESEARCH_PROBE"
+    RESEARCH_RECEIPT = "RESEARCH_RECEIPT"
+    RESEARCH_AUDIT = "RESEARCH_AUDIT"
+    RESEARCH_BUDGET = "RESEARCH_BUDGET"
     VALIDATION = "VALIDATION"
     UNKNOWN = "UNKNOWN"
 
@@ -292,9 +300,53 @@ class PhaseAOperation(StrEnum):
 
 
 class ResearchOperation(StrEnum):
-    """The sole operation available to the dedicated Phase-A research session."""
+    """The fixed operations available to the dedicated Phase-A research session."""
 
+    CHECK_READINESS = "check_readiness"
     RUN_FIXED_INVENTORY = "run_fixed_inventory"
+
+
+class ResearchFailureCategory(StrEnum):
+    """Whether a failed run proves that no PROBE could have been submitted."""
+
+    PRE_PROBE_FAILURE = "PRE_PROBE_FAILURE"
+    POST_OR_POSSIBLY_SUBMITTED_PROBE_FAILURE = (
+        "POST_OR_POSSIBLY_SUBMITTED_PROBE_FAILURE"
+    )
+
+
+class ResearchFailureStage(StrEnum):
+    """Small fixed research boundaries useful to a no-replay caller."""
+
+    ADMISSION = "ADMISSION"
+    TARGET_RESOLUTION = "TARGET_RESOLUTION"
+    HELPER_INVOCATION = "HELPER_INVOCATION"
+    PROBE_EVIDENCE = "PROBE_EVIDENCE"
+    RECEIPT_RECONCILIATION = "RECEIPT_RECONCILIATION"
+    AUDIT = "AUDIT"
+    REQUEST_ACCOUNTING = "REQUEST_ACCOUNTING"
+    DP_AGGREGATION = "DP_AGGREGATION"
+    RESULT_VALIDATION = "RESULT_VALIDATION"
+    REMOTE_TRANSPORT = "REMOTE_TRANSPORT"
+
+
+class ResearchFailureReason(StrEnum):
+    """Identifier-free terminal reasons for one fixed research operation."""
+
+    INVALID_SHAPE = "INVALID_SHAPE"
+    HTTP_REJECTED = "HTTP_REJECTED"
+    NO_ELIGIBLE_TARGET = "NO_ELIGIBLE_TARGET"
+    TARGET_METADATA_UNAVAILABLE = "TARGET_METADATA_UNAVAILABLE"
+    NONCE_MISMATCH = "NONCE_MISMATCH"
+    HELPER_TERMINAL = "HELPER_TERMINAL"
+    EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"
+    AUDIT_INSTANCE_CHANGED = "AUDIT_INSTANCE_CHANGED"
+    COUNTER_REGRESSION = "COUNTER_REGRESSION"
+    REQUEST_COUNT_MISMATCH = "REQUEST_COUNT_MISMATCH"
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+    PROTOCOL_WRITE_DETECTED = "PROTOCOL_WRITE_DETECTED"
+    AMBIGUOUS_SUBMISSION = "AMBIGUOUS_SUBMISSION"
+    UNKNOWN_BOUNDED = "UNKNOWN_BOUNDED"
 
 
 class PreflightFailureReason(StrEnum):
@@ -905,6 +957,35 @@ class PreflightRejectedError(LifecycleControllerError):
         self.http_status = http_status
 
 
+class RemotePhaseAResearchError(LifecycleControllerError):
+    """Expose only bounded dispatch provenance when no typed result survived."""
+
+    def __init__(
+        self,
+        dispatch_stage: DispatchFailureStage,
+        dispatch_class: DispatchFailureClass,
+        remote_scope: RemoteFailureScope | None,
+        remote_reason: RemoteFailureReason | None,
+    ) -> None:
+        if (
+            not isinstance(dispatch_stage, DispatchFailureStage)
+            or not isinstance(dispatch_class, DispatchFailureClass)
+            or (remote_scope is None) != (remote_reason is None)
+            or remote_scope is not None
+            and (
+                not isinstance(remote_scope, RemoteFailureScope)
+                or not isinstance(remote_reason, RemoteFailureReason)
+                or dispatch_class is not DispatchFailureClass.REMOTE_OPERATION
+            )
+        ):
+            raise TypeError("REMOTE_PHASE_A_RESEARCH_ERROR_INVALID") from None
+        super().__init__("REMOTE_PHASE_A_RESEARCH_DISPATCH_FAILED")
+        self.dispatch_stage = dispatch_stage
+        self.dispatch_class = dispatch_class
+        self.remote_scope = remote_scope
+        self.remote_reason = remote_reason
+
+
 @dataclass(frozen=True, slots=True)
 class _CapabilityIssuer:
     """Shared identity ledgers proving controller issuance and broker consumption."""
@@ -1412,6 +1493,26 @@ class RemotePhaseAInventoryResult:
     protocol_datapoint_packet_delta: int
     slots: tuple[RemotePhaseASlotSummary, ...]
     dp_inventory: tuple[RemotePhaseADPInventory, ...]
+    failure_category: ResearchFailureCategory | None
+    failure_stage: ResearchFailureStage | None
+    failure_reason: ResearchFailureReason | None
+    failed_slot: int | None
+    probe_submission_possible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePhaseAReadinessResult:
+    """Sanitized device-free admission for the fixed inventory operation."""
+
+    ready: bool
+    eligible_s1_count: int
+    selected: bool
+    same_target_binding_ready: bool
+    audit_ready: bool
+    audit_instance_continuity: bool
+    protocol_write_delta_zero: bool
+    failure_stage: ResearchFailureStage | None
+    failure_reason: ResearchFailureReason | None
 
 
 @dataclass
@@ -4223,6 +4324,11 @@ def _parse_remote_phase_a_inventory_result(
         "protocol_datapoint_packet_delta",
         "slots",
         "dp_inventory",
+        "failure_category",
+        "failure_stage",
+        "failure_reason",
+        "failed_slot",
+        "probe_submission_possible",
     }
     if not isinstance(payload, dict) or set(payload) != scalar_keys:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
@@ -4232,14 +4338,48 @@ def _parse_remote_phase_a_inventory_result(
         "probe_ambiguous",
         "protocol_write_gate_failed",
         "target_resolution_unsupported",
+        "research_failed",
     }
     if payload["outcome"] not in outcomes:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
-    bool_keys = {"selected", "same_private_target"}
-    count_keys = scalar_keys - bool_keys - {"outcome", "slots", "dp_inventory"}
+    bool_keys = {"selected", "same_private_target", "probe_submission_possible"}
+    failure_keys = {
+        "failure_category",
+        "failure_stage",
+        "failure_reason",
+        "failed_slot",
+    }
+    count_keys = (
+        scalar_keys
+        - bool_keys
+        - failure_keys
+        - {
+            "outcome",
+            "slots",
+            "dp_inventory",
+        }
+    )
     try:
         counts = {key: _count(payload[key]) for key in count_keys}
         booleans = {key: _bool(payload[key]) for key in bool_keys}
+        failure_category = (
+            None
+            if payload["failure_category"] is None
+            else ResearchFailureCategory(payload["failure_category"])
+        )
+        failure_stage = (
+            None
+            if payload["failure_stage"] is None
+            else ResearchFailureStage(payload["failure_stage"])
+        )
+        failure_reason = (
+            None
+            if payload["failure_reason"] is None
+            else ResearchFailureReason(payload["failure_reason"])
+        )
+        failed_slot = (
+            None if payload["failed_slot"] is None else _count(payload["failed_slot"])
+        )
     except (TypeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     if (
@@ -4261,6 +4401,34 @@ def _parse_remote_phase_a_inventory_result(
         or counts["same_session_retained_count"] > counts["retained_request_count"]
         or counts["automatic_reconnect_count"] > len(payload["slots"])
         or counts["observation_overflow_count"] > len(payload["slots"])
+        or failed_slot is not None
+        and failed_slot > 10
+        or payload["outcome"] == "research_failed"
+        and (
+            failure_category is None
+            or failure_stage is None
+            or failure_reason is None
+            or failed_slot is None
+        )
+        or payload["outcome"] != "research_failed"
+        and any(
+            item is not None
+            for item in (
+                failure_category,
+                failure_stage,
+                failure_reason,
+                failed_slot,
+            )
+        )
+        or failure_category is ResearchFailureCategory.PRE_PROBE_FAILURE
+        and (
+            booleans["probe_submission_possible"]
+            or counts["total_device_status_requests"] != 0
+            or counts["completed_probe_slots"] != 0
+        )
+        or failure_category
+        is ResearchFailureCategory.POST_OR_POSSIBLY_SUBMITTED_PROBE_FAILURE
+        and not booleans["probe_submission_possible"]
     ):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     slot_keys = {
@@ -4432,6 +4600,7 @@ def _parse_remote_phase_a_inventory_result(
     complete = payload["outcome"] == "complete"
     if (
         booleans["selected"]
+        and payload["outcome"] != "research_failed"
         and not minimum_dp_ids.issubset(seen_ids)
         or sum(slot.request_count for slot in slots)
         > counts["total_device_status_requests"]
@@ -4469,7 +4638,8 @@ def _parse_remote_phase_a_inventory_result(
         and counts["protocol_datapoint_packet_delta"] == 0
         or payload["outcome"] == "probe_ambiguous"
         and counts["ambiguity_count"] == 0
-        or payload["outcome"] != "target_resolution_unsupported"
+        or payload["outcome"]
+        not in {"target_resolution_unsupported", "research_failed"}
         and (
             not booleans["selected"]
             or not booleans["same_private_target"]
@@ -4517,6 +4687,80 @@ def _parse_remote_phase_a_inventory_result(
         counts["protocol_datapoint_packet_delta"],
         tuple(slots),
         tuple(dp_rows),
+        failure_category,
+        failure_stage,
+        failure_reason,
+        failed_slot,
+        booleans["probe_submission_possible"],
+    )
+
+
+def _parse_remote_phase_a_readiness_result(
+    private_output: bytes,
+) -> RemotePhaseAReadinessResult:
+    """Parse only the exact device-free readiness aggregate."""
+    payload = _exact_payload(private_output)
+    keys = {
+        "ready",
+        "eligible_s1_count",
+        "selected",
+        "same_target_binding_ready",
+        "audit_ready",
+        "audit_instance_continuity",
+        "protocol_write_delta_zero",
+        "failure_stage",
+        "failure_reason",
+    }
+    if not isinstance(payload, dict) or set(payload) != keys:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    try:
+        ready = _bool(payload["ready"])
+        eligible_count = _count(payload["eligible_s1_count"])
+        booleans = {
+            key: _bool(payload[key])
+            for key in (
+                "selected",
+                "same_target_binding_ready",
+                "audit_ready",
+                "audit_instance_continuity",
+                "protocol_write_delta_zero",
+            )
+        }
+        failure_stage = (
+            None
+            if payload["failure_stage"] is None
+            else ResearchFailureStage(payload["failure_stage"])
+        )
+        failure_reason = (
+            None
+            if payload["failure_reason"] is None
+            else ResearchFailureReason(payload["failure_reason"])
+        )
+    except (TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if (
+        eligible_count > 128
+        or ready
+        and (
+            eligible_count < 1
+            or not all(booleans.values())
+            or failure_stage is not None
+            or failure_reason is not None
+        )
+        or not ready
+        and (failure_stage is None or failure_reason is None)
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return RemotePhaseAReadinessResult(
+        ready,
+        eligible_count,
+        booleans["selected"],
+        booleans["same_target_binding_ready"],
+        booleans["audit_ready"],
+        booleans["audit_instance_continuity"],
+        booleans["protocol_write_delta_zero"],
+        failure_stage,
+        failure_reason,
     )
 
 
@@ -4754,7 +4998,9 @@ REMOTE_SCOPES = {
 REMOTE_REASONS = {
     'ROOT', 'ROOT_UNRESOLVED', 'ROOT_AMBIGUOUS', 'ROOT_INVALID', 'PAYLOAD',
     'AUTHORITY', 'MANIFEST', 'PATH', 'DIRECTORY', 'REGULAR_FILE', 'FILESYSTEM',
-    'PRIVATE_STATE', 'VALIDATION', 'UNKNOWN',
+    'PRIVATE_STATE', 'RESEARCH_PAYLOAD', 'RESEARCH_TARGET', 'RESEARCH_HELPER',
+    'RESEARCH_EVIDENCE', 'RESEARCH_PROBE', 'RESEARCH_RECEIPT',
+    'RESEARCH_AUDIT', 'RESEARCH_BUDGET', 'VALIDATION', 'UNKNOWN',
 }
 REMOTE_REASON_BY_TOKEN = {
     'root': 'ROOT',
@@ -4771,6 +5017,17 @@ REMOTE_REASON_BY_TOKEN = {
     'private_state': 'PRIVATE_STATE',
     'backup_identity': 'PRIVATE_STATE',
     'fallback_phase': 'PRIVATE_STATE',
+    'research_payload': 'RESEARCH_PAYLOAD',
+    'research_operation': 'RESEARCH_PAYLOAD',
+    'research_target': 'RESEARCH_TARGET',
+    'research_helper_exit': 'RESEARCH_HELPER',
+    'research_helper_output': 'RESEARCH_HELPER',
+    'research_helper_nonce': 'RESEARCH_HELPER',
+    'research_evidence': 'RESEARCH_EVIDENCE',
+    'research_probe': 'RESEARCH_PROBE',
+    'research_receipt': 'RESEARCH_RECEIPT',
+    'research_audit': 'RESEARCH_AUDIT',
+    'research_budget': 'RESEARCH_BUDGET',
 }
 
 def remote_error(scope, reason):
@@ -6974,11 +7231,156 @@ def research_audit_after_slot(index, previous):
     }
     return current, delta
 
+def research_failure_inventory_result(
+    stage, reason, failed_slot, submission_possible,
+    eligible_count=0, selected=False, counters=None, slots=None,
+):
+    if counters is None:
+        counters = {
+            'completed': 0, 'cold': 0, 'retained': 0, 'cold_ack': 0,
+            'retained_ack': 0, 'failure': 0, 'timeout': 0, 'receipt': 0,
+            'ambiguity': 0, 'release': 0, 'same_session': 0,
+            'reconnect': 0, 'overflow': 0, 'writes': 0, 'packets': 0,
+        }
+    if slots is None:
+        slots = []
+    return {
+        'outcome': 'research_failed', 'eligible_s1_count': eligible_count,
+        'selected': selected, 'same_private_target': False,
+        'completed_probe_slots': counters['completed'],
+        'cold_request_count': counters['cold'],
+        'retained_request_count': counters['retained'],
+        'total_device_status_requests': counters['cold'] + counters['retained'],
+        'cold_ack_success_count': counters['cold_ack'],
+        'retained_ack_success_count': counters['retained_ack'],
+        'failure_count': counters['failure'] + 1,
+        'timeout_count': counters['timeout'],
+        'receipt_lookup_count': counters['receipt'],
+        'ambiguity_count': counters['ambiguity'],
+        'normal_release_count': counters['release'],
+        'same_session_retained_count': counters['same_session'],
+        'automatic_reconnect_count': counters['reconnect'],
+        'observation_overflow_count': counters['overflow'],
+        'protocol_datapoint_write_delta': counters['writes'],
+        'protocol_datapoint_packet_delta': counters['packets'],
+        'slots': slots, 'dp_inventory': [],
+        'failure_category': (
+            'POST_OR_POSSIBLY_SUBMITTED_PROBE_FAILURE'
+            if submission_possible else 'PRE_PROBE_FAILURE'
+        ),
+        'failure_stage': stage, 'failure_reason': reason,
+        'failed_slot': failed_slot,
+        'probe_submission_possible': submission_possible,
+    }
+
+def research_readiness_result(
+    ready, eligible_count, selected, target_ready, audit_ready,
+    instance_continuity, zero_delta, stage=None, reason=None,
+):
+    return {
+        'ready': ready, 'eligible_s1_count': eligible_count,
+        'selected': selected,
+        'same_target_binding_ready': target_ready,
+        'audit_ready': audit_ready,
+        'audit_instance_continuity': instance_continuity,
+        'protocol_write_delta_zero': zero_delta,
+        'failure_stage': stage, 'failure_reason': reason,
+    }
+
+def remote_phase_a_readiness(value):
+    if not isinstance(value, dict) or set(value) != {'baseline'}:
+        return research_readiness_result(
+            False, 0, False, False, False, False, False,
+            'ADMISSION', 'INVALID_SHAPE',
+        )
+    try:
+        baseline = validate_research_audit(value['baseline'])
+    except Exception:
+        return research_readiness_result(
+            False, 0, False, False, False, False, False,
+            'ADMISSION', 'INVALID_SHAPE',
+        )
+    try:
+        eligible_count, selected = resolve_research_target()
+    except Exception:
+        return research_readiness_result(
+            False, 0, False, False, False, False, False,
+            'TARGET_RESOLUTION', 'TARGET_METADATA_UNAVAILABLE',
+        )
+    if selected is None:
+        return research_readiness_result(
+            False, eligible_count, False, False, False, False, False,
+            'TARGET_RESOLUTION', 'NO_ELIGIBLE_TARGET',
+        )
+    nonce = os.urandom(16).hex()
+    try:
+        code, outcome, evidence, _status = invoke_research_helper(
+            'audit', 'R63S_READY', nonce
+        )
+    except Exception:
+        return research_readiness_result(
+            False, eligible_count, True, True, False, False, False,
+            'AUDIT', 'HELPER_TERMINAL',
+        )
+    if code != 0 or outcome != 'audit_snapshot' or evidence is None:
+        return research_readiness_result(
+            False, eligible_count, True, True, False, False, False,
+            'AUDIT', 'HELPER_TERMINAL',
+        )
+    try:
+        current = validate_research_audit(evidence, nonce)
+    except Exception:
+        return research_readiness_result(
+            False, eligible_count, True, True, False, False, False,
+            'AUDIT', 'INVALID_SHAPE',
+        )
+    if current['audit_instance_token'] != baseline['audit_instance_token']:
+        return research_readiness_result(
+            False, eligible_count, True, True, True, False, False,
+            'AUDIT', 'AUDIT_INSTANCE_CHANGED',
+        )
+    if (
+        current['event_ordinal'] < baseline['event_ordinal']
+        or any(current['counters'][key] < baseline['counters'][key] for key in COUNTERS)
+    ):
+        return research_readiness_result(
+            False, eligible_count, True, True, True, True, False,
+            'AUDIT', 'COUNTER_REGRESSION',
+        )
+    zero_keys = {
+        'device_status_requests', 'device_info_requests', 'pair_requests',
+        'datapoint_write_operations', 'datapoint_protocol_packets',
+    }
+    zero_delta = all(
+        current['counters'][key] == baseline['counters'][key]
+        for key in zero_keys
+    )
+    if not zero_delta:
+        return research_readiness_result(
+            False, eligible_count, True, True, True, True, False,
+            'AUDIT', 'PROTOCOL_WRITE_DETECTED',
+        )
+    return research_readiness_result(
+        True, eligible_count, True, True, True, True, True,
+    )
+
 def remote_phase_a_inventory(value):
     if not isinstance(value, dict) or set(value) != {'baseline'}:
-        raise ValueError('research_payload')
-    baseline = validate_research_audit(value['baseline'])
-    eligible_count, selected = resolve_research_target()
+        return research_failure_inventory_result(
+            'ADMISSION', 'INVALID_SHAPE', 0, False
+        )
+    try:
+        baseline = validate_research_audit(value['baseline'])
+    except Exception:
+        return research_failure_inventory_result(
+            'ADMISSION', 'INVALID_SHAPE', 0, False
+        )
+    try:
+        eligible_count, selected = resolve_research_target()
+    except Exception:
+        return research_failure_inventory_result(
+            'TARGET_RESOLUTION', 'TARGET_METADATA_UNAVAILABLE', 0, False
+        )
     if selected is None:
         return {
             'outcome': 'target_resolution_unsupported', 'eligible_s1_count': 0,
@@ -6993,6 +7395,9 @@ def remote_phase_a_inventory(value):
             'protocol_datapoint_write_delta': 0,
             'protocol_datapoint_packet_delta': 0, 'slots': [],
             'dp_inventory': [],
+            'failure_category': None, 'failure_stage': None,
+            'failure_reason': None, 'failed_slot': None,
+            'probe_submission_possible': False,
         }
     plan = (
         ('R01', 'cold_then_retained'), ('R02', 'cold_then_retained'),
@@ -7020,33 +7425,63 @@ def remote_phase_a_inventory(value):
     private_target = selected
     for index, (slot, mode) in enumerate(plan, 1):
         if counters['cold'] >= 10 or counters['retained'] >= 5 and mode == 'cold_then_retained':
-            raise ValueError('research_budget')
+            return research_failure_inventory_result(
+                'REQUEST_ACCOUNTING', 'BUDGET_EXCEEDED', index,
+                bool(slots), eligible_count, True, counters, slots,
+            )
         nonce = os.urandom(16).hex()
         if nonce in used_nonces:
-            raise ValueError('research_nonce')
+            return research_failure_inventory_result(
+                'ADMISSION', 'NONCE_MISMATCH', index,
+                bool(slots), eligible_count, True, counters, slots,
+            )
         used_nonces.add(nonce)
-        code, helper_outcome, evidence, _status = invoke_research_helper(
-            'probe', 'R63S_' + slot, nonce, mode, private_target
-        )
+        try:
+            code, helper_outcome, evidence, _status = invoke_research_helper(
+                'probe', 'R63S_' + slot, nonce, mode, private_target
+            )
+        except Exception:
+            return research_failure_inventory_result(
+                'HELPER_INVOCATION', 'HELPER_TERMINAL', index,
+                True, eligible_count, True, counters, slots,
+            )
         helper_target_checks += 1
         receipt_used = False
         receipt_handed = False
         probe = None
         stop_after = False
         if evidence is not None:
-            probe = validate_research_probe(evidence, mode, nonce)
+            try:
+                probe = validate_research_probe(evidence, mode, nonce)
+            except Exception:
+                return research_failure_inventory_result(
+                    'PROBE_EVIDENCE', 'INVALID_SHAPE', index,
+                    True, eligible_count, True, counters, slots,
+                )
         elif code == 78 and helper_outcome == 'transport_ambiguous':
             receipt_used = True
             counters['ambiguity'] += 1
             outcome = 'probe_ambiguous'
             for receipt_index in range(1, 4):
                 receipt_nonce = nonce
-                receipt_code, _receipt_outcome, receipt_evidence, _receipt_status = invoke_research_helper(
-                    'receipt', 'R63S_Q' + str(index).zfill(2) + '_' + str(receipt_index), receipt_nonce
-                )
+                try:
+                    receipt_code, _receipt_outcome, receipt_evidence, _receipt_status = invoke_research_helper(
+                        'receipt', 'R63S_Q' + str(index).zfill(2) + '_' + str(receipt_index), receipt_nonce
+                    )
+                except Exception:
+                    return research_failure_inventory_result(
+                        'RECEIPT_RECONCILIATION', 'HELPER_TERMINAL', index,
+                        True, eligible_count, True, counters, slots,
+                    )
                 counters['receipt'] += 1
                 if receipt_evidence is not None:
-                    receipt = validate_research_receipt(receipt_evidence, nonce)
+                    try:
+                        receipt = validate_research_receipt(receipt_evidence, nonce)
+                    except Exception:
+                        return research_failure_inventory_result(
+                            'RECEIPT_RECONCILIATION', 'INVALID_SHAPE', index,
+                            True, eligible_count, True, counters, slots,
+                        )
                     receipt_handed = (
                         receipt_handed or receipt['request_handed_to_transport']
                     )
@@ -7062,7 +7497,35 @@ def remote_phase_a_inventory(value):
             counters['failure'] += 1
             outcome = 'sample_incomplete'
             stop_after = True
-        current, delta = research_audit_after_slot(index, previous)
+        try:
+            current, delta = research_audit_after_slot(index, previous)
+        except Exception:
+            if probe is not None:
+                request_count = probe['request_count']
+                cold_result = (
+                    probe['requests'][0]['result'] if request_count >= 1 else None
+                )
+                retained_result = (
+                    probe['requests'][1]['result'] if request_count >= 2 else None
+                )
+                counters['cold'] += int(request_count >= 1)
+                counters['retained'] += int(request_count >= 2)
+                counters['cold_ack'] += int(cold_result == 'ack_success')
+                counters['retained_ack'] += int(retained_result == 'ack_success')
+                slots.append({
+                    'label': slot, 'mode': mode, 'request_count': request_count,
+                    'cold_result': cold_result,
+                    'retained_result': retained_result,
+                    'same_session_retained': probe['same_session_retained'],
+                    'normal_release_observed': probe['normal_release_observed'],
+                    'automatic_reconnect_observed': probe['automatic_reconnect_observed'],
+                    'observation_overflow': probe['observation_overflow'],
+                    'receipt_used': receipt_used,
+                })
+            return research_failure_inventory_result(
+                'AUDIT', 'INVALID_SHAPE', index,
+                True, eligible_count, True, counters, slots,
+            )
         previous = current
         counters['writes'] += delta['datapoint_write_operations']
         counters['packets'] += delta['datapoint_protocol_packets']
@@ -7081,8 +7544,10 @@ def remote_phase_a_inventory(value):
             reconnect = probe['automatic_reconnect_observed']
             overflow = probe['observation_overflow']
             if delta['device_status_requests'] != request_count:
-                outcome = 'sample_incomplete'
-                stop_after = True
+                return research_failure_inventory_result(
+                    'REQUEST_ACCOUNTING', 'REQUEST_COUNT_MISMATCH', index,
+                    True, eligible_count, True, counters, slots,
+                )
             counters['cold'] += int(request_count >= 1)
             counters['retained'] += int(request_count >= 2)
             counters['cold_ack'] += int(cold_result == 'ack_success')
@@ -7134,7 +7599,10 @@ def remote_phase_a_inventory(value):
                 possible_requests = 1
             per_slot_limit = 2 if mode == 'cold_then_retained' else 1
             if possible_requests > per_slot_limit:
-                raise ValueError('research_budget')
+                return research_failure_inventory_result(
+                    'REQUEST_ACCOUNTING', 'BUDGET_EXCEEDED', index,
+                    True, eligible_count, True, counters, slots,
+                )
             counters['cold'] += int(possible_requests >= 1)
             counters['retained'] += int(possible_requests >= 2)
         if (
@@ -7142,7 +7610,10 @@ def remote_phase_a_inventory(value):
             or counters['retained'] > 5
             or counters['cold'] + counters['retained'] > 15
         ):
-            raise ValueError('research_budget')
+            return research_failure_inventory_result(
+                'REQUEST_ACCOUNTING', 'BUDGET_EXCEEDED', index,
+                True, eligible_count, True, counters, slots,
+            )
         slots.append({
             'label': slot, 'mode': mode, 'request_count': request_count,
             'cold_result': cold_result, 'retained_result': retained_result,
@@ -7209,6 +7680,9 @@ def remote_phase_a_inventory(value):
         'protocol_datapoint_write_delta': counters['writes'],
         'protocol_datapoint_packet_delta': counters['packets'],
         'slots': slots, 'dp_inventory': rows,
+        'failure_category': None, 'failure_stage': None,
+        'failure_reason': None, 'failed_slot': None,
+        'probe_submission_possible': False,
     }
 
 def restore_backup(value):
@@ -7362,6 +7836,8 @@ else:
                 result = invoke_helper(value)
             elif operation == 'remote_phase_a_inventory':
                 result = remote_phase_a_inventory(value)
+            elif operation == 'remote_phase_a_readiness':
+                result = remote_phase_a_readiness(value)
             elif operation == 'restore':
                 result = activate(value, restoring=True)
             elif operation == 'restore_backup':
@@ -7605,7 +8081,11 @@ class PrivateInteractiveSessionBroker:
             or capability.lifecycle_generation is not binding.lifecycle_generation
             or capability.source_generation is None
             or capability.session_generation is not binding.session_generation
-            or capability.operation is not ResearchOperation.RUN_FIXED_INVENTORY
+            or capability.operation
+            not in {
+                ResearchOperation.CHECK_READINESS,
+                ResearchOperation.RUN_FIXED_INVENTORY,
+            }
             or capability.issuance_identity is None
             or not any(capability is issued for issued in binding.issuer.issued)
             or any(capability is consumed for consumed in binding.issuer.consumed)
@@ -7993,7 +8473,7 @@ class PrivateInteractiveSessionBroker:
         _capability: object,
     ) -> bytes:
         """Run the one fixed research program without an operation/target input."""
-        self._require_research_capability(_capability, consume=True)
+        capability = self._require_research_capability(_capability, consume=True)
         if self._state is not BrokerState.SESSION_ACTIVE or not isinstance(
             baseline, dict
         ):
@@ -8039,11 +8519,16 @@ class PrivateInteractiveSessionBroker:
             '"error_reason":"UNKNOWN"}\',flush=True)\n'
         )
         bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
+        remote_operation = (
+            "remote_phase_a_readiness"
+            if capability.operation is ResearchOperation.CHECK_READINESS
+            else "remote_phase_a_inventory"
+        )
         command = (
             f"{self._frame_printf(start_payload)}; "
-            "HA_R30_OPERATION=remote_phase_a_inventory HA_R30_DETAIL=fixed "
+            f"HA_R30_OPERATION={remote_operation} HA_R30_DETAIL=fixed "
             f"HA_R63S_PROGRAM_SHA256={program_digest} "
-            f"python3 -c {shlex.quote(bootstrap)} remote_phase_a_inventory; "
+            f"python3 -c {shlex.quote(bootstrap)} {remote_operation}; "
             f"{self._frame_printf(end_payload)}\n"
         )
         try:
@@ -8086,7 +8571,7 @@ class PrivateInteractiveSessionBroker:
         baseline: AuditSnapshot,
         *,
         _capability: object = None,
-    ) -> RemotePhaseAInventoryResult:
+    ) -> RemotePhaseAInventoryResult | RemotePhaseAReadinessResult:
         """Invoke the fixed research program through its dedicated capability."""
         if not isinstance(baseline, AuditSnapshot) or baseline.nonce is None:
             raise SessionBrokerError(
@@ -8106,6 +8591,8 @@ class PrivateInteractiveSessionBroker:
             output = self.__execute_remote_phase_a_inventory(
                 baseline_payload, _capability=_capability
             )
+            if _capability.operation is ResearchOperation.CHECK_READINESS:
+                return _parse_remote_phase_a_readiness_result(output)
             return _parse_remote_phase_a_inventory_result(output)
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
@@ -9071,6 +9558,8 @@ class RemotePhaseAInventorySession:
         self._broker = broker
         self._permit = permit
         self._baseline = baseline
+        self._readiness_attempted = False
+        self._readiness_passed = False
         self._ran = False
         self._closed = False
 
@@ -9080,14 +9569,25 @@ class RemotePhaseAInventorySession:
             f"ran={self._ran!r}, closed={self._closed!r})"
         )
 
-    def run_remote_phase_a_inventory(self) -> RemotePhaseAInventoryResult:
-        """Execute the immutable R01-R10 plan exactly once."""
-        if self._closed or self._ran:
-            raise LifecycleControllerError("RESEARCH_SESSION_CONSUMED") from None
+    @staticmethod
+    def _dispatch_error(error: BaseException) -> RemotePhaseAResearchError:
+        failure = _bounded_dispatch_failure(
+            DispatchFailureStage.UNKNOWN,
+            error,
+        )
+        return RemotePhaseAResearchError(
+            failure.stage,
+            failure.failure_class,
+            failure.remote_failure_scope,
+            failure.remote_failure_reason,
+        )
+
+    def _assert_active(self) -> tuple[FullPreflightLifecycleController, object]:
         controller = self._controller
         permit = self._permit
         if (
-            controller.state is not LifecycleState.A2_COLLECTED
+            self._closed
+            or controller.state is not LifecycleState.A2_COLLECTED
             or not getattr(controller, "_research_session_active", False)
             or permit.controller is not controller
             or permit.lifecycle_generation is not controller._lifecycle_generation
@@ -9095,6 +9595,48 @@ class RemotePhaseAInventorySession:
             or permit.session_generation is not controller._session_generation
         ):
             raise LifecycleControllerError("RESEARCH_SESSION_INVALID") from None
+        return controller, permit
+
+    def check_readiness(self) -> RemotePhaseAReadinessResult:
+        """Run the one device-free target and audit admission exactly once."""
+        if self._readiness_attempted or self._ran:
+            raise LifecycleControllerError("RESEARCH_READINESS_CONSUMED") from None
+        controller, permit = self._assert_active()
+        self._readiness_attempted = True
+        capability = _RemotePhaseAResearchCapability(
+            controller,
+            self,
+            permit.issuer,
+            permit.lifecycle_generation,
+            permit.source_generation,
+            permit.session_generation,
+            ResearchOperation.CHECK_READINESS,
+            object(),
+        )
+        controller._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._invoke_remote_phase_a_research(
+                self._baseline, _capability=capability
+            )
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise self._dispatch_error(error) from None
+        if not isinstance(result, RemotePhaseAReadinessResult):
+            raise RemotePhaseAResearchError(
+                DispatchFailureStage.RESULT_VALIDATION,
+                DispatchFailureClass.SCHEMA,
+                None,
+                None,
+            ) from None
+        self._readiness_passed = result.ready
+        return result
+
+    def run_remote_phase_a_inventory(self) -> RemotePhaseAInventoryResult:
+        """Execute the immutable R01-R10 plan exactly once."""
+        if self._closed or self._ran:
+            raise LifecycleControllerError("RESEARCH_SESSION_CONSUMED") from None
+        if not self._readiness_passed:
+            raise LifecycleControllerError("RESEARCH_READINESS_REQUIRED") from None
+        controller, permit = self._assert_active()
         self._ran = True
         capability = _RemotePhaseAResearchCapability(
             controller,
@@ -9111,10 +9653,15 @@ class RemotePhaseAInventorySession:
             result = self._broker._invoke_remote_phase_a_research(
                 self._baseline, _capability=capability
             )
-        except (SessionBrokerError, TypeError, ValueError):
-            raise LifecycleControllerError("RESEARCH_RUN_FAILED") from None
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise self._dispatch_error(error) from None
         if not isinstance(result, RemotePhaseAInventoryResult):
-            raise LifecycleControllerError("RESEARCH_RUN_FAILED") from None
+            raise RemotePhaseAResearchError(
+                DispatchFailureStage.RESULT_VALIDATION,
+                DispatchFailureClass.SCHEMA,
+                None,
+                None,
+            ) from None
         return result
 
     def close(self) -> None:

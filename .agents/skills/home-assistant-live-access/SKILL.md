@@ -189,8 +189,23 @@ controller has durably reached `A2_COLLECTED` may it issue one dedicated
 inventory sequence and owns its target selection, modes, nonces, receipt
 reconciliation, audits, and request budgets internally. It is not a generic
 helper or command interface. Do not invoke the broker or its private research
-adapter directly. Close the research session after its one run, then continue
-the unchanged PR #41 restoration path through the normal lifecycle controller.
+adapter directly. Before its one inventory run, invoke its one device-free
+readiness check. Readiness may enumerate and diagnose loaded entries and invoke
+one standalone AUDIT, but it must issue no PROBE, Device Status, Device Info,
+Pair, lock, unlock, open, or configuration/datapoint-write operation. Inventory
+is unavailable unless readiness passes. A readiness failure is terminal for
+that session and still leaves the same A2 lifecycle restorable.
+
+The inventory result preserves only fixed research failure stage/reason,
+failed-slot, possible-submission, and bounded aggregate progress. A failure
+before any possible PROBE submission is distinct from a post- or
+possibly-submitted failure. A possibly submitted slot is consumed permanently;
+never retry or replace it. If no typed research result survives because of a
+bootstrap, framing, session, or result-parser failure, retain only the bounded
+dispatch stage/class/scope/reason wrapper, never exception text or remote
+output. Close the research session after readiness failure or the one inventory
+run, then continue the unchanged PR #41 restoration path through the normal
+lifecycle controller.
 
 The exact success sequence is:
 

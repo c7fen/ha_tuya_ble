@@ -1024,6 +1024,7 @@ def _synthetic_r30_source_authorities(
                 "test_r62c_",
                 "test_r62f_",
                 "test_r63s_",
+                "test_r63t_",
             )
         ),
     )
@@ -1047,6 +1048,7 @@ def _synthetic_r30_source_authorities(
             "test_r62c_",
             "test_r62f_",
             "test_r63s_",
+            "test_r63t_",
         )
     ):
         return
@@ -10195,6 +10197,25 @@ def _r63s_complete_result() -> access.RemotePhaseAInventoryResult:
         0,
         slots,
         rows,
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+
+
+def _r63t_ready_result() -> access.RemotePhaseAReadinessResult:
+    return access.RemotePhaseAReadinessResult(
+        True,
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        None,
+        None,
     )
 
 
@@ -10220,10 +10241,12 @@ def test_r63s_fixed_research_session_is_state_neutral_and_one_shot(
     ) -> access.RemotePhaseAInventoryResult:
         assert isinstance(baseline, access.AuditSnapshot)
         assert type(_capability) is access._RemotePhaseAResearchCapability
-        assert _capability.operation is access.ResearchOperation.RUN_FIXED_INVENTORY
         assert _capability.controller is controller
         broker._controller_binding[1].consumed.append(_capability)
         seen.append(_capability)
+        if _capability.operation is access.ResearchOperation.CHECK_READINESS:
+            return _r63t_ready_result()
+        assert _capability.operation is access.ResearchOperation.RUN_FIXED_INVENTORY
         return expected
 
     monkeypatch.setattr(broker, "_invoke_remote_phase_a_research", run, raising=False)
@@ -10236,10 +10259,12 @@ def test_r63s_fixed_research_session_is_state_neutral_and_one_shot(
     ):
         controller.stage_restore(_r32_bundles()[1])
 
+    readiness = session.check_readiness()
     result = session.run_remote_phase_a_inventory()
 
+    assert readiness.ready is True
     assert result == expected
-    assert len(seen) == 1
+    assert len(seen) == 2
     assert controller.state is access.LifecycleState.A2_COLLECTED
     assert controller._journal._record == before
     with pytest.raises(
@@ -10275,6 +10300,7 @@ def test_r63s_public_surface_and_normal_lifecycle_remain_narrow() -> None:
     assert "PROBE" not in access.LifecycleAction.__members__
     assert "PROBE" not in access.PhaseAOperation.__members__
     assert tuple(access.ResearchOperation) == (
+        access.ResearchOperation.CHECK_READINESS,
         access.ResearchOperation.RUN_FIXED_INVENTORY,
     )
     signature = inspect.signature(
@@ -10286,7 +10312,7 @@ def test_r63s_public_surface_and_normal_lifecycle_remain_narrow() -> None:
         for name, value in vars(access.RemotePhaseAInventorySession).items()
         if callable(value) and not name.startswith("_")
     }
-    assert public == {"run_remote_phase_a_inventory", "close"}
+    assert public == {"check_readiness", "run_remote_phase_a_inventory", "close"}
     source = inspect.getsource(access.RemotePhaseAInventorySession)
     for forbidden in (
         "config_entry_id",
@@ -10476,6 +10502,8 @@ def invoke_research_helper(operation, label, nonce, mode=None, target=None):
             'events': events,
             'invocation_nonce': nonce,
         }}
+        if SYN_SCENARIO == 'probe_invalid' and SYN_PROBES == 1:
+            result['unexpected'] = True
         return (66 if precondition else 0), result['result'], result, None
     if operation == 'receipt':
         if nonce != SYN_PROBE_NONCE:
@@ -10490,6 +10518,8 @@ def invoke_research_helper(operation, label, nonce, mode=None, target=None):
         }}
         return (66 if pending else 0), 'receipt', receipt, None
     if operation == 'audit':
+        if SYN_SCENARIO == 'audit_failure' and SYN_PROBES == 1:
+            raise ValueError('research_audit')
         counters = {{name: 0 for name in COUNTERS}}
         counters['device_status_requests'] = SYN_STATUS
         counters['datapoint_write_operations'] = SYN_WRITES
@@ -10587,10 +10617,13 @@ def test_r63s_authority_and_privacy_boundaries_remain_fail_closed() -> None:
 
 def test_r63s_closed_session_allows_same_durable_a2_restore_reconstruction() -> None:
     controller, broker = _r63s_controller_at_a2()
-    broker._invoke_remote_phase_a_research = lambda *_args, **_kwargs: (
-        _r63s_complete_result()
+    broker._invoke_remote_phase_a_research = lambda *_args, **kwargs: (
+        _r63t_ready_result()
+        if kwargs["_capability"].operation is access.ResearchOperation.CHECK_READINESS
+        else _r63s_complete_result()
     )
     session = controller.open_remote_phase_a_inventory_session()
+    session.check_readiness()
     session.run_remote_phase_a_inventory()
     session.close()
     controller.close()
@@ -10607,6 +10640,193 @@ def test_r63s_closed_session_allows_same_durable_a2_restore_reconstruction() -> 
     assert proof.complete is True
     assert reconstructed.state is access.LifecycleState.COMPLETE_NORMAL
     reconstructed.close()
+
+
+def test_r63t_research_dispatch_failure_preserves_bounded_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, broker = _r63s_controller_at_a2()
+    session = controller.open_remote_phase_a_inventory_session()
+    monkeypatch.setattr(
+        broker,
+        "_invoke_remote_phase_a_research",
+        lambda *_args, **_kwargs: _r63t_ready_result(),
+        raising=False,
+    )
+    session.check_readiness()
+    failure = access._DispatchFailure(
+        access.DispatchFailureStage.RESPONSE_PARSE,
+        access.DispatchFailureClass.REMOTE_OPERATION,
+        access.RemoteFailureScope.PHASE_A,
+        access.RemoteFailureReason.RESEARCH_TARGET,
+    )
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        broker,
+        "_invoke_remote_phase_a_research",
+        fail,
+        raising=False,
+    )
+
+    with pytest.raises(access.RemotePhaseAResearchError) as raised:
+        session.run_remote_phase_a_inventory()
+
+    assert str(raised.value) == "REMOTE_PHASE_A_RESEARCH_DISPATCH_FAILED"
+    assert raised.value.dispatch_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert raised.value.dispatch_class is access.DispatchFailureClass.REMOTE_OPERATION
+    assert raised.value.remote_scope is access.RemoteFailureScope.PHASE_A
+    assert raised.value.remote_reason is access.RemoteFailureReason.RESEARCH_TARGET
+    session.close()
+    controller.close()
+
+
+def test_r63t_session_requires_device_free_readiness_before_inventory() -> None:
+    controller, broker = _r63s_controller_at_a2()
+    session = controller.open_remote_phase_a_inventory_session()
+
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="RESEARCH_READINESS_REQUIRED",
+    ):
+        session.run_remote_phase_a_inventory()
+
+    assert not any(name == "research" for name, _detail in broker.calls)
+    session.close()
+    controller.close()
+
+
+def _r63t_readiness_replacements(scenario: str) -> dict[str, str]:
+    source = access._REMOTE_CONTROL_PROGRAM
+    invoke_start = source.index("def invoke_research_helper")
+    invoke_end = source.index("def loaded_tuya_entries")
+    original_invoke = source[invoke_start:invoke_end]
+    original_target = _r63s_embedded_function_source("resolve_research_target")
+    target = (
+        "def resolve_research_target():\n    return 0, None"
+        if scenario == "zero_target"
+        else (
+            "def resolve_research_target():\n" "    raise ValueError('research_target')"
+            if scenario == "target_failure"
+            else "def resolve_research_target():\n    return 1, 'a' * 32"
+        )
+    )
+    synthetic_invoke = f"""def invoke_research_helper(operation, label, nonce, mode=None, target=None):
+    if operation != 'audit' or mode is not None or target is not None:
+        raise ValueError('research_operation')
+    counters = {{name: 0 for name in COUNTERS}}
+    audit = {{
+        'result': 'audit_snapshot', 'protocol_version': 1,
+        'audit_instance_token': {'b' * 32!r} if {scenario!r} == 'instance' else {'a' * 32!r},
+        'event_ordinal': 0, 'history_overflow': False, 'runtime_ms': 1,
+        'counters': counters, 'events': [], 'nonce': nonce,
+    }}
+    if {scenario!r} == 'audit_failure':
+        return 67, 'schema_invalid', None, None
+    if {scenario!r} == 'counter_regression':
+        audit['counters']['connect_attempts'] = -1
+    if {scenario!r} == 'device_request':
+        audit['counters']['device_status_requests'] = 1
+    return 0, 'audit_snapshot', audit, None
+
+"""
+    return {original_invoke: synthetic_invoke, original_target: target}
+
+
+@pytest.mark.parametrize(
+    ("scenario", "ready", "stage", "reason"),
+    (
+        ("ready", True, None, None),
+        ("zero_target", False, "TARGET_RESOLUTION", "NO_ELIGIBLE_TARGET"),
+        (
+            "target_failure",
+            False,
+            "TARGET_RESOLUTION",
+            "TARGET_METADATA_UNAVAILABLE",
+        ),
+        ("audit_failure", False, "AUDIT", "HELPER_TERMINAL"),
+        ("instance", False, "AUDIT", "AUDIT_INSTANCE_CHANGED"),
+        ("counter_regression", False, "AUDIT", "INVALID_SHAPE"),
+        ("device_request", False, "AUDIT", "PROTOCOL_WRITE_DETECTED"),
+    ),
+)
+def test_r63t_remote_readiness_is_device_free_and_bounded(
+    tmp_path: Path,
+    scenario: str,
+    ready: bool,
+    stage: str | None,
+    reason: str | None,
+) -> None:
+    (tmp_path / "custom_components" / "tuya_ble").mkdir(parents=True)
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "remote_phase_a_readiness",
+        {"baseline": _r63s_remote_baseline()},
+        source_replacements=_r63t_readiness_replacements(scenario),
+    )
+
+    assert result["ready"] is ready
+    assert result["failure_stage"] == stage
+    assert result["failure_reason"] == reason
+    assert "probe" not in _r63s_embedded_function_source("remote_phase_a_readiness")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "stage", "reason", "failed_slot", "possible"),
+    (
+        ("probe_invalid", "PROBE_EVIDENCE", "INVALID_SHAPE", 1, True),
+        ("audit_failure", "AUDIT", "INVALID_SHAPE", 1, True),
+    ),
+)
+def test_r63t_remote_inventory_preserves_terminal_failure_progress(
+    tmp_path: Path,
+    scenario: str,
+    stage: str,
+    reason: str,
+    failed_slot: int,
+    possible: bool,
+) -> None:
+    (tmp_path / "custom_components" / "tuya_ble").mkdir(parents=True)
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "remote_phase_a_inventory",
+        {"baseline": _r63s_remote_baseline()},
+        source_replacements=_r63s_remote_replacements(scenario),
+    )
+
+    assert result["outcome"] == "research_failed"
+    assert result["failure_stage"] == stage
+    assert result["failure_reason"] == reason
+    assert result["failed_slot"] == failed_slot
+    assert result["probe_submission_possible"] is possible
+    assert result["cold_request_count"] <= 1
+    assert result["retained_request_count"] <= 1
+
+
+def test_r63t_remote_target_failure_proves_pre_probe_zero_requests(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "custom_components" / "tuya_ble").mkdir(parents=True)
+    replacements = _r63s_remote_replacements("complete")
+    original = _r63s_embedded_function_source("resolve_research_target")
+    replacements[original] = (
+        "def resolve_research_target():\n" "    raise ValueError('research_target')"
+    )
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "remote_phase_a_inventory",
+        {"baseline": _r63s_remote_baseline()},
+        source_replacements=replacements,
+    )
+
+    assert result["outcome"] == "research_failed"
+    assert result["failure_category"] == "PRE_PROBE_FAILURE"
+    assert result["failure_stage"] == "TARGET_RESOLUTION"
+    assert result["failed_slot"] == 0
+    assert result["probe_submission_possible"] is False
+    assert result["total_device_status_requests"] == 0
 
 
 def _r62c_retained_restored_after_abort_v1(
