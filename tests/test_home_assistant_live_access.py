@@ -10166,6 +10166,8 @@ def _r63s_complete_result() -> access.RemotePhaseAInventoryResult:
             5,
             ("DT_VALUE",),
             (4,),
+            ("DT_BOOL",),
+            (1,),
             "ALWAYS_REPORTED",
         )
         for dp_id in (8, 21, 33, 34, 36, 40, 47)
@@ -10318,8 +10320,10 @@ def test_r63s_result_parser_enforces_budgets_and_rejects_private_extras() -> Non
     payload["dp_inventory"] = [
         {
             **dict(item),
-            "type_set": list(item["type_set"]),
-            "encoded_length_set": list(item["encoded_length_set"]),
+            "cold_type_set": list(item["cold_type_set"]),
+            "cold_encoded_length_set": list(item["cold_encoded_length_set"]),
+            "retained_type_set": list(item["retained_type_set"]),
+            "retained_encoded_length_set": list(item["retained_encoded_length_set"]),
         }
         for item in payload["dp_inventory"]
     ]
@@ -10445,8 +10449,13 @@ def invoke_research_helper(operation, label, nonce, mode=None, target=None):
                 'trial': trial, 'observation_ordinal': trial,
                 'origin': 'explicit', 'kind': 'DP_BATCH',
                 'event_ordinal': trial, 'batch_ordinal': 1,
-                'dp_ids': [8, 21], 'dp_types': ['DT_VALUE', 'DT_BOOL'],
-                'encoded_value_lengths': [4, 1], 'exact_session': True,
+                'dp_ids': [8, 21],
+                'dp_types': (
+                    ['DT_VALUE', 'DT_BOOL']
+                    if trial == 1 else ['DT_ENUM', 'DT_RAW']
+                ),
+                'encoded_value_lengths': [4, 1] if trial == 1 else [1, 8],
+                'exact_session': True,
                 'ack_result': None, 'ack_phase': 'after_ack',
                 'monotonic_ms': trial,
             }}
@@ -10544,6 +10553,11 @@ def test_r63s_remote_fixed_plan_budgets_stops_and_no_replay(
         assert result["completed_probe_slots"] == 10
         assert result["cold_ack_success_count"] == 10
         assert result["retained_ack_success_count"] == 5
+        dp8 = next(item for item in result["dp_inventory"] if item["dp_id"] == 8)
+        assert dp8["cold_type_set"] == ["DT_VALUE"]
+        assert dp8["cold_encoded_length_set"] == [4]
+        assert dp8["retained_type_set"] == ["DT_ENUM"]
+        assert dp8["retained_encoded_length_set"] == [1]
     else:
         assert result["completed_probe_slots"] <= 1
 

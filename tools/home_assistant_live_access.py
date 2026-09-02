@@ -1379,8 +1379,10 @@ class RemotePhaseADPInventory:
     cold_eligible_count: int
     retained_reported_count: int
     retained_eligible_count: int
-    type_set: tuple[str, ...]
-    encoded_length_set: tuple[int, ...]
+    cold_type_set: tuple[str, ...]
+    cold_encoded_length_set: tuple[int, ...]
+    retained_type_set: tuple[str, ...]
+    retained_encoded_length_set: tuple[int, ...]
     classification: str
 
 
@@ -4332,8 +4334,10 @@ def _parse_remote_phase_a_inventory_result(
         "cold_eligible_count",
         "retained_reported_count",
         "retained_eligible_count",
-        "type_set",
-        "encoded_length_set",
+        "cold_type_set",
+        "cold_encoded_length_set",
+        "retained_type_set",
+        "retained_encoded_length_set",
         "classification",
     }
     dp_rows: list[RemotePhaseADPInventory] = []
@@ -4363,7 +4367,7 @@ def _parse_remote_phase_a_inventory_result(
             or retained_reported > retained_eligible
             or retained_eligible > 5
             or value["classification"] not in classifications
-            or not isinstance(value["type_set"], list)
+            or not isinstance(value["cold_type_set"], list)
             or not all(
                 item
                 in {
@@ -4374,15 +4378,37 @@ def _parse_remote_phase_a_inventory_result(
                     "DT_ENUM",
                     "DT_BITMAP",
                 }
-                for item in value["type_set"]
+                for item in value["cold_type_set"]
             )
-            or len(set(value["type_set"])) != len(value["type_set"])
-            or not isinstance(value["encoded_length_set"], list)
+            or len(set(value["cold_type_set"])) != len(value["cold_type_set"])
+            or not isinstance(value["retained_type_set"], list)
+            or not all(
+                item
+                in {
+                    "DT_RAW",
+                    "DT_BOOL",
+                    "DT_VALUE",
+                    "DT_STRING",
+                    "DT_ENUM",
+                    "DT_BITMAP",
+                }
+                for item in value["retained_type_set"]
+            )
+            or len(set(value["retained_type_set"])) != len(value["retained_type_set"])
+            or not isinstance(value["cold_encoded_length_set"], list)
             or any(
                 type(item) is not int or item < 0
-                for item in value["encoded_length_set"]
+                for item in value["cold_encoded_length_set"]
             )
-            or len(set(value["encoded_length_set"])) != len(value["encoded_length_set"])
+            or len(set(value["cold_encoded_length_set"]))
+            != len(value["cold_encoded_length_set"])
+            or not isinstance(value["retained_encoded_length_set"], list)
+            or any(
+                type(item) is not int or item < 0
+                for item in value["retained_encoded_length_set"]
+            )
+            or len(set(value["retained_encoded_length_set"]))
+            != len(value["retained_encoded_length_set"])
         ):
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
         seen_ids.add(dp_id)
@@ -4393,8 +4419,10 @@ def _parse_remote_phase_a_inventory_result(
                 cold_eligible,
                 retained_reported,
                 retained_eligible,
-                tuple(value["type_set"]),
-                tuple(value["encoded_length_set"]),
+                tuple(value["cold_type_set"]),
+                tuple(value["cold_encoded_length_set"]),
+                tuple(value["retained_type_set"]),
+                tuple(value["retained_encoded_length_set"]),
                 value["classification"],
             )
         )
@@ -6977,8 +7005,10 @@ def remote_phase_a_inventory(value):
     slots = []
     cold_samples = []
     retained_samples = []
-    dp_types_seen = {}
-    dp_lengths_seen = {}
+    cold_dp_types_seen = {}
+    cold_dp_lengths_seen = {}
+    retained_dp_types_seen = {}
+    retained_dp_lengths_seen = {}
     counters = {
         'completed': 0, 'cold': 0, 'retained': 0, 'cold_ack': 0,
         'retained_ack': 0, 'failure': 0, 'timeout': 0, 'receipt': 0,
@@ -7072,8 +7102,18 @@ def remote_phase_a_inventory(value):
                         event['dp_ids'], event['dp_types'], event['encoded_value_lengths']
                     ):
                         request_sets[trial].add(dp_id)
-                        dp_types_seen.setdefault(dp_id, set()).add(dp_type)
-                        dp_lengths_seen.setdefault(dp_id, set()).add(length)
+                        type_map = (
+                            cold_dp_types_seen
+                            if trial == 1
+                            else retained_dp_types_seen
+                        )
+                        length_map = (
+                            cold_dp_lengths_seen
+                            if trial == 1
+                            else retained_dp_lengths_seen
+                        )
+                        type_map.setdefault(dp_id, set()).add(dp_type)
+                        length_map.setdefault(dp_id, set()).add(length)
                 cold_samples.append(request_sets[1])
                 if mode == 'cold_then_retained':
                     retained_samples.append(request_sets[2])
@@ -7123,7 +7163,8 @@ def remote_phase_a_inventory(value):
     if outcome == 'complete' and not complete:
         outcome = 'sample_incomplete'
     all_ids = {8, 21, 33, 34, 36, 40, 47}
-    all_ids.update(dp_types_seen)
+    all_ids.update(cold_dp_types_seen)
+    all_ids.update(retained_dp_types_seen)
     rows = []
     for dp_id in sorted(all_ids):
         cold_reported = sum(dp_id in sample for sample in cold_samples)
@@ -7143,8 +7184,10 @@ def remote_phase_a_inventory(value):
             'cold_eligible_count': len(cold_samples),
             'retained_reported_count': retained_reported,
             'retained_eligible_count': len(retained_samples),
-            'type_set': sorted(dp_types_seen.get(dp_id, set())),
-            'encoded_length_set': sorted(dp_lengths_seen.get(dp_id, set())),
+            'cold_type_set': sorted(cold_dp_types_seen.get(dp_id, set())),
+            'cold_encoded_length_set': sorted(cold_dp_lengths_seen.get(dp_id, set())),
+            'retained_type_set': sorted(retained_dp_types_seen.get(dp_id, set())),
+            'retained_encoded_length_set': sorted(retained_dp_lengths_seen.get(dp_id, set())),
             'classification': classification,
         })
     return {
