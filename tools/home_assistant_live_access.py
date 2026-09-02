@@ -5054,6 +5054,7 @@ def operation_scope(operation):
         'service_inventory': 'CORE',
         'phase_a_helper': 'PHASE_A',
         'remote_phase_a_inventory': 'PHASE_A',
+        'remote_phase_a_readiness': 'PHASE_A',
         'restore': 'RESTORE',
         'restore_backup': 'RESTORE',
         'reconcile_backup': 'RESTORE',

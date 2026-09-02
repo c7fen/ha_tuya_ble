@@ -10683,6 +10683,29 @@ def test_r63t_research_dispatch_failure_preserves_bounded_provenance(
     controller.close()
 
 
+def test_r63t_remote_readiness_fallback_retains_phase_a_scope(tmp_path: Path) -> None:
+    (tmp_path / "custom_components" / "tuya_ble").mkdir(parents=True)
+    original_readiness = _r63s_embedded_function_source("remote_phase_a_readiness")
+    result = _run_synthetic_remote_program(
+        tmp_path,
+        "remote_phase_a_readiness",
+        {"baseline": _r63s_remote_baseline()},
+        source_replacements={
+            original_readiness: (
+                "def remote_phase_a_readiness(value):\n"
+                "    raise RuntimeError('synthetic-private-error')"
+            )
+        },
+    )
+
+    assert result == {
+        "error_class": "OPERATION_FAILED",
+        "error_scope": "PHASE_A",
+        "error_reason": "UNKNOWN",
+    }
+    assert "synthetic-private-error" not in repr(result)
+
+
 def test_r63t_session_requires_device_free_readiness_before_inventory() -> None:
     controller, broker = _r63s_controller_at_a2()
     session = controller.open_remote_phase_a_inventory_session()
@@ -10696,6 +10719,89 @@ def test_r63t_session_requires_device_free_readiness_before_inventory() -> None:
     assert not any(name == "research" for name, _detail in broker.calls)
     session.close()
     controller.close()
+
+
+def test_r63t_readiness_failure_closes_and_restores_same_a2_lifecycle() -> None:
+    controller, broker = _r63s_controller_at_a2()
+    seen: list[access.ResearchOperation] = []
+    failed_readiness = replace(
+        _r63t_ready_result(),
+        ready=False,
+        selected=False,
+        same_target_binding_ready=False,
+        audit_ready=False,
+        audit_instance_continuity=False,
+        failure_stage=access.ResearchFailureStage.TARGET_RESOLUTION,
+        failure_reason=access.ResearchFailureReason.TARGET_METADATA_UNAVAILABLE,
+    )
+
+    def fail_readiness(*_args: object, **kwargs: object) -> object:
+        seen.append(kwargs["_capability"].operation)
+        return failed_readiness
+
+    broker._invoke_remote_phase_a_research = fail_readiness
+    session = controller.open_remote_phase_a_inventory_session()
+
+    assert session.check_readiness() is failed_readiness
+    with pytest.raises(
+        access.LifecycleControllerError,
+        match="RESEARCH_READINESS_REQUIRED",
+    ):
+        session.run_remote_phase_a_inventory()
+    assert seen == [access.ResearchOperation.CHECK_READINESS]
+    session.close()
+    controller.close()
+
+    reconstructed_broker = _R32ScriptedBroker()
+    reconstructed_broker._durable_lifecycle_test = True
+    reconstructed = access.FullPreflightLifecycleController(reconstructed_broker)
+    assert reconstructed.state is access.LifecycleState.A2_COLLECTED
+    proof = _r32_complete_restore_tail(reconstructed, _r32_bundles()[1])
+    assert proof.complete is True
+    assert reconstructed.state is access.LifecycleState.COMPLETE_NORMAL
+    reconstructed.close()
+
+
+def test_r63t_mid_run_failure_closes_and_restores_same_a2_lifecycle() -> None:
+    controller, broker = _r63s_controller_at_a2()
+    failed_inventory = replace(
+        _r63s_complete_result(),
+        outcome="research_failed",
+        completed_probe_slots=1,
+        cold_request_count=1,
+        retained_request_count=0,
+        total_device_status_requests=1,
+        cold_ack_success_count=0,
+        retained_ack_success_count=0,
+        failure_count=1,
+        failure_category=(
+            access.ResearchFailureCategory.POST_OR_POSSIBLY_SUBMITTED_PROBE_FAILURE
+        ),
+        failure_stage=access.ResearchFailureStage.PROBE_EVIDENCE,
+        failure_reason=access.ResearchFailureReason.INVALID_SHAPE,
+        failed_slot=1,
+        probe_submission_possible=True,
+    )
+    broker._invoke_remote_phase_a_research = lambda *_args, **kwargs: (
+        _r63t_ready_result()
+        if kwargs["_capability"].operation is access.ResearchOperation.CHECK_READINESS
+        else failed_inventory
+    )
+    session = controller.open_remote_phase_a_inventory_session()
+
+    assert session.check_readiness().ready is True
+    assert session.run_remote_phase_a_inventory() is failed_inventory
+    session.close()
+    controller.close()
+
+    reconstructed_broker = _R32ScriptedBroker()
+    reconstructed_broker._durable_lifecycle_test = True
+    reconstructed = access.FullPreflightLifecycleController(reconstructed_broker)
+    assert reconstructed.state is access.LifecycleState.A2_COLLECTED
+    proof = _r32_complete_restore_tail(reconstructed, _r32_bundles()[1])
+    assert proof.complete is True
+    assert reconstructed.state is access.LifecycleState.COMPLETE_NORMAL
+    reconstructed.close()
 
 
 def _r63t_readiness_replacements(scenario: str) -> dict[str, str]:
