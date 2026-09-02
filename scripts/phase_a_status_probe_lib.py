@@ -56,6 +56,7 @@ class HelperResult:
     outcome: str
     response: dict[str, Any] | None = None
     nonce: str | None = None
+    http_status: int | None = None
 
 
 def generate_nonce() -> str:
@@ -514,7 +515,25 @@ def invoke_service(
     try:
         with opener(request, timeout=timeout) as http_response:
             wrapper = json.load(http_response)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+    except urllib.error.HTTPError as error:
+        http_status = error.code
+        if (
+            not isinstance(http_status, int)
+            or isinstance(http_status, bool)
+            or not 400 <= http_status <= 599
+        ):
+            return HelperResult(
+                HelperExit.SCHEMA_PRIVACY_FAILURE,
+                "schema_invalid",
+                nonce=submitted_nonce,
+            )
+        return HelperResult(
+            HelperExit.SERVICE_REJECTED,
+            "http_rejected",
+            nonce=submitted_nonce,
+            http_status=http_status,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
         return HelperResult(
             HelperExit.AMBIGUOUS_POST_SUBMISSION,
             "transport_ambiguous",
@@ -554,9 +573,11 @@ class _SanitizedArgumentParser(argparse.ArgumentParser):
 
 def _result_json(result: HelperResult, *, evidence_written: bool = False) -> str:
     """Render only the documented minimal, non-sensitive CLI projection."""
-    rendered: dict[str, str | bool] = {"outcome": result.outcome}
+    rendered: dict[str, str | bool | int] = {"outcome": result.outcome}
     if result.nonce is not None:
         rendered["nonce"] = result.nonce
+    if result.http_status is not None:
+        rendered["http_status"] = result.http_status
     if evidence_written:
         rendered["evidence_written"] = True
     return json.dumps(rendered, separators=(",", ":"))

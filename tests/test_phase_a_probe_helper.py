@@ -8,6 +8,7 @@ import subprocess
 import sys
 import urllib.error
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -477,6 +478,157 @@ def test_received_transport_ambiguous_result_is_schema_failure_not_exit_78():
     )
 
     assert outcome.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
+
+
+@pytest.mark.parametrize("http_status", (400, 404, 500))
+def test_r62f_received_http_error_is_definitive_service_rejection(http_status):
+    """A received HTTP response is not unknown-response transport ambiguity."""
+    nonce = "a" * 16
+    private_endpoint = "http://private-endpoint.invalid"
+    private_body = b"private response body"
+    private_reason = "private reason phrase"
+    private_headers = {"X-Private": "private header value"}
+
+    def reject(request, **_kwargs):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            http_status,
+            private_reason,
+            private_headers,
+            BytesIO(private_body),
+        )
+
+    outcome = invoke_service(
+        HelperOperation.PREFLIGHT,
+        private_endpoint,
+        {"nonce": nonce},
+        {},
+        opener=reject,
+    )
+
+    assert outcome.exit_code is HelperExit.SERVICE_REJECTED
+    assert outcome.outcome == "http_rejected"
+    assert outcome.nonce == nonce
+    assert outcome.http_status == http_status
+    assert outcome.response is None
+    rendered = repr(outcome)
+    assert private_body.decode() not in rendered
+    assert private_reason not in rendered
+    assert private_headers["X-Private"] not in rendered
+    assert private_endpoint not in rendered
+
+
+@pytest.mark.parametrize("http_status", (399, 600, True))
+def test_r62f_http_rejection_requires_bounded_non_boolean_status(http_status):
+    """An invalid synthetic HTTPError code cannot cross the bounded projection."""
+    outcome = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "f" * 16},
+        {},
+        opener=lambda request, **_kwargs: (_ for _ in ()).throw(
+            urllib.error.HTTPError(request.full_url, http_status, "", {}, None)
+        ),
+    )
+
+    assert outcome.exit_code is HelperExit.SCHEMA_PRIVACY_FAILURE
+    assert outcome.outcome == "schema_invalid"
+    assert outcome.http_status is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        urllib.error.URLError("synthetic transport"),
+        TimeoutError("synthetic timeout"),
+        OSError("synthetic os transport"),
+    ),
+)
+def test_r62f_true_transport_exceptions_remain_ambiguous(error):
+    """No response status is invented for unresolved transport failures."""
+    outcome = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "b" * 16},
+        {},
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    assert outcome.exit_code is HelperExit.AMBIGUOUS_POST_SUBMISSION
+    assert outcome.outcome == "transport_ambiguous"
+    assert outcome.http_status is None
+
+
+def test_r62f_http_rejection_cli_is_minimal_and_writes_no_evidence(tmp_path, capsys):
+    """Only outcome, nonce, and numeric status cross the rejection boundary."""
+    nonce = "c" * 16
+    private_body = b"private response body"
+    private_reason = "private reason phrase"
+    private_header = "private header value"
+    evidence_root = tmp_path / "private-evidence-root"
+
+    def reject(request, **_kwargs):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            422,
+            private_reason,
+            {"X-Private": private_header},
+            BytesIO(private_body),
+        )
+
+    exit_code = main(
+        ["preflight", "--nonce", nonce, "--evidence-label", "A0"],
+        environ={"SUPERVISOR_TOKEN": "synthetic-token"},
+        evidence_root=evidence_root,
+        opener=reject,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == HelperExit.SERVICE_REJECTED
+    assert json.loads(captured.out) == {
+        "outcome": "http_rejected",
+        "nonce": nonce,
+        "http_status": 422,
+    }
+    assert captured.err == ""
+    assert not evidence_root.exists()
+    for private_value in (private_body.decode(), private_reason, private_header):
+        assert private_value not in captured.out
+        assert private_value not in captured.err
+
+
+def test_r62f_success_and_invalid_input_contracts_remain_unchanged():
+    """The new rejection split neither changes success nor submits invalid input."""
+    nonce = "d" * 16
+    opener_calls = 0
+
+    def success(*args, **kwargs):
+        nonlocal opener_calls
+        opener_calls += 1
+        return _preflight_opener(nonce, [])(*args, **kwargs)
+
+    accepted = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": nonce},
+        {},
+        opener=success,
+    )
+    rejected_before_http = invoke_service(
+        HelperOperation.PREFLIGHT,
+        "http://supervisor/core",
+        {"nonce": "invalid"},
+        {},
+        opener=success,
+    )
+
+    assert accepted.exit_code is HelperExit.SUCCESS
+    assert accepted.outcome == "preflight_ok"
+    assert accepted.http_status is None
+    assert rejected_before_http.exit_code is HelperExit.DEFINITELY_NOT_SUBMITTED
+    assert rejected_before_http.outcome == "not_submitted"
+    assert rejected_before_http.http_status is None
+    assert opener_calls == 1
 
 
 def test_helper_distinguishes_not_submitted_ambiguity_and_schema_failure():
