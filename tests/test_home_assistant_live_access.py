@@ -1021,6 +1021,7 @@ def _synthetic_r30_source_authorities(
                 "test_r61_",
                 "test_r62_",
                 "test_r62c_",
+                "test_r62f_",
             )
         ),
     )
@@ -1042,6 +1043,7 @@ def _synthetic_r30_source_authorities(
             "test_r61_",
             "test_r62_",
             "test_r62c_",
+            "test_r62f_",
         )
     ):
         return
@@ -1173,7 +1175,7 @@ def test_r30_self_consistent_forged_manifest_rejected_by_git_authority(
     monkeypatch.setitem(
         access._AUTHORITY_MANIFEST_DIGESTS,
         access.SourceState.CANDIDATE.value,
-        "4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e",
+        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
     )
 
     with pytest.raises(access.SourceBundleError, match="AUTHORITY_MISMATCH"):
@@ -1918,7 +1920,7 @@ def _run_synthetic_remote_program(
         "ROOT = Path('/config')", f"ROOT = Path({str(tmp_path)!r})"
     )
     source = source.replace(
-        "4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e",
+        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
         access._source_manifest_digest(candidate.entries),
     ).replace(
         "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
@@ -2059,7 +2061,7 @@ def _r53_local_pty_source_inspection(
         "ROOT = Path('/config')", f"ROOT = Path({str(root)!r})"
     )
     remote_program = remote_program.replace(
-        "4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e",
+        "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
         access._source_manifest_digest(candidate.manifest.entries),
     ).replace(
         "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
@@ -7370,11 +7372,11 @@ def test_r35_mutation_contract_guards(mutation: str) -> None:
         controller._state = access.LifecycleState.AP0_COLLECTED
         broker.queue(
             "helper",
-            access.PhaseAResult(
+            lambda detail: access.PhaseAResult(
                 access.PhaseAOperation.PREFLIGHT,
                 67,
                 "schema_invalid",
-                "a" * 16,
+                detail[1],
             ),
         )
         with pytest.raises(access.PreflightRejectedError) as raised:
@@ -7387,11 +7389,11 @@ def test_r35_mutation_contract_guards(mutation: str) -> None:
         controller._state = access.LifecycleState.AP0_COLLECTED
         broker.queue(
             "helper",
-            access.PhaseAResult(
+            lambda detail: access.PhaseAResult(
                 access.PhaseAOperation.PREFLIGHT,
                 78,
                 "transport_ambiguous",
-                "a" * 16,
+                detail[1],
             ),
         )
         with pytest.raises(access.PreflightRejectedError) as raised:
@@ -10100,6 +10102,7 @@ def test_r62_valid_preflight_commits_result_and_transition_atomically(
     result = controller.run_non_probe_preflight()
 
     assert result.operation is access.PhaseAOperation.PREFLIGHT
+    assert result.http_status is None
     assert controller.state is access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED
     assert journal.action_transition_committed(access.LifecycleAction.PREFLIGHT)
     assert journal._record["consumed_operations"].count("preflight") == 1
@@ -10513,11 +10516,11 @@ def test_r62_e_t3_to_t10_typed_preflight_failure_is_bounded_and_not_replayed(
     controller, broker = _r33_advance_to_ap0()
     broker.queue(
         "helper",
-        access.PhaseAResult(
+        lambda detail: access.PhaseAResult(
             access.PhaseAOperation.PREFLIGHT,
             exit_code,
             outcome,
-            None if exit_code == 65 else "a" * 16,
+            None if exit_code == 65 else detail[1],
         ),
     )
 
@@ -10553,4 +10556,210 @@ def test_r62_e_t3_to_t10_typed_preflight_failure_is_bounded_and_not_replayed(
     ]
     assert len(preflight_calls) == 1
     assert not any(name in {"receipt", "probe"} for name, _detail in broker.calls)
+    controller.close()
+
+
+@pytest.mark.parametrize("http_status", (400, 404, 500))
+def test_r62f_c1_to_c3_http_rejection_parses_with_bounded_status(
+    http_status: int,
+) -> None:
+    """Exit 66 is a received HTTP rejection, not transport ambiguity."""
+    nonce = "d" * 16
+    result = access._parse_phase_a_result(
+        access.PhaseAOperation.PREFLIGHT,
+        json.dumps(
+            {
+                "exit_code": 66,
+                "outcome": "http_rejected",
+                "nonce": nonce,
+                "http_status": http_status,
+            }
+        ).encode(),
+        expected_nonce=nonce,
+    )
+
+    assert result == access.PhaseAResult(
+        operation=access.PhaseAOperation.PREFLIGHT,
+        exit_code=66,
+        outcome="http_rejected",
+        nonce=nonce,
+        http_status=http_status,
+    )
+    assert result.preflight is None
+    assert result.receipt is None
+    assert result.audit is None
+
+
+@pytest.mark.parametrize("http_status", (None, True, "404", 399, 600))
+def test_r62f_c2_c3_http_rejection_rejects_nonce_or_status_mismatch(
+    http_status: object,
+) -> None:
+    """The rejection projection requires matching nonce and exact status bounds."""
+    payload = {
+        "exit_code": 66,
+        "outcome": "http_rejected",
+        "nonce": "d" * 16,
+        "http_status": http_status,
+    }
+
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_phase_a_result(
+            access.PhaseAOperation.PREFLIGHT,
+            json.dumps(payload).encode(),
+            expected_nonce="d" * 16,
+        )
+
+
+def test_r62f_c2_http_rejection_requires_submitted_nonce_match() -> None:
+    payload = {
+        "exit_code": 66,
+        "outcome": "http_rejected",
+        "nonce": "d" * 16,
+        "http_status": 404,
+    }
+
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_phase_a_result(
+            access.PhaseAOperation.PREFLIGHT,
+            json.dumps(payload).encode(),
+            expected_nonce="e" * 16,
+        )
+
+
+@pytest.mark.parametrize("private_key", ("body", "headers", "reason", "url"))
+def test_r62f_c3_http_rejection_rejects_private_schema_extras(
+    private_key: str,
+) -> None:
+    """No response material can cross the exact four-field parser boundary."""
+    payload = {
+        "exit_code": 66,
+        "outcome": "http_rejected",
+        "nonce": "d" * 16,
+        "http_status": 404,
+        private_key: "synthetic-private-value",
+    }
+
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_phase_a_result(
+            access.PhaseAOperation.PREFLIGHT,
+            json.dumps(payload).encode(),
+            expected_nonce="d" * 16,
+        )
+
+
+def test_r62f_c1_remote_helper_projects_only_http_rejection_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The embedded remote adapter admits only outcome, nonce, and status."""
+    tree = ast.parse(access._REMOTE_CONTROL_PROGRAM)
+    invoke_helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "invoke_helper"
+    )
+    namespace = {
+        "sys": sys,
+        "HELPER": Path("/synthetic/helper"),
+        "EVIDENCE": Path("/synthetic/evidence"),
+        "decode_json": lambda value: json.loads(value),
+    }
+    exec(  # noqa: S102 - execute only the isolated, repository-owned AST fixture.
+        compile(
+            ast.Module(body=[invoke_helper], type_ignores=[]), "<invoke_helper>", "exec"
+        ),
+        namespace,
+    )
+
+    class Completed:
+        stderr = b""
+        returncode = 66
+        stdout = (
+            b'{"outcome":"http_rejected","nonce":"dddddddddddddddd","http_status":404}'
+        )
+
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: Completed())
+    result = namespace["invoke_helper"](
+        {"helper_operation": "preflight", "nonce": "d" * 16}
+    )
+
+    assert result == {
+        "exit_code": 66,
+        "outcome": "http_rejected",
+        "nonce": "d" * 16,
+        "http_status": 404,
+    }
+    Completed.stdout = b'{"outcome":"http_rejected","nonce":"dddddddddddddddd","http_status":404,"body":"private"}'
+    with pytest.raises(ValueError, match="helper_output"):
+        namespace["invoke_helper"]({"helper_operation": "preflight", "nonce": "d" * 16})
+
+
+def test_r62f_c4_to_c11_http_rejection_is_bounded_durable_and_not_replayed() -> None:
+    """A definitive rejection remains one-shot and cannot commit success."""
+    controller, broker = _r33_advance_to_ap0()
+    broker.queue(
+        "helper",
+        lambda detail: access.PhaseAResult(
+            operation=access.PhaseAOperation.PREFLIGHT,
+            exit_code=66,
+            outcome="http_rejected",
+            nonce=detail[1],
+            http_status=404,
+        ),
+    )
+
+    with pytest.raises(access.PreflightRejectedError) as raised:
+        controller.run_non_probe_preflight()
+
+    assert raised.value.reason is access.PreflightFailureReason.HTTP_REJECTED
+    assert raised.value.http_status == 404
+    assert str(raised.value) == "LIFECYCLE_ROLLBACK_REQUIRED"
+    assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
+    assert controller._permits[access.LifecycleAction.PREFLIGHT].consumed
+    operation = next(
+        item
+        for item in controller._journal._record["operations"]
+        if item["action"] == access.LifecycleAction.PREFLIGHT.value
+    )
+    assert operation["phase"] == "result_durable"
+    assert not controller._journal.action_transition_committed(
+        access.LifecycleAction.PREFLIGHT
+    )
+    assert all(
+        item["stage"] != access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED.value
+        for item in controller._journal.transitions
+    )
+    with pytest.raises((AttributeError, access.LifecycleControllerError)):
+        controller.run_non_probe_preflight()
+    assert (
+        len(
+            [
+                detail
+                for name, detail in broker.calls
+                if name == "helper" and detail[0] is access.PhaseAOperation.PREFLIGHT
+            ]
+        )
+        == 1
+    )
+    assert not any(name in {"receipt", "probe"} for name, _detail in broker.calls)
+    controller.close()
+
+
+def test_r62f_c11_transport_ambiguity_has_no_http_status() -> None:
+    """Exit 78 remains a distinct status-free transport terminal."""
+    controller, broker = _r33_advance_to_ap0()
+    broker.queue(
+        "helper",
+        lambda detail: access.PhaseAResult(
+            access.PhaseAOperation.PREFLIGHT,
+            78,
+            "transport_ambiguous",
+            detail[1],
+        ),
+    )
+
+    with pytest.raises(access.PreflightRejectedError) as raised:
+        controller.run_non_probe_preflight()
+
+    assert raised.value.reason is access.PreflightFailureReason.TRANSPORT_AMBIGUOUS
+    assert raised.value.http_status is None
     controller.close()

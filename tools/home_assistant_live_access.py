@@ -55,12 +55,12 @@ _LIFECYCLE_ANCHOR_NAME = "anchor.json"
 _LIFECYCLE_JOURNAL_NAME = "journal.json"
 _LIFECYCLE_LOCK_NAME = "journal.lock"
 _DISABLE_DURABLE_LIFECYCLE_FOR_TESTS = False
-PR45_CANDIDATE_COMMIT = "a382c08cd4e8613dc214505bcb8a6f59f8da3022"
-PR45_CANDIDATE_TREE = "73246ecd71f0953c7bf8a73df78d6506bee29c8e"
+PR45_CANDIDATE_COMMIT = "aac1ae8447b3a0e87d86d8a08bee6060ff7ed2fb"
+PR45_CANDIDATE_TREE = "0e61a2fbc0abe5ebf17b5bf4fdbde529a23c66f8"
 PR41_RESTORE_COMMIT = "4f73a9b008dcb89134bc41001c486f06d6056867"
 PR41_RESTORE_TREE = "463ed8553da01eae591de611e76e45392ad9e7bf"
 _AUTHORITY_MANIFEST_DIGESTS = {
-    "candidate": "4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e",
+    "candidate": "68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4",
     "restore": "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
 }
 _HELPER_FILES = frozenset(
@@ -298,6 +298,7 @@ class PreflightFailureReason(StrEnum):
     SCHEMA_INVALID = "SCHEMA_INVALID"
     NONCE_MISMATCH = "NONCE_MISMATCH"
     EVIDENCE_WRITE_FAILED = "EVIDENCE_WRITE_FAILED"
+    HTTP_REJECTED = "HTTP_REJECTED"
     TRANSPORT_AMBIGUOUS = "TRANSPORT_AMBIGUOUS"
     RESULT_INVALID = "RESULT_INVALID"
 
@@ -877,11 +878,22 @@ class LifecycleControllerError(RuntimeError):
 class PreflightRejectedError(LifecycleControllerError):
     """Expose one typed helper terminal without private or free-form data."""
 
-    def __init__(self, reason: PreflightFailureReason) -> None:
-        if not isinstance(reason, PreflightFailureReason):
+    def __init__(
+        self,
+        reason: PreflightFailureReason,
+        http_status: int | None = None,
+    ) -> None:
+        if (
+            not isinstance(reason, PreflightFailureReason)
+            or reason is PreflightFailureReason.HTTP_REJECTED
+            and (type(http_status) is not int or not 400 <= http_status <= 599)
+            or reason is not PreflightFailureReason.HTTP_REJECTED
+            and http_status is not None
+        ):
             raise TypeError("PREFLIGHT_FAILURE_REASON_INVALID") from None
         super().__init__("LIFECYCLE_ROLLBACK_REQUIRED")
         self.reason = reason
+        self.http_status = http_status
 
 
 @dataclass(frozen=True, slots=True)
@@ -1304,6 +1316,7 @@ class PhaseAResult:
     preflight: PreflightResponse | None = None
     receipt: ReceiptResponse | None = None
     audit: AuditSnapshot | None = None
+    http_status: int | None = None
 
 
 @dataclass
@@ -3944,6 +3957,7 @@ def _parse_phase_a_result(
     exit_code = value["exit_code"]
     outcome = value["outcome"]
     nonce = value.get("nonce")
+    http_status = value.get("http_status")
     if (
         type(exit_code) is not int
         or exit_code not in {0, 65, 66, 67, 78}
@@ -3958,6 +3972,15 @@ def _parse_phase_a_result(
     audit = None
     if exit_code == 65:
         if set(value) != {"exit_code", "outcome"} or outcome != "not_submitted":
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    elif operation is PhaseAOperation.PREFLIGHT and exit_code == 66:
+        if (
+            set(value) != {"exit_code", "outcome", "nonce", "http_status"}
+            or outcome != "http_rejected"
+            or nonce is None
+            or type(http_status) is not int
+            or not 400 <= http_status <= 599
+        ):
             raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     elif exit_code in {67, 78}:
         expected_outcomes = (
@@ -4058,6 +4081,7 @@ def _parse_phase_a_result(
         preflight=preflight,
         receipt=receipt,
         audit=audit,
+        http_status=http_status,
     )
 
 
@@ -4507,8 +4531,8 @@ def expected_manifest(value):
     state = manifest['state']
     authorities = {
         'candidate': (
-            'a382c08cd4e8613dc214505bcb8a6f59f8da3022',
-            '73246ecd71f0953c7bf8a73df78d6506bee29c8e',
+            'aac1ae8447b3a0e87d86d8a08bee6060ff7ed2fb',
+            '0e61a2fbc0abe5ebf17b5bf4fdbde529a23c66f8',
         ),
         'restore': (
             '4f73a9b008dcb89134bc41001c486f06d6056867',
@@ -4544,7 +4568,7 @@ def expected_manifest(value):
         for path, (size, digest) in sorted(expected.items())
     ).encode()
     fingerprints = {
-        'candidate': '4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e',
+        'candidate': '68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4',
         'restore': '2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2',
     }
     if hashlib.sha256(canonical).hexdigest() != fingerprints[state]:
@@ -6158,6 +6182,8 @@ def invoke_helper(value):
         if completed.returncode == 65
         else {'outcome', 'nonce', 'evidence_written'}
         if completed.returncode == 0
+        else {'outcome', 'nonce', 'http_status'}
+        if completed.returncode == 66
         else {'outcome', 'nonce'}
     )
     if (
@@ -6165,6 +6191,12 @@ def invoke_helper(value):
         or set(output) != expected_output
         or not isinstance(output.get('outcome'), str)
         or completed.returncode == 0 and output.get('evidence_written') is not True
+        or completed.returncode == 66
+        and (
+            output.get('outcome') != 'http_rejected'
+            or type(output.get('http_status')) is not int
+            or not 400 <= output['http_status'] <= 599
+        )
         or completed.returncode != 65 and output.get('nonce') != value.get('nonce')
     ):
         raise ValueError('helper_output')
@@ -6174,6 +6206,8 @@ def invoke_helper(value):
     }
     if 'nonce' in output:
         result['nonce'] = output['nonce']
+    if 'http_status' in output:
+        result['http_status'] = output['http_status']
     if invalid:
         if completed.returncode != 65 or output != {'outcome': 'not_submitted'}:
             raise ValueError('invalid_nonce')
@@ -6283,7 +6317,7 @@ def reconcile_backup(value):
     live_matches = live == expected
     if live_matches:
         result_phase = 'reconciled'
-    elif live_identity == '4b7d4222c57377a29961d35a7427ebc1b6dd032a82a9274a63a0f0269e13a20e':
+    elif live_identity == '68646223872d12085ccf237f1da332285d4c5b9315dbd3bd073763a1d8baccd4':
         result_phase = 'reconciled_candidate'
     else:
         result_phase = 'reconciled_unknown'
@@ -8830,6 +8864,7 @@ class FullPreflightLifecycleController:
             or result.audit is None
             or result.audit.nonce != nonce
             or result.audit.history_overflow
+            or result.http_status is not None
         ):
             self._rollback()
         snapshot = result.audit
@@ -8899,6 +8934,7 @@ class FullPreflightLifecycleController:
             or result.preflight is not None
             or result.receipt is not None
             or result.audit is not None
+            or result.http_status is not None
         ):
             self._rollback()
         self._advance(LifecycleState.P0_COMPLETED, LifecycleAction.P0)
@@ -8929,6 +8965,7 @@ class FullPreflightLifecycleController:
                 and result.preflight == PreflightResponse("preflight_ok", 1, nonce)
                 and result.receipt is None
                 and result.audit is None
+                and result.http_status is None
             )
 
         try:
@@ -8945,24 +8982,49 @@ class FullPreflightLifecycleController:
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
         if not valid_preflight(result):
-            reason = {
-                (65, "not_submitted"): PreflightFailureReason.NOT_SUBMITTED,
-                (67, "schema_invalid"): PreflightFailureReason.SCHEMA_INVALID,
-                (67, "nonce_mismatch"): PreflightFailureReason.NONCE_MISMATCH,
-                (
-                    67,
-                    "evidence_write_failed",
-                ): PreflightFailureReason.EVIDENCE_WRITE_FAILED,
-                (
-                    78,
-                    "transport_ambiguous",
-                ): PreflightFailureReason.TRANSPORT_AMBIGUOUS,
-            }.get(
-                (result.exit_code, result.outcome),
-                PreflightFailureReason.RESULT_INVALID,
-            )
+            reason = PreflightFailureReason.RESULT_INVALID
+            http_status = None
+            if (
+                isinstance(result, PhaseAResult)
+                and result.operation is PhaseAOperation.PREFLIGHT
+                and result.preflight is None
+                and result.receipt is None
+                and result.audit is None
+            ):
+                if (
+                    result.exit_code == 65
+                    and result.outcome == "not_submitted"
+                    and result.nonce is None
+                    and result.http_status is None
+                ):
+                    reason = PreflightFailureReason.NOT_SUBMITTED
+                elif (
+                    result.exit_code == 66
+                    and result.outcome == "http_rejected"
+                    and result.nonce == nonce
+                    and type(result.http_status) is int
+                    and 400 <= result.http_status <= 599
+                ):
+                    reason = PreflightFailureReason.HTTP_REJECTED
+                    http_status = result.http_status
+                elif result.nonce == nonce and result.http_status is None:
+                    reason = {
+                        (67, "schema_invalid"): PreflightFailureReason.SCHEMA_INVALID,
+                        (67, "nonce_mismatch"): PreflightFailureReason.NONCE_MISMATCH,
+                        (
+                            67,
+                            "evidence_write_failed",
+                        ): PreflightFailureReason.EVIDENCE_WRITE_FAILED,
+                        (
+                            78,
+                            "transport_ambiguous",
+                        ): PreflightFailureReason.TRANSPORT_AMBIGUOUS,
+                    }.get(
+                        (result.exit_code, result.outcome),
+                        PreflightFailureReason.RESULT_INVALID,
+                    )
             self._enter_recovery()
-            raise PreflightRejectedError(reason) from None
+            raise PreflightRejectedError(reason, http_status) from None
         self._preflight_result = result
         return result
 
