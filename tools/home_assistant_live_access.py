@@ -291,6 +291,17 @@ class PhaseAOperation(StrEnum):
     RECEIPT = "receipt"
 
 
+class PreflightFailureReason(StrEnum):
+    """Fixed reportable reasons for one typed non-success PREFLIGHT result."""
+
+    NOT_SUBMITTED = "NOT_SUBMITTED"
+    SCHEMA_INVALID = "SCHEMA_INVALID"
+    NONCE_MISMATCH = "NONCE_MISMATCH"
+    EVIDENCE_WRITE_FAILED = "EVIDENCE_WRITE_FAILED"
+    TRANSPORT_AMBIGUOUS = "TRANSPORT_AMBIGUOUS"
+    RESULT_INVALID = "RESULT_INVALID"
+
+
 class ServiceExpectation(StrEnum):
     """Whether all temporary Issue-37 services must exist or be absent."""
 
@@ -861,6 +872,16 @@ class SourceBundleError(ValueError):
 
 class LifecycleControllerError(RuntimeError):
     """A fixed lifecycle failure that contains no private operation data."""
+
+
+class PreflightRejectedError(LifecycleControllerError):
+    """Expose one typed helper terminal without private or free-form data."""
+
+    def __init__(self, reason: PreflightFailureReason) -> None:
+        if not isinstance(reason, PreflightFailureReason):
+            raise TypeError("PREFLIGHT_FAILURE_REASON_INVALID") from None
+        super().__init__("LIFECYCLE_ROLLBACK_REQUIRED")
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -4027,7 +4048,7 @@ def _parse_phase_a_result(
     else:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
 
-    if expected_nonce is not None and nonce != expected_nonce:
+    if expected_nonce is not None and exit_code != 65 and nonce != expected_nonce:
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     return PhaseAResult(
         operation=operation,
@@ -8924,7 +8945,24 @@ class FullPreflightLifecycleController:
         except (SessionBrokerError, TypeError, ValueError):
             self._rollback()
         if not valid_preflight(result):
-            self._rollback()
+            reason = {
+                (65, "not_submitted"): PreflightFailureReason.NOT_SUBMITTED,
+                (67, "schema_invalid"): PreflightFailureReason.SCHEMA_INVALID,
+                (67, "nonce_mismatch"): PreflightFailureReason.NONCE_MISMATCH,
+                (
+                    67,
+                    "evidence_write_failed",
+                ): PreflightFailureReason.EVIDENCE_WRITE_FAILED,
+                (
+                    78,
+                    "transport_ambiguous",
+                ): PreflightFailureReason.TRANSPORT_AMBIGUOUS,
+            }.get(
+                (result.exit_code, result.outcome),
+                PreflightFailureReason.RESULT_INVALID,
+            )
+            self._enter_recovery()
+            raise PreflightRejectedError(reason) from None
         self._preflight_result = result
         return result
 

@@ -7377,8 +7377,9 @@ def test_r35_mutation_contract_guards(mutation: str) -> None:
                 "a" * 16,
             ),
         )
-        with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        with pytest.raises(access.PreflightRejectedError) as raised:
             controller.run_non_probe_preflight()
+        assert raised.value.reason is access.PreflightFailureReason.SCHEMA_INVALID
         with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
             controller.collect_a1()
     elif mutation == "preflight_replayed_after_ambiguity":
@@ -7393,8 +7394,9 @@ def test_r35_mutation_contract_guards(mutation: str) -> None:
                 "a" * 16,
             ),
         )
-        with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        with pytest.raises(access.PreflightRejectedError) as raised:
             controller.run_non_probe_preflight()
+        assert raised.value.reason is access.PreflightFailureReason.TRANSPORT_AMBIGUOUS
         with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
             controller.run_non_probe_preflight()
         assert len([call for call in broker.calls if call[0] == "helper"]) == 1
@@ -10476,4 +10478,79 @@ def test_r62c_a30_full_migrated_terminal_to_complete_normal_path() -> None:
         access.LifecycleAction.ACTIVATION_RESTART.value,
         access.LifecycleAction.REMOVAL_RESTART.value,
     ]
+    controller.close()
+
+
+def test_r62_e_t3_not_submitted_remains_typed_with_expected_nonce() -> None:
+    """A definitely-not-submitted helper result has no nonce to correlate."""
+    result = access._parse_phase_a_result(
+        access.PhaseAOperation.PREFLIGHT,
+        b'{"exit_code":65,"outcome":"not_submitted"}',
+        expected_nonce="a" * 16,
+    )
+
+    assert result == access.PhaseAResult(
+        access.PhaseAOperation.PREFLIGHT, 65, "not_submitted"
+    )
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "outcome", "reason"),
+    (
+        (65, "not_submitted", "NOT_SUBMITTED"),
+        (67, "schema_invalid", "SCHEMA_INVALID"),
+        (67, "nonce_mismatch", "NONCE_MISMATCH"),
+        (67, "evidence_write_failed", "EVIDENCE_WRITE_FAILED"),
+        (78, "transport_ambiguous", "TRANSPORT_AMBIGUOUS"),
+    ),
+)
+def test_r62_e_t3_to_t10_typed_preflight_failure_is_bounded_and_not_replayed(
+    exit_code: int,
+    outcome: str,
+    reason: str,
+) -> None:
+    """A typed helper terminal remains reportable after durable rollback."""
+    controller, broker = _r33_advance_to_ap0()
+    broker.queue(
+        "helper",
+        access.PhaseAResult(
+            access.PhaseAOperation.PREFLIGHT,
+            exit_code,
+            outcome,
+            None if exit_code == 65 else "a" * 16,
+        ),
+    )
+
+    with pytest.raises(access.PreflightRejectedError) as raised:
+        controller.run_non_probe_preflight()
+
+    assert raised.value.reason is getattr(access.PreflightFailureReason, reason)
+    assert str(raised.value) == "LIFECYCLE_ROLLBACK_REQUIRED"
+    assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
+    assert controller._permits[access.LifecycleAction.PREFLIGHT].consumed
+    operation = next(
+        item
+        for item in controller._journal._record["operations"]
+        if item["action"] == access.LifecycleAction.PREFLIGHT.value
+    )
+    assert operation["phase"] == "result_durable"
+    assert (
+        controller._journal.action_transition_committed(
+            access.LifecycleAction.PREFLIGHT
+        )
+        is False
+    )
+    assert all(
+        transition["stage"] != access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED.value
+        for transition in controller._journal.transitions
+    )
+    with pytest.raises((AttributeError, access.LifecycleControllerError)):
+        controller.run_non_probe_preflight()
+    preflight_calls = [
+        detail
+        for name, detail in broker.calls
+        if name == "helper" and detail[0] is access.PhaseAOperation.PREFLIGHT
+    ]
+    assert len(preflight_calls) == 1
+    assert not any(name in {"receipt", "probe"} for name, _detail in broker.calls)
     controller.close()
