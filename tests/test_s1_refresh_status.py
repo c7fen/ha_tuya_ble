@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -133,6 +134,7 @@ def _install_response(
 
 def _assert_refresh_clean(device: TuyaBLEDevice) -> None:
     assert device._manual_status_refresh_active is False
+    assert device._manual_status_refresh_task is None
     assert device._status_observers == []
     assert device._status_task_tokens == {}
     assert device._input_expected_responses == {}
@@ -954,3 +956,233 @@ async def test_ble_control_off_rejects_before_connection_or_status_io() -> None:
     device._ensure_connected.assert_not_awaited()
     device._build_packets.assert_not_called()
     assert device._manual_status_refresh_active is False
+
+
+async def test_refresh_records_runtime_owner_before_connection_work() -> None:
+    """The accepted lifecycle exists before connection acquisition can yield."""
+    device, token = _connected_s1()
+
+    async def inspect_owner() -> None:
+        observation = device._manual_status_refresh_observation
+        assert device._manual_status_refresh_active is True
+        assert device._manual_status_refresh_task is asyncio.current_task()
+        assert observation is not None
+        assert observation.refresh_task is asyncio.current_task()
+        assert observation.entry_connection_token is token
+        assert observation.entry_connection_epoch == token.epoch
+        assert observation.bound_connection_token is None
+
+    device._ensure_connected = AsyncMock(side_effect=inspect_owner)
+    _install_response(device, token)
+
+    await device.async_refresh_s1_status()
+
+    assert device._manual_status_refresh_task is None
+
+
+async def test_cold_refresh_reports_session_claimed_by_refresh(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A token claimed by the accepted refresh is classified as NEW."""
+    device, old_token = _connected_s1()
+    old_token.client.is_connected = False
+    device._client = None
+    device._connection_token = None
+    device._is_paired = False
+    device._notifications_active = False
+    new_token: ConnectionSessionToken | None = None
+
+    async def establish() -> None:
+        nonlocal new_token
+        new_token = device._claim_connection_session(_SyntheticClient())
+        device._is_paired = True
+        device._notifications_active = True
+
+    async def respond(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        response_key = next(iter(device._input_expected_responses))
+        device._handle_command_or_response(
+            1,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=session_token,
+        )
+        device._parse_datapoints_v3(
+            session_token,
+            1.0,
+            0,
+            _dp(69, TuyaBLEDataPointType.DT_RAW, b"\x01\x02\x03"),
+            0,
+        )
+
+    device._ensure_connected = AsyncMock(side_effect=establish)
+    device._send_packets_locked = AsyncMock(side_effect=respond)
+
+    with caplog.at_level(logging.DEBUG):
+        await device.async_refresh_s1_status()
+
+    observation = device._manual_status_refresh_observation
+    assert observation is not None
+    assert observation.connection_claimed_by_refresh is True
+    assert observation.claimed_connection_token is new_token
+    assert observation.bound_connection_token is new_token
+    assert observation.terminal_outcome == "COMPLETED"
+    assert any("S1_REFRESH_SESSION_BOUND_NEW" in row.message for row in caplog.records)
+
+
+async def test_warm_refresh_reports_reused_existing_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An accepted refresh binding an existing token is classified as REUSED."""
+    device, token = _connected_s1()
+    _install_response(device, token)
+
+    with caplog.at_level(logging.DEBUG):
+        await device.async_refresh_s1_status()
+
+    observation = device._manual_status_refresh_observation
+    assert observation is not None
+    assert observation.connection_claimed_by_refresh is False
+    assert observation.claimed_connection_token is None
+    assert observation.bound_connection_token is token
+    assert observation.terminal_outcome == "COMPLETED"
+    assert any(
+        "S1_REFRESH_SESSION_BOUND_REUSED" in row.message for row in caplog.records
+    )
+
+
+async def test_foreign_connection_claim_is_not_credited_to_refresh(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A concurrent task cannot donate NEW provenance to the refresh owner."""
+    device, old_token = _connected_s1()
+    old_token.client.is_connected = False
+    device._client = None
+    device._connection_token = None
+    device._is_paired = False
+    device._notifications_active = False
+    refresh_waiting = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def wait_for_foreign_session() -> None:
+        refresh_waiting.set()
+        await release_refresh.wait()
+
+    device._ensure_connected = AsyncMock(side_effect=wait_for_foreign_session)
+    refresh = asyncio.create_task(device.async_refresh_s1_status())
+    await refresh_waiting.wait()
+
+    foreign_token = device._claim_connection_session(_SyntheticClient())
+    device._is_paired = True
+    device._notifications_active = True
+    _install_response(device, foreign_token)
+    observation = device._manual_status_refresh_observation
+    assert observation is not None
+    assert observation.connection_claimed_by_refresh is False
+    assert observation.claimed_connection_token is None
+
+    with caplog.at_level(logging.DEBUG):
+        release_refresh.set()
+        await refresh
+
+    assert observation.bound_connection_token is foreign_token
+    assert any(
+        "S1_REFRESH_SESSION_BOUND_REUSED" in row.message for row in caplog.records
+    )
+
+
+async def test_two_refreshes_bind_same_private_session_ordinal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The normal hold keeps the exact private session ordinal continuous."""
+    device, token = _connected_s1()
+    _install_response(device, token)
+
+    with caplog.at_level(logging.DEBUG):
+        await device.async_refresh_s1_status()
+        first = device._manual_status_refresh_observation
+        assert first is not None
+        await device.async_refresh_s1_status()
+        second = device._manual_status_refresh_observation
+
+    assert second is not None
+    assert first.bound_connection_token is token
+    assert second.bound_connection_token is token
+    bound_messages = [
+        row.message
+        for row in caplog.records
+        if "S1_REFRESH_SESSION_BOUND_" in row.message
+    ]
+    assert len(bound_messages) == 2
+    assert f"session_ordinal={token.epoch}" in bound_messages[0]
+    assert f"session_ordinal={token.epoch}" in bound_messages[1]
+
+
+@pytest.mark.parametrize("outcome", ("failure", "cancellation"))
+async def test_terminal_refresh_clears_runtime_task_ownership(outcome: str) -> None:
+    """Failure and cancellation both release the accepted refresh task owner."""
+    device, _ = _connected_s1()
+    entered = asyncio.Event()
+
+    async def terminate(*_: object, **__: object) -> None:
+        entered.set()
+        if outcome == "failure":
+            raise OSError("synthetic failure")
+        await asyncio.Event().wait()
+
+    device._send_packets_locked = AsyncMock(side_effect=terminate)
+    task = asyncio.create_task(device.async_refresh_s1_status())
+    await entered.wait()
+    if outcome == "cancellation":
+        task.cancel()
+
+    expected = (
+        asyncio.CancelledError
+        if outcome == "cancellation"
+        else TuyaBLES1StatusRefreshFailedError
+    )
+    with pytest.raises(expected):
+        await task
+
+    observation = device._manual_status_refresh_observation
+    assert observation is not None
+    assert observation.refresh_task is None
+    assert observation.terminal_outcome == "FAILED"
+    assert device._manual_status_refresh_task is None
+
+
+async def test_refresh_lifecycle_logs_are_identifier_and_dp_value_free(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Runtime provenance carries only the opaque label and session ordinal."""
+    private_device_id = "private-device-id-r65c"
+    private_name = "Private Room R65C"
+    private_address = "AA:BB:CC:DD:EE:65"
+    private_dp_value = b"\xde\xad\xbe\xef"
+    device, token = _connected_s1(device_id=private_device_id)
+    device._device_info.device_name = private_name
+    device._address = private_address
+    _install_response(
+        device,
+        token,
+        payload=_dp(69, TuyaBLEDataPointType.DT_RAW, private_dp_value),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await device.async_refresh_s1_status()
+
+    lifecycle = "\n".join(
+        row.message for row in caplog.records if "S1_REFRESH_" in row.message
+    )
+    assert "S1_REFRESH_ACCEPTED" in lifecycle
+    assert "S1_REFRESH_COMPLETED" in lifecycle
+    for private_value in (
+        private_device_id,
+        private_name,
+        private_address,
+        private_dp_value.hex(),
+        repr(private_dp_value),
+    ):
+        assert private_value not in lifecycle

@@ -178,6 +178,25 @@ class _StatusObservationGeneration:
     ack_observed: bool = False
 
 
+@dataclass(slots=True)
+class _ManualStatusRefreshObservation:
+    """Private runtime provenance for one accepted manual S1 refresh."""
+
+    refresh_task: asyncio.Task[Any] | None = field(repr=False)
+    entry_connection_token: ConnectionSessionToken | None = field(repr=False)
+    entry_connection_epoch: int
+    connection_claimed_by_refresh: bool = False
+    claimed_connection_token: ConnectionSessionToken | None = field(
+        default=None,
+        repr=False,
+    )
+    bound_connection_token: ConnectionSessionToken | None = field(
+        default=None,
+        repr=False,
+    )
+    terminal_outcome: str | None = None
+
+
 class TuyaBLEDataPoint:
     def __init__(
         self,
@@ -759,6 +778,10 @@ class TuyaBLEDevice:
         self._status_observation: _StatusObservationGeneration | None = None
         self._status_observers: list[Callable[[StatusObservationEvent], None]] = []
         self._manual_status_refresh_active = False
+        self._manual_status_refresh_task: asyncio.Task[Any] | None = None
+        self._manual_status_refresh_observation: (
+            _ManualStatusRefreshObservation | None
+        ) = None
         self._connected_notified_token: ConnectionSessionToken | None = None
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
@@ -973,6 +996,16 @@ class TuyaBLEDevice:
         self._confirmed_activity_session = None
         self._current_seq_num = 1
         self._clean_input()
+        refresh_task = self._manual_status_refresh_task
+        refresh_observation = self._manual_status_refresh_observation
+        if (
+            refresh_task is not None
+            and asyncio.current_task() is refresh_task
+            and refresh_observation is not None
+            and refresh_observation.refresh_task is refresh_task
+        ):
+            refresh_observation.connection_claimed_by_refresh = True
+            refresh_observation.claimed_connection_token = token
         return token
 
     def _owns_connection_session(
@@ -2189,8 +2222,17 @@ class TuyaBLEDevice:
         batch_waiter: asyncio.Future[None] | None = None
         unregister_observer: Callable[[], None] | None = None
         status_task = asyncio.current_task()
+        self._manual_status_refresh_task = status_task
+        refresh_observation = _ManualStatusRefreshObservation(
+            refresh_task=status_task,
+            entry_connection_token=self._connection_token,
+            entry_connection_epoch=self._connection_epoch,
+        )
+        self._manual_status_refresh_observation = refresh_observation
+        _LOGGER.debug("%s: S1_REFRESH_ACCEPTED", self.log_identity)
         token: ConnectionSessionToken | None = None
         observation_ordinal: int | None = None
+        completed = False
 
         def bind_observation(generation: _StatusObservationGeneration) -> None:
             nonlocal observation_ordinal
@@ -2222,6 +2264,19 @@ class TuyaBLEDevice:
                         token, require_notifications=True
                     ):
                         raise TuyaBLEConnectionUnavailableError()
+                    refresh_observation.bound_connection_token = token
+                    session_kind = (
+                        "NEW"
+                        if refresh_observation.connection_claimed_by_refresh
+                        and refresh_observation.claimed_connection_token is token
+                        else "REUSED"
+                    )
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_SESSION_BOUND_%s session_ordinal=%d",
+                        self.log_identity,
+                        session_kind,
+                        token.epoch,
+                    )
                     batch_waiter = asyncio.get_running_loop().create_future()
                     unregister_observer = self.register_status_observer(observe)
                     if status_task is not None:
@@ -2240,6 +2295,13 @@ class TuyaBLEDevice:
                         if not confirmed:
                             raise TuyaBLES1StatusRefreshFailedError()
                         await batch_waiter
+                        refresh_observation.terminal_outcome = "COMPLETED"
+                        completed = True
+                        _LOGGER.debug(
+                            "%s: S1_REFRESH_COMPLETED session_ordinal=%d",
+                            self.log_identity,
+                            token.epoch,
+                        )
         except TuyaBLES1StatusRefreshFailedError:
             raise
         except asyncio.CancelledError:
@@ -2265,6 +2327,22 @@ class TuyaBLEDevice:
                 and self._status_task_tokens.get(status_task) is token
             ):
                 self._status_task_tokens.pop(status_task, None)
+            if not completed:
+                refresh_observation.terminal_outcome = "FAILED"
+                if refresh_observation.bound_connection_token is None:
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_FAILED session_ordinal=none",
+                        self.log_identity,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_FAILED session_ordinal=%d",
+                        self.log_identity,
+                        refresh_observation.bound_connection_token.epoch,
+                    )
+            refresh_observation.refresh_task = None
+            if self._manual_status_refresh_task is status_task:
+                self._manual_status_refresh_task = None
             self._manual_status_refresh_active = False
 
     async def startup_update(self) -> None:
