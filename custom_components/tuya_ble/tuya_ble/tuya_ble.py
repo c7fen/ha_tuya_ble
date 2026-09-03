@@ -78,6 +78,8 @@ from .exceptions import (
     TuyaBLEEnumValueError,
     TuyaBLEError,
     TuyaBLEPolicyTransitionError,
+    TuyaBLES1StatusRefreshBusyError,
+    TuyaBLES1StatusRefreshFailedError,
 )
 from .manager import AbstaractTuyaBLEDeviceManager, TuyaBLEDeviceCredentials
 from .security import TuyaBLESecurityMaterial
@@ -174,6 +176,25 @@ class _StatusObservationGeneration:
     started_monotonic: float
     batch_ordinal: int = 0
     ack_observed: bool = False
+
+
+@dataclass(slots=True)
+class _ManualStatusRefreshObservation:
+    """Private runtime provenance for one accepted manual S1 refresh."""
+
+    refresh_task: asyncio.Task[Any] | None = field(repr=False)
+    entry_connection_token: ConnectionSessionToken | None = field(repr=False)
+    entry_connection_epoch: int
+    connection_claimed_by_refresh: bool = False
+    claimed_connection_token: ConnectionSessionToken | None = field(
+        default=None,
+        repr=False,
+    )
+    bound_connection_token: ConnectionSessionToken | None = field(
+        default=None,
+        repr=False,
+    )
+    terminal_outcome: str | None = None
 
 
 class TuyaBLEDataPoint:
@@ -756,6 +777,11 @@ class TuyaBLEDevice:
         self._status_observation_event_ordinal = 0
         self._status_observation: _StatusObservationGeneration | None = None
         self._status_observers: list[Callable[[StatusObservationEvent], None]] = []
+        self._manual_status_refresh_active = False
+        self._manual_status_refresh_task: asyncio.Task[Any] | None = None
+        self._manual_status_refresh_observation: (
+            _ManualStatusRefreshObservation | None
+        ) = None
         self._connected_notified_token: ConnectionSessionToken | None = None
         self._data_invalidated_token: ConnectionSessionToken | None = None
         self._session_active_since: float | None = None
@@ -970,6 +996,16 @@ class TuyaBLEDevice:
         self._confirmed_activity_session = None
         self._current_seq_num = 1
         self._clean_input()
+        refresh_task = self._manual_status_refresh_task
+        refresh_observation = self._manual_status_refresh_observation
+        if (
+            refresh_task is not None
+            and asyncio.current_task() is refresh_task
+            and refresh_observation is not None
+            and refresh_observation.refresh_task is refresh_task
+        ):
+            refresh_observation.connection_claimed_by_refresh = True
+            refresh_observation.claimed_connection_token = token
         return token
 
     def _owns_connection_session(
@@ -1123,7 +1159,12 @@ class TuyaBLEDevice:
                 )
 
     def _start_status_observation(
-        self, token: ConnectionSessionToken, origin: str, request_sequence: int
+        self,
+        token: ConnectionSessionToken,
+        origin: str,
+        request_sequence: int,
+        *,
+        on_created: Callable[[_StatusObservationGeneration], None] | None = None,
     ) -> _StatusObservationGeneration:
         """Start exactly one passive generation for an actual status request."""
         previous = self._status_observation
@@ -1139,6 +1180,8 @@ class TuyaBLEDevice:
             time.monotonic(),
         )
         self._status_observation = generation
+        if on_created is not None:
+            on_created(generation)
         self._emit_status_observation("REQUEST_CREATED", generation=generation)
         return generation
 
@@ -1253,9 +1296,15 @@ class TuyaBLEDevice:
                 or new_enabled != self._ble_control_enabled
                 or new_hold_time != self._on_demand_connection_hold_time
             )
+            status_boundary_changed = (
+                new_mode is not self._connection_mode
+                or new_enabled != self._ble_control_enabled
+            )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
             self._on_demand_connection_hold_time = new_hold_time
+            if status_boundary_changed:
+                self._cancel_active_status_tasks()
             if policy_changed:
                 async with self._policy_lock:
                     self._cancel_idle_disconnect_locked()
@@ -1291,9 +1340,15 @@ class TuyaBLEDevice:
                 or new_enabled != self._ble_control_enabled
                 or new_hold_time != self._on_demand_connection_hold_time
             )
+            status_boundary_changed = (
+                new_mode is not self._connection_mode
+                or new_enabled != self._ble_control_enabled
+            )
             self._connection_mode = new_mode
             self._ble_control_enabled = new_enabled
             self._on_demand_connection_hold_time = new_hold_time
+            if status_boundary_changed:
+                self._cancel_active_status_tasks()
             if policy_changed:
                 async with self._policy_lock:
                     self._cancel_idle_disconnect_locked()
@@ -1594,6 +1649,7 @@ class TuyaBLEDevice:
                 ):
                     return False
                 self._unload_quiescing = True
+                self._cancel_active_status_tasks()
                 self._pending_release = PendingRelease(
                     PendingReleaseReason.UNLOAD,
                     self._policy_revision,
@@ -2153,6 +2209,142 @@ class TuyaBLEDevice:
             TuyaBLECode.FUN_SENDER_DEVICE_STATUS, b"", status_origin="explicit"
         )
 
+    async def async_refresh_s1_status(self) -> None:
+        """Request one exact-session S1 status batch without replay."""
+        self.ensure_control_available()
+        if not self.supports_on_demand_connection_hold_time:
+            raise TuyaBLES1StatusRefreshFailedError()
+        if self._manual_status_refresh_active:
+            raise TuyaBLES1StatusRefreshBusyError()
+
+        # Claim synchronously before connection establishment or any other I/O.
+        self._manual_status_refresh_active = True
+        batch_waiter: asyncio.Future[None] | None = None
+        unregister_observer: Callable[[], None] | None = None
+        status_task = asyncio.current_task()
+        self._manual_status_refresh_task = status_task
+        refresh_observation = _ManualStatusRefreshObservation(
+            refresh_task=status_task,
+            entry_connection_token=self._connection_token,
+            entry_connection_epoch=self._connection_epoch,
+        )
+        self._manual_status_refresh_observation = refresh_observation
+        _LOGGER.debug("%s: S1_REFRESH_ACCEPTED", self.log_identity)
+        token: ConnectionSessionToken | None = None
+        observation_ordinal: int | None = None
+        completed = False
+
+        def bind_observation(generation: _StatusObservationGeneration) -> None:
+            nonlocal observation_ordinal
+            observation_ordinal = generation.ordinal
+
+        def observe(event: StatusObservationEvent) -> None:
+            if event.origin != "explicit":
+                return
+            if event.observation_ordinal != observation_ordinal:
+                return
+            if batch_waiter is None or batch_waiter.done():
+                return
+            if event.kind == "DP_BATCH" and event.exact_session:
+                batch_waiter.set_result(None)
+            elif event.kind in {
+                "ACK_FAILURE",
+                "ACK_TIMEOUT",
+                "OBSERVATION_SUPERSEDED",
+                "OBSERVATION_ENDED",
+                "SESSION_INVALIDATED",
+            }:
+                batch_waiter.set_exception(TuyaBLES1StatusRefreshFailedError())
+
+        try:
+            async with asyncio.timeout(RESPONSE_WAIT_TIMEOUT):
+                async with self.connection_lease("manual status refresh"):
+                    token = self._connection_token
+                    if token is None or not self._owns_connection_session(
+                        token, require_notifications=True
+                    ):
+                        raise TuyaBLEConnectionUnavailableError()
+                    refresh_observation.bound_connection_token = token
+                    session_kind = (
+                        "NEW"
+                        if refresh_observation.connection_claimed_by_refresh
+                        and refresh_observation.claimed_connection_token is token
+                        else "REUSED"
+                    )
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_SESSION_BOUND_%s session_ordinal=%d",
+                        self.log_identity,
+                        session_kind,
+                        token.epoch,
+                    )
+                    batch_waiter = asyncio.get_running_loop().create_future()
+                    unregister_observer = self.register_status_observer(observe)
+                    if status_task is not None:
+                        self._status_task_tokens[status_task] = token
+                    async with token.operation_lock:
+                        confirmed = await self._send_packet_while_connected(
+                            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+                            b"",
+                            0,
+                            True,
+                            session_token=token,
+                            status_origin="explicit",
+                            status_generation_callback=bind_observation,
+                            operation_lock_held=True,
+                        )
+                        if not confirmed:
+                            raise TuyaBLES1StatusRefreshFailedError()
+                        await batch_waiter
+                        refresh_observation.terminal_outcome = "COMPLETED"
+                        completed = True
+                        _LOGGER.debug(
+                            "%s: S1_REFRESH_COMPLETED session_ordinal=%d",
+                            self.log_identity,
+                            token.epoch,
+                        )
+        except TuyaBLES1StatusRefreshFailedError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except (
+            *BLEAK_EXCEPTIONS,
+            TuyaBLEError,
+            TuyaBLEConnectionUnavailableError,
+            TimeoutError,
+        ):
+            raise TuyaBLES1StatusRefreshFailedError() from None
+        finally:
+            if unregister_observer is not None:
+                unregister_observer()
+            if batch_waiter is not None:
+                if batch_waiter.done() and not batch_waiter.cancelled():
+                    batch_waiter.exception()
+                elif not batch_waiter.done():
+                    batch_waiter.cancel()
+            if (
+                status_task is not None
+                and token is not None
+                and self._status_task_tokens.get(status_task) is token
+            ):
+                self._status_task_tokens.pop(status_task, None)
+            if not completed:
+                refresh_observation.terminal_outcome = "FAILED"
+                if refresh_observation.bound_connection_token is None:
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_FAILED session_ordinal=none",
+                        self.log_identity,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: S1_REFRESH_FAILED session_ordinal=%d",
+                        self.log_identity,
+                        refresh_observation.bound_connection_token.epoch,
+                    )
+            refresh_observation.refresh_task = None
+            if self._manual_status_refresh_task is status_task:
+                self._manual_status_refresh_task = None
+            self._manual_status_refresh_active = False
+
     async def startup_update(self) -> None:
         """Run the initial status path without failing config-entry setup."""
         try:
@@ -2521,6 +2713,7 @@ class TuyaBLEDevice:
                 return
             self._terminal_stopped = True
             self._suspension_requested = True
+            self._cancel_active_status_tasks()
             self._policy_state = ConnectionPolicyState.STOPPED
             self._pending_release = PendingRelease(
                 PendingReleaseReason.STOP,
@@ -2589,6 +2782,16 @@ class TuyaBLEDevice:
         }
         for task in tasks:
             task.cancel()
+
+    def _cancel_active_status_tasks(self) -> None:
+        """Cancel status owners at a connection-policy lifecycle boundary."""
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        for task in tuple(self._status_task_tokens):
+            if task is not current_task:
+                task.cancel()
 
     def _invalidate_session_data(self, token: ConnectionSessionToken | None) -> None:
         """Publish loss of exact-session datapoint validity once."""
@@ -3428,6 +3631,10 @@ class TuyaBLEDevice:
         session_token: ConnectionSessionToken | None = None,
         require_always_connected: bool = False,
         status_origin: str | None = None,
+        status_generation_callback: (
+            Callable[[_StatusObservationGeneration], None] | None
+        ) = None,
+        operation_lock_held: bool = False,
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
@@ -3439,6 +3646,24 @@ class TuyaBLEDevice:
             raise TuyaBLEConnectionUnavailableError()
         if code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS and wait_for_response:
             expected_response_code = TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+        if (
+            code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+            and self._manual_status_refresh_active
+            and not operation_lock_held
+        ):
+            async with token.operation_lock:
+                return await self._send_packet_while_connected(
+                    code,
+                    data,
+                    response_to,
+                    wait_for_response,
+                    expected_response_code,
+                    session_token=token,
+                    require_always_connected=require_always_connected,
+                    status_origin=status_origin,
+                    status_generation_callback=status_generation_callback,
+                    operation_lock_held=True,
+                )
         result = True
         future: asyncio.Future | None = None
         generation: _StatusObservationGeneration | None = None
@@ -3452,7 +3677,10 @@ class TuyaBLEDevice:
                 else "explicit"
             )
             generation = self._start_status_observation(
-                token, status_origin or inferred_origin, seq_num
+                token,
+                status_origin or inferred_origin,
+                seq_num,
+                on_created=status_generation_callback,
             )
             self._emit_status_observation(
                 "REQUEST_HANDED_TO_TRANSPORT", generation=generation
@@ -3490,7 +3718,18 @@ class TuyaBLEDevice:
             )
         try:
             packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-            if require_always_connected:
+            if operation_lock_held:
+                if not token.operation_lock.locked():
+                    raise TuyaBLEConnectionUnavailableError()
+                if require_always_connected:
+                    await self._send_packets_locked(
+                        token,
+                        packets,
+                        require_always_connected=True,
+                    )
+                else:
+                    await self._send_packets_locked(token, packets)
+            elif require_always_connected:
                 await self._int_send_packet_while_connected(
                     token,
                     packets,

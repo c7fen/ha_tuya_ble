@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import logging
+from dataclasses import dataclass, field
 from typing import Callable
 
 from homeassistant.components.button import (
-    ButtonEntityDescription,
-    ButtonEntity,
     ButtonDeviceClass,
+    ButtonEntity,
+    ButtonEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.helpers.entity import EntityCategory
 
 from .const import DOMAIN
 from .devices import (
@@ -29,6 +28,14 @@ from .devices import (
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+S1_CATEGORY = "jtmspro"
+S1_PRODUCT_ID = "xqeob8h6"
+S1_REFRESH_STATUS_DESCRIPTION = ButtonEntityDescription(
+    key="refresh_status",
+    icon="mdi:refresh",
+    entity_category=EntityCategory.DIAGNOSTIC,
+)
 
 
 TuyaBLEButtonIsAvailable = Callable[["TuyaBLEButton", TuyaBLEProductInfo], bool] | None
@@ -313,6 +320,17 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
         return result
 
 
+class TuyaBLES1RefreshStatusButton(TuyaBLEEntity, ButtonEntity):
+    """Request current status from the exact S1 product."""
+
+    platform = Platform.BUTTON
+    _is_command_entity = True
+
+    async def async_press(self) -> None:
+        """Request one non-actuating Device Status exchange."""
+        await self._device.async_refresh_s1_status()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -321,7 +339,7 @@ async def async_setup_entry(
     """Set up the Tuya BLE sensors."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLEButton] = []
+    entities: list[ButtonEntity] = []
     for mapping in mappings:
         if mapping.force_add or data.device.datapoints.has_id(
             mapping.dp_id, mapping.dp_type
@@ -335,4 +353,17 @@ async def async_setup_entry(
                     mapping,
                 )
             )
+    if (data.device.category, data.device.product_id) == (
+        S1_CATEGORY,
+        S1_PRODUCT_ID,
+    ):
+        entities.append(
+            TuyaBLES1RefreshStatusButton(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+                S1_REFRESH_STATUS_DESCRIPTION,
+            )
+        )
     async_add_entities(entities)
