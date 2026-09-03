@@ -1352,6 +1352,7 @@ class RefreshStatusFailureClass(StrEnum):
     OWNERSHIP_NOT_PROVEN = "OWNERSHIP_NOT_PROVEN"
     PRECONDITION_NOT_PROVEN = "PRECONDITION_NOT_PROVEN"
     LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
+    LOG_BOUNDARY_NOT_ESTABLISHED = "LOG_BOUNDARY_NOT_ESTABLISHED"
     COLD_STATE_NOT_PROVEN = "COLD_STATE_NOT_PROVEN"
     COLD_REQUEST_FAILED = "COLD_REQUEST_FAILED"
     WARM_REQUEST_FAILED = "WARM_REQUEST_FAILED"
@@ -8607,6 +8608,7 @@ import urllib.error
 import urllib.request
 
 LOGGER = 'custom_components.tuya_ble.tuya_ble.tuya_ble'
+BOUNDARY_LOGGER = 'ha_tuya_ble.r65_validation_boundary'
 EMPTY_COUNTS = {'device_info': 0, 'pair': 0, 'device_status': 0, 'datapoint': 0, 'other': 0}
 EMPTY_PRESS = {
     'service_success': False,
@@ -8749,19 +8751,6 @@ class LogStream:
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
 
-    def establish_boundary(self):
-        # The fixed lines=1 query supplies exactly one historical line before
-        # the followed stream.
-        # Consuming it proves that every subsequently queued line is newer than
-        # this boundary; a timeout is therefore an admission failure, not an
-        # empty-log success.
-        try:
-            self.lines.get(timeout=10)
-        except queue.Empty:
-            raise ValueError('log_boundary')
-        if self.overflow:
-            raise ValueError('log_overflow')
-
     def _read(self):
         try:
             while not self.closed:
@@ -8775,7 +8764,7 @@ class LogStream:
         except Exception:
             if not self.closed: self.overflow = True
 
-    def drain(self):
+    def take_available(self):
         result = []
         while True:
             try: result.append(self.lines.get_nowait())
@@ -8784,11 +8773,74 @@ class LogStream:
             raise ValueError('log_overflow')
         return result
 
+    def until_marker(self, marker):
+        deadline = time.monotonic() + 10
+        result = []
+        while time.monotonic() < deadline:
+            if self.overflow:
+                raise ValueError('log_overflow')
+            try:
+                line = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if marker_line(line, marker):
+                return result
+            result.append(line)
+        raise ValueError('log_marker')
+
     def close(self):
         self.closed = True
         try: self.response.close()
         except Exception: pass
         self.thread.join(timeout=1)
+
+def marker_line(raw, marker):
+    raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
+    match = re.fullmatch(
+        r'.*\[ha_tuya_ble\.r65_validation_boundary\] '
+        r'(R65_WINDOW_(?:START|END)_[0-9a-f]{64})',
+        raw,
+    )
+    return match is not None and match.group(1) == marker
+
+def emit_validation_log_marker(ws, marker):
+    ws.command(
+        'call_service', domain='system_log', service='write',
+        service_data={'message': marker, 'level': 'critical',
+                      'logger': BOUNDARY_LOGGER},
+        return_response=False,
+    )
+
+class LogBoundaryNotEstablished(Exception):
+    pass
+
+class LogWindow:
+    def __init__(self, stream, ws):
+        token = os.urandom(32).hex()
+        self.stream = stream
+        self.ws = ws
+        self.start_marker = 'R65_WINDOW_START_' + token
+        self.end_marker = 'R65_WINDOW_END_' + token
+        self.established = False
+        self.finish_attempted = False
+        self.closed = False
+
+    def start(self):
+        emit_validation_log_marker(self.ws, self.start_marker)
+        try:
+            self.stream.until_marker(self.start_marker)
+        except Exception:
+            raise LogBoundaryNotEstablished() from None
+        self.established = True
+
+    def finish(self):
+        if not self.established or self.finish_attempted:
+            raise ValueError('log_window')
+        self.finish_attempted = True
+        emit_validation_log_marker(self.ws, self.end_marker)
+        lines = self.stream.until_marker(self.end_marker)
+        self.closed = True
+        return lines
 
 def entries_by_key(entities, device_id, domain, key):
     return [entry for entry in entities if (
@@ -8828,11 +8880,23 @@ def parse_lines(lines, required_identity=None):
         SEND_RE.fullmatch(message)
         or message.startswith(('Connecting;', 'Connected;', 'Successfully connected', 'Disconnecting', 'Disconnected from device;', 'Scheduling reconnect;', 'Reconnect,'))
     )}
-    if required_identity is not None and any(item != required_identity for item in identities):
-        raise ValueError('multiple_identity')
     if required_identity is None:
-        if len(identities) != 1: raise ValueError('identity')
-        required_identity = next(iter(identities))
+        candidates = []
+        for identity in identities:
+            _identity, counts, events = parse_lines(lines, identity)
+            if (
+                counts['device_info'] == 1 and counts['pair'] == 1
+                and counts['device_status'] == 1 and counts['datapoint'] == 0
+                and events.count('connecting') == 1
+                and events.count('connected') == 1
+                and events.count('authenticated') == 1
+                and not any(event in events for event in (
+                    'disconnecting', 'disconnected', 'reconnect'
+                ))
+            ):
+                candidates.append(identity)
+        if len(candidates) != 1: raise ValueError('identity')
+        required_identity = candidates[0]
     counts = dict(EMPTY_COUNTS)
     events = []
     for identity, message in records:
@@ -8885,23 +8949,26 @@ def relevant_session_activity(lines):
             return True
     return False
 
+def cold_gate_admissible(stream, connection_id):
+    if state(connection_id).get('state') != 'off':
+        return False
+    if relevant_session_activity(stream.take_available()):
+        return False
+    return state(connection_id).get('state') == 'off'
+
 def press(ws, entity_id):
     ws.command('call_service', domain='button', service='press',
                target={'entity_id': entity_id}, return_response=False)
 
-def observe_press(stream, last_id, previous):
+def observe_press(last_id, previous):
     deadline = time.monotonic() + 30
-    lines = []
     current = previous
     while time.monotonic() < deadline:
         time.sleep(0.2)
-        lines.extend(stream.drain())
         current = state(last_id).get('state')
         if current != previous:
-            time.sleep(0.8)
-            lines.extend(stream.drain())
             break
-    return lines, current
+    return current
 
 def empty_result():
     return {
@@ -8918,7 +8985,7 @@ def empty_result():
     }
 
 def run_validation():
-    result = empty_result(); ws = stream = None; prior_level = None
+    result = empty_result(); ws = stream = window = None; prior_level = None
     try:
         ws = WebSocket()
         display = ws.command('config/entity_registry/list_for_display')
@@ -8979,21 +9046,28 @@ def run_validation():
         prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
         stream = LogStream()
-        stream.establish_boundary()
+        window = LogWindow(stream, ws); window.start()
         time.sleep(hold + 5)
-        startup = stream.drain()
+        startup = window.finish(); window = None
         if state(connection_id).get('state') != 'off' or not all_sessions_quiescent(startup):
             result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
-        stream.close(); stream = LogStream(); stream.establish_boundary()
-        if state(connection_id).get('state') != 'off':
-            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
-        time.sleep(0.25)
-        if relevant_session_activity(stream.drain()) or state(connection_id).get('state') != 'off':
-            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+        cold_deadline = time.monotonic() + hold + 5
+        while True:
+            while state(connection_id).get('state') != 'off':
+                if time.monotonic() >= cold_deadline:
+                    result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+                time.sleep(0.2)
+            window = LogWindow(stream, ws); window.start()
+            if cold_gate_admissible(stream, connection_id):
+                break
+            window.finish(); window = None
+            if time.monotonic() >= cold_deadline:
+                result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
         before_last = state(last_id).get('state')
         before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
         press(ws, button_id)
-        cold_lines, after_cold = observe_press(stream, last_id, before_last)
+        after_cold = observe_press(last_id, before_last)
+        cold_lines = window.finish(); window = None
         identity, cold_counts, cold_events = parse_lines(cold_lines)
         changed_cold = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
         result['cold'] = {'service_success': True, 'counts': cold_counts,
@@ -9002,12 +9076,17 @@ def run_validation():
         result['conditional_omission_observed'] = bool(dp_entities) and len(changed_cold) < len(dp_entities)
         if cold_counts['datapoint']:
             result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
-        if not (cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1 and cold_events.count('connecting') == 1 and cold_events.count('connected') == 1 and cold_events.count('authenticated') == 1 and not any(event in cold_events for event in ('disconnecting', 'disconnected', 'reconnect')) and result['cold']['last_status_update_advanced']):
+        if not (state(connection_id).get('state') == 'on' and cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1 and cold_events.count('connecting') == 1 and cold_events.count('connected') == 1 and cold_events.count('authenticated') == 1 and not any(event in cold_events for event in ('disconnecting', 'disconnected', 'reconnect')) and result['cold']['last_status_update_advanced']):
             result['failure_class'] = 'COLD_REQUEST_FAILED'; return result
         delay = min(1.1, max(0.1, hold / 4)); time.sleep(delay)
         before_warm = after_cold; before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
-        stream.drain(); press(ws, button_id)
-        warm_lines, after_warm = observe_press(stream, last_id, before_warm)
+        window = LogWindow(stream, ws); window.start()
+        if state(connection_id).get('state') != 'on':
+            window.finish(); window = None
+            result['failure_class'] = 'WARM_REQUEST_FAILED'; return result
+        press(ws, button_id)
+        after_warm = observe_press(last_id, before_warm)
+        warm_lines = window.finish(); window = None
         _, warm_counts, warm_events = parse_lines(warm_lines, identity)
         changed_warm = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
         result['warm'] = {'service_success': True, 'counts': warm_counts,
@@ -9016,23 +9095,35 @@ def run_validation():
         if warm_counts['datapoint']:
             result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
         result['same_authenticated_session_reused'] = not any(event in warm_events for event in ('connecting', 'connected', 'authenticated', 'disconnecting', 'disconnected', 'reconnect'))
-        if not (warm_counts['device_info'] == 0 and warm_counts['pair'] == 0 and warm_counts['device_status'] == 1 and result['same_authenticated_session_reused']):
+        if not (state(connection_id).get('state') == 'on' and warm_counts['device_info'] == 0 and warm_counts['pair'] == 0 and warm_counts['device_status'] == 1 and result['same_authenticated_session_reused']):
             result['failure_class'] = 'WARM_REQUEST_FAILED'; return result
         if not result['warm']['last_status_update_advanced']:
             result['failure_class'] = 'RETAINED_CONFIRMATION_NOT_OBSERVED'; return result
         result['hold']['warm_immediately_after_press'] = True
-        time.sleep(hold + 5); _, _, release_events = parse_lines(stream.drain(), identity)
-        result['hold']['normal_release_observed'] = 'disconnecting' in release_events and 'disconnected' in release_events
+        window = LogWindow(stream, ws); window.start()
+        time.sleep(hold + 5); hold_lines = window.finish(); window = None
+        _, _, release_events = parse_lines(hold_lines, identity)
+        result['hold']['normal_release_observed'] = state(connection_id).get('state') == 'off' and 'disconnecting' in release_events and 'disconnected' in release_events
         if not result['hold']['normal_release_observed']:
             result['failure_class'] = 'HOLD_RELEASE_NOT_OBSERVED'; return result
-        time.sleep(5); _, _, post_events = parse_lines(stream.drain(), identity)
-        result['hold']['automatic_reconnect_observed'] = any(event in post_events for event in ('connecting', 'connected', 'authenticated', 'reconnect'))
+        window = LogWindow(stream, ws); window.start()
+        time.sleep(5); post_lines = window.finish(); window = None
+        _, _, post_events = parse_lines(post_lines, identity)
+        result['hold']['automatic_reconnect_observed'] = state(connection_id).get('state') != 'off' or any(event in post_events for event in ('connecting', 'connected', 'authenticated', 'reconnect'))
         if result['hold']['automatic_reconnect_observed']:
             result['failure_class'] = 'AUTOMATIC_RECONNECT_OBSERVED'; return result
         return result
+    except LogBoundaryNotEstablished:
+        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
     except Exception:
         result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'; return result
     finally:
+        if window is not None and window.established and not window.finish_attempted:
+            try:
+                window.finish()
+            except Exception:
+                result['ambiguous'] = True
+                result['failure_class'] = 'AMBIGUOUS'
         if stream is not None: stream.close()
         if ws is not None:
             if prior_level is not None:

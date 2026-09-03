@@ -11880,7 +11880,12 @@ def _r65_packet_parser() -> object:
             )
             or isinstance(node, ast.FunctionDef)
             and node.name
-            in {"parse_lines", "all_sessions_quiescent", "relevant_session_activity"}
+            in {
+                "parse_lines",
+                "all_sessions_quiescent",
+                "relevant_session_activity",
+                "cold_gate_admissible",
+            }
         ):
             selected.append(node)
     namespace: dict[str, object] = {}
@@ -11890,6 +11895,66 @@ def _r65_packet_parser() -> object:
         namespace,
     )
     return namespace
+
+
+def _r65_log_boundary() -> dict[str, object]:
+    """Load only the private embedded marker protocol for synthetic tests."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    names = {
+        "BOUNDARY_LOGGER",
+        "LogStream",
+        "LogBoundaryNotEstablished",
+        "LogWindow",
+        "marker_line",
+        "emit_validation_log_marker",
+    }
+    selected = []
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            or isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in names
+            or isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in names
+                for target in node.targets
+            )
+        ):
+            selected.append(node)
+    namespace: dict[str, object] = {}
+    exec(  # noqa: S102 - execute only isolated repository-owned marker code.
+        compile(
+            ast.fix_missing_locations(ast.Module(selected, type_ignores=[])),
+            "<r65b-boundary>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+def _r65b_stream(boundary: dict[str, object]) -> object:
+    stream = boundary["LogStream"].__new__(boundary["LogStream"])
+    stream.lines = __import__("queue").Queue(maxsize=512)
+    stream.overflow = False
+    return stream
+
+
+class _R65BMarkerWebSocket:
+    def __init__(self, stream: object, *, start: bool = True, end: bool = True) -> None:
+        self.stream = stream
+        self.start = start
+        self.end = end
+        self.calls: list[dict[str, object]] = []
+
+    def command(self, kind: str, **fields: object) -> None:
+        self.calls.append({"kind": kind, **fields})
+        marker = fields["service_data"]["message"]
+        permitted = self.start if "_START_" in marker else self.end
+        if permitted:
+            self.stream.lines.put(
+                "2026-01-01 [ha_tuya_ble.r65_validation_boundary] " + marker + "\n"
+            )
 
 
 class _R65ScriptedBroker(_R32ScriptedBroker):
@@ -12186,7 +12251,8 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
             prefix + "Sending packet: #4 FUN_SENDER_DPS\n",
             prefix + "Sending packet: #5 FUN_SENDER_DPS_V4\n",
             prefix + "Sending packet: #6 FUN_SENDER_LOCK\n",
-        ]
+        ],
+        first,
     )
     assert identity == first
     assert counts == {
@@ -12197,16 +12263,17 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
         "other": 1,
     }
     second = "tuya-ble-session-" + "h" * 16
-    with pytest.raises(ValueError, match="multiple_identity"):
-        parse_lines(
-            [
-                prefix + "Sending packet: #1 FUN_SENDER_DEVICE_STATUS\n",
-                "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
-                + second
-                + ": Connecting; synthetic\n",
-            ],
-            first,
-        )
+    selected, selected_counts, _ = parse_lines(
+        [
+            prefix + "Sending packet: #1 FUN_SENDER_DEVICE_STATUS\n",
+            "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+            + second
+            + ": Connecting; synthetic\n",
+        ],
+        first,
+    )
+    assert selected == first
+    assert selected_counts["device_status"] == 1
     assert not all_sessions_quiescent([prefix + "Connecting; synthetic\n"])
     assert all_sessions_quiescent(
         [
@@ -12216,7 +12283,7 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
     )
     assert relevant_session_activity([prefix + "Connecting; synthetic\n"])
     assert not relevant_session_activity(["synthetic unrelated log line\n"])
-    assert "stream.establish_boundary()" in access._REMOTE_REFRESH_STATUS_PROGRAM
+    assert "stream.establish_boundary()" not in access._REMOTE_REFRESH_STATUS_PROGRAM
     assert "state(connection_id).get('state') != 'off'" in (
         access._REMOTE_REFRESH_STATUS_PROGRAM
     )
@@ -12242,6 +12309,216 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
         False,
     )
     assert result.passed
+
+
+@pytest.mark.parametrize("historical_count", (2, 5))
+def test_r65_m1_to_m4_r65b_marker_discards_arbitrary_history(
+    historical_count: int,
+) -> None:
+    boundary = _r65_log_boundary()
+    stream = _r65b_stream(boundary)
+    history = [
+        "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+        "tuya-ble-session-"
+        + "g" * 16
+        + ": Sending packet: #1 FUN_SENDER_DEVICE_STATUS\n"
+    ] + [f"historical {index}\n" for index in range(1, historical_count)]
+    for line in history:
+        stream.lines.put(line)
+    ws = _R65BMarkerWebSocket(stream)
+    window = boundary["LogWindow"](stream, ws)
+
+    assert not window.established
+    window.start()
+    assert window.established
+    stream.lines.put("active only after observed start\n")
+    lines = window.finish()
+
+    assert lines == ["active only after observed start\n"]
+    assert len(ws.calls) == 2
+    assert all(call["kind"] == "call_service" for call in ws.calls)
+
+
+def test_r65_m5_r65b_missing_start_is_zero_press_boundary_failure() -> None:
+    boundary = _r65_log_boundary()
+    stream = _r65b_stream(boundary)
+    ws = _R65BMarkerWebSocket(stream, start=False)
+    press_count = 0
+    values = [0.0, 0.0, 11.0]
+    boundary["time"] = type(
+        "SyntheticTime",
+        (),
+        {"monotonic": staticmethod(lambda: values.pop(0) if values else 11.0)},
+    )
+
+    with pytest.raises(boundary["LogBoundaryNotEstablished"]):
+        boundary["LogWindow"](stream, ws).start()
+
+    assert press_count == 0
+    assert "LOG_BOUNDARY_NOT_ESTABLISHED" in access._REMOTE_REFRESH_STATUS_PROGRAM
+
+
+def test_r65_m6_to_m8_r65b_end_is_required_and_exclusive() -> None:
+    boundary = _r65_log_boundary()
+    stream = _r65b_stream(boundary)
+    ws = _R65BMarkerWebSocket(stream, end=False)
+    window = boundary["LogWindow"](stream, ws)
+    window.start()
+    press_count = 1
+    original_time = boundary["time"]
+    values = [0.0, 0.0, 11.0]
+    boundary["time"] = type(
+        "SyntheticTime",
+        (),
+        {"monotonic": staticmethod(lambda: values.pop(0) if values else 11.0)},
+    )
+
+    with pytest.raises(ValueError, match="log_marker"):
+        window.finish()
+
+    assert press_count == 1
+    assert window.finish_attempted
+    with pytest.raises(ValueError, match="log_window"):
+        window.finish()
+    boundary["time"] = original_time
+
+    complete_stream = _r65b_stream(boundary)
+    complete_ws = _R65BMarkerWebSocket(complete_stream)
+    complete = boundary["LogWindow"](complete_stream, complete_ws)
+    complete.start()
+    complete_stream.lines.put("inside\n")
+    complete.finish()
+    complete_stream.lines.put("after end\n")
+    assert complete_stream.take_available() == ["after end\n"]
+
+
+def test_r65_m9_m10_r65b_identity_binding_is_selected_and_fail_closed() -> None:
+    parser = _r65_packet_parser()["parse_lines"]
+    first = "tuya-ble-session-" + "g" * 16
+    second = "tuya-ble-session-" + "h" * 16
+
+    def record(identity: str, message: str) -> str:
+        return (
+            "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+            + identity
+            + ": "
+            + message
+            + "\n"
+        )
+
+    cold = [
+        record(first, "Connecting; synthetic"),
+        record(first, "Connected; synthetic"),
+        record(first, "Successfully connected synthetic"),
+        record(first, "Sending packet: #1 FUN_SENDER_DEVICE_INFO"),
+        record(first, "Sending packet: #2 FUN_SENDER_PAIR"),
+        record(first, "Sending packet: #3 FUN_SENDER_DEVICE_STATUS"),
+    ]
+    foreign = record(second, "Sending packet: #4 FUN_SENDER_DPS")
+    identity, counts, _ = parser(cold + [foreign])
+    assert identity == first
+    assert counts["datapoint"] == 0
+    with pytest.raises(ValueError, match="identity"):
+        parser(cold + [line.replace(first, second) for line in cold])
+
+
+def test_r65_m11_m12_r65b_marker_is_private_and_service_is_fixed() -> None:
+    boundary = _r65_log_boundary()
+    stream = _r65b_stream(boundary)
+    ws = _R65BMarkerWebSocket(stream)
+    window = boundary["LogWindow"](stream, ws)
+    token = window.start_marker
+    window.start()
+    window.finish()
+    rendered = json.dumps({"failure_class": "LOG_BOUNDARY_NOT_ESTABLISHED"})
+
+    assert token not in repr(window)
+    assert token not in rendered
+    assert tuple(
+        inspect.signature(
+            access.RefreshStatusLiveValidationController.run_s1_refresh_status_live_validation
+        ).parameters
+    ) == ("self",)
+    assert all(
+        call
+        == {
+            "kind": "call_service",
+            "domain": "system_log",
+            "service": "write",
+            "service_data": {
+                "message": call["service_data"]["message"],
+                "level": "critical",
+                "logger": "ha_tuya_ble.r65_validation_boundary",
+            },
+            "return_response": False,
+        }
+        for call in ws.calls
+    )
+
+
+def test_r65_g1_to_g6_r65b_exact_cold_gate_has_no_availability_substitute() -> None:
+    program = access._REMOTE_REFRESH_STATUS_PROGRAM
+    boundary = _r65_log_boundary()
+    parser = _r65_packet_parser()
+    session = "tuya-ble-session-" + "g" * 16
+    startup = (
+        "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+        + session
+        + ": Connecting; synthetic\n"
+    )
+
+    class Stream:
+        def __init__(self, lines: list[str]) -> None:
+            self.lines = lines
+
+        def take_available(self) -> list[str]:
+            result, self.lines = self.lines, []
+            return result
+
+    gate = parser["cold_gate_admissible"]
+
+    parser["state"] = lambda _entity: {"state": "off"}
+    assert gate(Stream([]), "binary_sensor.synthetic")
+    parser["state"] = lambda _entity: {"state": "on"}
+    assert not gate(Stream([]), "binary_sensor.synthetic")
+    parser["state"] = lambda _entity: {"state": "off"}
+    assert not gate(Stream([startup]), "binary_sensor.synthetic")
+    assert gate(Stream([]), "binary_sensor.synthetic")
+    assert not gate(Stream([startup]), "binary_sensor.synthetic")
+
+    assert "'binary_sensor', 'bluetooth_connection'" in program
+    assert "state(connection_id).get('state') != 'off'" in program
+    assert "state(button_id).get('state') == 'unavailable'" in program
+    assert "window.start()" in program
+    assert "cold_gate_admissible(stream, connection_id)" in program
+    assert parser["relevant_session_activity"]([startup])
+    assert not parser["relevant_session_activity"](["unrelated startup\n"])
+    assert boundary["marker_line"](
+        "2026 [ha_tuya_ble.r65_validation_boundary] R65_WINDOW_START_"
+        + "a" * 64
+        + "\n",
+        "R65_WINDOW_START_" + "a" * 64,
+    )
+    assert not boundary["marker_line"](
+        "2026 [wrong.logger] R65_WINDOW_START_" + "a" * 64 + "\n",
+        "R65_WINDOW_START_" + "a" * 64,
+    )
+
+
+def test_r65_r65b_supervisor_minimum_history_regression_is_marker_bounded() -> None:
+    """A two-record minimum defeats one-pop logic but not an exact START marker."""
+    boundary = _r65_log_boundary()
+    historical = ["history one\n", "history two\n"]
+    old_remaining = historical[1:]
+    stream = _r65b_stream(boundary)
+    for line in historical:
+        stream.lines.put(line)
+    ws = _R65BMarkerWebSocket(stream)
+    window = boundary["LogWindow"](stream, ws)
+    window.start()
+
+    assert old_remaining == ["history two\n"]
+    assert stream.take_available() == []
 
 
 def test_r65_c14_to_c19_two_press_operation_and_exact_restore(
