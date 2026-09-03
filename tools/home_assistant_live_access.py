@@ -263,6 +263,13 @@ class FeatureBackupClassification(StrEnum):
     OTHER_OR_INDETERMINATE = "OTHER_OR_INDETERMINATE"
 
 
+class FeatureLiveResultDurabilityClassification(StrEnum):
+    """Whether a retained feature lifecycle contains a sanitized live result."""
+
+    DURABLY_AVAILABLE = "REMOTE_LIVE_RESULT_DURABLY_AVAILABLE"
+    NOT_DURABLY_AVAILABLE = "REMOTE_LIVE_RESULT_NOT_DURABLY_AVAILABLE"
+
+
 class LifecycleAnchorFormat(StrEnum):
     """Exact durable anchor layouts retained by the Issue-37 lifecycle."""
 
@@ -3780,11 +3787,13 @@ class _DurableFeatureValidationJournal:
         }
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
         self._directory = _fixed_lifecycle_state_root()
         self._root_fd: int | None = None
         self._lock_fd: int | None = None
         self._closed = False
+        self._retained_terminal_inspection = _retained_terminal_inspection
+        self._retired = False
         self.reconstructed = False
         try:
             self._directory.parent.mkdir(parents=True, exist_ok=True)
@@ -3836,6 +3845,10 @@ class _DurableFeatureValidationJournal:
                 raise LifecycleControllerError("LIFECYCLE_MODE_CONFLICT") from None
             record = self._read()
             if record is None:
+                if _retained_terminal_inspection:
+                    raise LifecycleControllerError(
+                        "FEATURE_TERMINAL_REQUIRED"
+                    ) from None
                 record = {
                     "schema_version": 1,
                     "revision": 0,
@@ -3859,7 +3872,21 @@ class _DurableFeatureValidationJournal:
             else:
                 self.reconstructed = True
                 self._validate(record)
-                if record["active"] is not True:
+                if _retained_terminal_inspection:
+                    if record["active"] is True:
+                        raise LifecycleControllerError(
+                            "FEATURE_TERMINAL_REQUIRED"
+                        ) from None
+                    if (
+                        record["terminal"]
+                        != FeatureValidationState.COMPLETE_NORMAL.value
+                        or record["state"]
+                        != FeatureValidationState.COMPLETE_NORMAL.value
+                    ):
+                        raise LifecycleControllerError(
+                            "FEATURE_TERMINAL_NOT_COMPLETE"
+                        ) from None
+                elif record["active"] is not True:
                     raise LifecycleControllerError(
                         "FEATURE_TERMINAL_RETAINED"
                     ) from None
@@ -3867,6 +3894,41 @@ class _DurableFeatureValidationJournal:
         except BaseException:
             self.close()
             raise
+
+    @classmethod
+    def open_retained_terminal(cls) -> Self:
+        """Open only a retained successful Feature-Validation terminal."""
+        return cls(_retained_terminal_inspection=True)
+
+    @staticmethod
+    def _final_restore_complete(record: dict[str, object]) -> bool:
+        """Return the canonical durable equivalent of FinalRestoreProof.complete."""
+        operations = record.get("operations")
+        restart_results = record.get("restart_results")
+        required = {
+            FeatureValidationAction.RESTORE_INVENTORY.value,
+            FeatureValidationAction.RESTORE_CORE_CHECK.value,
+            FeatureValidationAction.REMOVAL_RESTART.value,
+            FeatureValidationAction.RESTORE_READINESS.value,
+            FeatureValidationAction.FEATURE_ABSENCE.value,
+            FeatureValidationAction.POST_RESTORE_REPAIRS.value,
+            FeatureValidationAction.FINAL_ACCEPTANCE.value,
+        }
+        return (
+            record.get("active") is False
+            and record.get("state") == FeatureValidationState.COMPLETE_NORMAL.value
+            and record.get("terminal") == FeatureValidationState.COMPLETE_NORMAL.value
+            and isinstance(operations, dict)
+            and all(
+                operations.get(action) == "transition_committed" for action in required
+            )
+            and isinstance(restart_results, dict)
+            and restart_results.get(FeatureValidationAction.REMOVAL_RESTART.value)
+            in {
+                RestartDispatchOutcome.RESPONSE_ACCEPTED.value,
+                RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN.value,
+            }
+        )
 
     def _read(self) -> dict[str, object] | None:
         try:
@@ -4040,6 +4102,23 @@ class _DurableFeatureValidationJournal:
     @property
     def state(self) -> FeatureValidationState:
         return FeatureValidationState(self._record["state"])
+
+    @property
+    def terminal_state(self) -> FeatureValidationState | None:
+        value = self._record["terminal"]
+        return None if value is None else FeatureValidationState(value)
+
+    @property
+    def active(self) -> bool:
+        return self._record["active"]
+
+    @property
+    def schema_version(self) -> int:
+        return self._record["schema_version"]
+
+    @property
+    def final_restore_complete(self) -> bool:
+        return self._final_restore_complete(self._record)
 
     @property
     def lifecycle_generation(self) -> str:
@@ -4263,6 +4342,25 @@ class _DurableFeatureValidationJournal:
             record["active"] = False
 
         self._mutate(mutate)
+
+    def retire_terminal(self) -> None:
+        """Remove only this successfully completed retained feature journal."""
+        if (
+            not self._retained_terminal_inspection
+            or self._retired
+            or not self.final_restore_complete
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_TERMINAL_RETIREMENT_NOT_AUTHORIZED"
+            ) from None
+        try:
+            os.unlink(_FEATURE_VALIDATION_JOURNAL_NAME, dir_fd=self._root_fd)
+            os.fsync(self._root_fd)
+        except OSError:
+            raise LifecycleControllerError(
+                "FEATURE_TERMINAL_RETIREMENT_FAILED"
+            ) from None
+        self._retired = True
 
     def close(self) -> None:
         if self._closed:
@@ -9517,6 +9615,7 @@ class PrivateInteractiveSessionBroker:
                 FullPreflightLifecycleController,
                 RefreshStatusLiveValidationController,
                 RetainedAnchorContinuityInspector,
+                RetainedFeatureValidationTerminalInspector,
                 RetainedTerminalLifecycleInspector,
             }
         ):
@@ -9542,6 +9641,31 @@ class PrivateInteractiveSessionBroker:
         binding = self._controller_binding
         if (
             controller.__class__ is not RetainedAnchorContinuityInspector
+            or binding is None
+            or binding.controller is not controller
+            or binding.issuer is not issuer
+            or binding.session_generation is not session_generation
+            or self._session_generation is not session_generation
+            or any(
+                not any(capability is consumed for consumed in binding.issuer.consumed)
+                for capability in binding.issuer.issued
+            )
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_CONTROLLER_RELEASE_INVALID"
+            ) from None
+        self._controller_binding = None
+
+    def _release_retained_feature_validation_terminal_inspector(
+        self,
+        controller: object,
+        issuer: object,
+        session_generation: object,
+    ) -> None:
+        """Release only the exact completed feature-terminal inspector."""
+        binding = self._controller_binding
+        if (
+            controller.__class__ is not RetainedFeatureValidationTerminalInspector
             or binding is None
             or binding.controller is not controller
             or binding.issuer is not issuer
@@ -11017,6 +11141,18 @@ class RetainedTerminalMetadata:
     state: LifecycleState
     revision: int
     lifecycle_generation: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedFeatureValidationTerminalMetadata:
+    """Public-safe facts about one retained successful feature lifecycle."""
+
+    state: FeatureValidationState
+    terminal: FeatureValidationState
+    active: bool
+    schema_version: int
+    final_restore_complete: bool
+    live_result_durability: FeatureLiveResultDurabilityClassification
 
 
 @dataclass(frozen=True, slots=True)
@@ -13243,6 +13379,243 @@ _FEATURE_TO_LIFECYCLE_ACTION = {
         LifecycleAction.POST_RESTORE_REPAIRS
     ),
 }
+
+
+class RetainedFeatureValidationTerminalInspector:
+    """State-neutral handle for one retained successful feature lifecycle."""
+
+    def __init__(self, broker: Any) -> None:
+        if (
+            getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(broker, "_session_generation", None) is None
+            or not callable(getattr(broker, "_register_lifecycle_controller", None))
+            or not callable(
+                getattr(
+                    broker,
+                    "_release_retained_feature_validation_terminal_inspector",
+                    None,
+                )
+            )
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        self._broker = broker
+        self._session_generation = broker._session_generation
+        self._source_inspection_attempted = False
+        self._exact_pr41_source_proven = False
+        self._feature_backup_classification: FeatureBackupClassification | None = None
+        self._retired = False
+        self._closed = False
+        self._journal = _DurableFeatureValidationJournal.open_retained_terminal()
+        try:
+            self._capability_issuer = broker._register_lifecycle_controller(
+                self,
+                self._journal.lifecycle_generation,
+                self._session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if type(self._capability_issuer) is not _CapabilityIssuer:
+            self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+
+    @property
+    def metadata(self) -> RetainedFeatureValidationTerminalMetadata:
+        return RetainedFeatureValidationTerminalMetadata(
+            state=self._journal.state,
+            terminal=self._journal.terminal_state,
+            active=self._journal.active,
+            schema_version=self._journal.schema_version,
+            final_restore_complete=self._journal.final_restore_complete,
+            live_result_durability=(
+                FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
+            ),
+        )
+
+    def _assert_session_binding(self) -> None:
+        if (
+            self._closed
+            or getattr(self._broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(self._broker, "_session_generation", None)
+            is not self._session_generation
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_CHANGED") from None
+
+    @staticmethod
+    def _exact_inventory(
+        result: CurrentSourceInventoryResult,
+        manifest: SourceManifest,
+    ) -> bool:
+        evidence = result.evidence
+        return (
+            evidence is not None
+            and _source_inventory_exact(evidence, len(manifest.entries))
+            and evidence.root_profile is RemoteRootProfile.HOMEASSISTANT_CONFIG
+            and _exact_non_bool_int(evidence.content_mismatch_count)
+            and evidence.content_mismatch_count == 0
+            and evidence.managed_manifest_identity
+            == _source_manifest_digest(manifest.entries)
+        )
+
+    def inspect_current_source(
+        self,
+        r64_manifest: SourceManifest,
+        restore_manifest: SourceManifest,
+    ) -> CurrentSourceInventoryResult:
+        """Classify current source without progressing the retained lifecycle."""
+        self._assert_session_binding()
+        if self._source_inspection_attempted:
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_INSPECTION_ALREADY_ATTEMPTED"
+            ) from None
+        self._source_inspection_attempted = True
+        self._exact_pr41_source_proven = False
+        self._feature_backup_classification = None
+        try:
+            validate_source_manifest(r64_manifest)
+            validate_source_manifest(restore_manifest)
+        except (SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError("FEATURE_SOURCE_INSPECTION_FAILED") from None
+        if (
+            r64_manifest.state is not SourceState.R64_RUNTIME
+            or restore_manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("FEATURE_SOURCE_INSPECTION_FAILED") from None
+        capability = _SourceInspectionCapability(
+            self,
+            self._capability_issuer.identity,
+            self._session_generation,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._inspect_current_source(
+                r64_manifest,
+                restore_manifest,
+                _capability=capability,
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError) as error:
+            failure = _bounded_dispatch_failure(DispatchFailureStage.UNKNOWN, error)
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE,
+                failure_stage=failure.stage,
+                failure_class=failure.failure_class,
+                remote_failure_scope=failure.remote_failure_scope,
+                remote_failure_reason=failure.remote_failure_reason,
+            )
+        if not isinstance(result, CurrentSourceInventoryResult):
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE,
+                failure_stage=DispatchFailureStage.RESULT_VALIDATION,
+                failure_class=DispatchFailureClass.SCHEMA,
+            )
+        expected_manifest = {
+            CurrentSourceClassification.EXACT_PR41: restore_manifest,
+            CurrentSourceClassification.EXACT_R64: r64_manifest,
+        }.get(result.classification)
+        if expected_manifest is not None and not self._exact_inventory(
+            result, expected_manifest
+        ):
+            return CurrentSourceInventoryResult(
+                CurrentSourceClassification.INDETERMINATE,
+                failure_stage=DispatchFailureStage.RESULT_VALIDATION,
+                failure_class=DispatchFailureClass.SCHEMA,
+            )
+        self._exact_pr41_source_proven = (
+            result.classification is CurrentSourceClassification.EXACT_PR41
+        )
+        return result
+
+    def inspect_feature_backup(
+        self, restore_manifest: SourceManifest
+    ) -> FeatureBackupContinuityResult:
+        """Classify this lifecycle's remote backup without mutating it."""
+        self._assert_session_binding()
+        if (
+            not self._exact_pr41_source_proven
+            or self._feature_backup_classification is not None
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_CONTINUITY_NOT_AUTHORIZED"
+            ) from None
+        try:
+            validate_source_manifest(restore_manifest)
+        except (SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_CONTINUITY_NOT_AUTHORIZED"
+            ) from None
+        if restore_manifest.state is not SourceState.RESTORE:
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_CONTINUITY_NOT_AUTHORIZED"
+            ) from None
+        capability = _FeatureBackupContinuityCapability(
+            self,
+            self._capability_issuer.identity,
+            self._journal.lifecycle_generation,
+            PR41_RESTORE_COMMIT,
+            self._session_generation,
+            secrets.token_hex(16),
+            FeatureBackupAction.INSPECT,
+            self._journal.backup_identity,
+            self._journal.committed(FeatureValidationAction.RESTORE_INSTALL),
+        )
+        self._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._feature_backup_continuity_operation(
+                restore_manifest,
+                FeatureBackupAction.INSPECT,
+                _capability=capability,
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            result = FeatureBackupContinuityResult(
+                FeatureBackupClassification.OTHER_OR_INDETERMINATE
+            )
+        if not isinstance(result, FeatureBackupContinuityResult) or result.retired:
+            result = FeatureBackupContinuityResult(
+                FeatureBackupClassification.OTHER_OR_INDETERMINATE
+            )
+        self._feature_backup_classification = result.classification
+        return result
+
+    def retire_terminal(self) -> None:
+        """Retire exactly this proven clean completed feature terminal."""
+        self._assert_session_binding()
+        if (
+            self._retired
+            or not self._exact_pr41_source_proven
+            or self._feature_backup_classification
+            is not FeatureBackupClassification.NONE
+            or not self._journal.final_restore_complete
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_TERMINAL_RETIREMENT_NOT_AUTHORIZED"
+            ) from None
+        self._journal.retire_terminal()
+        self._retired = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        release_error: SessionBrokerError | None = None
+        try:
+            self._broker._release_retained_feature_validation_terminal_inspector(
+                self,
+                self._capability_issuer,
+                self._session_generation,
+            )
+        except SessionBrokerError as error:
+            release_error = error
+        finally:
+            self._journal.close()
+        if release_error is not None:
+            raise LifecycleControllerError("LIFECYCLE_SESSION_RELEASE_FAILED") from None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 class RefreshStatusLiveValidationController:

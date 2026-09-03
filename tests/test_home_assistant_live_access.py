@@ -1027,6 +1027,7 @@ def _synthetic_r30_source_authorities(
                 "test_r63t_",
                 "test_r65_",
                 "test_r65e_",
+                "test_r65g_",
             )
         ),
     )
@@ -4159,6 +4160,29 @@ class _R32ScriptedBroker:
         binding = self._controller_binding
         if (
             controller.__class__ is not access.RetainedAnchorContinuityInspector
+            or binding is None
+            or binding[0] is not controller
+            or binding[1] is not issuer
+            or binding[3] is not session_generation
+            or self._session_generation is not session_generation
+            or any(
+                not any(capability is consumed for consumed in binding[1].consumed)
+                for capability in binding[1].issued
+            )
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_CONTROLLER_RELEASE_INVALID")
+        self._controller_binding = None
+
+    def _release_retained_feature_validation_terminal_inspector(
+        self,
+        controller: object,
+        issuer: object,
+        session_generation: object,
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            controller.__class__
+            is not access.RetainedFeatureValidationTerminalInspector
             or binding is None
             or binding[0] is not controller
             or binding[1] is not issuer
@@ -13516,3 +13540,292 @@ def test_r65e_public_backup_continuity_api_has_no_path_or_identity_inputs() -> N
     assert "generation" not in rendered
     assert "digest" not in rendered
     assert "path" not in rendered
+
+
+def _r65g_complete_feature_terminal(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> tuple[object, access.SourceBundle, access.SourceBundle]:
+    controller, _broker, r64, restore = _r65_advance_to_live(r65_bundles)
+    controller.run_s1_refresh_status_live_validation()
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.retire_owned_feature_backup(restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_refresh_feature_absent()
+    controller.admit_post_restore_repairs()
+    assert controller._journal is not None
+    generation = controller._journal.lifecycle_generation
+    assert controller.complete().complete is True
+    return generation, r64, restore
+
+
+def _r65g_feature_inspector(
+    *,
+    backup: access.FeatureBackupClassification = access.FeatureBackupClassification.NONE,
+) -> tuple[access.RetainedFeatureValidationTerminalInspector, _R65ScriptedBroker]:
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    broker.feature_backup_classification = backup
+    return access.RetainedFeatureValidationTerminalInspector(broker), broker
+
+
+def test_r65g_t1_complete_feature_terminal_is_admitted_with_bounded_metadata(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r65g_complete_feature_terminal(r65_bundles)
+
+    inspector, _broker = _r65g_feature_inspector()
+
+    assert inspector.metadata == access.RetainedFeatureValidationTerminalMetadata(
+        state=access.FeatureValidationState.COMPLETE_NORMAL,
+        terminal=access.FeatureValidationState.COMPLETE_NORMAL,
+        active=False,
+        schema_version=1,
+        final_restore_complete=True,
+        live_result_durability=(
+            access.FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
+        ),
+    )
+    rendered = repr(inspector.metadata)
+    for forbidden in ("generation", "revision", "digest", "path", "identity"):
+        assert forbidden not in rendered
+    inspector.close()
+
+
+def test_r65g_t2_active_feature_lifecycle_is_rejected_without_mutation(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r64, _restore = r65_bundles
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    controller = access.RefreshStatusLiveValidationController(broker)
+    controller.close()
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    before = journal.read_bytes()
+
+    with pytest.raises(access.LifecycleControllerError, match="TERMINAL_REQUIRED"):
+        _r65g_feature_inspector()
+
+    assert journal.read_bytes() == before
+
+
+def test_r65g_t3_failed_feature_terminal_is_rejected_without_mutation(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r64, _restore = r65_bundles
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    controller = access.RefreshStatusLiveValidationController(broker)
+    assert controller._journal is not None
+    controller._journal.terminal(access.FeatureValidationState.RESTORE_FAILED)
+    controller.close()
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    before = journal.read_bytes()
+
+    with pytest.raises(access.LifecycleControllerError, match="TERMINAL_NOT_COMPLETE"):
+        _r65g_feature_inspector()
+
+    assert journal.read_bytes() == before
+
+
+@pytest.mark.parametrize("malformation", ("empty", "unknown_schema"))
+def test_r65g_t4_malformed_feature_terminal_is_rejected_without_mutation(
+    malformation: str,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r65g_complete_feature_terminal(r65_bundles)
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    if malformation == "empty":
+        journal.write_bytes(b"{}")
+    else:
+        record = json.loads(journal.read_text(encoding="ascii"))
+        record["schema_version"] = 999
+        journal.write_text(json.dumps(record), encoding="ascii")
+    before = journal.read_bytes()
+
+    with pytest.raises(
+        access.LifecycleControllerError, match="FEATURE_JOURNAL_INVALID"
+    ):
+        _r65g_feature_inspector()
+
+    assert journal.read_bytes() == before
+
+
+def test_r65g_t5_legacy_lifecycle_cannot_open_as_feature_terminal() -> None:
+    broker = _R32ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    legacy = access.FullPreflightLifecycleController(broker)
+    legacy.close()
+    legacy_journal = access._LIFECYCLE_STATE_ROOT / access._LIFECYCLE_JOURNAL_NAME
+    before = legacy_journal.read_bytes()
+
+    with pytest.raises(access.LifecycleControllerError, match="MODE_CONFLICT"):
+        _r65g_feature_inspector()
+
+    assert legacy_journal.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "classification",
+    (
+        access.CurrentSourceClassification.EXACT_R64,
+        access.CurrentSourceClassification.OTHER,
+        access.CurrentSourceClassification.INDETERMINATE,
+    ),
+)
+def test_r65g_t7_to_t9_non_pr41_source_denies_retirement(
+    classification: access.CurrentSourceClassification,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    inspector, broker = _r65g_feature_inspector()
+    broker.source_classification = classification
+
+    result = inspector.inspect_current_source(r64.manifest, restore.manifest)
+
+    assert result.classification is classification
+    with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
+        inspector.retire_terminal()
+    inspector.close()
+
+
+def test_r65g_t6_retirement_requires_same_handle_current_source_proof(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r65g_complete_feature_terminal(r65_bundles)
+    inspector, _broker = _r65g_feature_inspector()
+
+    with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
+        inspector.retire_terminal()
+
+    inspector.close()
+
+
+@pytest.mark.parametrize(
+    "classification",
+    (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE,
+        access.FeatureBackupClassification.OTHER_OR_INDETERMINATE,
+    ),
+)
+def test_r65g_t10_t11_non_none_backup_denies_terminal_retirement(
+    classification: access.FeatureBackupClassification,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    inspector, _broker = _r65g_feature_inspector(backup=classification)
+    assert (
+        inspector.inspect_current_source(r64.manifest, restore.manifest).classification
+        is access.CurrentSourceClassification.EXACT_PR41
+    )
+    assert inspector.inspect_feature_backup(restore.manifest).classification is (
+        classification
+    )
+
+    with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
+        inspector.retire_terminal()
+
+    inspector.close()
+
+
+def test_r65g_t12_to_t15_clean_retirement_is_single_and_allows_fresh_lifecycle(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    old_generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    inspector, broker = _r65g_feature_inspector()
+    assert (
+        inspector.inspect_current_source(r64.manifest, restore.manifest).classification
+        is access.CurrentSourceClassification.EXACT_PR41
+    )
+    assert inspector.inspect_feature_backup(restore.manifest).classification is (
+        access.FeatureBackupClassification.NONE
+    )
+
+    inspector.retire_terminal()
+    with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
+        inspector.retire_terminal()
+    inspector.close()
+
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    assert not journal.exists()
+    with pytest.raises(access.LifecycleControllerError, match="TERMINAL_REQUIRED"):
+        _r65g_feature_inspector()
+    fresh = access.RefreshStatusLiveValidationController(broker)
+    assert fresh.state is access.FeatureValidationState.BASELINE
+    assert fresh._journal is not None
+    assert fresh._journal.lifecycle_generation != old_generation
+    assert fresh._journal.consumed_actions == frozenset()
+    assert fresh._journal._record["operations"] == {}
+    assert fresh._journal.backup_identity is None
+    assert fresh._journal.source_classification is None
+    fresh.close()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    (
+        access.FeatureValidationAction.RESTORE_INVENTORY,
+        access.FeatureValidationAction.RESTORE_CORE_CHECK,
+        access.FeatureValidationAction.REMOVAL_RESTART,
+        access.FeatureValidationAction.RESTORE_READINESS,
+        access.FeatureValidationAction.FEATURE_ABSENCE,
+        access.FeatureValidationAction.POST_RESTORE_REPAIRS,
+        access.FeatureValidationAction.FINAL_ACCEPTANCE,
+    ),
+)
+def test_r65g_final_proof_incomplete_terminal_is_rejected_without_mutation(
+    missing: access.FeatureValidationAction,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    record = json.loads(journal.read_text(encoding="ascii"))
+    record["consumed_actions"].remove(missing.value)
+    del record["operations"][missing.value]
+    if missing is access.FeatureValidationAction.REMOVAL_RESTART:
+        record["restart_results"].pop(missing.value, None)
+    journal.write_text(json.dumps(record), encoding="ascii")
+    before = journal.read_bytes()
+
+    inspector, _broker = _r65g_feature_inspector()
+    assert inspector.metadata.final_restore_complete is False
+    assert (
+        inspector.inspect_current_source(r64.manifest, restore.manifest).classification
+        is access.CurrentSourceClassification.EXACT_PR41
+    )
+    assert inspector.inspect_feature_backup(restore.manifest).classification is (
+        access.FeatureBackupClassification.NONE
+    )
+    with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
+        inspector.retire_terminal()
+    inspector.close()
+
+    assert journal.read_bytes() == before
+
+
+def test_r65g_public_inspector_surface_has_no_paths_ids_or_mutation_bypass() -> None:
+    public = {
+        name
+        for name, value in inspect.getmembers(
+            access.RetainedFeatureValidationTerminalInspector,
+            predicate=callable,
+        )
+        if not name.startswith("_")
+    }
+    assert public == {
+        "inspect_current_source",
+        "inspect_feature_backup",
+        "retire_terminal",
+        "close",
+    }
+    assert tuple(
+        inspect.signature(
+            access.RetainedFeatureValidationTerminalInspector.retire_terminal
+        ).parameters
+    ) == ("self",)
