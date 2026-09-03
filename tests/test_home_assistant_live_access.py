@@ -13784,7 +13784,7 @@ def test_r65g_final_proof_incomplete_terminal_is_rejected_without_mutation(
     missing: access.FeatureValidationAction,
     r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
 ) -> None:
-    _generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    _generation, _r64, _restore = _r65g_complete_feature_terminal(r65_bundles)
     journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
     record = json.loads(journal.read_text(encoding="ascii"))
     record["consumed_actions"].remove(missing.value)
