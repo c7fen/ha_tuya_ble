@@ -13174,6 +13174,38 @@ def test_r65e_b1_to_b4_historical_ambiguous_backup_is_boundedly_classified(
     controller.close()
 
 
+def test_r65e_b4_real_malformed_package_is_preserved_as_indeterminate(
+    tmp_path: Path,
+) -> None:
+    context = _r58_create_remote_backup(tmp_path)
+    package = tmp_path / ".ha_tuya_ble_r36_backup"
+    metadata = package / "metadata.json"
+    metadata.write_bytes(b"{}")
+    before = {
+        path.relative_to(package).as_posix(): path.read_bytes()
+        for path in package.rglob("*")
+        if path.is_file()
+    }
+
+    inspected = _run_synthetic_remote_program(
+        tmp_path, "inspect_retained_backup", context
+    )
+    retired = _run_synthetic_remote_program(tmp_path, "retire_retained_backup", context)
+    after = {
+        path.relative_to(package).as_posix(): path.read_bytes()
+        for path in package.rglob("*")
+        if path.is_file()
+    }
+
+    assert inspected == {
+        "classification": "OTHER_OR_INDETERMINATE",
+        "retired": False,
+    }
+    assert retired == inspected
+    assert package.is_dir()
+    assert after == before
+
+
 def test_r65e_b5_b6_to_b12_owned_backup_reconciles_and_retires_once(
     r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
 ) -> None:
