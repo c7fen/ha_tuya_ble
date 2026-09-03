@@ -60,12 +60,12 @@ PR45_CANDIDATE_COMMIT = "835f602cc6a73bf224b5d134b3e0c96021696138"
 PR45_CANDIDATE_TREE = "2e25fc0971fe0dd6ab698b796454f7970be9b257"
 PR41_RESTORE_COMMIT = "4f73a9b008dcb89134bc41001c486f06d6056867"
 PR41_RESTORE_TREE = "463ed8553da01eae591de611e76e45392ad9e7bf"
-R64_RUNTIME_COMMIT = "c5c9cda147972c5e08cc9ba2958c4235b9f2eb68"
-R64_RUNTIME_TREE = "ab9c29acf5d95b161ae6786804c71935e1aa79a0"
+R64_RUNTIME_COMMIT = "7cfcf9598941de253a24b7c30b06170a98b4ba86"
+R64_RUNTIME_TREE = "f289523beedb1abe38b28221b1880fa4dec2a7b9"
 _AUTHORITY_MANIFEST_DIGESTS = {
     "candidate": "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
     "restore": "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
-    "r64_runtime": "0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb",
+    "r64_runtime": "4eaed95e3a0dea264e11fffde6a42facdedf775552a3ea85026e85ecffd4b1d7",
 }
 _HELPER_FILES = frozenset(
     {
@@ -1354,7 +1354,9 @@ class RefreshStatusFailureClass(StrEnum):
     LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
     LOG_BOUNDARY_NOT_ESTABLISHED = "LOG_BOUNDARY_NOT_ESTABLISHED"
     COLD_STATE_NOT_PROVEN = "COLD_STATE_NOT_PROVEN"
+    COLD_SESSION_PROVENANCE_FAILED = "COLD_SESSION_PROVENANCE_FAILED"
     COLD_REQUEST_FAILED = "COLD_REQUEST_FAILED"
+    WARM_SESSION_PROVENANCE_FAILED = "WARM_SESSION_PROVENANCE_FAILED"
     WARM_REQUEST_FAILED = "WARM_REQUEST_FAILED"
     RETAINED_CONFIRMATION_NOT_OBSERVED = "RETAINED_CONFIRMATION_NOT_OBSERVED"
     DATAPOINT_WRITE_DETECTED = "DATAPOINT_WRITE_DETECTED"
@@ -1374,12 +1376,20 @@ class RefreshPacketCounts:
     other: int
 
 
+class RefreshSessionProvenance(StrEnum):
+    """Runtime-owned classification of the exact bound refresh session."""
+
+    NEW_SESSION = "NEW_SESSION"
+    REUSED_SESSION = "REUSED_SESSION"
+
+
 @dataclass(frozen=True, slots=True)
 class RefreshPressResult:
     """Sanitized result for one explicitly consumed Refresh Status press."""
 
     service_success: bool
     counts: RefreshPacketCounts
+    session_provenance: RefreshSessionProvenance | None
     last_status_update_advanced: bool
     retained_confirmation_changed_dp_ids: tuple[int, ...] = ()
 
@@ -1405,7 +1415,7 @@ class RefreshStatusLiveValidationResult:
     hold_time_valid: bool
     cold: RefreshPressResult
     warm: RefreshPressResult
-    same_authenticated_session_reused: bool
+    same_authenticated_session: bool
     hold: RefreshHoldResult
     ambiguous: bool
     failure_class: RefreshStatusFailureClass | None
@@ -1425,14 +1435,14 @@ class RefreshStatusLiveValidationResult:
             and self.cold.counts.pair == 1
             and self.cold.counts.device_status == 1
             and self.cold.counts.datapoint == 0
-            and self.cold.last_status_update_advanced is True
+            and self.cold.session_provenance is RefreshSessionProvenance.NEW_SESSION
             and self.warm.service_success is True
             and self.warm.counts.device_info == 0
             and self.warm.counts.pair == 0
             and self.warm.counts.device_status == 1
             and self.warm.counts.datapoint == 0
-            and self.warm.last_status_update_advanced is True
-            and self.same_authenticated_session_reused is True
+            and self.warm.session_provenance is RefreshSessionProvenance.REUSED_SESSION
+            and self.same_authenticated_session is True
             and self.hold == RefreshHoldResult(True, True, False)
             and self.ambiguous is False
             and self.failure_class is None
@@ -5409,7 +5419,7 @@ def _parse_refresh_status_live_validation_result(
         "hold_time_valid",
         "cold",
         "warm",
-        "same_authenticated_session_reused",
+        "same_authenticated_session",
         "hold",
         "ambiguous",
         "failure_class",
@@ -5430,6 +5440,7 @@ def _parse_refresh_status_live_validation_result(
         if not isinstance(payload, dict) or set(payload) != {
             "service_success",
             "counts",
+            "session_provenance",
             "last_status_update_advanced",
             "retained_confirmation_changed_dp_ids",
         }:
@@ -5444,6 +5455,11 @@ def _parse_refresh_status_live_validation_result(
         return RefreshPressResult(
             _bool(payload["service_success"]),
             parse_counts(payload["counts"]),
+            (
+                None
+                if payload["session_provenance"] is None
+                else RefreshSessionProvenance(payload["session_provenance"])
+            ),
             _bool(payload["last_status_update_advanced"]),
             tuple(ids),
         )
@@ -5468,7 +5484,7 @@ def _parse_refresh_status_live_validation_result(
             _bool(value["hold_time_valid"]),
             cold,
             warm,
-            _bool(value["same_authenticated_session_reused"]),
+            _bool(value["same_authenticated_session"]),
             RefreshHoldResult(
                 _bool(hold_value["warm_immediately_after_press"]),
                 _bool(hold_value["normal_release_observed"]),
@@ -5951,8 +5967,8 @@ def expected_manifest(value):
             '463ed8553da01eae591de611e76e45392ad9e7bf',
         ),
         'r64_runtime': (
-            'c5c9cda147972c5e08cc9ba2958c4235b9f2eb68',
-            'ab9c29acf5d95b161ae6786804c71935e1aa79a0',
+            '7cfcf9598941de253a24b7c30b06170a98b4ba86',
+            'f289523beedb1abe38b28221b1880fa4dec2a7b9',
         ),
     }
     if state not in authorities or (
@@ -5986,7 +6002,7 @@ def expected_manifest(value):
     fingerprints = {
         'candidate': 'c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075',
         'restore': '2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2',
-        'r64_runtime': '0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb',
+        'r64_runtime': '4eaed95e3a0dea264e11fffde6a42facdedf775552a3ea85026e85ecffd4b1d7',
     }
     if hashlib.sha256(canonical).hexdigest() != fingerprints[state]:
         raise ValueError('fingerprint')
@@ -8613,6 +8629,7 @@ EMPTY_COUNTS = {'device_info': 0, 'pair': 0, 'device_status': 0, 'datapoint': 0,
 EMPTY_PRESS = {
     'service_success': False,
     'counts': dict(EMPTY_COUNTS),
+    'session_provenance': None,
     'last_status_update_advanced': False,
     'retained_confirmation_changed_dp_ids': [],
 }
@@ -8824,6 +8841,7 @@ class LogWindow:
         self.established = False
         self.finish_attempted = False
         self.closed = False
+        self.lines = []
 
     def start(self):
         emit_validation_log_marker(self.ws, self.start_marker)
@@ -8833,12 +8851,43 @@ class LogWindow:
             raise LogBoundaryNotEstablished() from None
         self.established = True
 
+    def wait_for_refresh_terminal(self):
+        if not self.established or self.finish_attempted:
+            raise ValueError('log_window')
+        deadline = time.monotonic() + 30
+        refresh_identity = None
+        while time.monotonic() < deadline:
+            if self.stream.overflow:
+                raise ValueError('log_overflow')
+            try:
+                line = self.stream.lines.get(
+                    timeout=max(0.01, deadline - time.monotonic())
+                )
+            except queue.Empty:
+                break
+            self.lines.append(line)
+            raw = re.sub(r'\x1b\[[0-9;]*m', '', line.rstrip('\r\n'))
+            match = LOG_RE.fullmatch(raw)
+            if not match:
+                continue
+            identity, message = match.groups()
+            if message == 'S1_REFRESH_ACCEPTED':
+                if refresh_identity is not None:
+                    raise ValueError('refresh_lifecycle')
+                refresh_identity = identity
+            elif (
+                refresh_identity == identity
+                and REFRESH_TERMINAL_RE.fullmatch(message)
+            ):
+                return
+        raise ValueError('refresh_terminal')
+
     def finish(self):
         if not self.established or self.finish_attempted:
             raise ValueError('log_window')
         self.finish_attempted = True
         emit_validation_log_marker(self.ws, self.end_marker)
-        lines = self.stream.until_marker(self.end_marker)
+        lines = self.lines + self.stream.until_marker(self.end_marker)
         self.closed = True
         return lines
 
@@ -8869,6 +8918,12 @@ LOG_RE = re.compile(
     r'(tuya-ble-session-[ghjkmnpqrstuvwxyz]{16}): (.*)$'
 )
 SEND_RE = re.compile(r'^Sending packet: #[0-9]+ ([A-Z0-9_]+)(?: in response to #[0-9]+)?$')
+REFRESH_BOUND_RE = re.compile(
+    r'^S1_REFRESH_SESSION_BOUND_(NEW|REUSED) session_ordinal=([1-9][0-9]*)$'
+)
+REFRESH_TERMINAL_RE = re.compile(
+    r'^S1_REFRESH_(COMPLETED|FAILED) session_ordinal=([1-9][0-9]*|none)$'
+)
 
 def parse_lines(lines, required_identity=None):
     records = []
@@ -8876,27 +8931,8 @@ def parse_lines(lines, required_identity=None):
         raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
         match = LOG_RE.fullmatch(raw)
         if match: records.append((match.group(1), match.group(2)))
-    identities = {identity for identity, message in records if (
-        SEND_RE.fullmatch(message)
-        or message.startswith(('Connecting;', 'Connected;', 'Successfully connected', 'Disconnecting', 'Disconnected from device;', 'Scheduling reconnect;', 'Reconnect,'))
-    )}
     if required_identity is None:
-        candidates = []
-        for identity in identities:
-            _identity, counts, events = parse_lines(lines, identity)
-            if (
-                counts['device_info'] == 1 and counts['pair'] == 1
-                and counts['device_status'] == 1 and counts['datapoint'] == 0
-                and events.count('connecting') == 1
-                and events.count('connected') == 1
-                and events.count('authenticated') == 1
-                and not any(event in events for event in (
-                    'disconnecting', 'disconnected', 'reconnect'
-                ))
-            ):
-                candidates.append(identity)
-        if len(candidates) != 1: raise ValueError('identity')
-        required_identity = candidates[0]
+        raise ValueError('identity')
     counts = dict(EMPTY_COUNTS)
     events = []
     for identity, message in records:
@@ -8921,54 +8957,86 @@ def parse_lines(lines, required_identity=None):
             if message.startswith(prefix): events.append(event)
     return required_identity, counts, events
 
-def all_sessions_quiescent(lines):
-    active = {}
+def parse_refresh_lifecycle(lines, required_identity=None):
+    records = []
     for raw in lines:
         raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
         match = LOG_RE.fullmatch(raw)
-        if not match: continue
-        identity, message = match.groups()
-        if SEND_RE.fullmatch(message) or message.startswith(
-            ('Connecting;', 'Connected;', 'Successfully connected',
-             'Disconnecting', 'Scheduling reconnect;', 'Reconnect,')
+        if match:
+            records.append((match.group(1), match.group(2)))
+    accepted = [
+        (index, identity)
+        for index, (identity, message) in enumerate(records)
+        if message == 'S1_REFRESH_ACCEPTED'
+    ]
+    if len(accepted) != 1:
+        raise ValueError('refresh_lifecycle')
+    start, identity = accepted[0]
+    if required_identity is not None and identity != required_identity:
+        raise ValueError('refresh_lifecycle')
+    counts = dict(EMPTY_COUNTS)
+    events = []
+    bound = None
+    terminal = None
+    terminal_index = None
+    for index, (record_identity, message) in enumerate(
+        records[start + 1:], start + 1
+    ):
+        if record_identity != identity:
+            continue
+        if message == 'S1_REFRESH_ACCEPTED':
+            raise ValueError('refresh_lifecycle')
+        bound_match = REFRESH_BOUND_RE.fullmatch(message)
+        if bound_match:
+            if bound is not None:
+                raise ValueError('refresh_lifecycle')
+            bound = (bound_match.group(1) + '_SESSION', int(bound_match.group(2)))
+            continue
+        terminal_match = REFRESH_TERMINAL_RE.fullmatch(message)
+        if terminal_match:
+            if bound is None or terminal_match.group(2) == 'none':
+                raise ValueError('refresh_lifecycle')
+            if int(terminal_match.group(2)) != bound[1]:
+                raise ValueError('refresh_lifecycle')
+            terminal = terminal_match.group(1) == 'COMPLETED'
+            terminal_index = index
+            break
+        sent = SEND_RE.fullmatch(message)
+        if sent:
+            code = sent.group(1)
+            name = {
+                'FUN_SENDER_DEVICE_INFO': 'device_info',
+                'FUN_SENDER_PAIR': 'pair',
+                'FUN_SENDER_DEVICE_STATUS': 'device_status',
+                'FUN_SENDER_DPS': 'datapoint',
+                'FUN_SENDER_DPS_V4': 'datapoint',
+            }.get(code, 'other')
+            counts[name] += 1
+        for prefix, event in (
+            ('Connecting;', 'connecting'), ('Connected;', 'connected'),
+            ('Successfully connected', 'authenticated'),
+            ('Disconnecting', 'disconnecting'),
+            ('Disconnected from device;', 'disconnected'),
+            ('Scheduling reconnect;', 'reconnect'), ('Reconnect,', 'reconnect'),
         ):
-            active[identity] = True
-        if message.startswith('Disconnected from device;'):
-            active[identity] = False
-    return not any(active.values())
-
-def relevant_session_activity(lines):
-    for raw in lines:
-        raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
-        match = LOG_RE.fullmatch(raw)
-        if match and (SEND_RE.fullmatch(match.group(2)) or match.group(2).startswith(
-            ('Connecting;', 'Connected;', 'Successfully connected',
-             'Disconnecting', 'Disconnected from device;',
-             'Scheduling reconnect;', 'Reconnect,')
-        )):
-            return True
-    return False
-
-def cold_gate_admissible(stream, connection_id):
-    if state(connection_id).get('state') != 'off':
-        return False
-    if relevant_session_activity(stream.take_available()):
-        return False
-    return state(connection_id).get('state') == 'off'
+            if message.startswith(prefix): events.append(event)
+    if terminal is None or terminal_index is None:
+        raise ValueError('refresh_lifecycle')
+    if any(
+        record_identity == identity
+        and (
+            message == 'S1_REFRESH_ACCEPTED'
+            or REFRESH_BOUND_RE.fullmatch(message)
+            or REFRESH_TERMINAL_RE.fullmatch(message)
+        )
+        for record_identity, message in records[terminal_index + 1:]
+    ):
+        raise ValueError('refresh_lifecycle')
+    return identity, counts, events, bound[0], bound[1], terminal
 
 def press(ws, entity_id):
     ws.command('call_service', domain='button', service='press',
                target={'entity_id': entity_id}, return_response=False)
-
-def observe_press(last_id, previous):
-    deadline = time.monotonic() + 30
-    current = previous
-    while time.monotonic() < deadline:
-        time.sleep(0.2)
-        current = state(last_id).get('state')
-        if current != previous:
-            break
-    return current
 
 def empty_result():
     return {
@@ -8976,7 +9044,7 @@ def empty_result():
         'refresh_button_present': False, 'policy_on_demand': False,
         'ble_control_enabled': False, 'hold_time_valid': False,
         'cold': dict(EMPTY_PRESS), 'warm': dict(EMPTY_PRESS),
-        'same_authenticated_session_reused': False,
+        'same_authenticated_session': False,
         'hold': {'warm_immediately_after_press': False,
                  'normal_release_observed': False,
                  'automatic_reconnect_observed': False},
@@ -9047,58 +9115,50 @@ def run_validation():
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
         stream = LogStream()
         window = LogWindow(stream, ws); window.start()
-        time.sleep(hold + 5)
-        startup = window.finish(); window = None
-        if state(connection_id).get('state') != 'off' or not all_sessions_quiescent(startup):
-            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
-        cold_deadline = time.monotonic() + hold + 5
-        while True:
-            while state(connection_id).get('state') != 'off':
-                if time.monotonic() >= cold_deadline:
-                    result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
-                time.sleep(0.2)
-            window = LogWindow(stream, ws); window.start()
-            if cold_gate_admissible(stream, connection_id):
-                break
+        if state(connection_id).get('state') != 'off':
             window.finish(); window = None
-            if time.monotonic() >= cold_deadline:
-                result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
         before_last = state(last_id).get('state')
         before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
         press(ws, button_id)
-        after_cold = observe_press(last_id, before_last)
+        window.wait_for_refresh_terminal()
         cold_lines = window.finish(); window = None
-        identity, cold_counts, cold_events = parse_lines(cold_lines)
+        identity, cold_counts, _cold_events, cold_provenance, cold_session, cold_completed = parse_refresh_lifecycle(cold_lines)
+        after_cold = state(last_id).get('state')
         changed_cold = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
-        result['cold'] = {'service_success': True, 'counts': cold_counts,
+        result['cold'] = {'service_success': cold_completed, 'counts': cold_counts,
+                          'session_provenance': cold_provenance,
                           'last_status_update_advanced': after_cold != before_last,
                           'retained_confirmation_changed_dp_ids': changed_cold}
         result['conditional_omission_observed'] = bool(dp_entities) and len(changed_cold) < len(dp_entities)
         if cold_counts['datapoint']:
             result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
-        if not (state(connection_id).get('state') == 'on' and cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1 and cold_events.count('connecting') == 1 and cold_events.count('connected') == 1 and cold_events.count('authenticated') == 1 and not any(event in cold_events for event in ('disconnecting', 'disconnected', 'reconnect')) and result['cold']['last_status_update_advanced']):
+        if cold_provenance != 'NEW_SESSION':
+            result['failure_class'] = 'COLD_SESSION_PROVENANCE_FAILED'; return result
+        if not (cold_completed and state(connection_id).get('state') == 'on' and cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1):
             result['failure_class'] = 'COLD_REQUEST_FAILED'; return result
-        delay = min(1.1, max(0.1, hold / 4)); time.sleep(delay)
         before_warm = after_cold; before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
         window = LogWindow(stream, ws); window.start()
         if state(connection_id).get('state') != 'on':
             window.finish(); window = None
             result['failure_class'] = 'WARM_REQUEST_FAILED'; return result
         press(ws, button_id)
-        after_warm = observe_press(last_id, before_warm)
+        window.wait_for_refresh_terminal()
         warm_lines = window.finish(); window = None
-        _, warm_counts, warm_events = parse_lines(warm_lines, identity)
+        _, warm_counts, _warm_events, warm_provenance, warm_session, warm_completed = parse_refresh_lifecycle(warm_lines, identity)
+        after_warm = state(last_id).get('state')
         changed_warm = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
-        result['warm'] = {'service_success': True, 'counts': warm_counts,
+        result['warm'] = {'service_success': warm_completed, 'counts': warm_counts,
+                          'session_provenance': warm_provenance,
                           'last_status_update_advanced': after_warm != before_warm,
                           'retained_confirmation_changed_dp_ids': changed_warm}
         if warm_counts['datapoint']:
             result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
-        result['same_authenticated_session_reused'] = not any(event in warm_events for event in ('connecting', 'connected', 'authenticated', 'disconnecting', 'disconnected', 'reconnect'))
-        if not (state(connection_id).get('state') == 'on' and warm_counts['device_info'] == 0 and warm_counts['pair'] == 0 and warm_counts['device_status'] == 1 and result['same_authenticated_session_reused']):
+        result['same_authenticated_session'] = warm_session == cold_session
+        if warm_provenance != 'REUSED_SESSION' or not result['same_authenticated_session']:
+            result['failure_class'] = 'WARM_SESSION_PROVENANCE_FAILED'; return result
+        if not (warm_completed and state(connection_id).get('state') == 'on' and warm_counts['device_info'] == 0 and warm_counts['pair'] == 0 and warm_counts['device_status'] == 1):
             result['failure_class'] = 'WARM_REQUEST_FAILED'; return result
-        if not result['warm']['last_status_update_advanced']:
-            result['failure_class'] = 'RETAINED_CONFIRMATION_NOT_OBSERVED'; return result
         result['hold']['warm_immediately_after_press'] = True
         window = LogWindow(stream, ws); window.start()
         time.sleep(hold + 5); hold_lines = window.finish(); window = None
@@ -13453,8 +13513,8 @@ class RefreshStatusLiveValidationController:
                 False,
                 False,
                 False,
-                RefreshPressResult(False, zero, False),
-                RefreshPressResult(False, zero, False),
+                RefreshPressResult(False, zero, None, False),
+                RefreshPressResult(False, zero, None, False),
                 False,
                 RefreshHoldResult(False, False, False),
                 True,

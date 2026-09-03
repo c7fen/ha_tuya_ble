@@ -11815,8 +11815,8 @@ def _r65_exact_r64_manifest() -> access.SourceManifest:
         ),
         (
             "integration/tuya_ble/tuya_ble.py",
-            175298,
-            "4a5ddece92b37232dd8a2b2ec848710f3f3f550d3f1bf469d87fbedaa0db46ac",
+            178784,
+            "bc573c61e134fde333b299cff26617ae1a99a4aad29f22b6bd06a457199f1ccc",
         ),
         (
             "integration/util.py",
@@ -11879,13 +11879,7 @@ def _r65_packet_parser() -> object:
                 )
             )
             or isinstance(node, ast.FunctionDef)
-            and node.name
-            in {
-                "parse_lines",
-                "all_sessions_quiescent",
-                "relevant_session_activity",
-                "cold_gate_admissible",
-            }
+            and node.name == "parse_lines"
         ):
             selected.append(node)
     namespace: dict[str, object] = {}
@@ -11902,6 +11896,8 @@ def _r65_log_boundary() -> dict[str, object]:
     tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
     names = {
         "BOUNDARY_LOGGER",
+        "LOG_RE",
+        "REFRESH_TERMINAL_RE",
         "LogStream",
         "LogBoundaryNotEstablished",
         "LogWindow",
@@ -12090,10 +12086,18 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
         )
         self.calls.append(("live_validation", None))
         cold = access.RefreshPressResult(
-            True, access.RefreshPacketCounts(1, 1, 1, 0, 0), True, (8, 33)
+            True,
+            access.RefreshPacketCounts(1, 1, 1, 0, 0),
+            access.RefreshSessionProvenance.NEW_SESSION,
+            True,
+            (8, 33),
         )
         warm = access.RefreshPressResult(
-            True, access.RefreshPacketCounts(0, 0, 1, 0, 0), True, (8,)
+            True,
+            access.RefreshPacketCounts(0, 0, 1, 0, 0),
+            access.RefreshSessionProvenance.REUSED_SESSION,
+            True,
+            (8,),
         )
         return access.RefreshStatusLiveValidationResult(
             4,
@@ -12156,13 +12160,13 @@ def test_r65_c1_to_c6_exact_authorities_are_distinct_and_closed() -> None:
     assert access.PR41_RESTORE_TREE == "463ed8553da01eae591de611e76e45392ad9e7bf"
     access.validate_source_manifest(r64)
     assert len(r64.entries) == 37
-    assert sum(item.size for item in r64.entries) == 835324
+    assert sum(item.size for item in r64.entries) == 838810
     assert r64.authority_commit == access.R64_RUNTIME_COMMIT
     assert r64.authority_tree == access.R64_RUNTIME_TREE
     assert r64.state is access.SourceState.R64_RUNTIME
     assert (
         access._source_manifest_digest(r64.entries)
-        == "0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb"
+        == "4eaed95e3a0dea264e11fffde6a42facdedf775552a3ea85026e85ecffd4b1d7"
     )
     assert set(access.SourceState) == {
         access.SourceState.CANDIDATE,
@@ -12203,6 +12207,7 @@ def test_r65_c7_to_c9_api_and_result_boundary_are_private_and_fixed() -> None:
                 "datapoint": 0,
                 "other": 0,
             },
+            "session_provenance": "NEW_SESSION",
             "last_status_update_advanced": True,
             "retained_confirmation_changed_dp_ids": [],
         },
@@ -12215,10 +12220,11 @@ def test_r65_c7_to_c9_api_and_result_boundary_are_private_and_fixed() -> None:
                 "datapoint": 0,
                 "other": 0,
             },
+            "session_provenance": "REUSED_SESSION",
             "last_status_update_advanced": True,
             "retained_confirmation_changed_dp_ids": [],
         },
-        "same_authenticated_session_reused": True,
+        "same_authenticated_session": True,
         "hold": {
             "warm_immediately_after_press": True,
             "normal_release_observed": True,
@@ -12239,8 +12245,6 @@ def test_r65_c7_to_c9_api_and_result_boundary_are_private_and_fixed() -> None:
 def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
     parser = _r65_packet_parser()
     parse_lines = parser["parse_lines"]
-    all_sessions_quiescent = parser["all_sessions_quiescent"]
-    relevant_session_activity = parser["relevant_session_activity"]
     first = "tuya-ble-session-" + "g" * 16
     prefix = "2026-01-01 [custom_components.tuya_ble.tuya_ble.tuya_ble] " + first + ": "
     identity, counts, _events = parse_lines(
@@ -12274,24 +12278,23 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
     )
     assert selected == first
     assert selected_counts["device_status"] == 1
-    assert not all_sessions_quiescent([prefix + "Connecting; synthetic\n"])
-    assert all_sessions_quiescent(
-        [
-            prefix + "Connecting; synthetic\n",
-            prefix + "Disconnected from device; synthetic\n",
-        ]
-    )
-    assert relevant_session_activity([prefix + "Connecting; synthetic\n"])
-    assert not relevant_session_activity(["synthetic unrelated log line\n"])
+    with pytest.raises(ValueError, match="identity"):
+        parse_lines([prefix + "Sending packet: #1 FUN_SENDER_DEVICE_INFO\n"])
     assert "stream.establish_boundary()" not in access._REMOTE_REFRESH_STATUS_PROGRAM
     assert "state(connection_id).get('state') != 'off'" in (
         access._REMOTE_REFRESH_STATUS_PROGRAM
     )
     cold = access.RefreshPressResult(
-        True, access.RefreshPacketCounts(1, 1, 1, 0, 0), True
+        True,
+        access.RefreshPacketCounts(1, 1, 1, 0, 0),
+        access.RefreshSessionProvenance.NEW_SESSION,
+        True,
     )
     warm = access.RefreshPressResult(
-        True, access.RefreshPacketCounts(0, 0, 1, 0, 0), True
+        True,
+        access.RefreshPacketCounts(0, 0, 1, 0, 0),
+        access.RefreshSessionProvenance.REUSED_SESSION,
+        True,
     )
     result = access.RefreshStatusLiveValidationResult(
         1,
@@ -12415,11 +12418,11 @@ def test_r65_m9_m10_r65b_identity_binding_is_selected_and_fail_closed() -> None:
         record(first, "Sending packet: #3 FUN_SENDER_DEVICE_STATUS"),
     ]
     foreign = record(second, "Sending packet: #4 FUN_SENDER_DPS")
-    identity, counts, _ = parser(cold + [foreign])
+    identity, counts, _ = parser(cold + [foreign], first)
     assert identity == first
     assert counts["datapoint"] == 0
     with pytest.raises(ValueError, match="identity"):
-        parser(cold + [line.replace(first, second) for line in cold])
+        parser(cold + [foreign])
 
 
 def test_r65_m11_m12_r65b_marker_is_private_and_service_is_fixed() -> None:
@@ -12459,40 +12462,18 @@ def test_r65_m11_m12_r65b_marker_is_private_and_service_is_fixed() -> None:
 def test_r65_g1_to_g6_r65b_exact_cold_gate_has_no_availability_substitute() -> None:
     program = access._REMOTE_REFRESH_STATUS_PROGRAM
     boundary = _r65_log_boundary()
-    parser = _r65_packet_parser()
-    session = "tuya-ble-session-" + "g" * 16
-    startup = (
-        "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
-        + session
-        + ": Connecting; synthetic\n"
-    )
-
-    class Stream:
-        def __init__(self, lines: list[str]) -> None:
-            self.lines = lines
-
-        def take_available(self) -> list[str]:
-            result, self.lines = self.lines, []
-            return result
-
-    gate = parser["cold_gate_admissible"]
-
-    parser["state"] = lambda _entity: {"state": "off"}
-    assert gate(Stream([]), "binary_sensor.synthetic")
-    parser["state"] = lambda _entity: {"state": "on"}
-    assert not gate(Stream([]), "binary_sensor.synthetic")
-    parser["state"] = lambda _entity: {"state": "off"}
-    assert not gate(Stream([startup]), "binary_sensor.synthetic")
-    assert gate(Stream([]), "binary_sensor.synthetic")
-    assert not gate(Stream([startup]), "binary_sensor.synthetic")
+    cold_precondition = program.split("stream = LogStream()", 1)[1].split(
+        "before_last = state(last_id).get('state')", 1
+    )[0]
 
     assert "'binary_sensor', 'bluetooth_connection'" in program
     assert "state(connection_id).get('state') != 'off'" in program
     assert "state(button_id).get('state') == 'unavailable'" in program
-    assert "window.start()" in program
-    assert "cold_gate_admissible(stream, connection_id)" in program
-    assert parser["relevant_session_activity"]([startup])
-    assert not parser["relevant_session_activity"](["unrelated startup\n"])
+    assert "window.start()" in cold_precondition
+    assert "time.sleep" not in cold_precondition
+    assert "take_available" not in cold_precondition
+    assert "cold_gate_admissible" not in program
+    assert "relevant_session_activity" not in program
     assert boundary["marker_line"](
         "2026 [ha_tuya_ble.r65_validation_boundary] R65_WINDOW_START_"
         + "a" * 64
@@ -12519,6 +12500,277 @@ def test_r65_r65b_supervisor_minimum_history_regression_is_marker_bounded() -> N
 
     assert old_remaining == ["history two\n"]
     assert stream.take_available() == []
+
+
+def _r65c_refresh_lifecycle_parser() -> object:
+    """Load only the fixed identifier-free lifecycle parser from remote source."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    selected = [ast.Import(names=[ast.alias("re")])]
+    wanted_assignments = {
+        "EMPTY_COUNTS",
+        "LOG_RE",
+        "SEND_RE",
+        "REFRESH_BOUND_RE",
+        "REFRESH_TERMINAL_RE",
+    }
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in wanted_assignments
+                for target in node.targets
+            )
+        ) or (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "parse_refresh_lifecycle"
+        ):
+            selected.append(node)
+    namespace: dict[str, object] = {}
+    exec(  # noqa: S102 - execute only the reviewed embedded parser definitions
+        compile(
+            ast.fix_missing_locations(ast.Module(selected, type_ignores=[])),
+            "<r65c-refresh-lifecycle-parser>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+def _r65c_record(identity: str, message: str) -> str:
+    return (
+        "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+        + identity
+        + ": "
+        + message
+        + "\n"
+    )
+
+
+def test_r65c_runtime_lifecycle_excludes_pre_accept_selected_traffic() -> None:
+    parser = _r65c_refresh_lifecycle_parser()["parse_refresh_lifecycle"]
+    identity = "tuya-ble-session-" + "g" * 16
+    lines = [
+        _r65c_record(identity, "Sending packet: #7 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "Sending packet: #8 FUN_SENDER_DEVICE_INFO"),
+        _r65c_record(identity, "Sending packet: #9 FUN_SENDER_PAIR"),
+        _r65c_record(identity, "S1_REFRESH_SESSION_BOUND_NEW session_ordinal=4"),
+        _r65c_record(identity, "Sending packet: #10 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=4"),
+        _r65c_record(identity, "Sending packet: #11 FUN_SENDER_DEVICE_STATUS"),
+    ]
+
+    parsed = parser(lines)
+
+    assert parsed[0] == identity
+    assert parsed[1] == {
+        "device_info": 1,
+        "pair": 1,
+        "device_status": 1,
+        "datapoint": 0,
+        "other": 0,
+    }
+    assert parsed[3:] == ("NEW_SESSION", 4, True)
+
+
+def test_r65c_new_and_reused_cannot_be_synthesized_from_packet_counts() -> None:
+    parser = _r65c_refresh_lifecycle_parser()["parse_refresh_lifecycle"]
+    identity = "tuya-ble-session-" + "h" * 16
+    cold_counts_only = [
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "Sending packet: #1 FUN_SENDER_DEVICE_INFO"),
+        _r65c_record(identity, "Sending packet: #2 FUN_SENDER_PAIR"),
+        _r65c_record(identity, "Sending packet: #3 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=8"),
+    ]
+    reused_zero_info = [
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "S1_REFRESH_SESSION_BOUND_REUSED session_ordinal=8"),
+        _r65c_record(identity, "Sending packet: #4 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=8"),
+    ]
+
+    with pytest.raises(ValueError, match="refresh_lifecycle"):
+        parser(cold_counts_only)
+    parsed = parser(reused_zero_info)
+    assert parsed[1]["device_info"] == 0
+    assert parsed[3] == "REUSED_SESSION"
+
+
+def test_r65c_foreign_claim_classification_cannot_satisfy_cold() -> None:
+    parser = _r65c_refresh_lifecycle_parser()["parse_refresh_lifecycle"]
+    identity = "tuya-ble-session-" + "j" * 16
+    lines = [
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "Sending packet: #1 FUN_SENDER_DEVICE_INFO"),
+        _r65c_record(identity, "Sending packet: #2 FUN_SENDER_PAIR"),
+        _r65c_record(identity, "S1_REFRESH_SESSION_BOUND_REUSED session_ordinal=12"),
+        _r65c_record(identity, "Sending packet: #3 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=12"),
+    ]
+
+    parsed = parser(lines)
+    cold = access.RefreshPressResult(
+        True,
+        access.RefreshPacketCounts(1, 1, 1, 0, 0),
+        access.RefreshSessionProvenance(parsed[3]),
+        True,
+    )
+    warm = access.RefreshPressResult(
+        True,
+        access.RefreshPacketCounts(0, 0, 1, 0, 0),
+        access.RefreshSessionProvenance.REUSED_SESSION,
+        True,
+    )
+    result = access.RefreshStatusLiveValidationResult(
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        cold,
+        warm,
+        True,
+        access.RefreshHoldResult(True, True, False),
+        False,
+        None,
+        False,
+    )
+
+    assert parsed[3] == "REUSED_SESSION"
+    assert not result.passed
+
+
+def test_r65c_cold_and_warm_require_exact_matching_runtime_session() -> None:
+    parser = _r65c_refresh_lifecycle_parser()["parse_refresh_lifecycle"]
+    cold_identity = "tuya-ble-session-" + "k" * 16
+    warm_identity = "tuya-ble-session-" + "m" * 16
+    cold = parser(
+        [
+            _r65c_record(cold_identity, "S1_REFRESH_ACCEPTED"),
+            _r65c_record(
+                cold_identity, "S1_REFRESH_SESSION_BOUND_NEW session_ordinal=2"
+            ),
+            _r65c_record(cold_identity, "Sending packet: #1 FUN_SENDER_DEVICE_INFO"),
+            _r65c_record(cold_identity, "Sending packet: #2 FUN_SENDER_PAIR"),
+            _r65c_record(cold_identity, "Sending packet: #3 FUN_SENDER_DEVICE_STATUS"),
+            _r65c_record(cold_identity, "S1_REFRESH_COMPLETED session_ordinal=2"),
+        ]
+    )
+    warm_lines = [
+        _r65c_record(warm_identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(
+            warm_identity, "S1_REFRESH_SESSION_BOUND_REUSED session_ordinal=2"
+        ),
+        _r65c_record(warm_identity, "Sending packet: #1 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(warm_identity, "S1_REFRESH_COMPLETED session_ordinal=2"),
+    ]
+
+    with pytest.raises(ValueError, match="refresh_lifecycle"):
+        parser(warm_lines, cold_identity)
+    assert cold[4] == 2
+
+
+def test_r65c_program_uses_runtime_provenance_not_external_cold_inference() -> None:
+    program = access._REMOTE_REFRESH_STATUS_PROGRAM
+
+    assert "parse_refresh_lifecycle" in program
+    assert "S1_REFRESH_SESSION_BOUND_(NEW|REUSED)" in program
+    assert "NEW_SESSION" in program
+    assert "REUSED_SESSION" in program
+    assert "cold_gate_admissible" not in program
+    assert "relevant_session_activity" not in program
+    assert "stream.take_available()" not in program
+    assert program.count("press(ws, button_id)") == 2
+    assert "same_authenticated_session" in program
+    assert "same_authenticated_session_reused" not in program
+    assert "if cold_provenance != 'NEW_SESSION'" in program
+    assert "COLD_SESSION_PROVENANCE_FAILED" in program
+
+
+def test_r65c_public_result_retains_classification_but_not_session_ordinal() -> None:
+    payload = {
+        "eligible_s1_count": 1,
+        "selected": True,
+        "refresh_button_present": True,
+        "policy_on_demand": True,
+        "ble_control_enabled": True,
+        "hold_time_valid": True,
+        "cold": {
+            "service_success": True,
+            "counts": {
+                "device_info": 1,
+                "pair": 1,
+                "device_status": 1,
+                "datapoint": 0,
+                "other": 0,
+            },
+            "session_provenance": "NEW_SESSION",
+            "last_status_update_advanced": False,
+            "retained_confirmation_changed_dp_ids": [],
+        },
+        "warm": {
+            "service_success": True,
+            "counts": {
+                "device_info": 0,
+                "pair": 0,
+                "device_status": 1,
+                "datapoint": 0,
+                "other": 0,
+            },
+            "session_provenance": "REUSED_SESSION",
+            "last_status_update_advanced": False,
+            "retained_confirmation_changed_dp_ids": [],
+        },
+        "same_authenticated_session": True,
+        "hold": {
+            "warm_immediately_after_press": True,
+            "normal_release_observed": True,
+            "automatic_reconnect_observed": False,
+        },
+        "ambiguous": False,
+        "failure_class": None,
+        "conditional_omission_observed": True,
+    }
+
+    result = access._parse_refresh_status_live_validation_result(
+        json.dumps(payload).encode()
+    )
+
+    assert result.passed
+    assert result.same_authenticated_session is True
+    assert result.cold.session_provenance is access.RefreshSessionProvenance.NEW_SESSION
+    assert (
+        result.warm.session_provenance is access.RefreshSessionProvenance.REUSED_SESSION
+    )
+    assert "session_ordinal" not in repr(result)
+
+
+def test_r65c_exact_runtime_authority_manifest_is_git_derived() -> None:
+    manifest = _r65_exact_r64_manifest()
+    runtime = next(
+        entry
+        for entry in manifest.entries
+        if entry.relative_path == "integration/tuya_ble/tuya_ble.py"
+    )
+
+    commit = "7cfcf9598941de253a24b7c30b06170a98b4ba86"  # gitleaks:allow
+    tree = "f289523beedb1abe38b28221b1880fa4dec2a7b9"  # gitleaks:allow
+    assert access.R64_RUNTIME_COMMIT == commit
+    assert access.R64_RUNTIME_TREE == tree
+    assert len(manifest.entries) == 37
+    assert sum(item.size for item in manifest.entries) == 838810
+    assert runtime.size == 178784
+    assert (
+        runtime.sha256
+        == "bc573c61e134fde333b299cff26617ae1a99a4aad29f22b6bd06a457199f1ccc"
+    )
+    assert (
+        access._source_manifest_digest(manifest.entries)
+        == "4eaed95e3a0dea264e11fffde6a42facdedf775552a3ea85026e85ecffd4b1d7"
+    )
 
 
 def test_r65_c14_to_c19_two_press_operation_and_exact_restore(
