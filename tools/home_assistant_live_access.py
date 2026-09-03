@@ -255,6 +255,14 @@ class PriorBackupClassification(StrEnum):
     OTHER_OR_INDETERMINATE = "OTHER_OR_INDETERMINATE"
 
 
+class FeatureBackupClassification(StrEnum):
+    """Bounded state of the retained Feature-Validation baseline backup."""
+
+    NONE = "NONE"
+    OWNED_BY_CURRENT_FEATURE_LIFECYCLE = "OWNED_BY_CURRENT_FEATURE_LIFECYCLE"
+    OTHER_OR_INDETERMINATE = "OTHER_OR_INDETERMINATE"
+
+
 class LifecycleAnchorFormat(StrEnum):
     """Exact durable anchor layouts retained by the Issue-37 lifecycle."""
 
@@ -272,6 +280,13 @@ class LifecycleAnchorClassification(StrEnum):
 
 class RetainedBackupAction(StrEnum):
     """The two exact backup-continuity operations available to an inspector."""
+
+    INSPECT = "inspect"
+    RETIRE = "retire"
+
+
+class FeatureBackupAction(StrEnum):
+    """Fixed backup-continuity operations available to the feature controller."""
 
     INSPECT = "inspect"
     RETIRE = "retire"
@@ -330,6 +345,7 @@ class FeatureValidationAction(StrEnum):
     RESTORE_INSTALL = "restore_install"
     BACKUP_FALLBACK = "backup_fallback"
     BACKUP_FALLBACK_RECONCILE = "backup_fallback_reconcile"
+    BACKUP_RETIRE = "backup_retire"
     RESTORE_INVENTORY = "restore_inventory"
     RESTORE_CORE_CHECK = "restore_core_check"
     REMOVAL_RESTART = "removal_restart"
@@ -1114,6 +1130,21 @@ class _RetainedBackupCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class _FeatureBackupContinuityCapability:
+    """One controller-owned feature-backup inspection or retirement permit."""
+
+    controller: object = field(repr=False)
+    issuer: object = field(repr=False)
+    lifecycle_generation: object = field(repr=False)
+    source_generation: object = field(repr=False)
+    session_generation: object = field(repr=False)
+    issuance_identity: object = field(repr=False)
+    action: FeatureBackupAction
+    backup_identity: object = field(default=None, repr=False)
+    restore_marker_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _RemotePhaseAInventoryPermit:
     """One controller-issued opening permit outside LifecycleAction."""
 
@@ -1471,6 +1502,20 @@ def _source_inventory_exact(result: object, expected_count: int) -> bool:
     )
 
 
+def _feature_restore_inventory_exact(result: object, manifest: SourceManifest) -> bool:
+    """Require the complete current-source evidence used for backup retirement."""
+    return (
+        manifest.state is SourceState.RESTORE
+        and _source_inventory_exact(result, len(manifest.entries))
+        and isinstance(result, SourceInventoryResult)
+        and result.root_profile is RemoteRootProfile.HOMEASSISTANT_CONFIG
+        and _exact_non_bool_int(result.content_mismatch_count)
+        and result.content_mismatch_count == 0
+        and result.managed_manifest_identity
+        == _source_manifest_digest(manifest.entries)
+    )
+
+
 @dataclass(frozen=True)
 class CoreCheckResult:
     attempt_ordinal: int
@@ -1485,6 +1530,14 @@ class CoreCheckResult:
 @dataclass(frozen=True)
 class PriorBackupContinuityResult:
     classification: PriorBackupClassification
+    retired: bool = False
+
+
+@dataclass(frozen=True)
+class FeatureBackupContinuityResult:
+    """Identifier-free state of the retained Feature-Validation backup."""
+
+    classification: FeatureBackupClassification
     retired: bool = False
 
 
@@ -4004,6 +4057,11 @@ class _DurableFeatureValidationJournal:
     def operation_phase(self, action: FeatureValidationAction) -> str | None:
         return self._record["operations"].get(action.value)
 
+    @property
+    def backup_identity(self) -> dict[str, object] | None:
+        value = self._record["backup_identity"]
+        return None if value is None else copy.deepcopy(value)
+
     def _mutate(self, callback: Callable[[dict[str, object]], None]) -> None:
         record = copy.deepcopy(self._record)
         callback(record)
@@ -4085,6 +4143,48 @@ class _DurableFeatureValidationJournal:
 
         self._mutate(mutate)
 
+    def mark_ambiguous_state_neutral(self, action: FeatureValidationAction) -> None:
+        """Retain the lifecycle state while tombstoning an uncertain mutation."""
+        if action is not FeatureValidationAction.BACKUP_RETIRE:
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) not in {
+                "intent_durable",
+                "dispatch_started",
+                "result_durable",
+            }:
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = "ambiguous"
+
+        self._mutate(mutate)
+
+    def commit_state_neutral(self, action: FeatureValidationAction) -> None:
+        """Commit one result without changing the restore-side lifecycle state."""
+        if action is not FeatureValidationAction.BACKUP_RETIRE:
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) != "result_durable":
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = "transition_committed"
+
+        self._mutate(mutate)
+
+    def reconcile_state_neutral_ambiguity(
+        self, action: FeatureValidationAction
+    ) -> None:
+        """Resolve an uncertain mutation from later non-mutating evidence."""
+        if action is not FeatureValidationAction.BACKUP_RETIRE:
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) != "ambiguous":
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = "transition_committed"
+
+        self._mutate(mutate)
+
     def reconstruction_requires_restore(self) -> None:
         """Persist the restore-only posture before a reconstructed mutation."""
 
@@ -4128,6 +4228,31 @@ class _DurableFeatureValidationJournal:
                 "manifest_identity": result.manifest_identity,
                 "backup_digest": result.backup_digest,
             }
+
+        self._mutate(mutate)
+
+    def reconcile_backup_creation(self, result: BackupResult) -> None:
+        """Bind an exact existing package without moving the current source state."""
+
+        def mutate(record: dict[str, object]) -> None:
+            if (
+                record["backup_identity"] is not None
+                or record["operations"].get(FeatureValidationAction.BACKUP.value)
+                != "ambiguous"
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_BACKUP_RECONCILIATION_FAILED"
+                ) from None
+            record["backup_identity"] = {
+                "lifecycle_generation": result.lifecycle_generation,
+                "source_generation": result.source_generation,
+                "backup_generation": result.backup_generation,
+                "manifest_identity": result.manifest_identity,
+                "backup_digest": result.backup_digest,
+            }
+            record["operations"][
+                FeatureValidationAction.BACKUP.value
+            ] = "transition_committed"
 
         self._mutate(mutate)
 
@@ -4380,6 +4505,48 @@ def _retained_backup_context_payload(
         "backup_digest": identity["backup_digest"],
         "restore_marker_owned": capability.restore_marker_owned,
     }
+
+
+def _feature_backup_context_payload(
+    manifest: SourceManifest, capability: _FeatureBackupContinuityCapability
+) -> dict[str, object]:
+    """Build an authority-owned context without accepting caller identity."""
+    if manifest.state is not SourceState.RESTORE:
+        raise SourceBundleError("RESTORE_MANIFEST_REQUIRED") from None
+    validate_source_manifest(manifest)
+    payload = {
+        "lifecycle_generation": str(capability.lifecycle_generation),
+        "source_generation": str(capability.source_generation),
+        "source_state": "PR41_BASELINE",
+        "manifest": _manifest_payload(manifest),
+        "restore_marker_owned": capability.restore_marker_owned,
+    }
+    identity = capability.backup_identity
+    if identity is None:
+        return payload
+    if not (
+        type(identity) is dict
+        and identity.get("lifecycle_generation") == str(capability.lifecycle_generation)
+        and identity.get("source_generation") == str(capability.source_generation)
+        and all(
+            isinstance(identity.get(name), str)
+            and re.fullmatch(pattern, identity[name]) is not None
+            for name, pattern in (
+                ("backup_generation", r"[0-9a-f]{32}"),
+                ("manifest_identity", r"[0-9a-f]{64}"),
+                ("backup_digest", r"[0-9a-f]{64}"),
+            )
+        )
+    ):
+        raise SourceBundleError("BACKUP_IDENTITY_REQUIRED") from None
+    payload.update(
+        {
+            "backup_generation": identity["backup_generation"],
+            "manifest_identity": identity["manifest_identity"],
+            "backup_digest": identity["backup_digest"],
+        }
+    )
+    return payload
 
 
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -9529,6 +9696,42 @@ class PrivateInteractiveSessionBroker:
             binding.issuer.consumed.append(capability)
         return capability
 
+    def _require_feature_backup_continuity_capability(
+        self,
+        capability: object,
+        action: FeatureBackupAction,
+        *,
+        consume: bool = False,
+    ) -> _FeatureBackupContinuityCapability:
+        """Validate one controller-owned feature-backup continuity permit."""
+        binding = self._controller_binding
+        if (
+            type(capability) is not _FeatureBackupContinuityCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.lifecycle_generation is not binding.lifecycle_generation
+            or capability.source_generation is None
+            or capability.session_generation is not binding.session_generation
+            or capability.issuance_identity is None
+            or capability.action is not action
+            or action is FeatureBackupAction.RETIRE
+            and type(capability.backup_identity) is not dict
+            or action is FeatureBackupAction.INSPECT
+            and capability.backup_identity is not None
+            and type(capability.backup_identity) is not dict
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_BACKUP_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+        return capability
+
     def __write_wire(self, packet: _PrivateWirePacket) -> None:
         if (
             type(packet) is not _PrivateWirePacket
@@ -10345,6 +10548,62 @@ class PrivateInteractiveSessionBroker:
                 or action is RetainedBackupAction.RETIRE
                 and (
                     result.classification is not PriorBackupClassification.NONE
+                    or result.retired is not True
+                )
+            ):
+                raise ValueError
+            return result
+        except (KeyError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _feature_backup_continuity_operation(
+        self,
+        manifest: SourceManifest,
+        action: FeatureBackupAction,
+        *,
+        _capability: object = None,
+    ) -> FeatureBackupContinuityResult:
+        """Inspect or retire only the current feature lifecycle's PR41 backup."""
+        capability = self._require_feature_backup_continuity_capability(
+            _capability, action, consume=True
+        )
+        operation = {
+            FeatureBackupAction.INSPECT: BoundedOperation.INSPECT_RETAINED_BACKUP,
+            FeatureBackupAction.RETIRE: BoundedOperation.RETIRE_RETAINED_BACKUP,
+        }[action]
+        output = self.__execute_bounded_operation(
+            operation,
+            _feature_backup_context_payload(manifest, capability),
+            detail=manifest.state.value,
+            _inspection_token=self.__inspection_token,
+        )
+        try:
+            payload = _exact_payload(output)
+            if not isinstance(payload, dict) or set(payload) != {
+                "classification",
+                "retired",
+            }:
+                raise ValueError
+            classification = {
+                PriorBackupClassification.NONE.value: FeatureBackupClassification.NONE,
+                PriorBackupClassification.OWNED_BY_RETAINED_LIFECYCLE.value: (
+                    FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+                ),
+                PriorBackupClassification.OTHER_OR_INDETERMINATE.value: (
+                    FeatureBackupClassification.OTHER_OR_INDETERMINATE
+                ),
+            }[payload["classification"]]
+            result = FeatureBackupContinuityResult(
+                classification, _bool(payload["retired"])
+            )
+            if (
+                action is FeatureBackupAction.INSPECT
+                and result.retired is not False
+                or action is FeatureBackupAction.RETIRE
+                and (
+                    result.classification is not FeatureBackupClassification.NONE
                     or result.retired is not True
                 )
             ):
@@ -12856,6 +13115,19 @@ class FullPreflightLifecycleController:
         return result
 
 
+_FEATURE_RESTORE_SIDE_STATES = frozenset(
+    {
+        FeatureValidationState.PR41_RESTORED,
+        FeatureValidationState.RESTORE_INVENTORY_VERIFIED,
+        FeatureValidationState.RESTORE_CORE_CHECKED,
+        FeatureValidationState.REMOVAL_RESTART_CONSUMED,
+        FeatureValidationState.PR41_READY,
+        FeatureValidationState.FEATURE_ABSENCE_VERIFIED,
+        FeatureValidationState.POST_RESTORE_REPAIRS_PASS,
+    }
+)
+
+
 _FEATURE_ACTION_PREDECESSORS: dict[
     FeatureValidationAction, frozenset[FeatureValidationState]
 ] = {
@@ -12913,6 +13185,7 @@ _FEATURE_ACTION_PREDECESSORS: dict[
     FeatureValidationAction.BACKUP_FALLBACK_RECONCILE: frozenset(
         {FeatureValidationState.RESTORE_REQUIRED}
     ),
+    FeatureValidationAction.BACKUP_RETIRE: _FEATURE_RESTORE_SIDE_STATES,
     FeatureValidationAction.RESTORE_INVENTORY: frozenset(
         {FeatureValidationState.PR41_RESTORED}
     ),
@@ -13012,6 +13285,14 @@ class RefreshStatusLiveValidationController:
                 }:
                     self._journal.require_restore(action)
                     break
+            if self._journal.operation_phase(FeatureValidationAction.BACKUP_RETIRE) in {
+                "intent_durable",
+                "dispatch_started",
+                "result_durable",
+            }:
+                self._journal.mark_ambiguous_state_neutral(
+                    FeatureValidationAction.BACKUP_RETIRE
+                )
             for action, predecessor, successor in (
                 (
                     FeatureValidationAction.R64_RESTART,
@@ -13082,6 +13363,11 @@ class RefreshStatusLiveValidationController:
         self._feature_absence: FeatureAbsenceResult | None = None
         self._restore_repairs: RepairsEvidence | None = None
         self._live_result: RefreshStatusLiveValidationResult | None = None
+        self._exact_pr41_source_proven = False
+        self._feature_backup_classification: FeatureBackupClassification | None = None
+        self._feature_backup_identity = (
+            self._journal.backup_identity if self._journal is not None else None
+        )
         if (
             self._journal is not None
             and type(broker) is PrivateInteractiveSessionBroker
@@ -13375,6 +13661,13 @@ class RefreshStatusLiveValidationController:
             raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
         if self._journal is not None:
             self._journal.bind_backup(result)
+        self._feature_backup_identity = {
+            "lifecycle_generation": result.lifecycle_generation,
+            "source_generation": result.source_generation,
+            "backup_generation": result.backup_generation,
+            "manifest_identity": result.manifest_identity,
+            "backup_digest": result.backup_digest,
+        }
         self._advance(
             FeatureValidationState.R64_BACKUP_VERIFIED,
             FeatureValidationAction.BACKUP,
@@ -13568,7 +13861,7 @@ class RefreshStatusLiveValidationController:
     def reconcile_interrupted_source(
         self, r64_manifest: SourceManifest, restore_manifest: SourceManifest
     ) -> CurrentSourceInventoryResult:
-        """Classify installed source once before resuming interrupted restoration."""
+        """Classify installed source before resuming or cleaning restoration."""
         if (
             r64_manifest.state is not SourceState.R64_RUNTIME
             or restore_manifest.state is not SourceState.RESTORE
@@ -13579,10 +13872,15 @@ class RefreshStatusLiveValidationController:
         validate_source_manifest(r64_manifest)
         validate_source_manifest(restore_manifest)
         self._assert_session()
-        if self.state is not FeatureValidationState.RESTORE_REQUIRED:
+        starting_state = self.state
+        if starting_state not in {
+            FeatureValidationState.RESTORE_REQUIRED,
+            *_FEATURE_RESTORE_SIDE_STATES,
+        }:
             raise LifecycleControllerError(
                 "FEATURE_SOURCE_RECONCILIATION_FAILED"
             ) from None
+        self._exact_pr41_source_proven = False
         capability = _SourceInspectionCapability(
             self,
             self._capability_issuer.identity,
@@ -13598,31 +13896,228 @@ class RefreshStatusLiveValidationController:
             raise LifecycleControllerError(
                 "FEATURE_SOURCE_RECONCILIATION_FAILED"
             ) from None
-        if not isinstance(
-            result, CurrentSourceInventoryResult
-        ) or result.classification not in {
-            CurrentSourceClassification.EXACT_PR41,
-            CurrentSourceClassification.EXACT_R64,
-        }:
+        if (
+            not isinstance(result, CurrentSourceInventoryResult)
+            or result.classification
+            not in {
+                CurrentSourceClassification.EXACT_PR41,
+                CurrentSourceClassification.EXACT_R64,
+            }
+            or (
+                result.classification is CurrentSourceClassification.EXACT_PR41
+                and not _feature_restore_inventory_exact(
+                    result.evidence, restore_manifest
+                )
+            )
+            or (
+                starting_state in _FEATURE_RESTORE_SIDE_STATES
+                and result.classification is not CurrentSourceClassification.EXACT_PR41
+            )
+        ):
             raise LifecycleControllerError(
                 "FEATURE_SOURCE_RECONCILIATION_FAILED"
             ) from None
         self._r64_manifest = r64_manifest
         self._restore_manifest = restore_manifest
-        target = (
-            FeatureValidationState.PR41_RESTORED
-            if result.classification is CurrentSourceClassification.EXACT_PR41
-            else FeatureValidationState.RESTORE_REQUIRED
-        )
-        if self._journal is not None:
+        target = starting_state
+        if starting_state is FeatureValidationState.RESTORE_REQUIRED:
+            target = (
+                FeatureValidationState.PR41_RESTORED
+                if result.classification is CurrentSourceClassification.EXACT_PR41
+                else FeatureValidationState.RESTORE_REQUIRED
+            )
+        if (
+            self._journal is not None
+            and starting_state is FeatureValidationState.RESTORE_REQUIRED
+        ):
             self._journal.record_source_reconciliation(result.classification)
         self._state = target
+        self._exact_pr41_source_proven = (
+            result.classification is CurrentSourceClassification.EXACT_PR41
+        )
         if type(self._broker) is PrivateInteractiveSessionBroker:
             self._broker._active_source_state = (
                 SourceState.RESTORE
                 if result.classification is CurrentSourceClassification.EXACT_PR41
                 else SourceState.R64_RUNTIME
             )
+        return result
+
+    def _feature_backup_capability(
+        self, action: FeatureBackupAction
+    ) -> _FeatureBackupContinuityCapability:
+        capability = _FeatureBackupContinuityCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._restore_source_generation,
+            self._session_generation,
+            secrets.token_hex(16),
+            action,
+            self._feature_backup_identity,
+            (
+                self._journal is not None
+                and self._journal.committed(FeatureValidationAction.RESTORE_INSTALL)
+            ),
+        )
+        self._capability_issuer.issued.append(capability)
+        return capability
+
+    def _bind_feature_restore_manifest(self, manifest: SourceManifest) -> None:
+        if not isinstance(manifest, SourceManifest):
+            raise LifecycleControllerError("FEATURE_BACKUP_CONTINUITY_FAILED") from None
+        try:
+            validate_source_manifest(manifest)
+        except SourceBundleError:
+            raise LifecycleControllerError("FEATURE_BACKUP_CONTINUITY_FAILED") from None
+        if (
+            manifest.state is not SourceState.RESTORE
+            or self.state not in _FEATURE_RESTORE_SIDE_STATES
+            or self._restore_manifest is not None
+            and manifest != self._restore_manifest
+        ):
+            raise LifecycleControllerError("FEATURE_BACKUP_CONTINUITY_FAILED") from None
+        self._restore_manifest = manifest
+
+    def inspect_feature_backup(
+        self, manifest: SourceManifest
+    ) -> FeatureBackupContinuityResult:
+        """Classify the fixed feature backup without consuming a mutation."""
+        self._assert_session()
+        self._bind_feature_restore_manifest(manifest)
+        capability = self._feature_backup_capability(FeatureBackupAction.INSPECT)
+        try:
+            result = self._broker._feature_backup_continuity_operation(
+                manifest,
+                FeatureBackupAction.INSPECT,
+                _capability=capability,
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._feature_backup_classification = (
+                FeatureBackupClassification.OTHER_OR_INDETERMINATE
+            )
+            raise LifecycleControllerError("FEATURE_BACKUP_CONTINUITY_FAILED") from None
+        if not isinstance(result, FeatureBackupContinuityResult) or result.retired:
+            self._feature_backup_classification = (
+                FeatureBackupClassification.OTHER_OR_INDETERMINATE
+            )
+            raise LifecycleControllerError("FEATURE_BACKUP_CONTINUITY_FAILED") from None
+        self._feature_backup_classification = result.classification
+        if (
+            result.classification is FeatureBackupClassification.NONE
+            and self._journal is not None
+            and self._journal.operation_phase(FeatureValidationAction.BACKUP_RETIRE)
+            == "ambiguous"
+        ):
+            self._journal.reconcile_state_neutral_ambiguity(
+                FeatureValidationAction.BACKUP_RETIRE
+            )
+        return result
+
+    def reconcile_feature_backup_creation(
+        self, manifest: SourceManifest
+    ) -> FeatureBackupContinuityResult:
+        """Adopt an exact existing package without replaying backup creation."""
+        self._assert_session()
+        self._bind_feature_restore_manifest(manifest)
+        if (
+            not self._exact_pr41_source_proven
+            or self._feature_backup_classification
+            is not FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+            or self._journal is None
+            or self._feature_backup_identity is not None
+            or self._journal.operation_phase(FeatureValidationAction.BACKUP)
+            != "ambiguous"
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RECONCILIATION_FAILED"
+            ) from None
+        capability = _LifecycleCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._restore_source_generation,
+            self._session_generation,
+            LifecycleAction.BACKUP_RECONCILE,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._reconcile_private_backup_creation(
+                manifest, _capability=capability
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RECONCILIATION_FAILED"
+            ) from None
+        if not (
+            isinstance(result, BackupResult)
+            and result.success is True
+            and result.file_count == len(manifest.entries)
+            and result.manifest_match is True
+            and result.regular_files_only is True
+            and result.lifecycle_generation == str(self._lifecycle_generation)
+            and result.source_generation == str(self._restore_source_generation)
+            and result.manifest_identity == _source_manifest_digest(manifest.entries)
+            and re.fullmatch(r"[0-9a-f]{32}", result.backup_generation)
+            and re.fullmatch(r"[0-9a-f]{64}", result.backup_digest)
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RECONCILIATION_FAILED"
+            ) from None
+        self._journal.reconcile_backup_creation(result)
+        self._feature_backup_identity = self._journal.backup_identity
+        return FeatureBackupContinuityResult(
+            FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+        )
+
+    def retire_owned_feature_backup(
+        self, manifest: SourceManifest
+    ) -> FeatureBackupContinuityResult:
+        """Consume at most one exact-owner retirement dispatch."""
+        self._assert_session()
+        self._bind_feature_restore_manifest(manifest)
+        if (
+            not self._exact_pr41_source_proven
+            or self._feature_backup_classification
+            is not FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+            or type(self._feature_backup_identity) is not dict
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RETIREMENT_NOT_AUTHORIZED"
+            ) from None
+        action = FeatureValidationAction.BACKUP_RETIRE
+        self._begin(action)
+        capability = self._feature_backup_capability(FeatureBackupAction.RETIRE)
+        self._mark(action, "dispatch_started")
+        try:
+            result = self._broker._feature_backup_continuity_operation(
+                manifest,
+                FeatureBackupAction.RETIRE,
+                _capability=capability,
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._feature_backup_classification = None
+            if self._journal is not None:
+                self._journal.mark_ambiguous_state_neutral(action)
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RETIREMENT_AMBIGUOUS"
+            ) from None
+        self._mark(action, "result_durable")
+        if not (
+            isinstance(result, FeatureBackupContinuityResult)
+            and result.classification is FeatureBackupClassification.NONE
+            and result.retired is True
+        ):
+            self._feature_backup_classification = None
+            if self._journal is not None:
+                self._journal.mark_ambiguous_state_neutral(action)
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_RETIREMENT_AMBIGUOUS"
+            ) from None
+        if self._journal is not None:
+            self._journal.commit_state_neutral(action)
+        self._feature_backup_classification = None
         return result
 
     def restore_private_backup_fallback(
@@ -13941,6 +14436,17 @@ class RefreshStatusLiveValidationController:
 
     def complete(self) -> FinalRestoreProof:
         action = FeatureValidationAction.FINAL_ACCEPTANCE
+        if (
+            not self._exact_pr41_source_proven
+            or self._feature_backup_classification
+            is not FeatureBackupClassification.NONE
+            or self._journal is not None
+            and self._journal.operation_phase(FeatureValidationAction.BACKUP_RETIRE)
+            not in {None, "transition_committed"}
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_BACKUP_CONTINUITY_REQUIRED"
+            ) from None
         self._begin(action)
         proof = self._final_proof()
         self._mark(action, "dispatch_started")

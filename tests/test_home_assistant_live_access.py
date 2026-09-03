@@ -1026,6 +1026,7 @@ def _synthetic_r30_source_authorities(
                 "test_r63s_",
                 "test_r63t_",
                 "test_r65_",
+                "test_r65e_",
             )
         ),
     )
@@ -11956,6 +11957,12 @@ class _R65BMarkerWebSocket:
 class _R65ScriptedBroker(_R32ScriptedBroker):
     source_classification = access.CurrentSourceClassification.EXACT_PR41
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_backup_classification = (
+            access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+        )
+
     def _consume_feature_capability(
         self, capability: object, action: access.FeatureValidationAction
     ) -> None:
@@ -11973,6 +11980,27 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
         ):
             raise access.SessionBrokerError("SYNTHETIC_FEATURE_CAPABILITY_INVALID")
         binding[1].consumed.append(capability)
+
+    def _consume_feature_backup_capability(
+        self, capability: object, action: access.FeatureBackupAction
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            type(capability) is not access._FeatureBackupContinuityCapability
+            or binding is None
+            or capability.controller is not binding[0]
+            or capability.issuer is not binding[1].identity
+            or capability.lifecycle_generation is not binding[2]
+            or capability.session_generation is not binding[3]
+            or capability.action is not action
+            or action is access.FeatureBackupAction.RETIRE
+            and type(capability.backup_identity) is not dict
+            or not any(capability is issued for issued in binding[1].issued)
+            or any(capability is consumed for consumed in binding[1].consumed)
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_BACKUP_CAPABILITY_INVALID")
+        binding[1].consumed.append(capability)
+        self._pending_capability = capability
 
     def _create_private_backup(
         self, manifest: access.SourceManifest, *, _capability: object = None
@@ -12021,6 +12049,35 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
                 True,
                 0,
                 0,
+                access.RemoteRootProfile.HOMEASSISTANT_CONFIG,
+                0,
+                0,
+                access._source_manifest_digest(
+                    restore_manifest.entries
+                    if self.source_classification
+                    is access.CurrentSourceClassification.EXACT_PR41
+                    else candidate_manifest.entries
+                ),
+            ),
+        )
+
+    def _feature_backup_continuity_operation(
+        self,
+        manifest: access.SourceManifest,
+        action: access.FeatureBackupAction,
+        *,
+        _capability: object = None,
+    ) -> access.FeatureBackupContinuityResult:
+        assert manifest.state is access.SourceState.RESTORE
+        self._consume_feature_backup_capability(_capability, action)
+        if action is access.FeatureBackupAction.RETIRE:
+            self.feature_backup_classification = access.FeatureBackupClassification.NONE
+        return self._next(
+            "feature_backup_" + action.value,
+            None,
+            access.FeatureBackupContinuityResult(
+                self.feature_backup_classification,
+                action is access.FeatureBackupAction.RETIRE,
             ),
         )
 
@@ -12147,6 +12204,62 @@ def _r65_advance_to_live(
     controller.restart_for_r64()
     controller.await_r64_readiness()
     controller.verify_r64_inventory(r64.manifest)
+    return controller, broker, r64, restore
+
+
+def _r65e_historical_pr41_controller(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+    *,
+    backup_classification: access.FeatureBackupClassification = (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    ),
+    prove_source: bool = True,
+) -> tuple[
+    access.RefreshStatusLiveValidationController,
+    _R65ScriptedBroker,
+    access.SourceBundle,
+    access.SourceBundle,
+]:
+    """Reconstruct the retained schema-1 R65D journal without rewriting it."""
+    r64, restore = r65_bundles
+    original_broker = _R65ScriptedBroker()
+    original_broker._durable_lifecycle_test = True
+    original = access.RefreshStatusLiveValidationController(original_broker)
+    original.inspect_initial_source(r64.manifest, restore.manifest)
+    original.admit_initial_repairs()
+
+    def lose_backup_response(
+        _manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.BackupResult:
+        original_broker._consume_capability(_capability, access.LifecycleAction.BACKUP)
+        original_broker.calls.append(("backup", None))
+        raise access.SessionBrokerError("SYNTHETIC_BACKUP_RESPONSE_LOST")
+
+    original_broker._create_private_backup = lose_backup_response
+    with pytest.raises(access.LifecycleControllerError, match="BACKUP_VERIFICATION"):
+        original.create_backup(restore.manifest)
+    original.close()
+
+    retained = json.loads(
+        (
+            access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+        ).read_text(encoding="ascii")
+    )
+    assert retained["schema_version"] == 1
+    assert retained["state"] == access.FeatureValidationState.RESTORE_REQUIRED.value
+    assert retained["operations"][access.FeatureValidationAction.BACKUP.value] == (
+        "ambiguous"
+    )
+    assert retained["backup_identity"] is None
+
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    broker.feature_backup_classification = backup_classification
+    controller = access.RefreshStatusLiveValidationController(broker)
+    if prove_source:
+        result = controller.reconcile_interrupted_source(r64.manifest, restore.manifest)
+        assert result.classification is access.CurrentSourceClassification.EXACT_PR41
+        assert controller.state is access.FeatureValidationState.PR41_RESTORED
     return controller, broker, r64, restore
 
 
@@ -12782,6 +12895,10 @@ def test_r65_c14_to_c19_two_press_operation_and_exact_restore(
         controller.run_s1_refresh_status_live_validation()
     controller.stage_restore(restore)
     controller.restore_pr41(restore.manifest)
+    controller.reconcile_interrupted_source(_r64.manifest, restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.retire_owned_feature_backup(restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
     controller.verify_restore_inventory(restore.manifest)
     controller.check_restore_core()
     controller.restart_for_restore()
@@ -12981,7 +13098,7 @@ def test_r65_c20_interrupted_backup_fallback_uses_reconciliation_only(
 def test_r65_c20_restoration_and_final_proof_survive_reconstruction(
     r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
 ) -> None:
-    controller, _broker, _r64, restore = _r65_advance_to_live(r65_bundles)
+    controller, _broker, r64, restore = _r65_advance_to_live(r65_bundles)
     controller.run_s1_refresh_status_live_validation()
     controller.stage_restore(restore)
     controller.restore_pr41(restore.manifest)
@@ -13000,8 +13117,343 @@ def test_r65_c20_restoration_and_final_proof_survive_reconstruction(
 
     final_broker = _R65ScriptedBroker()
     final_broker._durable_lifecycle_test = True
+    final_broker.feature_backup_classification = access.FeatureBackupClassification.NONE
     final = access.RefreshStatusLiveValidationController(final_broker)
+    final.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    final.inspect_feature_backup(restore.manifest)
     proof = final.complete()
 
     assert proof.complete
     assert final.state is access.FeatureValidationState.COMPLETE_NORMAL
+
+
+@pytest.mark.parametrize(
+    ("scenario", "classification"),
+    (
+        (
+            "owned",
+            access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE,
+        ),
+        ("none", access.FeatureBackupClassification.NONE),
+        (
+            "foreign",
+            access.FeatureBackupClassification.OTHER_OR_INDETERMINATE,
+        ),
+        (
+            "malformed",
+            access.FeatureBackupClassification.OTHER_OR_INDETERMINATE,
+        ),
+    ),
+)
+def test_r65e_b1_to_b4_historical_ambiguous_backup_is_boundedly_classified(
+    scenario: str,
+    classification: access.FeatureBackupClassification,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, restore = _r65e_historical_pr41_controller(
+        r65_bundles, backup_classification=classification
+    )
+
+    result = controller.inspect_feature_backup(restore.manifest)
+
+    assert scenario in {"owned", "none", "foreign", "malformed"}
+    assert result == access.FeatureBackupContinuityResult(classification)
+    assert set(asdict(result)) == {"classification", "retired"}
+    assert not any(
+        name in {"backup", "transfer", "install", "feature_backup_retire"}
+        for name, _detail in broker.calls
+    )
+    assert controller._journal is not None
+    assert controller._journal.consumed_actions == frozenset(
+        {
+            access.FeatureValidationAction.INITIAL_SOURCE,
+            access.FeatureValidationAction.INITIAL_REPAIRS,
+            access.FeatureValidationAction.BACKUP,
+        }
+    )
+    controller.close()
+
+
+def test_r65e_b5_b6_to_b12_owned_backup_reconciles_and_retires_once(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, r64, restore = _r65e_historical_pr41_controller(r65_bundles)
+    assert controller.inspect_feature_backup(restore.manifest).classification is (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    )
+    reconciled = controller.reconcile_feature_backup_creation(restore.manifest)
+    assert reconciled.classification is (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    )
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.feature_backup_classification = (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    )
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    reconstructed.inspect_feature_backup(restore.manifest)
+    with pytest.raises(
+        access.LifecycleControllerError, match="RETIREMENT_NOT_AUTHORIZED"
+    ):
+        reconstructed.retire_owned_feature_backup(restore.manifest)
+
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    retired = reconstructed.retire_owned_feature_backup(restore.manifest)
+    final = reconstructed.inspect_feature_backup(restore.manifest)
+
+    assert retired == access.FeatureBackupContinuityResult(
+        access.FeatureBackupClassification.NONE, retired=True
+    )
+    assert final == access.FeatureBackupContinuityResult(
+        access.FeatureBackupClassification.NONE
+    )
+    assert [name for name, _detail in broker.calls].count(
+        "backup_creation_reconcile"
+    ) == 1
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_retire"
+    ) == 1
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_inspect"
+    ) == 2
+    assert not any(
+        name in {"backup", "transfer", "install"} for name, _detail in replacement.calls
+    )
+    with pytest.raises(access.LifecycleControllerError):
+        reconstructed.retire_owned_feature_backup(restore.manifest)
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_retire"
+    ) == 1
+    reconstructed.close()
+
+
+def test_r65e_i1_inspection_interruption_is_repeatable_before_one_retirement(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, r64, restore = _r65e_historical_pr41_controller(r65_bundles)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed.inspect_feature_backup(restore.manifest)
+    reconstructed.reconcile_feature_backup_creation(restore.manifest)
+    reconstructed.retire_owned_feature_backup(restore.manifest)
+
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_inspect"
+    ) == 1
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_retire"
+    ) == 1
+    assert not any(name == "backup" for name, _detail in replacement.calls)
+    reconstructed.close()
+
+
+def test_r65e_i2_i3_lost_retirement_response_reconciles_none_without_replay(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, r64, restore = _r65e_historical_pr41_controller(r65_bundles)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.reconcile_feature_backup_creation(restore.manifest)
+    broker.queue(
+        "feature_backup_retire",
+        access.SessionBrokerError("SYNTHETIC_RETIREMENT_RESPONSE_LOST"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="RETIREMENT_AMBIGUOUS"):
+        controller.retire_owned_feature_backup(restore.manifest)
+    assert controller.state is access.FeatureValidationState.PR41_RESTORED
+    assert controller._journal is not None
+    assert (
+        controller._journal.operation_phase(
+            access.FeatureValidationAction.BACKUP_RETIRE
+        )
+        == "ambiguous"
+    )
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.feature_backup_classification = access.FeatureBackupClassification.NONE
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    result = reconstructed.inspect_feature_backup(restore.manifest)
+
+    assert result.classification is access.FeatureBackupClassification.NONE
+    assert reconstructed._journal is not None
+    assert (
+        reconstructed._journal.operation_phase(
+            access.FeatureValidationAction.BACKUP_RETIRE
+        )
+        == "transition_committed"
+    )
+    assert not any(
+        name == "feature_backup_retire" for name, _detail in replacement.calls
+    )
+    with pytest.raises(access.LifecycleControllerError):
+        reconstructed.retire_owned_feature_backup(restore.manifest)
+    assert not any(
+        name == "feature_backup_retire" for name, _detail in replacement.calls
+    )
+    reconstructed.close()
+
+
+def test_r65e_i2_process_loss_after_retirement_dispatch_is_tombstoned_on_open(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, r64, restore = _r65e_historical_pr41_controller(r65_bundles)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.reconcile_feature_backup_creation(restore.manifest)
+    controller._begin(access.FeatureValidationAction.BACKUP_RETIRE)
+    controller._mark(access.FeatureValidationAction.BACKUP_RETIRE, "dispatch_started")
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.feature_backup_classification = access.FeatureBackupClassification.NONE
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    assert reconstructed._journal is not None
+    assert (
+        reconstructed._journal.operation_phase(
+            access.FeatureValidationAction.BACKUP_RETIRE
+        )
+        == "ambiguous"
+    )
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed.inspect_feature_backup(restore.manifest)
+
+    assert (
+        reconstructed._journal.operation_phase(
+            access.FeatureValidationAction.BACKUP_RETIRE
+        )
+        == "transition_committed"
+    )
+    assert not any(
+        name == "feature_backup_retire" for name, _detail in replacement.calls
+    )
+    reconstructed.close()
+
+
+def test_r65e_i4_reconstruction_clears_transient_source_retirement_authority(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, r64, restore = _r65e_historical_pr41_controller(r65_bundles)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.reconcile_feature_backup_creation(restore.manifest)
+    controller.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    reconstructed.inspect_feature_backup(restore.manifest)
+    with pytest.raises(
+        access.LifecycleControllerError, match="RETIREMENT_NOT_AUTHORIZED"
+    ):
+        reconstructed.retire_owned_feature_backup(restore.manifest)
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed.retire_owned_feature_backup(restore.manifest)
+
+    assert [name for name, _detail in replacement.calls].count(
+        "feature_backup_retire"
+    ) == 1
+    reconstructed.close()
+
+
+def test_r65e_i5_i6_foreign_backup_blocks_all_mutations_and_completion(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, restore = _r65e_historical_pr41_controller(
+        r65_bundles,
+        backup_classification=(
+            access.FeatureBackupClassification.OTHER_OR_INDETERMINATE
+        ),
+    )
+    assert controller.inspect_feature_backup(restore.manifest).classification is (
+        access.FeatureBackupClassification.OTHER_OR_INDETERMINATE
+    )
+    with pytest.raises(access.LifecycleControllerError, match="RECONCILIATION_FAILED"):
+        controller.reconcile_feature_backup_creation(restore.manifest)
+    with pytest.raises(
+        access.LifecycleControllerError, match="RETIREMENT_NOT_AUTHORIZED"
+    ):
+        controller.retire_owned_feature_backup(restore.manifest)
+    with pytest.raises(access.LifecycleControllerError, match="CONTINUITY_REQUIRED"):
+        controller.complete()
+
+    assert not any(
+        name
+        in {
+            "backup",
+            "backup_creation_reconcile",
+            "feature_backup_retire",
+            "transfer",
+            "install",
+        }
+        for name, _detail in broker.calls
+    )
+    assert controller._journal is not None
+    assert (
+        controller._journal.operation_phase(
+            access.FeatureValidationAction.FINAL_ACCEPTANCE
+        )
+        is None
+    )
+    controller.close()
+
+
+def test_r65e_final_acceptance_requires_fresh_none_without_consuming_failure(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, restore = _r65e_historical_pr41_controller(
+        r65_bundles, backup_classification=access.FeatureBackupClassification.NONE
+    )
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_refresh_feature_absent()
+    controller.admit_post_restore_repairs()
+
+    with pytest.raises(access.LifecycleControllerError, match="CONTINUITY_REQUIRED"):
+        controller.complete()
+    assert controller._journal is not None
+    assert (
+        controller._journal.operation_phase(
+            access.FeatureValidationAction.FINAL_ACCEPTANCE
+        )
+        is None
+    )
+
+    controller.inspect_feature_backup(restore.manifest)
+    proof = controller.complete()
+
+    assert proof.complete is True
+    assert controller.state is access.FeatureValidationState.COMPLETE_NORMAL
+    assert not any(
+        name in {"backup", "feature_backup_retire", "transfer", "install"}
+        for name, _detail in broker.calls
+    )
+
+
+def test_r65e_public_backup_continuity_api_has_no_path_or_identity_inputs() -> None:
+    for name in (
+        "inspect_feature_backup",
+        "reconcile_feature_backup_creation",
+        "retire_owned_feature_backup",
+    ):
+        signature = inspect.signature(
+            getattr(access.RefreshStatusLiveValidationController, name)
+        )
+        assert tuple(signature.parameters) == ("self", "manifest")
+    result = access.FeatureBackupContinuityResult(
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    )
+    rendered = repr(result)
+    assert "generation" not in rendered
+    assert "digest" not in rendered
+    assert "path" not in rendered
