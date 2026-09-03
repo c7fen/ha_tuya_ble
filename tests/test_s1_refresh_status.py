@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
@@ -289,6 +289,59 @@ async def test_two_separate_presses_reuse_warm_session() -> None:
     assert device._ensure_connected.await_count == 2
     assert device._connection_token is token
     assert device._connection_epoch == token.epoch
+
+
+async def test_cold_on_demand_refresh_composes_setup_and_one_status_request() -> None:
+    """A cold lease establishes one session before its sole explicit status request."""
+    device, old_token = _connected_s1()
+    old_token.client.is_connected = False
+    device._client = None
+    device._connection_token = None
+    device._is_paired = False
+    device._notifications_active = False
+    setup_steps: list[str] = []
+    new_token: ConnectionSessionToken | None = None
+
+    async def establish() -> None:
+        nonlocal new_token
+        assert device.active_lease_count == 1
+        setup_steps.extend(("device_info", "pair"))
+        new_token = device._claim_connection_session(_SyntheticClient())
+        device._is_paired = True
+        device._notifications_active = True
+
+    async def respond(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        assert session_token is new_token
+        setup_steps.append("device_status")
+        response_key = next(iter(device._input_expected_responses))
+        device._handle_command_or_response(
+            1,
+            response_key[1],
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=session_token,
+        )
+        device._parse_datapoints_v3(
+            session_token,
+            1.0,
+            0,
+            _dp(69, TuyaBLEDataPointType.DT_RAW, b"\x01\x02\x03"),
+            0,
+        )
+
+    device._ensure_connected = AsyncMock(side_effect=establish)
+    device._send_packets_locked = AsyncMock(side_effect=respond)
+
+    await device.async_refresh_s1_status()
+
+    assert setup_steps == ["device_info", "pair", "device_status"]
+    assert device._ensure_connected.await_count == 1
+    assert device._send_packets_locked.await_count == 1
+    assert device._connection_token is new_token
+    assert device.is_connection_active is True
+    _assert_refresh_clean(device)
 
 
 async def test_always_connected_refresh_reuses_session_without_policy_churn() -> None:
@@ -729,6 +782,140 @@ async def test_existing_session_lock_serializes_a_concurrent_command() -> None:
 
     assert device._send_packets_locked.await_count == 2
     assert device._build_packets.call_count == 1
+
+
+async def test_foreign_status_waits_before_refresh_generation() -> None:
+    """A queued explicit update cannot create an observation ahead of refresh."""
+    device, token = _connected_s1()
+
+    async def respond_to_current_generation(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        for response_token, sequence in tuple(device._input_expected_responses):
+            assert response_token is session_token
+            device._handle_command_or_response(
+                1,
+                sequence,
+                TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+                b"\x00",
+                session_token=session_token,
+            )
+        device._parse_datapoints_v3(
+            session_token,
+            1.0,
+            0,
+            _dp(69, TuyaBLEDataPointType.DT_RAW, b"\x01\x02\x03"),
+            0,
+        )
+
+    transport = AsyncMock(side_effect=respond_to_current_generation)
+    device._send_packets_locked = transport
+    await token.operation_lock.acquire()
+    refresh = asyncio.create_task(device.async_refresh_s1_status())
+    while not device._status_observers:
+        await asyncio.sleep(0)
+    foreign_update = asyncio.create_task(device.update())
+    await asyncio.sleep(0)
+
+    assert device._status_observation is None
+    token.operation_lock.release()
+    await refresh
+    await foreign_update
+
+    assert transport.await_count == 2
+    assert device._status_observation is not None
+    assert device._status_observation.ordinal == 2
+    _assert_refresh_clean(device)
+
+
+async def test_foreign_status_cannot_supersede_in_flight_refresh() -> None:
+    """A later status sender waits before creating its observation generation."""
+    device, _ = _connected_s1()
+    refresh_entered = asyncio.Event()
+    release_refresh = asyncio.Event()
+    own_ordinal: int | None = None
+
+    async def respond_in_order(
+        session_token: ConnectionSessionToken, _: list[bytes], **__: object
+    ) -> None:
+        nonlocal own_ordinal
+        generation = device._status_observation
+        assert generation is not None
+        if device._send_packets_locked.await_count == 1:
+            own_ordinal = generation.ordinal
+            refresh_entered.set()
+            await release_refresh.wait()
+        response_key = (session_token, generation.request_sequence)
+        assert response_key in device._input_expected_responses
+        device._handle_command_or_response(
+            1,
+            generation.request_sequence,
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+            b"\x00",
+            session_token=session_token,
+        )
+        device._parse_datapoints_v3(
+            session_token,
+            1.0,
+            0,
+            _dp(69, TuyaBLEDataPointType.DT_RAW, b"\x01\x02\x03"),
+            0,
+        )
+
+    transport = AsyncMock(side_effect=respond_in_order)
+    device._send_packets_locked = transport
+    refresh = asyncio.create_task(device.async_refresh_s1_status())
+    await refresh_entered.wait()
+    foreign_update = asyncio.create_task(device.update())
+    await asyncio.sleep(0)
+
+    assert device._status_observation is not None
+    assert device._status_observation.ordinal == own_ordinal
+    assert transport.await_count == 1
+    release_refresh.set()
+    await refresh
+    await foreign_update
+
+    assert transport.await_count == 2
+    assert device._status_observation is not None
+    assert device._status_observation.ordinal > own_ordinal
+    _assert_refresh_clean(device)
+
+
+async def test_refresh_then_hold_expiry_uses_normal_release_without_reconnect() -> None:
+    """Refresh completion composes with the established intentional hold release."""
+    device, token = _connected_s1(hold_time=15)
+    _install_response(device, token)
+    await device.async_refresh_s1_status()
+    disconnect = AsyncMock()
+
+    async def release() -> None:
+        token.client.is_connected = False
+
+    disconnect.side_effect = release
+    token.client.stop_notify = AsyncMock()
+    token.client.disconnect = disconnect
+    device._schedule_reconnect_locked = Mock()
+    device._unexpected_reconnect_failures = 2
+    device._last_confirmed_activity_monotonic = 0.0
+    device._confirmed_activity_session = token
+
+    with (
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.time.monotonic",
+            return_value=15.0,
+        ),
+        patch(
+            "custom_components.tuya_ble.tuya_ble.tuya_ble.asyncio.sleep",
+            new=AsyncMock(),
+        ),
+    ):
+        await device._idle_disconnect_after_deadline(token)
+
+    assert disconnect.await_count == 1
+    assert device._unexpected_reconnect_failures == 2
+    device._schedule_reconnect_locked.assert_not_called()
+    assert device._connection_token is None
 
 
 async def test_cancellation_releases_all_manual_refresh_ownership() -> None:

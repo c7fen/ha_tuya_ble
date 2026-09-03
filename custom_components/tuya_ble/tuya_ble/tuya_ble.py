@@ -1126,7 +1126,12 @@ class TuyaBLEDevice:
                 )
 
     def _start_status_observation(
-        self, token: ConnectionSessionToken, origin: str, request_sequence: int
+        self,
+        token: ConnectionSessionToken,
+        origin: str,
+        request_sequence: int,
+        *,
+        on_created: Callable[[_StatusObservationGeneration], None] | None = None,
     ) -> _StatusObservationGeneration:
         """Start exactly one passive generation for an actual status request."""
         previous = self._status_observation
@@ -1142,6 +1147,8 @@ class TuyaBLEDevice:
             time.monotonic(),
         )
         self._status_observation = generation
+        if on_created is not None:
+            on_created(generation)
         self._emit_status_observation("REQUEST_CREATED", generation=generation)
         return generation
 
@@ -2185,12 +2192,12 @@ class TuyaBLEDevice:
         token: ConnectionSessionToken | None = None
         observation_ordinal: int | None = None
 
-        def observe(event: StatusObservationEvent) -> None:
+        def bind_observation(generation: _StatusObservationGeneration) -> None:
             nonlocal observation_ordinal
+            observation_ordinal = generation.ordinal
+
+        def observe(event: StatusObservationEvent) -> None:
             if event.origin != "explicit":
-                return
-            if event.kind == "REQUEST_CREATED" and observation_ordinal is None:
-                observation_ordinal = event.observation_ordinal
                 return
             if event.observation_ordinal != observation_ordinal:
                 return
@@ -2227,6 +2234,7 @@ class TuyaBLEDevice:
                             True,
                             session_token=token,
                             status_origin="explicit",
+                            status_generation_callback=bind_observation,
                             operation_lock_held=True,
                         )
                         if not confirmed:
@@ -3545,6 +3553,9 @@ class TuyaBLEDevice:
         session_token: ConnectionSessionToken | None = None,
         require_always_connected: bool = False,
         status_origin: str | None = None,
+        status_generation_callback: (
+            Callable[[_StatusObservationGeneration], None] | None
+        ) = None,
         operation_lock_held: bool = False,
         # retry: int | None = None
     ) -> bool:
@@ -3557,6 +3568,24 @@ class TuyaBLEDevice:
             raise TuyaBLEConnectionUnavailableError()
         if code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS and wait_for_response:
             expected_response_code = TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+        if (
+            code is TuyaBLECode.FUN_SENDER_DEVICE_STATUS
+            and self._manual_status_refresh_active
+            and not operation_lock_held
+        ):
+            async with token.operation_lock:
+                return await self._send_packet_while_connected(
+                    code,
+                    data,
+                    response_to,
+                    wait_for_response,
+                    expected_response_code,
+                    session_token=token,
+                    require_always_connected=require_always_connected,
+                    status_origin=status_origin,
+                    status_generation_callback=status_generation_callback,
+                    operation_lock_held=True,
+                )
         result = True
         future: asyncio.Future | None = None
         generation: _StatusObservationGeneration | None = None
@@ -3570,7 +3599,10 @@ class TuyaBLEDevice:
                 else "explicit"
             )
             generation = self._start_status_observation(
-                token, status_origin or inferred_origin, seq_num
+                token,
+                status_origin or inferred_origin,
+                seq_num,
+                on_created=status_generation_callback,
             )
             self._emit_status_observation(
                 "REQUEST_HANDED_TO_TRANSPORT", generation=generation
