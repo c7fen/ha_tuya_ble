@@ -1028,6 +1028,7 @@ def _synthetic_r30_source_authorities(
                 "test_r65_",
                 "test_r65e_",
                 "test_r65g_",
+                "test_r65h_",
             )
         ),
     )
@@ -3326,6 +3327,9 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
     )
 
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
+    synthetic_controller = access.FullPreflightLifecycleController(broker)
+    synthetic_controller._restore_source_generation = "b" * 32
+    broker._synthetic_test_controller = synthetic_controller
 
     def capability(action: access.LifecycleAction) -> object:
         return _r32_controller_minted_capability(broker, action)
@@ -5819,6 +5823,7 @@ def test_r32_synthetic_controlling_pty_full_controller_lifecycle(
 
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
     controller = access.FullPreflightLifecycleController(broker)
+    controller._restore_source_generation = "b" * 32
     controller.admit_initial_repairs()
     controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
@@ -13256,6 +13261,147 @@ def test_r65e_feature_pr41_source_generation_is_accepted_by_remote_backup(
         "classification": "OWNED_BY_RETAINED_LIFECYCLE",
         "retired": False,
     }
+
+
+def test_r65h_feature_backup_reconciliation_accepts_exact_pr41_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The remote result crosses the parser before Feature reconciliation."""
+    r64_manifest = access.SourceManifest(
+        access.SourceState.R64_RUNTIME, _r30_manifest("RESTORE").entries
+    )
+    monkeypatch.setitem(
+        access._AUTHORITY_MANIFEST_DIGESTS,
+        access.SourceState.R64_RUNTIME.value,
+        access._source_manifest_digest(r64_manifest.entries),
+    )
+    monkeypatch.setitem(
+        access._AUTHORITY_MANIFEST_DIGESTS,
+        access.SourceState.RESTORE.value,
+        access._source_manifest_digest(_r30_manifest("RESTORE").entries),
+    )
+    r64 = access.build_source_bundle(
+        access.SourceState.R64_RUNTIME, _r30_files("RESTORE"), r64_manifest
+    )
+    restore = access.build_source_bundle(
+        access.SourceState.RESTORE,
+        _r30_files("RESTORE"),
+        _r30_manifest("RESTORE"),
+    )
+    controller, broker, _r64, restore = _r65e_historical_pr41_controller((r64, restore))
+    _write_remote_source(tmp_path, restore)
+    context = {
+        "lifecycle_generation": str(controller._lifecycle_generation),
+        "source_generation": access.PR41_RESTORE_COMMIT,
+        "source_state": "PR41_BASELINE",
+        "manifest": access._manifest_payload(restore.manifest),
+    }
+    created = _run_synthetic_remote_program(tmp_path, "backup", context)
+    remote_result = _run_synthetic_remote_program(
+        tmp_path, "reconcile_backup_creation", context
+    )
+    private_output = json.dumps(remote_result, separators=(",", ":")).encode("ascii")
+    parsed = access._parse_backup_result(
+        private_output,
+        expected_source_generation=access.PR41_RESTORE_COMMIT,
+    )
+
+    def parse_reconciliation(
+        manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.BackupResult:
+        assert manifest == restore.manifest
+        broker._consume_capability(_capability, access.LifecycleAction.BACKUP_RECONCILE)
+        assert parsed.source_generation == str(_capability.source_generation)
+        return access._bind_evidence_origin(parsed, _capability)
+
+    monkeypatch.setattr(
+        broker, "_reconcile_private_backup_creation", parse_reconciliation
+    )
+    controller.inspect_feature_backup(restore.manifest)
+
+    reconciled = controller.reconcile_feature_backup_creation(restore.manifest)
+
+    assert created["source_generation"] == access.PR41_RESTORE_COMMIT
+    assert remote_result["source_generation"] == access.PR41_RESTORE_COMMIT
+    assert reconciled.classification is (
+        access.FeatureBackupClassification.OWNED_BY_CURRENT_FEATURE_LIFECYCLE
+    )
+    controller.close()
+
+
+def _r65h_backup_result_output(**overrides: object) -> bytes:
+    payload: dict[str, object] = {
+        "success": True,
+        "file_count": 1,
+        "manifest_match": True,
+        "regular_files_only": True,
+        "lifecycle_generation": "a" * 32,
+        "source_generation": access.PR41_RESTORE_COMMIT,
+        "backup_generation": "b" * 32,
+        "manifest_identity": "c" * 64,
+        "backup_digest": "d" * 64,
+    }
+    payload.update(overrides)
+    return json.dumps(payload, separators=(",", ":")).encode("ascii")
+
+
+def test_r65h_legacy_backup_source_generation_remains_exact() -> None:
+    source_generation = "e" * 32
+
+    result = access._parse_backup_result(
+        _r65h_backup_result_output(source_generation=source_generation),
+        expected_source_generation=source_generation,
+    )
+
+    assert result.source_generation == source_generation
+
+
+@pytest.mark.parametrize("wrong_source", ("0" * 40, "f" * 32))
+def test_r65h_backup_parser_rejects_wrong_source_authority(
+    wrong_source: str,
+) -> None:
+    assert wrong_source != access.PR41_RESTORE_COMMIT
+
+    with pytest.raises(
+        access.SessionBrokerError, match="PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+    ):
+        access._parse_backup_result(
+            _r65h_backup_result_output(source_generation=wrong_source),
+            expected_source_generation=access.PR41_RESTORE_COMMIT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("lifecycle_generation", "a" * 40),
+        ("backup_generation", "b" * 40),
+        ("manifest_identity", "c" * 63),
+        ("backup_digest", "g" * 64),
+    ),
+)
+def test_r65h_backup_parser_keeps_other_identity_fields_strict(
+    field: str, invalid: str
+) -> None:
+    with pytest.raises(
+        access.SessionBrokerError, match="PRIVATE_INTERACTIVE_SESSION_PROTOCOL"
+    ):
+        access._parse_backup_result(
+            _r65h_backup_result_output(**{field: invalid}),
+            expected_source_generation=access.PR41_RESTORE_COMMIT,
+        )
+
+
+def test_r65h_backup_parser_requires_source_authority_binding() -> None:
+    parameter = inspect.signature(access._parse_backup_result).parameters[
+        "expected_source_generation"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        access._parse_backup_result(_r65h_backup_result_output())
 
 
 def test_r65e_b5_b6_to_b12_owned_backup_reconciles_and_retires_once(

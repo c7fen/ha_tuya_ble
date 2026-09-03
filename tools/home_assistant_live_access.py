@@ -5046,7 +5046,9 @@ def _exact_payload(private_output: bytes) -> dict[str, Any]:
     return payload
 
 
-def _parse_backup_result(private_output: bytes) -> BackupResult:
+def _parse_backup_result(
+    private_output: bytes, *, expected_source_generation: str
+) -> BackupResult:
     value = _exact_payload(private_output)
     if set(value) != {
         "success",
@@ -5079,18 +5081,23 @@ def _parse_backup_result(private_output: bytes) -> BackupResult:
         )
     except (KeyError, TypeError, ValueError):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
-    if any(
-        not isinstance(getattr(result, name), str)
-        or re.fullmatch(r"[0-9a-f]{32}", getattr(result, name)) is None
-        for name in (
-            "lifecycle_generation",
-            "source_generation",
-            "backup_generation",
+    if (
+        not isinstance(expected_source_generation, str)
+        or not isinstance(result.source_generation, str)
+        or result.source_generation != expected_source_generation
+        or any(
+            not isinstance(getattr(result, name), str)
+            or re.fullmatch(r"[0-9a-f]{32}", getattr(result, name)) is None
+            for name in (
+                "lifecycle_generation",
+                "backup_generation",
+            )
         )
-    ) or any(
-        not isinstance(getattr(result, name), str)
-        or re.fullmatch(r"[0-9a-f]{64}", getattr(result, name)) is None
-        for name in ("manifest_identity", "backup_digest")
+        or any(
+            not isinstance(getattr(result, name), str)
+            or re.fullmatch(r"[0-9a-f]{64}", getattr(result, name)) is None
+            for name in ("manifest_identity", "backup_digest")
+        )
     ):
         raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
     return result
@@ -10842,7 +10849,10 @@ class PrivateInteractiveSessionBroker:
             _capability=_capability,
         )
         try:
-            result = _parse_backup_result(output)
+            result = _parse_backup_result(
+                output,
+                expected_source_generation=str(capability.source_generation),
+            )
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -10860,7 +10870,13 @@ class PrivateInteractiveSessionBroker:
             _backup_context_payload(manifest, capability),
             _capability=_capability,
         )
-        return _bind_evidence_origin(_parse_backup_result(output), capability)
+        return _bind_evidence_origin(
+            _parse_backup_result(
+                output,
+                expected_source_generation=str(capability.source_generation),
+            ),
+            capability,
+        )
 
     def _transfer_source_bundle(
         self, bundle: SourceBundle, *, _capability: object = None
