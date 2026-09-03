@@ -328,6 +328,8 @@ class FeatureValidationAction(StrEnum):
     LIVE_VALIDATION = "live_validation"
     RESTORE_TRANSFER = "restore_transfer"
     RESTORE_INSTALL = "restore_install"
+    BACKUP_FALLBACK = "backup_fallback"
+    BACKUP_FALLBACK_RECONCILE = "backup_fallback_reconcile"
     RESTORE_INVENTORY = "restore_inventory"
     RESTORE_CORE_CHECK = "restore_core_check"
     REMOVAL_RESTART = "removal_restart"
@@ -3710,6 +3712,7 @@ class _DurableFeatureValidationJournal:
             "operations",
             "backup_identity",
             "restart_results",
+            "source_classification",
         }
     )
 
@@ -3786,6 +3789,7 @@ class _DurableFeatureValidationJournal:
                     "operations": {},
                     "backup_identity": None,
                     "restart_results": {},
+                    "source_classification": None,
                 }
                 self._write(record, replace=False)
             else:
@@ -3905,6 +3909,12 @@ class _DurableFeatureValidationJournal:
                 for key, value in record["restart_results"].items()
             )
             or not backup_valid
+            or record.get("source_classification")
+            not in {
+                None,
+                CurrentSourceClassification.EXACT_PR41.value,
+                CurrentSourceClassification.EXACT_R64.value,
+            }
             or record.get("active") is True
             and record.get("terminal") is not None
             or record.get("active") is False
@@ -4061,6 +4071,38 @@ class _DurableFeatureValidationJournal:
                 raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
             record["operations"][action.value] = "ambiguous"
             record["state"] = FeatureValidationState.RESTORE_REQUIRED.value
+
+        self._mutate(mutate)
+
+    def reconstruction_requires_restore(self) -> None:
+        """Persist the restore-only posture before a reconstructed mutation."""
+
+        def mutate(record: dict[str, object]) -> None:
+            record["state"] = FeatureValidationState.RESTORE_REQUIRED.value
+
+        self._mutate(mutate)
+
+    @property
+    def source_classification(self) -> CurrentSourceClassification | None:
+        value = self._record["source_classification"]
+        return None if value is None else CurrentSourceClassification(value)
+
+    def record_source_reconciliation(
+        self, classification: CurrentSourceClassification
+    ) -> None:
+        if classification not in {
+            CurrentSourceClassification.EXACT_PR41,
+            CurrentSourceClassification.EXACT_R64,
+        }:
+            raise LifecycleControllerError("FEATURE_SOURCE_RECONCILIATION_FAILED")
+
+        def mutate(record: dict[str, object]) -> None:
+            record["source_classification"] = classification.value
+            record["state"] = (
+                FeatureValidationState.PR41_RESTORED.value
+                if classification is CurrentSourceClassification.EXACT_PR41
+                else FeatureValidationState.RESTORE_REQUIRED.value
+            )
 
         self._mutate(mutate)
 
@@ -8697,8 +8739,8 @@ class WebSocket:
 class LogStream:
     def __init__(self):
         request = urllib.request.Request(
-            'http://supervisor/core/logs/follow',
-            headers={**headers(), 'Accept': 'text/plain', 'Range': 'entries=-1:1'},
+            'http://supervisor/core/logs/follow?lines=1&no_colors',
+            headers={**headers(), 'Accept': 'text/plain'},
         )
         self.response = urllib.request.urlopen(request, timeout=30)
         self.lines = queue.Queue(maxsize=512)
@@ -8706,6 +8748,19 @@ class LogStream:
         self.closed = False
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
+
+    def establish_boundary(self):
+        # The fixed lines=1 query supplies exactly one historical line before
+        # the followed stream.
+        # Consuming it proves that every subsequently queued line is newer than
+        # this boundary; a timeout is therefore an admission failure, not an
+        # empty-log success.
+        try:
+            self.lines.get(timeout=10)
+        except queue.Empty:
+            raise ValueError('log_boundary')
+        if self.overflow:
+            raise ValueError('log_overflow')
 
     def _read(self):
         try:
@@ -8818,6 +8873,18 @@ def all_sessions_quiescent(lines):
             active[identity] = False
     return not any(active.values())
 
+def relevant_session_activity(lines):
+    for raw in lines:
+        raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
+        match = LOG_RE.fullmatch(raw)
+        if match and (SEND_RE.fullmatch(match.group(2)) or match.group(2).startswith(
+            ('Connecting;', 'Connected;', 'Successfully connected',
+             'Disconnecting', 'Disconnected from device;',
+             'Scheduling reconnect;', 'Reconnect,')
+        )):
+            return True
+    return False
+
 def press(ws, entity_id):
     ws.command('call_service', domain='button', service='press',
                target={'entity_id': entity_id}, return_response=False)
@@ -8895,9 +8962,12 @@ def run_validation():
         if not (result['policy_on_demand'] and result['ble_control_enabled'] and result['hold_time_valid']):
             result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
         last_entities = entries_by_key(entities, device_id, 'sensor', 'last_status_update')
-        if len(last_entities) != 1:
+        connection_entities = entries_by_key(
+            entities, device_id, 'binary_sensor', 'bluetooth_connection'
+        )
+        if len(last_entities) != 1 or len(connection_entities) != 1:
             result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
-        last_id = last_entities[0]['ei']
+        last_id = last_entities[0]['ei']; connection_id = connection_entities[0]['ei']
         dp_entities = {}
         for dp, domain, key in ((8, 'sensor', 'battery'), (33, 'switch', 'automatic_lock'), (34, 'select', 'unlock_switch'), (36, 'number', 'auto_lock_time')):
             matches = entries_by_key(entities, device_id, domain, key)
@@ -8909,12 +8979,20 @@ def run_validation():
         prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
         stream = LogStream()
-        time.sleep(hold + 5); quiescence = stream.drain()
-        if not all_sessions_quiescent(quiescence):
+        stream.establish_boundary()
+        time.sleep(hold + 5)
+        startup = stream.drain()
+        if state(connection_id).get('state') != 'off' or not all_sessions_quiescent(startup):
+            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+        stream.close(); stream = LogStream(); stream.establish_boundary()
+        if state(connection_id).get('state') != 'off':
+            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+        time.sleep(0.25)
+        if relevant_session_activity(stream.drain()) or state(connection_id).get('state') != 'off':
             result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
         before_last = state(last_id).get('state')
         before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
-        stream.drain(); press(ws, button_id)
+        press(ws, button_id)
         cold_lines, after_cold = observe_press(stream, last_id, before_last)
         identity, cold_counts, cold_events = parse_lines(cold_lines)
         changed_cold = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
@@ -12663,6 +12741,8 @@ _FEATURE_ACTION_PREDECESSORS: dict[
     ),
     FeatureValidationAction.RESTORE_TRANSFER: frozenset(
         {
+            FeatureValidationState.R64_BACKUP_VERIFIED,
+            FeatureValidationState.R64_STAGED,
             FeatureValidationState.R64_INSTALLED,
             FeatureValidationState.R64_INVENTORY_VERIFIED,
             FeatureValidationState.R64_CORE_CHECKED,
@@ -12675,6 +12755,12 @@ _FEATURE_ACTION_PREDECESSORS: dict[
     ),
     FeatureValidationAction.RESTORE_INSTALL: frozenset(
         {FeatureValidationState.RESTORE_STAGED}
+    ),
+    FeatureValidationAction.BACKUP_FALLBACK: frozenset(
+        {FeatureValidationState.RESTORE_REQUIRED}
+    ),
+    FeatureValidationAction.BACKUP_FALLBACK_RECONCILE: frozenset(
+        {FeatureValidationState.RESTORE_REQUIRED}
     ),
     FeatureValidationAction.RESTORE_INVENTORY: frozenset(
         {FeatureValidationState.PR41_RESTORED}
@@ -12713,6 +12799,10 @@ _FEATURE_TO_LIFECYCLE_ACTION = {
     ),
     FeatureValidationAction.RESTORE_TRANSFER: LifecycleAction.RESTORE_TRANSFER,
     FeatureValidationAction.RESTORE_INSTALL: LifecycleAction.RESTORE_INSTALL,
+    FeatureValidationAction.BACKUP_FALLBACK: LifecycleAction.BACKUP_FALLBACK,
+    FeatureValidationAction.BACKUP_FALLBACK_RECONCILE: (
+        LifecycleAction.BACKUP_FALLBACK_RECONCILE
+    ),
     FeatureValidationAction.RESTORE_INVENTORY: LifecycleAction.RESTORE_INVENTORY,
     FeatureValidationAction.RESTORE_CORE_CHECK: LifecycleAction.RESTORE_CORE_CHECK_1,
     FeatureValidationAction.REMOVAL_RESTART: LifecycleAction.REMOVAL_RESTART,
@@ -12757,6 +12847,20 @@ class RefreshStatusLiveValidationController:
         )
         self._journal = _DurableFeatureValidationJournal() if durable_required else None
         if self._journal is not None and self._journal.reconstructed:
+            for action in (
+                FeatureValidationAction.R64_TRANSFER,
+                FeatureValidationAction.R64_INSTALL,
+                FeatureValidationAction.RESTORE_TRANSFER,
+                FeatureValidationAction.RESTORE_INSTALL,
+                FeatureValidationAction.BACKUP_FALLBACK,
+            ):
+                if self._journal.operation_phase(action) in {
+                    "intent_durable",
+                    "dispatch_started",
+                    "result_durable",
+                }:
+                    self._journal.require_restore(action)
+                    break
             for action, predecessor, successor in (
                 (
                     FeatureValidationAction.R64_RESTART,
@@ -12775,6 +12879,18 @@ class RefreshStatusLiveValidationController:
                     and self._journal.restart_outcome(action) is not None
                 ):
                     self._journal.transition(successor, action)
+            if self._journal.state in {
+                FeatureValidationState.R64_BACKUP_VERIFIED,
+                FeatureValidationState.R64_STAGED,
+                FeatureValidationState.R64_INSTALLED,
+                FeatureValidationState.R64_INVENTORY_VERIFIED,
+                FeatureValidationState.R64_CORE_CHECKED,
+                FeatureValidationState.R64_RESTART_CONSUMED,
+                FeatureValidationState.R64_READY,
+                FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
+                FeatureValidationState.LIVE_VALIDATION_CONSUMED,
+            }:
+                self._journal.reconstruction_requires_restore()
         self._state = (
             self._journal.state
             if self._journal is not None
@@ -12834,7 +12950,6 @@ class RefreshStatusLiveValidationController:
             FeatureValidationState.R64_READY,
             FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
             FeatureValidationState.LIVE_VALIDATION_CONSUMED,
-            FeatureValidationState.RESTORE_REQUIRED,
             FeatureValidationState.RESTORE_STAGED,
         }:
             self._broker._active_source_state = SourceState.R64_RUNTIME
@@ -12848,6 +12963,15 @@ class RefreshStatusLiveValidationController:
             FeatureValidationState.POST_RESTORE_REPAIRS_PASS,
         }:
             self._broker._active_source_state = SourceState.RESTORE
+        elif (
+            self.state is FeatureValidationState.RESTORE_REQUIRED
+            and self._journal is not None
+            and self._journal.source_classification is not None
+        ):
+            self._broker._active_source_state = {
+                CurrentSourceClassification.EXACT_R64: SourceState.R64_RUNTIME,
+                CurrentSourceClassification.EXACT_PR41: SourceState.RESTORE,
+            }[self._journal.source_classification]
         if FeatureValidationAction.R64_RESTART in self._consumed:
             self._broker._restarted_states.add(SourceState.R64_RUNTIME)
         if FeatureValidationAction.REMOVAL_RESTART in self._consumed:
@@ -13261,6 +13385,15 @@ class RefreshStatusLiveValidationController:
     def stage_restore(self, bundle: SourceBundle) -> TransferResult:
         if bundle.state is not SourceState.RESTORE:
             raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
+        if (
+            self._journal is not None
+            and self._journal.reconstructed
+            and self.state is FeatureValidationState.RESTORE_REQUIRED
+            and self._journal.source_classification is None
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_RECONCILIATION_REQUIRED"
+            ) from None
         validate_source_bundle(bundle)
         result = self._dispatch_shared(
             FeatureValidationAction.RESTORE_TRANSFER,
@@ -13269,12 +13402,149 @@ class RefreshStatusLiveValidationController:
             ),
         )
         if not self._bundle_pass(result, len(bundle.files)):
-            self._restore_failed()
+            self._require_restoration(FeatureValidationAction.RESTORE_TRANSFER)
+            raise LifecycleControllerError(
+                "LIFECYCLE_RESTORE_RECONCILIATION_REQUIRED"
+            ) from None
         self._restore_bundle = bundle
         self._restore_manifest = bundle.manifest
         self._advance(
             FeatureValidationState.RESTORE_STAGED,
             FeatureValidationAction.RESTORE_TRANSFER,
+        )
+        return result
+
+    def reconcile_interrupted_source(
+        self, r64_manifest: SourceManifest, restore_manifest: SourceManifest
+    ) -> CurrentSourceInventoryResult:
+        """Classify installed source once before resuming interrupted restoration."""
+        if (
+            r64_manifest.state is not SourceState.R64_RUNTIME
+            or restore_manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_RECONCILIATION_FAILED"
+            ) from None
+        validate_source_manifest(r64_manifest)
+        validate_source_manifest(restore_manifest)
+        self._assert_session()
+        if self.state is not FeatureValidationState.RESTORE_REQUIRED:
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_RECONCILIATION_FAILED"
+            ) from None
+        capability = _SourceInspectionCapability(
+            self,
+            self._capability_issuer.identity,
+            self._session_generation,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        try:
+            result = self._broker._inspect_current_source(
+                r64_manifest, restore_manifest, _capability=capability
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_RECONCILIATION_FAILED"
+            ) from None
+        if not isinstance(
+            result, CurrentSourceInventoryResult
+        ) or result.classification not in {
+            CurrentSourceClassification.EXACT_PR41,
+            CurrentSourceClassification.EXACT_R64,
+        }:
+            raise LifecycleControllerError(
+                "FEATURE_SOURCE_RECONCILIATION_FAILED"
+            ) from None
+        self._r64_manifest = r64_manifest
+        self._restore_manifest = restore_manifest
+        target = (
+            FeatureValidationState.PR41_RESTORED
+            if result.classification is CurrentSourceClassification.EXACT_PR41
+            else FeatureValidationState.RESTORE_REQUIRED
+        )
+        if self._journal is not None:
+            self._journal.record_source_reconciliation(result.classification)
+        self._state = target
+        if type(self._broker) is PrivateInteractiveSessionBroker:
+            self._broker._active_source_state = (
+                SourceState.RESTORE
+                if result.classification is CurrentSourceClassification.EXACT_PR41
+                else SourceState.R64_RUNTIME
+            )
+        return result
+
+    def restore_private_backup_fallback(
+        self, manifest: SourceManifest
+    ) -> InstallResult:
+        """Use the exact bound PR41 backup after an ambiguous restore mutation."""
+        if (
+            manifest.state is not SourceState.RESTORE
+            or self._journal is None
+            or self._journal.source_classification
+            is not CurrentSourceClassification.EXACT_R64
+        ):
+            raise LifecycleControllerError("LIFECYCLE_RESTORE_FAILED") from None
+        validate_source_manifest(manifest)
+        self._restore_manifest = manifest
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.BACKUP_FALLBACK,
+                lambda capability: self._broker._restore_private_backup(
+                    manifest, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError(
+                "LIFECYCLE_RESTORE_RECONCILIATION_REQUIRED"
+            ) from None
+        if not self._bundle_pass(result, len(manifest.entries)):
+            self._require_restoration(FeatureValidationAction.BACKUP_FALLBACK)
+            raise LifecycleControllerError(
+                "LIFECYCLE_RESTORE_RECONCILIATION_REQUIRED"
+            ) from None
+        self._advance(
+            FeatureValidationState.PR41_RESTORED,
+            FeatureValidationAction.BACKUP_FALLBACK,
+        )
+        return result
+
+    def reconcile_private_backup_fallback(
+        self, manifest: SourceManifest
+    ) -> FallbackReconciliationResult:
+        """Resolve an interrupted fallback without replaying its mutation."""
+        if (
+            manifest.state is not SourceState.RESTORE
+            or self._journal is None
+            or FeatureValidationAction.BACKUP_FALLBACK
+            not in self._journal.consumed_actions
+            or self._journal.operation_phase(FeatureValidationAction.BACKUP_FALLBACK)
+            != "ambiguous"
+        ):
+            raise LifecycleControllerError("LIFECYCLE_RESTORE_FAILED") from None
+        validate_source_manifest(manifest)
+        self._restore_manifest = manifest
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.BACKUP_FALLBACK_RECONCILE,
+                lambda capability: self._broker._reconcile_private_backup(
+                    manifest, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._restore_failed()
+        valid = (
+            isinstance(result, FallbackReconciliationResult)
+            and result.phase == "reconciled"
+            and result.restoration_applied is True
+            and result.manifest_match is True
+            and result.file_count == len(manifest.entries)
+        )
+        if not valid:
+            self._restore_failed()
+        self._advance(
+            FeatureValidationState.PR41_RESTORED,
+            FeatureValidationAction.BACKUP_FALLBACK_RECONCILE,
         )
         return result
 
@@ -13310,9 +13580,14 @@ class RefreshStatusLiveValidationController:
                 ),
             )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
-            self._restore_failed()
+            raise LifecycleControllerError(
+                "LIFECYCLE_RESTORE_RECONCILIATION_REQUIRED"
+            ) from None
         if not self._bundle_pass(result, len(manifest.entries)):
-            self._restore_failed()
+            self._require_restoration(FeatureValidationAction.RESTORE_INSTALL)
+            raise LifecycleControllerError(
+                "LIFECYCLE_RESTORE_RECONCILIATION_REQUIRED"
+            ) from None
         self._advance(
             FeatureValidationState.PR41_RESTORED,
             FeatureValidationAction.RESTORE_INSTALL,

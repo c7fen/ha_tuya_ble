@@ -11640,30 +11640,229 @@ def test_r62f_c11_transport_ambiguity_has_no_http_status() -> None:
     controller.close()
 
 
-def _r65_git_bundle(state: access.SourceState, commit: str) -> access.SourceBundle:
-    output = subprocess.check_output(
-        ["git", "ls-tree", "-rz", commit, "custom_components/tuya_ble"]
+def _r65_exact_r64_manifest() -> access.SourceManifest:
+    """Return the metadata-only immutable R64 authority; no Git object is needed."""
+    raw = (
+        (
+            "integration/__init__.py",
+            37986,
+            "0af97bd07f5831b2d78b72fcaf8d3b80f208b96db5d5eaecef4a7c8c46f1a056",
+        ),
+        (
+            "integration/base.py",
+            3198,
+            "fe8328c56c96afd8fdabe03cdc8af04b19367e984c122428c30ce8e50296ffd6",
+        ),
+        (
+            "integration/binary_sensor.py",
+            21836,
+            "28c719fa01b4668d2d60a255e803b3ad458118e90c28b0e5b0932f71c69cf171",
+        ),
+        (
+            "integration/button.py",
+            11682,
+            "8a28f2dc0e7965b59facb1074ae569547d98f17981d6a37b06cd8072d29c056a",
+        ),
+        (
+            "integration/climate.py",
+            16446,
+            "ef63c5451be5524611bd9a08d679f9427c4a0597091c3a3f518b8f32d718c08f",
+        ),
+        (
+            "integration/cloud.py",
+            13260,
+            "10523fe9427bcb2e4a2f6ca99ea249ce4e1259573290aedad927cd6eeeabb915",
+        ),
+        (
+            "integration/config_flow.py",
+            18117,
+            "463c920cb6a838113d09f597002f119b4c585c1635bfbe925777e66fe8946ca4",
+        ),
+        (
+            "integration/const.py",
+            33178,
+            "d95b348e92a3b4c48988f37bf0504bf406c56eed1a9a99a36d3fd766f3eef48f",
+        ),
+        (
+            "integration/cover.py",
+            13944,
+            "bde8e9b28dfe19993d69a2e18605da749d96e0d176a6f262b23f41eadfcc1550",
+        ),
+        (
+            "integration/devices.py",
+            29766,
+            "6625c5aa4e7d5907c5cf1e4bf97bab77727a9d6bf7ef9e03d399001534f62e38",
+        ),
+        (
+            "integration/diagnostics.py",
+            1000,
+            "e01dd4f13e78ef30c879b5b53859393272196b36c4b1bffe06d9c3fdf0627d0c",
+        ),
+        (
+            "integration/event.py",
+            5322,
+            "7fa28029ac69a6cbafb6d20de30cd464b0e2e51144cc81a7700453109a92e862",
+        ),
+        (
+            "integration/last_confirmed.py",
+            3273,
+            "8d82d5e80e7da34a3dc155788bf64697e18159be5d044524b87f2a2aa7d24e60",
+        ),
+        (
+            "integration/light.py",
+            32978,
+            "f20f77a97b6c52433cc4ffa73c14770c2b36e600a81c9f9d18c35c4b9eba1f10",
+        ),
+        (
+            "integration/lock.py",
+            25958,
+            "a8e8c6d616319c8aa09fafd84056726edb28c96b3279c1919c2d6c8442809e46",
+        ),
+        (
+            "integration/manifest.json",
+            751,
+            "5f572bf9ccb6c9e35a3cf2483c18789b062f321e1eba9dbf34e630e79d0299c1",
+        ),
+        (
+            "integration/number.py",
+            45692,
+            "650bcf5c9161f3e4735d2d1ea5e9523ade52846fb9a35f64137db479b754b281",
+        ),
+        (
+            "integration/select.py",
+            35099,
+            "cd62fbabeea1d73f9f827fd16410b9bcc698b2484ebf993c360e2489e5bcd731",
+        ),
+        (
+            "integration/sensor.py",
+            95498,
+            "0de06c14b55a1254a95a86912663d0297e11ab85951d96a1366630dfad554288",
+        ),
+        (
+            "integration/strings.json",
+            20455,
+            "9d9a4d1525a18f9f30da868fae958934971332c67d3b6310f2dabc7e345e29b2",
+        ),
+        (
+            "integration/switch.py",
+            40865,
+            "ae5cfbffa3501f643c57b422a6a79a6f47f4820ec86b826e337f537d98a1f8ac",
+        ),
+        (
+            "integration/text.py",
+            9272,
+            "5440b13b5abf176e70e069efa482422747a9e8fbcbbbb776498a5ca09c17043f",
+        ),
+        (
+            "integration/translations/de.json",
+            16959,
+            "2c1e0f7793826a5096dcb7b9894b679db380d309d19368afc84c72a944f80a47",
+        ),
+        (
+            "integration/translations/en.json",
+            20913,
+            "e5b8925729c601b2f6d925ed46bd6bd5f6bbe4953bab436004bdfb200fb2d7c2",
+        ),
+        (
+            "integration/translations/es.json",
+            16610,
+            "becdcd23e115588e09e982ced8c70ceb926faf1c811db4a0430d7e9eeba84293",
+        ),
+        (
+            "integration/translations/fr.json",
+            16698,
+            "b1797e5c0ba989df5394927a5e079a8dcb5a7a204ad575a807391c6a53ddfada",
+        ),
+        (
+            "integration/translations/it.json",
+            16603,
+            "954b36366a62891ce369ed1e68b39959d45dd43f832c1c3cabaa27331c1a6635",
+        ),
+        (
+            "integration/translations/pt-BR.json",
+            16627,
+            "4aa3042b9bfb39bb44230b3afca1a577da06682a76c34c882715e7147ae53597",
+        ),
+        (
+            "integration/translations/zh-Hans.json",
+            15357,
+            "d7d048dea414ecfddad07faedb77c6deacf828a045efe14e01f62cfcccab8fd8",
+        ),
+        (
+            "integration/tuya_ble/__init__.py",
+            515,
+            "76ccce79bcae72ec606f1409da968361913a4cd7c460e35b83ab76d6ff63b7a7",
+        ),
+        (
+            "integration/tuya_ble/const.py",
+            2177,
+            "d262f9bbde4787ecc7b3d10d713652d30471a1eb7b0d90add4ad4f313fa347c7",
+        ),
+        (
+            "integration/tuya_ble/exceptions.py",
+            3330,
+            "c1cd47d9ece846cf70e4f1abc079df9e17e7a3863a6aa49c16e61d026a05d678",
+        ),
+        (
+            "integration/tuya_ble/manager.py",
+            2686,
+            "f668097f7647fe20302a96c5252fcb0a1128f7990f7b76f672c8a07cb4e47e0b",
+        ),
+        (
+            "integration/tuya_ble/security.py",
+            2408,
+            "1dd3655e035945f39f0f4079fc6f6646ddad5adb8f65a675ee23852b3b18b55e",
+        ),
+        (
+            "integration/tuya_ble/tuya_ble.py",
+            175298,
+            "4a5ddece92b37232dd8a2b2ec848710f3f3f550d3f1bf469d87fbedaa0db46ac",
+        ),
+        (
+            "integration/util.py",
+            499,
+            "c829772d9b5ce3ddbe9a41e3ab38e57f39911bf48213f7782372a2e23a784ee8",
+        ),
+        (
+            "integration/vacuum.py",
+            13068,
+            "4be1fe04e030e255d07010ae0ba385dcd74007aacc270657c4e83ab76ead1dbb",
+        ),
     )
-    files = []
-    entries = []
-    for row in output.rstrip(b"\0").split(b"\0"):
-        metadata, raw_path = row.split(b"\t", 1)
-        mode, kind, object_id = metadata.split()
-        assert mode == b"100644" and kind == b"blob"
-        content = subprocess.check_output(
-            ["git", "cat-file", "blob", object_id.decode("ascii")]
+    return access.SourceManifest(
+        access.SourceState.R64_RUNTIME,
+        tuple(access.SourceManifestEntry(*item) for item in raw),
+    )
+
+
+@pytest.fixture
+def r65_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[access.SourceBundle, access.SourceBundle]:
+    """Use small visible-synthetic bundles for lifecycle behavior tests."""
+    bundles = []
+    for state, content in (
+        (access.SourceState.R64_RUNTIME, b"synthetic r64 runtime\n"),
+        (access.SourceState.RESTORE, b"synthetic pr41 restore\n"),
+    ):
+        file = access.SourceBundleFile("integration/__init__.py", content)
+        manifest = access.SourceManifest(
+            state,
+            (
+                access.SourceManifestEntry(
+                    file.relative_path,
+                    len(content),
+                    hashlib.sha256(content).hexdigest(),
+                ),
+            ),
         )
-        path = "integration/" + raw_path.decode("utf-8").removeprefix(
-            "custom_components/tuya_ble/"
+        monkeypatch.setitem(
+            access._AUTHORITY_MANIFEST_DIGESTS,
+            state.value,
+            access._source_manifest_digest(manifest.entries),
         )
-        files.append(access.SourceBundleFile(path, content))
-        entries.append(
-            access.SourceManifestEntry(
-                path, len(content), hashlib.sha256(content).hexdigest()
-            )
-        )
-    manifest = access.SourceManifest(state, tuple(entries))
-    return access.build_source_bundle(state, tuple(files), manifest)
+        bundles.append(access.build_source_bundle(state, (file,), manifest))
+    return bundles[0], bundles[1]
 
 
 def _r65_packet_parser() -> object:
@@ -11680,7 +11879,8 @@ def _r65_packet_parser() -> object:
                 )
             )
             or isinstance(node, ast.FunctionDef)
-            and node.name in {"parse_lines", "all_sessions_quiescent"}
+            and node.name
+            in {"parse_lines", "all_sessions_quiescent", "relevant_session_activity"}
         ):
             selected.append(node)
     namespace: dict[str, object] = {}
@@ -11693,6 +11893,8 @@ def _r65_packet_parser() -> object:
 
 
 class _R65ScriptedBroker(_R32ScriptedBroker):
+    source_classification = access.CurrentSourceClassification.EXACT_PR41
+
     def _consume_feature_capability(
         self, capability: object, action: access.FeatureValidationAction
     ) -> None:
@@ -11741,14 +11943,43 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
         self._consume_source_inspection_capability(_capability)
         self.calls.append(("current_source_inventory", None))
         return access.CurrentSourceInventoryResult(
-            access.CurrentSourceClassification.EXACT_PR41,
+            self.source_classification,
             access.SourceInventoryResult(
-                len(restore_manifest.entries),
-                len(restore_manifest.entries),
+                len(
+                    restore_manifest.entries
+                    if self.source_classification
+                    is access.CurrentSourceClassification.EXACT_PR41
+                    else candidate_manifest.entries
+                ),
+                len(
+                    restore_manifest.entries
+                    if self.source_classification
+                    is access.CurrentSourceClassification.EXACT_PR41
+                    else candidate_manifest.entries
+                ),
                 True,
                 0,
                 0,
             ),
+        )
+
+    def _restore_private_backup(
+        self, manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.InstallResult:
+        self._consume_capability(_capability, access.LifecycleAction.BACKUP_FALLBACK)
+        self.calls.append(("backup_fallback", None))
+        count = len(manifest.entries)
+        return access.InstallResult(True, count, count, True)
+
+    def _reconcile_private_backup(
+        self, manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.FallbackReconciliationResult:
+        self._consume_capability(
+            _capability, access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
+        )
+        self.calls.append(("backup_fallback_reconcile", None))
+        return access.FallbackReconciliationResult(
+            "reconciled", True, True, len(manifest.entries)
         )
 
     def _transfer_source_bundle(
@@ -11825,14 +12056,15 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
         return access.FeatureAbsenceResult(False)
 
 
-def _r65_advance_to_live() -> tuple[
+def _r65_advance_to_live(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> tuple[
     access.RefreshStatusLiveValidationController,
     _R65ScriptedBroker,
     access.SourceBundle,
     access.SourceBundle,
 ]:
-    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
-    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+    r64, restore = r65_bundles
     broker = _R65ScriptedBroker()
     broker._durable_lifecycle_test = True
     controller = access.RefreshStatusLiveValidationController(broker)
@@ -11851,18 +12083,22 @@ def _r65_advance_to_live() -> tuple[
 
 def test_r65_c1_to_c6_exact_authorities_are_distinct_and_closed() -> None:
     candidate = _r30_manifest()
-    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
-    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+    r64 = _r65_exact_r64_manifest()
 
     assert candidate.authority_commit == access.PR45_CANDIDATE_COMMIT
     assert candidate.authority_tree == access.PR45_CANDIDATE_TREE
-    assert restore.manifest.authority_commit == access.PR41_RESTORE_COMMIT
-    assert restore.manifest.authority_tree == access.PR41_RESTORE_TREE
-    access.validate_source_bundle(r64)
-    access.validate_source_bundle(restore)
-    assert r64.manifest.state is access.SourceState.R64_RUNTIME
-    assert restore.manifest.state is access.SourceState.RESTORE
-    assert r64.manifest != restore.manifest
+    assert access.PR41_RESTORE_COMMIT == "4f73a9b008dcb89134bc41001c486f06d6056867"
+    assert access.PR41_RESTORE_TREE == "463ed8553da01eae591de611e76e45392ad9e7bf"
+    access.validate_source_manifest(r64)
+    assert len(r64.entries) == 37
+    assert sum(item.size for item in r64.entries) == 835324
+    assert r64.authority_commit == access.R64_RUNTIME_COMMIT
+    assert r64.authority_tree == access.R64_RUNTIME_TREE
+    assert r64.state is access.SourceState.R64_RUNTIME
+    assert (
+        access._source_manifest_digest(r64.entries)
+        == "0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb"
+    )
     assert set(access.SourceState) == {
         access.SourceState.CANDIDATE,
         access.SourceState.RESTORE,
@@ -11870,7 +12106,7 @@ def test_r65_c1_to_c6_exact_authorities_are_distinct_and_closed() -> None:
     }
     wrong = access.SourceManifest(
         access.SourceState.R64_RUNTIME,
-        (replace(r64.manifest.entries[0], sha256="0" * 64),) + r64.manifest.entries[1:],
+        (replace(r64.entries[0], sha256="0" * 64),) + r64.entries[1:],
     )
     with pytest.raises(access.SourceBundleError, match="AUTHORITY"):
         access.validate_source_manifest(wrong)
@@ -11939,6 +12175,7 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
     parser = _r65_packet_parser()
     parse_lines = parser["parse_lines"]
     all_sessions_quiescent = parser["all_sessions_quiescent"]
+    relevant_session_activity = parser["relevant_session_activity"]
     first = "tuya-ble-session-" + "g" * 16
     prefix = "2026-01-01 [custom_components.tuya_ble.tuya_ble.tuya_ble] " + first + ": "
     identity, counts, _events = parse_lines(
@@ -11977,6 +12214,12 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
             prefix + "Disconnected from device; synthetic\n",
         ]
     )
+    assert relevant_session_activity([prefix + "Connecting; synthetic\n"])
+    assert not relevant_session_activity(["synthetic unrelated log line\n"])
+    assert "stream.establish_boundary()" in access._REMOTE_REFRESH_STATUS_PROGRAM
+    assert "state(connection_id).get('state') != 'off'" in (
+        access._REMOTE_REFRESH_STATUS_PROGRAM
+    )
     cold = access.RefreshPressResult(
         True, access.RefreshPacketCounts(1, 1, 1, 0, 0), True
     )
@@ -12001,8 +12244,10 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
     assert result.passed
 
 
-def test_r65_c14_to_c19_two_press_operation_and_exact_restore() -> None:
-    controller, broker, _r64, restore = _r65_advance_to_live()
+def test_r65_c14_to_c19_two_press_operation_and_exact_restore(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, restore = _r65_advance_to_live(r65_bundles)
     result = controller.run_s1_refresh_status_live_validation()
     with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
         controller.run_s1_refresh_status_live_validation()
@@ -12026,8 +12271,10 @@ def test_r65_c14_to_c19_two_press_operation_and_exact_restore() -> None:
     ]
 
 
-def test_r65_c15_c16_c20_ambiguous_live_operation_cannot_be_replayed() -> None:
-    controller, broker, _r64, restore = _r65_advance_to_live()
+def test_r65_c15_c16_c20_ambiguous_live_operation_cannot_be_replayed(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, restore = _r65_advance_to_live(r65_bundles)
 
     def fail_once(*, _capability: object = None) -> object:
         broker._consume_feature_capability(
@@ -12041,21 +12288,24 @@ def test_r65_c15_c16_c20_ambiguous_live_operation_cannot_be_replayed() -> None:
     controller.close()
     replacement = _R65ScriptedBroker()
     replacement._durable_lifecycle_test = True
+    replacement.source_classification = access.CurrentSourceClassification.EXACT_R64
     reconstructed = access.RefreshStatusLiveValidationController(replacement)
 
     assert result.ambiguous
     assert result.failure_class is access.RefreshStatusFailureClass.AMBIGUOUS
     with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
         reconstructed.run_s1_refresh_status_live_validation()
+    reconstructed.reconcile_interrupted_source(_r64.manifest, restore.manifest)
     reconstructed.stage_restore(restore)
     assert [name for name, _detail in broker.calls].count("live_validation") == 1
     assert not any(name == "live_validation" for name, _detail in replacement.calls)
     reconstructed.close()
 
 
-def test_r65_c20_interrupted_activation_restart_is_restore_only() -> None:
-    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
-    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+def test_r65_c20_interrupted_activation_restart_is_restore_only(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    r64, restore = r65_bundles
     broker = _R65ScriptedBroker()
     broker._durable_lifecycle_test = True
     controller = access.RefreshStatusLiveValidationController(broker)
@@ -12075,9 +12325,11 @@ def test_r65_c20_interrupted_activation_restart_is_restore_only() -> None:
 
     replacement = _R65ScriptedBroker()
     replacement._durable_lifecycle_test = True
+    replacement.source_classification = access.CurrentSourceClassification.EXACT_R64
     reconstructed = access.RefreshStatusLiveValidationController(replacement)
     with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
         reconstructed.restart_for_r64()
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
     reconstructed.stage_restore(restore)
 
     assert [name for name, _detail in broker.calls].count("restart") == 1
@@ -12085,8 +12337,122 @@ def test_r65_c20_interrupted_activation_restart_is_restore_only() -> None:
     reconstructed.close()
 
 
-def test_r65_c20_restoration_and_final_proof_survive_reconstruction() -> None:
-    controller, _broker, _r64, restore = _r65_advance_to_live()
+@pytest.mark.parametrize(
+    "action",
+    (
+        access.FeatureValidationAction.R64_TRANSFER,
+        access.FeatureValidationAction.R64_INSTALL,
+        access.FeatureValidationAction.RESTORE_TRANSFER,
+        access.FeatureValidationAction.RESTORE_INSTALL,
+    ),
+)
+def test_r65_c20_source_mutation_interruption_reconciles_without_replay(
+    action: access.FeatureValidationAction,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    r64, restore = r65_bundles
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    controller = access.RefreshStatusLiveValidationController(broker)
+    controller.inspect_initial_source(r64.manifest, restore.manifest)
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    if action is not access.FeatureValidationAction.R64_TRANSFER:
+        controller.stage_r64(r64)
+    if action not in {
+        access.FeatureValidationAction.R64_TRANSFER,
+        access.FeatureValidationAction.R64_INSTALL,
+    }:
+        controller.install_r64(r64.manifest)
+        controller.verify_r64_inventory(r64.manifest)
+        controller.check_r64_core()
+        controller.restart_for_r64()
+        controller.await_r64_readiness()
+        controller.verify_r64_inventory(r64.manifest)
+        controller.run_s1_refresh_status_live_validation()
+    if action is access.FeatureValidationAction.RESTORE_INSTALL:
+        controller.stage_restore(restore)
+    controller._begin(action)
+    controller._mark(action, "dispatch_started")
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.source_classification = access.CurrentSourceClassification.EXACT_R64
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    assert reconstructed.state is access.FeatureValidationState.RESTORE_REQUIRED
+    classification = reconstructed.reconcile_interrupted_source(
+        r64.manifest, restore.manifest
+    )
+    assert classification.classification is access.CurrentSourceClassification.EXACT_R64
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
+        getattr(
+            reconstructed,
+            {
+                access.FeatureValidationAction.R64_TRANSFER: "stage_r64",
+                access.FeatureValidationAction.R64_INSTALL: "install_r64",
+                access.FeatureValidationAction.RESTORE_TRANSFER: "stage_restore",
+                access.FeatureValidationAction.RESTORE_INSTALL: "restore_pr41",
+            }[action],
+        )(
+            {
+                access.FeatureValidationAction.R64_TRANSFER: r64,
+                access.FeatureValidationAction.R64_INSTALL: r64.manifest,
+                access.FeatureValidationAction.RESTORE_TRANSFER: restore,
+                access.FeatureValidationAction.RESTORE_INSTALL: restore.manifest,
+            }[action]
+        )
+    if action in {
+        access.FeatureValidationAction.RESTORE_TRANSFER,
+        access.FeatureValidationAction.RESTORE_INSTALL,
+    }:
+        reconstructed.restore_private_backup_fallback(restore.manifest)
+        assert [name for name, _detail in replacement.calls].count(
+            "backup_fallback"
+        ) == 1
+    else:
+        reconstructed.stage_restore(restore)
+        reconstructed.restore_pr41(restore.manifest)
+    assert reconstructed.state is access.FeatureValidationState.PR41_RESTORED
+    reconstructed.close()
+
+
+def test_r65_c20_interrupted_backup_fallback_uses_reconciliation_only(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    r64, restore = r65_bundles
+    controller, _broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.run_s1_refresh_status_live_validation()
+    controller.close()
+
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    broker.source_classification = access.CurrentSourceClassification.EXACT_R64
+    reconstructed = access.RefreshStatusLiveValidationController(broker)
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed._begin(access.FeatureValidationAction.BACKUP_FALLBACK)
+    reconstructed._mark(
+        access.FeatureValidationAction.BACKUP_FALLBACK, "dispatch_started"
+    )
+    reconstructed.close()
+
+    final_broker = _R65ScriptedBroker()
+    final_broker._durable_lifecycle_test = True
+    final = access.RefreshStatusLiveValidationController(final_broker)
+    final.reconcile_private_backup_fallback(restore.manifest)
+
+    assert final.state is access.FeatureValidationState.PR41_RESTORED
+    assert not any(name == "backup_fallback" for name, _ in final_broker.calls)
+    assert [name for name, _ in final_broker.calls].count(
+        "backup_fallback_reconcile"
+    ) == 1
+    final.close()
+
+
+def test_r65_c20_restoration_and_final_proof_survive_reconstruction(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, _r64, restore = _r65_advance_to_live(r65_bundles)
     controller.run_s1_refresh_status_live_validation()
     controller.stage_restore(restore)
     controller.restore_pr41(restore.manifest)
