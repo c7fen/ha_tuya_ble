@@ -348,6 +348,7 @@ class FeatureValidationAction(StrEnum):
     R64_READINESS = "r64_readiness"
     R64_POST_RESTART_INVENTORY = "r64_post_restart_inventory"
     LIVE_VALIDATION = "live_validation"
+    HARDWARE_OBSERVATION = "hardware_observation"
     RESTORE_TRANSFER = "restore_transfer"
     RESTORE_INSTALL = "restore_install"
     BACKUP_FALLBACK = "backup_fallback"
@@ -1420,6 +1421,90 @@ class RefreshSessionProvenance(StrEnum):
 
     NEW_SESSION = "NEW_SESSION"
     REUSED_SESSION = "REUSED_SESSION"
+
+
+class OwnerRefreshTrialKind(StrEnum):
+    """The two fixed classes in the owner-operated R66 trial plan."""
+
+    COLD = "COLD"
+    RETAINED = "RETAINED"
+
+
+class OwnerRefreshFailureClass(StrEnum):
+    """Bounded outcomes for one observer-only owner Refresh trial."""
+
+    OWNERSHIP_NOT_PROVEN = "OWNERSHIP_NOT_PROVEN"
+    PRECONDITION_NOT_PROVEN = "PRECONDITION_NOT_PROVEN"
+    LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
+    LOG_BOUNDARY_NOT_ESTABLISHED = "LOG_BOUNDARY_NOT_ESTABLISHED"
+    OWNER_PRESS_NOT_OBSERVED = "OWNER_PRESS_NOT_OBSERVED"
+    OVERLAPPING_REFRESH = "OVERLAPPING_REFRESH"
+    PROVENANCE_MISMATCH = "PROVENANCE_MISMATCH"
+    REQUEST_FAILED = "REQUEST_FAILED"
+    PROTOCOL_WRITE_DETECTED = "PROTOCOL_WRITE_DETECTED"
+    HOLD_NOT_ACTIVE = "HOLD_NOT_ACTIVE"
+    RELEASE_NOT_OBSERVED = "RELEASE_NOT_OBSERVED"
+    AUTOMATIC_RECONNECT_OBSERVED = "AUTOMATIC_RECONNECT_OBSERVED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+class HardwareObservationPhase(StrEnum):
+    """Durable R66 owner-operated observation progress."""
+
+    ACTIVE = "ACTIVE"
+    COMPLETE = "COMPLETE"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshDpMetadata:
+    """Value-free metadata observed for one datapoint identifier."""
+
+    dp_id: int
+    types: tuple[str, ...]
+    encoded_lengths: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshTrialResult:
+    """One immutable, identifier-free owner-operated Refresh observation."""
+
+    trial_kind: OwnerRefreshTrialKind
+    owner_press_observed: bool
+    request_completed: bool
+    session_provenance: RefreshSessionProvenance | None
+    counts: RefreshPacketCounts
+    reported_dp_ids: tuple[int, ...]
+    per_dp: tuple[OwnerRefreshDpMetadata, ...]
+    current_session_provenance: bool | None
+    retained_confirmation_observed: bool
+    hold_active_after_refresh: bool | None
+    ambiguous: bool
+    failure_class: OwnerRefreshFailureClass | None
+
+    @property
+    def zero_write(self) -> bool:
+        """Return whether no outbound datapoint or other packet was observed."""
+        return self.counts.datapoint == 0 and self.counts.other == 0
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshReleaseResult:
+    """One identifier-free read-only Hold expiry observation."""
+
+    normal_release_observed: bool
+    automatic_reconnect_observed: bool
+    ambiguous: bool
+    failure_class: OwnerRefreshFailureClass | None
+
+
+@dataclass(frozen=True, slots=True)
+class DurableHardwareObservation:
+    """The bounded R66 hardware evidence retained by the feature journal."""
+
+    phase: HardwareObservationPhase
+    trials: tuple[OwnerRefreshTrialResult, ...]
+    releases: tuple[OwnerRefreshReleaseResult, ...]
+    zero_write_aggregate: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -4050,6 +4135,328 @@ def _parse_durable_refresh_live_result(
     return result
 
 
+_OWNER_REFRESH_TYPES = frozenset(
+    {
+        "DT_RAW",
+        "DT_BOOL",
+        "DT_VALUE",
+        "DT_STRING",
+        "DT_ENUM",
+        "DT_BITMAP",
+    }
+)
+
+
+def _owner_refresh_trial_record(
+    result: OwnerRefreshTrialResult,
+) -> dict[str, object]:
+    """Encode one value-free R66 trial row."""
+    return {
+        "trial_kind": result.trial_kind.value,
+        "owner_press_observed": result.owner_press_observed,
+        "request_completed": result.request_completed,
+        "session_provenance": (
+            None
+            if result.session_provenance is None
+            else result.session_provenance.value
+        ),
+        "counts": asdict(result.counts),
+        "reported_dp_ids": list(result.reported_dp_ids),
+        "per_dp": [
+            {
+                "dp_id": item.dp_id,
+                "types": list(item.types),
+                "encoded_lengths": list(item.encoded_lengths),
+            }
+            for item in result.per_dp
+        ],
+        "current_session_provenance": result.current_session_provenance,
+        "retained_confirmation_observed": result.retained_confirmation_observed,
+        "hold_active_after_refresh": result.hold_active_after_refresh,
+        "ambiguous": result.ambiguous,
+        "failure_class": (
+            None if result.failure_class is None else result.failure_class.value
+        ),
+    }
+
+
+def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult:
+    """Strictly decode one bounded owner-operated Refresh result."""
+    fields = {
+        "trial_kind",
+        "owner_press_observed",
+        "request_completed",
+        "session_provenance",
+        "counts",
+        "reported_dp_ids",
+        "per_dp",
+        "current_session_provenance",
+        "retained_confirmation_observed",
+        "hold_active_after_refresh",
+        "ambiguous",
+        "failure_class",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("owner_refresh_trial")
+
+    def optional_bool(name: str) -> bool | None:
+        item = value[name]
+        if item is not None and type(item) is not bool:
+            raise ValueError("owner_refresh_trial")
+        return item
+
+    count_names = ("device_info", "pair", "device_status", "datapoint", "other")
+    counts_value = value["counts"]
+    if not isinstance(counts_value, dict) or set(counts_value) != set(count_names):
+        raise ValueError("owner_refresh_trial")
+    counts = RefreshPacketCounts(*(_count(counts_value[name]) for name in count_names))
+    if any(item > 8 for item in asdict(counts).values()):
+        raise ValueError("owner_refresh_trial")
+
+    ids = value["reported_dp_ids"]
+    rows = value["per_dp"]
+    if (
+        not isinstance(ids, list)
+        or len(ids) > 256
+        or any(type(item) is not int or not 0 <= item <= 255 for item in ids)
+        or ids != sorted(set(ids))
+        or not isinstance(rows, list)
+        or len(rows) != len(ids)
+    ):
+        raise ValueError("owner_refresh_trial")
+    parsed_rows: list[OwnerRefreshDpMetadata] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+            "dp_id",
+            "types",
+            "encoded_lengths",
+        }:
+            raise ValueError("owner_refresh_trial")
+        types = row["types"]
+        lengths = row["encoded_lengths"]
+        if (
+            type(row["dp_id"]) is not int
+            or row["dp_id"] not in ids
+            or not isinstance(types, list)
+            or not types
+            or any(item not in _OWNER_REFRESH_TYPES for item in types)
+            or types != sorted(set(types))
+            or not isinstance(lengths, list)
+            or not lengths
+            or any(type(item) is not int or not 0 <= item <= 65535 for item in lengths)
+            or lengths != sorted(set(lengths))
+        ):
+            raise ValueError("owner_refresh_trial")
+        parsed_rows.append(
+            OwnerRefreshDpMetadata(row["dp_id"], tuple(types), tuple(lengths))
+        )
+    if [row.dp_id for row in parsed_rows] != ids:
+        raise ValueError("owner_refresh_trial")
+    try:
+        provenance = (
+            None
+            if value["session_provenance"] is None
+            else RefreshSessionProvenance(value["session_provenance"])
+        )
+        failure = (
+            None
+            if value["failure_class"] is None
+            else OwnerRefreshFailureClass(value["failure_class"])
+        )
+        result = OwnerRefreshTrialResult(
+            OwnerRefreshTrialKind(value["trial_kind"]),
+            _bool(value["owner_press_observed"]),
+            _bool(value["request_completed"]),
+            provenance,
+            counts,
+            tuple(ids),
+            tuple(parsed_rows),
+            optional_bool("current_session_provenance"),
+            _bool(value["retained_confirmation_observed"]),
+            optional_bool("hold_active_after_refresh"),
+            _bool(value["ambiguous"]),
+            failure,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("owner_refresh_trial") from None
+    expected_provenance = {
+        OwnerRefreshTrialKind.COLD: RefreshSessionProvenance.NEW_SESSION,
+        OwnerRefreshTrialKind.RETAINED: RefreshSessionProvenance.REUSED_SESSION,
+    }[result.trial_kind]
+    if (
+        not result.owner_press_observed
+        and (
+            result.request_completed
+            or result.session_provenance is not None
+            or result.reported_dp_ids
+        )
+        or result.request_completed
+        and result.session_provenance is None
+        or set(result.reported_dp_ids) != {row.dp_id for row in result.per_dp}
+        or result.failure_class is OwnerRefreshFailureClass.PROVENANCE_MISMATCH
+        and result.session_provenance is expected_provenance
+        or result.failure_class is None
+        and (
+            not result.owner_press_observed
+            or not result.request_completed
+            or result.session_provenance is not expected_provenance
+            or not result.zero_write
+            or result.current_session_provenance is not True
+            or result.hold_active_after_refresh is not True
+            or result.ambiguous
+        )
+    ):
+        raise ValueError("owner_refresh_trial")
+    return result
+
+
+def _owner_refresh_release_record(
+    result: OwnerRefreshReleaseResult,
+) -> dict[str, object]:
+    return {
+        "normal_release_observed": result.normal_release_observed,
+        "automatic_reconnect_observed": result.automatic_reconnect_observed,
+        "ambiguous": result.ambiguous,
+        "failure_class": (
+            None if result.failure_class is None else result.failure_class.value
+        ),
+    }
+
+
+def _parse_owner_refresh_release_payload(value: object) -> OwnerRefreshReleaseResult:
+    fields = {
+        "normal_release_observed",
+        "automatic_reconnect_observed",
+        "ambiguous",
+        "failure_class",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("owner_refresh_release")
+    try:
+        failure = (
+            None
+            if value["failure_class"] is None
+            else OwnerRefreshFailureClass(value["failure_class"])
+        )
+        result = OwnerRefreshReleaseResult(
+            _bool(value["normal_release_observed"]),
+            _bool(value["automatic_reconnect_observed"]),
+            _bool(value["ambiguous"]),
+            failure,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("owner_refresh_release") from None
+    if result.failure_class is None and (
+        not result.normal_release_observed
+        or result.automatic_reconnect_observed
+        or result.ambiguous
+    ):
+        raise ValueError("owner_refresh_release")
+    return result
+
+
+def _parse_owner_refresh_trial_result(
+    private_output: bytes,
+) -> OwnerRefreshTrialResult:
+    try:
+        return _parse_owner_refresh_trial_payload(_exact_payload(private_output))
+    except (SessionBrokerError, TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+
+
+def _parse_owner_refresh_release_result(
+    private_output: bytes,
+) -> OwnerRefreshReleaseResult:
+    try:
+        return _parse_owner_refresh_release_payload(_exact_payload(private_output))
+    except (SessionBrokerError, TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+
+
+_R66_TRIAL_SEQUENCE = (
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.RETAINED,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.RETAINED,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.RETAINED,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.RETAINED,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.RETAINED,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.COLD,
+    OwnerRefreshTrialKind.COLD,
+)
+_R66_RELEASE_AFTER_TRIAL_COUNTS = (2, 4, 6, 8, 10, 11, 12, 13, 14, 15)
+
+
+def _parse_hardware_observation(value: object) -> DurableHardwareObservation:
+    """Validate and project the optional bounded R66 journal section."""
+    if not isinstance(value, dict) or set(value) != {
+        "phase",
+        "trials",
+        "releases",
+        "zero_write_aggregate",
+        "pending",
+    }:
+        raise ValueError("hardware_observation")
+    trials_value = value["trials"]
+    releases_value = value["releases"]
+    if (
+        not isinstance(trials_value, list)
+        or len(trials_value) > len(_R66_TRIAL_SEQUENCE)
+        or not isinstance(releases_value, list)
+        or len(releases_value) > len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+    ):
+        raise ValueError("hardware_observation")
+    trials = tuple(_parse_owner_refresh_trial_payload(item) for item in trials_value)
+    releases = tuple(
+        _parse_owner_refresh_release_payload(item) for item in releases_value
+    )
+    if tuple(item.trial_kind for item in trials) != _R66_TRIAL_SEQUENCE[: len(trials)]:
+        raise ValueError("hardware_observation")
+    completed_release_points = tuple(
+        point for point in _R66_RELEASE_AFTER_TRIAL_COUNTS if point <= len(trials)
+    )
+    if len(releases) > len(completed_release_points):
+        raise ValueError("hardware_observation")
+    pending = value["pending"]
+    if pending is not None:
+        if not isinstance(pending, dict) or set(pending) != {"operation", "ordinal"}:
+            raise ValueError("hardware_observation")
+        operation = pending["operation"]
+        ordinal = pending["ordinal"]
+        if (
+            operation not in {"trial", "release"}
+            or type(ordinal) is not int
+            or ordinal < 1
+            or operation == "trial"
+            and ordinal != len(trials) + 1
+            or operation == "release"
+            and ordinal != len(releases) + 1
+        ):
+            raise ValueError("hardware_observation")
+    try:
+        phase = HardwareObservationPhase(value["phase"])
+        zero_write = _bool(value["zero_write_aggregate"])
+    except (TypeError, ValueError):
+        raise ValueError("hardware_observation") from None
+    if (
+        zero_write is not all(item.zero_write for item in trials)
+        or phase is HardwareObservationPhase.COMPLETE
+        and (
+            len(trials) != len(_R66_TRIAL_SEQUENCE)
+            or len(releases) != len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+            or pending is not None
+        )
+    ):
+        raise ValueError("hardware_observation")
+    return DurableHardwareObservation(phase, trials, releases, zero_write)
+
+
 class _DurableFeatureValidationJournal:
     """Small durable ledger for the separate exact-R64 lifecycle."""
 
@@ -4069,7 +4476,8 @@ class _DurableFeatureValidationJournal:
             "source_classification",
         }
     )
-    _FIELDS = _V1_FIELDS | {"live_result", "final_restore_complete"}
+    _V2_FIELDS = _V1_FIELDS | {"live_result", "final_restore_complete"}
+    _FIELDS = _V2_FIELDS | {"hardware_observation"}
 
     def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
         self._directory = _fixed_lifecycle_state_root()
@@ -4257,7 +4665,8 @@ class _DurableFeatureValidationJournal:
         schema_version = record.get("schema_version")
         expected_fields = {
             1: cls._V1_FIELDS,
-            2: cls._FIELDS,
+            2: cls._V2_FIELDS,
+            3: cls._FIELDS,
         }.get(schema_version)
         live_result_valid = schema_version == 1
         if schema_version == 2:
@@ -4277,6 +4686,35 @@ class _DurableFeatureValidationJournal:
                     isinstance(operations, dict)
                     and operations.get(FeatureValidationAction.LIVE_VALIDATION.value)
                     in {"ambiguous", "result_durable", "transition_committed"}
+                )
+        hardware_observation_valid = schema_version in {1, 2}
+        if schema_version == 3:
+            live_result = record.get("live_result")
+            try:
+                parsed_live_result = (
+                    None
+                    if live_result is None
+                    else _parse_durable_refresh_live_result(live_result)
+                )
+                hardware_observation = record.get("hardware_observation")
+                parsed_hardware_observation = (
+                    None
+                    if hardware_observation is None
+                    else _parse_hardware_observation(hardware_observation)
+                )
+            except (SessionBrokerError, TypeError, ValueError):
+                parsed_live_result = False
+                parsed_hardware_observation = False
+            live_result_valid = parsed_live_result is not False
+            hardware_observation_valid = parsed_hardware_observation is not False
+            if hardware_observation is not None:
+                operations = record.get("operations")
+                hardware_observation_valid = hardware_observation_valid and (
+                    isinstance(operations, dict)
+                    and operations.get(
+                        FeatureValidationAction.HARDWARE_OBSERVATION.value
+                    )
+                    == "transition_committed"
                 )
         final_restore_complete = record.get("final_restore_complete")
         backup_valid = backup is None or (
@@ -4345,7 +4783,8 @@ class _DurableFeatureValidationJournal:
             )
             or not backup_valid
             or not live_result_valid
-            or schema_version == 2
+            or not hardware_observation_valid
+            or schema_version in {2, 3}
             and type(final_restore_complete) is not bool
             or record.get("source_classification")
             not in {
@@ -4360,10 +4799,10 @@ class _DurableFeatureValidationJournal:
                 record.get("terminal") is None
                 or record.get("terminal") != record.get("state")
             )
-            or schema_version == 2
+            or schema_version in {2, 3}
             and final_restore_complete is True
             and not cls._final_restore_complete(record)
-            or schema_version == 2
+            or schema_version in {2, 3}
             and record.get("active") is False
             and record.get("terminal") == FeatureValidationState.COMPLETE_NORMAL.value
             and final_restore_complete is not True
@@ -4443,6 +4882,19 @@ class _DurableFeatureValidationJournal:
     def live_result(self) -> DurableRefreshStatusLiveResult | None:
         value = self._record.get("live_result")
         return None if value is None else _parse_durable_refresh_live_result(value)
+
+    @property
+    def hardware_observation(self) -> DurableHardwareObservation | None:
+        value = self._record.get("hardware_observation")
+        return None if value is None else _parse_hardware_observation(value)
+
+    @property
+    def hardware_pending(self) -> dict[str, object] | None:
+        value = self._record.get("hardware_observation")
+        if not isinstance(value, dict):
+            return None
+        pending = value.get("pending")
+        return None if pending is None else copy.deepcopy(pending)
 
     @property
     def live_result_durability(self) -> FeatureLiveResultDurabilityClassification:
@@ -4554,6 +5006,139 @@ class _DurableFeatureValidationJournal:
             record["live_result"] = _durable_refresh_live_result_record(durable)
 
         self._mutate(mutate)
+
+    def begin_hardware_observation(self) -> None:
+        """Create the sole bounded R66 evidence section without changing state."""
+
+        def mutate(record: dict[str, object]) -> None:
+            if (
+                record["operations"].get(
+                    FeatureValidationAction.HARDWARE_OBSERVATION.value
+                )
+                != "dispatch_started"
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            if record.get("hardware_observation") is not None:
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_ALREADY_STARTED"
+                ) from None
+            if record["schema_version"] == 1:
+                record["live_result"] = None
+                record["final_restore_complete"] = False
+            if record["schema_version"] in {1, 2}:
+                record["schema_version"] = 3
+                record["hardware_observation"] = None
+            record["hardware_observation"] = {
+                "phase": HardwareObservationPhase.ACTIVE.value,
+                "trials": [],
+                "releases": [],
+                "zero_write_aggregate": True,
+                "pending": None,
+            }
+            record["operations"][
+                FeatureValidationAction.HARDWARE_OBSERVATION.value
+            ] = "transition_committed"
+
+        self._mutate(mutate)
+
+    def begin_hardware_item(self, operation: str, ordinal: int) -> None:
+        """Durably reserve one external observation before its bounded wait."""
+
+        def mutate(record: dict[str, object]) -> None:
+            hardware = record.get("hardware_observation")
+            if (
+                not isinstance(hardware, dict)
+                or hardware.get("phase") != HardwareObservationPhase.ACTIVE.value
+                or hardware.get("pending") is not None
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            hardware["pending"] = {"operation": operation, "ordinal": ordinal}
+
+        self._mutate(mutate)
+
+    def record_hardware_trial(self, result: OwnerRefreshTrialResult) -> None:
+        """Append exactly one sanitized owner-operated trial row."""
+
+        def mutate(record: dict[str, object]) -> None:
+            hardware = record.get("hardware_observation")
+            if not isinstance(hardware, dict):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            trials = hardware.get("trials")
+            if (
+                not isinstance(trials, list)
+                or len(trials) >= len(_R66_TRIAL_SEQUENCE)
+                or hardware.get("pending")
+                != {"operation": "trial", "ordinal": len(trials) + 1}
+                or result.trial_kind is not _R66_TRIAL_SEQUENCE[len(trials)]
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            trials.append(_owner_refresh_trial_record(result))
+            hardware["zero_write_aggregate"] = (
+                hardware["zero_write_aggregate"] and result.zero_write
+            )
+            hardware["pending"] = None
+
+        self._mutate(mutate)
+
+    def record_hardware_release(self, result: OwnerRefreshReleaseResult) -> None:
+        """Append one read-only release/no-reconnect result."""
+
+        def mutate(record: dict[str, object]) -> None:
+            hardware = record.get("hardware_observation")
+            if not isinstance(hardware, dict):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            releases = hardware.get("releases")
+            if (
+                not isinstance(releases, list)
+                or len(releases) >= len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+                or hardware.get("pending")
+                != {"operation": "release", "ordinal": len(releases) + 1}
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            releases.append(_owner_refresh_release_record(result))
+            hardware["pending"] = None
+
+        self._mutate(mutate)
+
+    def finish_hardware_observation(self) -> DurableHardwareObservation:
+        """Close the fixed 15-trial/10-release evidence sequence."""
+
+        def mutate(record: dict[str, object]) -> None:
+            hardware = record.get("hardware_observation")
+            if not isinstance(hardware, dict):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INCOMPLETE"
+                ) from None
+            parsed = _parse_hardware_observation(hardware)
+            if (
+                len(parsed.trials) != len(_R66_TRIAL_SEQUENCE)
+                or len(parsed.releases) != len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+                or hardware.get("pending") is not None
+            ):
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INCOMPLETE"
+                ) from None
+            hardware["phase"] = HardwareObservationPhase.COMPLETE.value
+
+        self._mutate(mutate)
+        result = self.hardware_observation
+        if result is None:
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INVALID"
+            ) from None
+        return result
 
     def restart_outcome(
         self, action: FeatureValidationAction
@@ -4694,7 +5279,7 @@ class _DurableFeatureValidationJournal:
             record["state"] = state.value
             record["terminal"] = state.value
             record["active"] = False
-            if record["schema_version"] == 2:
+            if record["schema_version"] in {2, 3}:
                 record["final_restore_complete"] = (
                     state is FeatureValidationState.COMPLETE_NORMAL
                 )
@@ -9489,10 +10074,10 @@ class LogWindow:
             raise LogBoundaryNotEstablished() from None
         self.established = True
 
-    def wait_for_refresh_terminal(self):
+    def wait_for_refresh_terminal(self, timeout_seconds=30):
         if not self.established or self.finish_attempted:
             raise ValueError('log_window')
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + timeout_seconds
         refresh_identity = None
         while time.monotonic() < deadline:
             if self.stream.overflow:
@@ -9671,6 +10256,256 @@ def parse_refresh_lifecycle(lines, required_identity=None):
     ):
         raise ValueError('refresh_lifecycle')
     return identity, counts, events, bound[0], bound[1], terminal
+
+DP_RE = re.compile(
+    r'^Received datapoint update, id: ([0-9]{1,3}), '
+    r'type: (DT_(?:RAW|BOOL|VALUE|STRING|ENUM|BITMAP)), length: ([0-9]{1,5})$'
+)
+
+def owner_press_event(value, entity_id):
+    if not isinstance(value, dict) or value.get('type') != 'event':
+        return False
+    event = value.get('event')
+    if not isinstance(event, dict) or event.get('event_type') != 'call_service':
+        return False
+    data = event.get('data')
+    if not isinstance(data, dict) or data.get('domain') != 'button' or data.get('service') != 'press':
+        return False
+    service_data = data.get('service_data')
+    target = data.get('target')
+    candidates = []
+    if isinstance(service_data, dict): candidates.append(service_data.get('entity_id'))
+    if isinstance(target, dict): candidates.append(target.get('entity_id'))
+    for candidate in candidates:
+        if candidate == entity_id:
+            return True
+        if isinstance(candidate, list) and candidate == [entity_id]:
+            return True
+    return False
+
+def wait_for_owner_press(ws, entity_id, timeout_seconds=60):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        ws.sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            value = ws.recv()
+        except socket.timeout:
+            break
+        if owner_press_event(value, entity_id):
+            ws.sock.settimeout(15)
+            return True
+    ws.sock.settimeout(15)
+    return False
+
+def discard_before_owner_lifecycle(log_stream):
+    getattr(log_stream, 'take_available')()
+
+def parse_owner_refresh_lifecycle(lines):
+    identity, counts, events, provenance, _ordinal, completed = parse_refresh_lifecycle(lines)
+    metadata = {}
+    inside = False
+    for raw in lines:
+        raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
+        match = LOG_RE.fullmatch(raw)
+        if not match or match.group(1) != identity:
+            continue
+        message = match.group(2)
+        if message == 'S1_REFRESH_ACCEPTED':
+            inside = True
+            continue
+        if inside and REFRESH_TERMINAL_RE.fullmatch(message):
+            break
+        if not inside:
+            continue
+        dp = DP_RE.fullmatch(message)
+        if dp:
+            identifier = int(dp.group(1)); length = int(dp.group(3))
+            if identifier > 255 or length > 65535:
+                raise ValueError('dp_metadata')
+            row = metadata.setdefault(identifier, {'types': set(), 'lengths': set()})
+            row['types'].add(dp.group(2)); row['lengths'].add(length)
+    rows = [
+        {'dp_id': identifier, 'types': sorted(metadata[identifier]['types']),
+         'encoded_lengths': sorted(metadata[identifier]['lengths'])}
+        for identifier in sorted(metadata)
+    ]
+    return identity, counts, events, provenance, completed, rows
+
+def resolve_owner_refresh_target(ws):
+    display = ws.command('config/entity_registry/list_for_display')
+    devices = ws.command('config/device_registry/list')
+    if not isinstance(display, dict) or not isinstance(display.get('entities'), list) or not isinstance(devices, list):
+        raise ValueError('registry')
+    entities = display['entities']
+    config_entries = http_json('/config/config_entries/entry?domain=tuya_ble')
+    if not isinstance(config_entries, list): raise ValueError('entries')
+    loaded = [item for item in config_entries if isinstance(item, dict) and item.get('state') == 'loaded' and isinstance(item.get('entry_id'), str)]
+    eligible = []
+    for item in sorted(loaded, key=lambda entry: entry['entry_id']):
+        diagnostic = http_json('/diagnostics/config_entry/' + item['entry_id'])
+        data = diagnostic.get('data') if isinstance(diagnostic, dict) else None
+        options = data.get('options') if isinstance(data, dict) else None
+        if isinstance(options, dict) and options.get('category') == 'jtmspro' and options.get('product_id') == 'xqeob8h6':
+            eligible.append((item['entry_id'], options))
+    if len(eligible) != 1: raise ValueError('ownership')
+    entry_id, options = eligible[0]
+    owned_devices = [item.get('id') for item in devices if (
+        isinstance(item, dict) and isinstance(item.get('id'), str)
+        and isinstance(item.get('config_entries'), list)
+        and entry_id in item['config_entries']
+    )]
+    if len(owned_devices) != 1: raise ValueError('ownership')
+    device_id = owned_devices[0]
+    buttons = entries_by_key(entities, device_id, 'button', 'refresh_status')
+    connections = entries_by_key(entities, device_id, 'binary_sensor', 'bluetooth_connection')
+    last_updates = entries_by_key(entities, device_id, 'sensor', 'last_status_update')
+    if len(buttons) != 1 or len(connections) != 1 or len(last_updates) != 1: raise ValueError('ownership')
+    button_id = buttons[0]['ei']; connection_id = connections[0]['ei']
+    if state(button_id).get('state') == 'unavailable': raise ValueError('ownership')
+    hold = options.get('on_demand_connection_hold_time', 15)
+    if options.get('connection_mode') != 'on_demand' or options.get('ble_control_enabled') is not True or type(hold) is not int or not 15 <= hold <= 105:
+        raise ValueError('precondition')
+    dp_entities = {}
+    for dp, domain, key in ((8, 'sensor', 'battery'), (33, 'switch', 'automatic_lock'), (34, 'select', 'unlock_switch'), (36, 'number', 'auto_lock_time')):
+        matches = entries_by_key(entities, device_id, domain, key)
+        if len(matches) == 1: dp_entities[dp] = matches[0]['ei']
+    return button_id, connection_id, last_updates[0]['ei'], dp_entities, hold
+
+def empty_owner_trial(kind):
+    return {
+        'trial_kind': kind, 'owner_press_observed': False,
+        'request_completed': False, 'session_provenance': None,
+        'counts': dict(EMPTY_COUNTS), 'reported_dp_ids': [], 'per_dp': [],
+        'current_session_provenance': None,
+        'retained_confirmation_observed': False,
+        'hold_active_after_refresh': None, 'ambiguous': False,
+        'failure_class': None,
+    }
+
+def observe_owner_trial(kind):
+    result = empty_owner_trial(kind); ws = stream = window = None; prior_level = None
+    try:
+        ws = WebSocket()
+        button_id, connection_id, last_id, dp_entities, _hold = resolve_owner_refresh_target(ws)
+        expected_state = 'off' if kind == 'COLD' else 'on'
+        if state(connection_id).get('state') != expected_state:
+            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        info = ws.command('logger/log_info')
+        levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
+        if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
+            result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
+        prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
+        ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        ws.command('subscribe_events', event_type='call_service')
+        stream=LogStream(); window = LogWindow(stream, ws); window.start()
+        before_last = state(last_id).get('state')
+        before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
+        discard_before_owner_lifecycle(stream)
+        if not wait_for_owner_press(ws, button_id, 60):
+            result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
+        result['owner_press_observed'] = True
+        try:
+            window.wait_for_refresh_terminal(30)
+            lines = window.finish(); window = None
+            _identity, counts, _events, provenance, completed, rows = parse_owner_refresh_lifecycle(lines)
+        except ValueError as error:
+            if str(error) == 'refresh_lifecycle':
+                result['failure_class'] = 'OVERLAPPING_REFRESH'; return result
+            raise
+        result['counts'] = counts
+        result['session_provenance'] = provenance
+        result['request_completed'] = completed
+        result['per_dp'] = rows
+        result['reported_dp_ids'] = [row['dp_id'] for row in rows]
+        result['current_session_provenance'] = state(last_id).get('state') != before_last if completed else None
+        result['retained_confirmation_observed'] = any(stamp(state(entity)) != before_dp[dp] for dp, entity in dp_entities.items())
+        result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
+        expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
+        if counts['datapoint'] or counts['other']:
+            result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
+        elif provenance != expected:
+            result['failure_class'] = 'PROVENANCE_MISMATCH'
+        elif not completed or counts['device_status'] != 1 or not rows or result['current_session_provenance'] is not True:
+            result['failure_class'] = 'REQUEST_FAILED'
+        elif result['hold_active_after_refresh'] is not True:
+            result['failure_class'] = 'HOLD_NOT_ACTIVE'
+        return result
+    except LogBoundaryNotEstablished:
+        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
+    except ValueError as error:
+        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+        result['ambiguous'] = result['failure_class'] == 'AMBIGUOUS'; return result
+    except Exception:
+        result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'; return result
+    finally:
+        if window is not None and window.established and not window.finish_attempted:
+            try: window.finish()
+            except Exception: result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'
+        if stream is not None: stream.close()
+        if ws is not None:
+            if prior_level is not None:
+                try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                except Exception: result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'
+            ws.close()
+
+def observe_release():
+    result = {'normal_release_observed': False, 'automatic_reconnect_observed': False,
+              'ambiguous': False, 'failure_class': None}
+    ws = stream = window = None; prior_level = None
+    try:
+        ws = WebSocket()
+        _button_id, connection_id, _last_id, _dp_entities, hold = resolve_owner_refresh_target(ws)
+        if state(connection_id).get('state') != 'on':
+            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        info = ws.command('logger/log_info')
+        levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
+        if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
+            result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
+        prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
+        ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        stream=LogStream(); window = LogWindow(stream, ws); window.start()
+        time.sleep(hold + 5)
+        lines = window.finish(); window = None
+        records = []
+        for raw in lines:
+            match = LOG_RE.fullmatch(re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n')))
+            if match: records.append(match.groups())
+        released = {
+            identity for identity, _message in records
+            if any(message.startswith(prefix) for record_identity, message in records if record_identity == identity for prefix in ('Disconnecting', 'Disconnected from device;'))
+        }
+        released = {identity for identity in released if any(record_identity == identity and message.startswith('Disconnecting') for record_identity, message in records) and any(record_identity == identity and message.startswith('Disconnected from device;') for record_identity, message in records)}
+        result['normal_release_observed'] = len(released) == 1 and state(connection_id).get('state') == 'off'
+        identity = next(iter(released)) if len(released) == 1 else None
+        window = LogWindow(stream, ws); window.start(); time.sleep(5)
+        post = window.finish(); window = None
+        post_records = []
+        for raw in post:
+            match = LOG_RE.fullmatch(re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n')))
+            if match: post_records.append(match.groups())
+        result['automatic_reconnect_observed'] = state(connection_id).get('state') != 'off' or identity is not None and any(record_identity == identity and message.startswith(('Connecting;', 'Connected;', 'Successfully connected', 'Scheduling reconnect;', 'Reconnect,')) for record_identity, message in post_records)
+        if result['automatic_reconnect_observed']:
+            result['failure_class'] = 'AUTOMATIC_RECONNECT_OBSERVED'
+        elif not result['normal_release_observed']:
+            result['failure_class'] = 'RELEASE_NOT_OBSERVED'
+        return result
+    except LogBoundaryNotEstablished:
+        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
+    except ValueError as error:
+        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+        result['ambiguous'] = result['failure_class'] == 'AMBIGUOUS'; return result
+    except Exception:
+        result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'; return result
+    finally:
+        if window is not None and window.established and not window.finish_attempted:
+            try: window.finish()
+            except Exception: result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'
+        if stream is not None: stream.close()
+        if ws is not None:
+            if prior_level is not None:
+                try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                except Exception: result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'
+            ws.close()
 
 def press(ws, entity_id):
     ws.command('call_service', domain='button', service='press',
@@ -9855,7 +10690,13 @@ def feature_absence():
 
 operation = sys.argv[1]
 try:
-    result = run_validation() if operation == 'refresh_status_live_validation' else feature_absence() if operation == 'feature_absence' else None
+    if operation == 'owner_refresh_trial':
+        kind = os.environ.pop('HA_R66_TRIAL_KIND', '')
+        result = observe_owner_trial(kind) if kind in {'COLD', 'RETAINED'} else None
+    elif operation == 'owner_refresh_release':
+        result = observe_release()
+    else:
+        result = run_validation() if operation == 'refresh_status_live_validation' else feature_absence() if operation == 'feature_absence' else None
     if result is None: raise ValueError('operation')
 except Exception:
     result = {'error_class': 'OPERATION_FAILED', 'error_scope': 'OTHER', 'error_reason': 'VALIDATION'}
@@ -10675,15 +11516,24 @@ class PrivateInteractiveSessionBroker:
         self,
         operation: str,
         *,
+        trial_kind: OwnerRefreshTrialKind | None = None,
         _capability: object,
     ) -> bytes:
-        """Run one parameter-free exact-R64 validation operation."""
+        """Run one fixed exact-R64 validation or observer operation."""
         actions = {
             "refresh_status_live_validation": FeatureValidationAction.LIVE_VALIDATION,
             "feature_absence": FeatureValidationAction.FEATURE_ABSENCE,
+            "owner_refresh_trial": FeatureValidationAction.HARDWARE_OBSERVATION,
+            "owner_refresh_release": FeatureValidationAction.HARDWARE_OBSERVATION,
         }
         action = actions.get(operation)
-        if action is None:
+        if (
+            action is None
+            or operation == "owner_refresh_trial"
+            and type(trial_kind) is not OwnerRefreshTrialKind
+            or operation != "owner_refresh_trial"
+            and trial_kind is not None
+        ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_FEATURE_INVALID"
             ) from None
@@ -10716,9 +11566,12 @@ class PrivateInteractiveSessionBroker:
             '"error_reason":"UNKNOWN"}\',flush=True)\n'
         )
         bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
+        trial_environment = (
+            "" if trial_kind is None else f"HA_R66_TRIAL_KIND={trial_kind.value} "
+        )
         command = (
             f"{self._frame_printf(start_payload)}; "
-            f"HA_R65_PROGRAM_SHA256={program_digest} "
+            f"HA_R65_PROGRAM_SHA256={program_digest} {trial_environment}"
             f"python3 -c {shlex.quote(bootstrap)} {operation}; "
             f"{self._frame_printf(end_payload)}\n"
         )
@@ -10742,7 +11595,13 @@ class PrivateInteractiveSessionBroker:
             return self._read_until(
                 end_frame,
                 timeout_seconds=(
-                    360.0 if action is FeatureValidationAction.LIVE_VALIDATION else 40.0
+                    360.0
+                    if action is FeatureValidationAction.LIVE_VALIDATION
+                    else (
+                        40.0
+                        if action is not FeatureValidationAction.HARDWARE_OBSERVATION
+                        else 180.0
+                    )
                 ),
             )
         except SessionBrokerError as error:
@@ -10771,6 +11630,37 @@ class PrivateInteractiveSessionBroker:
         )
         try:
             return _parse_feature_absence_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _observe_owner_refresh_status_trial(
+        self,
+        trial_kind: OwnerRefreshTrialKind,
+        *,
+        _capability: object = None,
+    ) -> OwnerRefreshTrialResult:
+        output = self.__execute_refresh_feature_operation(
+            "owner_refresh_trial",
+            trial_kind=trial_kind,
+            _capability=_capability,
+        )
+        try:
+            return _parse_owner_refresh_trial_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _observe_owner_refresh_release(
+        self, *, _capability: object = None
+    ) -> OwnerRefreshReleaseResult:
+        output = self.__execute_refresh_feature_operation(
+            "owner_refresh_release", _capability=_capability
+        )
+        try:
+            return _parse_owner_refresh_release_result(output)
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -13684,6 +14574,9 @@ _FEATURE_ACTION_PREDECESSORS: dict[
     FeatureValidationAction.LIVE_VALIDATION: frozenset(
         {FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED}
     ),
+    FeatureValidationAction.HARDWARE_OBSERVATION: frozenset(
+        {FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED}
+    ),
     FeatureValidationAction.RESTORE_TRANSFER: frozenset(
         {
             FeatureValidationState.R64_BACKUP_VERIFIED,
@@ -14010,6 +14903,7 @@ class RefreshStatusLiveValidationController:
             FeatureValidationAction.R64_READINESS,
             FeatureValidationAction.R64_POST_RESTART_INVENTORY,
             FeatureValidationAction.LIVE_VALIDATION,
+            FeatureValidationAction.HARDWARE_OBSERVATION,
         }
     )
 
@@ -14079,7 +14973,14 @@ class RefreshStatusLiveValidationController:
                 FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
                 FeatureValidationState.LIVE_VALIDATION_CONSUMED,
             }:
-                self._journal.reconstruction_requires_restore()
+                resumable_hardware = (
+                    self._journal.state
+                    is FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+                    and self._journal.hardware_observation is not None
+                    and self._journal.hardware_pending is None
+                )
+                if not resumable_hardware:
+                    self._journal.reconstruction_requires_restore()
         self._state = (
             self._journal.state
             if self._journal is not None
@@ -14123,6 +15024,9 @@ class RefreshStatusLiveValidationController:
         self._durable_live_result = (
             self._journal.live_result if self._journal is not None else None
         )
+        self._hardware_observation: DurableHardwareObservation | None = (
+            self._journal.hardware_observation if self._journal is not None else None
+        )
         self._exact_pr41_source_proven = False
         self._feature_backup_classification: FeatureBackupClassification | None = None
         self._feature_backup_identity = (
@@ -14142,6 +15046,173 @@ class RefreshStatusLiveValidationController:
     def durable_live_result(self) -> DurableRefreshStatusLiveResult | None:
         """Return only the reconstructed identifier-free live result."""
         return self._durable_live_result
+
+    @property
+    def hardware_observation(self) -> DurableHardwareObservation | None:
+        """Return only the bounded durable R66 evidence projection."""
+        return (
+            self._journal.hardware_observation
+            if self._journal is not None
+            else self._hardware_observation
+        )
+
+    def _hardware_capability(self) -> _FeatureValidationCapability:
+        capability = _FeatureValidationCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._r64_source_generation,
+            self._session_generation,
+            FeatureValidationAction.HARDWARE_OBSERVATION,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        return capability
+
+    def begin_hardware_observation(self) -> DurableHardwareObservation:
+        """Open the sole fixed R66 owner-operated observation sequence."""
+        action = FeatureValidationAction.HARDWARE_OBSERVATION
+        self._begin(action)
+        self._mark(action, "dispatch_started")
+        if self._journal is not None:
+            self._journal.begin_hardware_observation()
+            result = self._journal.hardware_observation
+        else:
+            result = DurableHardwareObservation(
+                HardwareObservationPhase.ACTIVE, (), (), True
+            )
+            self._hardware_observation = result
+        if result is None:
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INVALID"
+            ) from None
+        return result
+
+    def observe_owner_refresh_trial(
+        self, trial_kind: OwnerRefreshTrialKind
+    ) -> OwnerRefreshTrialResult:
+        """Observe one external owner press without invoking a device operation."""
+        if type(trial_kind) is not OwnerRefreshTrialKind:
+            raise LifecycleControllerError("OWNER_REFRESH_TRIAL_KIND_INVALID") from None
+        observation = self.hardware_observation
+        if (
+            self.state is not FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+            or observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or len(observation.trials) >= len(_R66_TRIAL_SEQUENCE)
+            or trial_kind is not _R66_TRIAL_SEQUENCE[len(observation.trials)]
+            or any(item.failure_class is not None for item in observation.trials)
+            or any(item.failure_class is not None for item in observation.releases)
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INVALID"
+            ) from None
+        due_releases = sum(
+            point <= len(observation.trials)
+            for point in _R66_RELEASE_AFTER_TRIAL_COUNTS
+        )
+        if len(observation.releases) != due_releases:
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_RELEASE_REQUIRED"
+            ) from None
+        ordinal = len(observation.trials) + 1
+        if self._journal is not None:
+            self._journal.begin_hardware_item("trial", ordinal)
+        try:
+            result = self._broker._observe_owner_refresh_status_trial(
+                trial_kind, _capability=self._hardware_capability()
+            )
+            if not isinstance(result, OwnerRefreshTrialResult):
+                raise TypeError
+        except (SessionBrokerError, TypeError, ValueError):
+            result = OwnerRefreshTrialResult(
+                trial_kind,
+                False,
+                False,
+                None,
+                RefreshPacketCounts(0, 0, 0, 0, 0),
+                (),
+                (),
+                None,
+                False,
+                None,
+                True,
+                OwnerRefreshFailureClass.AMBIGUOUS,
+            )
+        if self._journal is not None:
+            self._journal.record_hardware_trial(result)
+        else:
+            self._hardware_observation = DurableHardwareObservation(
+                HardwareObservationPhase.ACTIVE,
+                observation.trials + (result,),
+                observation.releases,
+                observation.zero_write_aggregate and result.zero_write,
+            )
+        return result
+
+    def observe_hardware_release(self) -> OwnerRefreshReleaseResult:
+        """Observe one normal Hold expiry without issuing a device request."""
+        observation = self.hardware_observation
+        if (
+            self.state is not FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+            or observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or len(observation.releases) >= len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+            or len(observation.trials)
+            != _R66_RELEASE_AFTER_TRIAL_COUNTS[len(observation.releases)]
+            or any(item.failure_class is not None for item in observation.trials)
+            or any(item.failure_class is not None for item in observation.releases)
+        ):
+            raise LifecycleControllerError("FEATURE_HARDWARE_RELEASE_INVALID") from None
+        ordinal = len(observation.releases) + 1
+        if self._journal is not None:
+            self._journal.begin_hardware_item("release", ordinal)
+        try:
+            result = self._broker._observe_owner_refresh_release(
+                _capability=self._hardware_capability()
+            )
+            if not isinstance(result, OwnerRefreshReleaseResult):
+                raise TypeError
+        except (SessionBrokerError, TypeError, ValueError):
+            result = OwnerRefreshReleaseResult(
+                False, False, True, OwnerRefreshFailureClass.AMBIGUOUS
+            )
+        if self._journal is not None:
+            self._journal.record_hardware_release(result)
+        else:
+            self._hardware_observation = DurableHardwareObservation(
+                HardwareObservationPhase.ACTIVE,
+                observation.trials,
+                observation.releases + (result,),
+                observation.zero_write_aggregate,
+            )
+        return result
+
+    def finish_hardware_observation(self) -> DurableHardwareObservation:
+        """Close the exact 15-trial/10-release R66 sequence."""
+        observation = self.hardware_observation
+        if (
+            observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or len(observation.trials) != len(_R66_TRIAL_SEQUENCE)
+            or len(observation.releases) != len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
+            or not observation.zero_write_aggregate
+            or any(item.failure_class is not None for item in observation.trials)
+            or any(item.failure_class is not None for item in observation.releases)
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INCOMPLETE"
+            ) from None
+        if self._journal is not None:
+            return self._journal.finish_hardware_observation()
+        result = DurableHardwareObservation(
+            HardwareObservationPhase.COMPLETE,
+            observation.trials,
+            observation.releases,
+            observation.zero_write_aggregate,
+        )
+        self._hardware_observation = result
+        return result
 
     def _restore_broker_runtime_state(self) -> None:
         if self.state in {

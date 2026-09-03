@@ -1029,6 +1029,7 @@ def _synthetic_r30_source_authorities(
                 "test_r65e_",
                 "test_r65g_",
                 "test_r65h_",
+                "test_r66a_",
             )
         ),
     )
@@ -12201,6 +12202,49 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
             False,
         )
 
+    def _observe_owner_refresh_status_trial(
+        self,
+        trial_kind: access.OwnerRefreshTrialKind,
+        *,
+        _capability: object = None,
+    ) -> access.OwnerRefreshTrialResult:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        self.calls.append(("owner_refresh_trial", trial_kind))
+        cold = trial_kind is access.OwnerRefreshTrialKind.COLD
+        failure = getattr(self, "owner_trial_failure", None)
+        return access.OwnerRefreshTrialResult(
+            trial_kind,
+            True,
+            True,
+            (
+                access.RefreshSessionProvenance.NEW_SESSION
+                if cold and failure is None
+                else access.RefreshSessionProvenance.REUSED_SESSION
+            ),
+            access.RefreshPacketCounts(1 if cold else 0, 1 if cold else 0, 1, 0, 0),
+            (8, 33),
+            (
+                access.OwnerRefreshDpMetadata(8, ("DT_VALUE",), (4,)),
+                access.OwnerRefreshDpMetadata(33, ("DT_BOOL",), (1,)),
+            ),
+            True,
+            True,
+            True,
+            False,
+            failure,
+        )
+
+    def _observe_owner_refresh_release(
+        self, *, _capability: object = None
+    ) -> access.OwnerRefreshReleaseResult:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        self.calls.append(("owner_refresh_release", None))
+        return access.OwnerRefreshReleaseResult(True, False, False, None)
+
     def _verify_refresh_feature_absent(
         self, *, _capability: object = None
     ) -> access.FeatureAbsenceResult:
@@ -14085,6 +14129,428 @@ def test_r65g_ambiguous_live_result_is_durable_before_restoration(
     assert reconstructed.durable_live_result is not None
     assert reconstructed.durable_live_result.ambiguous is True
     reconstructed.close()
+
+
+def test_r66a_red1_public_owner_refresh_observer_exists() -> None:
+    """The exact R65H parent has no observer-only owner-press API."""
+    method = access.RefreshStatusLiveValidationController.observe_owner_refresh_trial
+    assert tuple(inspect.signature(method).parameters) == ("self", "trial_kind")
+
+
+def test_r66a_red2_automated_collector_is_not_the_owner_observer() -> None:
+    """The existing live collector triggers its own two Refresh presses."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    automated = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_validation"
+    )
+    press_calls = [
+        node
+        for node in ast.walk(automated)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "press"
+    ]
+    assert len(press_calls) == 2
+    assert hasattr(
+        access.RefreshStatusLiveValidationController, "begin_hardware_observation"
+    )
+
+
+def test_r66a_red3_feature_journal_can_retain_owner_trial_rows() -> None:
+    """The exact parent journal has no durable R66 hardware section."""
+    assert hasattr(access._DurableFeatureValidationJournal, "hardware_observation")
+    assert hasattr(access._DurableFeatureValidationJournal, "record_hardware_trial")
+
+
+def test_r66a_red4_partial_owner_sequence_has_reconstruction_api() -> None:
+    """The exact parent cannot resume at the next unobserved owner trial."""
+    assert hasattr(
+        access.RefreshStatusLiveValidationController,
+        "hardware_observation",
+    )
+    assert hasattr(
+        access.RefreshStatusLiveValidationController,
+        "observe_hardware_release",
+    )
+
+
+def _r66a_owner_parser() -> dict[str, object]:
+    """Load only the value-free owner lifecycle parser from embedded source."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    selected = [ast.Import(names=[ast.alias("re")])]
+    assignments = {
+        "EMPTY_COUNTS",
+        "LOG_RE",
+        "SEND_RE",
+        "REFRESH_BOUND_RE",
+        "REFRESH_TERMINAL_RE",
+        "DP_RE",
+    }
+    functions = {"parse_refresh_lifecycle", "parse_owner_refresh_lifecycle"}
+    for node in tree.body:
+        if (
+            (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id in assignments
+                    for target in node.targets
+                )
+            )
+            or isinstance(node, ast.FunctionDef)
+            and node.name in functions
+        ):
+            selected.append(node)
+    namespace: dict[str, object] = {}
+    exec(  # noqa: S102 - isolated repository-owned parser definitions only.
+        compile(
+            ast.fix_missing_locations(ast.Module(selected, type_ignores=[])),
+            "<r66a-owner-parser>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+def _r66a_embedded_function(name: str) -> object:
+    """Load one dependency-free embedded observer helper."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    namespace: dict[str, object] = {}
+    exec(  # noqa: S102 - isolated repository-owned helper definition only.
+        compile(
+            ast.fix_missing_locations(ast.Module([function], type_ignores=[])),
+            f"<r66a-{name}>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[name]
+
+
+def test_r66a_o1_observer_source_has_no_refresh_or_generic_service_dispatch() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    observer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
+    )
+    called_names = {
+        node.func.id
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    literals = {
+        node.value
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    assert "press" not in called_names
+    assert "button.press" not in literals
+    service_dispatches = [
+        node
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "command"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "call_service"
+    ]
+    assert service_dispatches == []
+    assert "owner_refresh_trial" in access._REMOTE_REFRESH_STATUS_PROGRAM
+    source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
+    assert source is not None
+    assert source.index("discard_before_owner_lifecycle(stream)") < source.index(
+        "wait_for_owner_press(ws, button_id, 60)"
+    )
+
+
+def test_r66a_o2_to_o4_only_exact_owned_button_event_can_start_trial() -> None:
+    owner_press_event = _r66a_embedded_function("owner_press_event")
+    selected = "button.selected_refresh_status"
+
+    def event(entity_id: object, *, service: str = "press") -> dict[str, object]:
+        return {
+            "type": "event",
+            "event": {
+                "event_type": "call_service",
+                "data": {
+                    "domain": "button",
+                    "service": service,
+                    "service_data": {"entity_id": entity_id},
+                },
+            },
+        }
+
+    assert owner_press_event(event(selected), selected) is True
+    assert owner_press_event(event("button.foreign_refresh_status"), selected) is False
+    assert owner_press_event(event(selected, service="turn_on"), selected) is False
+    assert owner_press_event({"type": "event", "event": {}}, selected) is False
+
+
+def test_r66a_o2_to_o12_exact_lifecycle_metadata_is_value_free() -> None:
+    parser = _r66a_owner_parser()["parse_owner_refresh_lifecycle"]
+    identity = "tuya-ble-session-" + "n" * 16
+    foreign = "tuya-ble-session-" + "p" * 16
+    lines = [
+        _r65c_record(foreign, "Sending packet: #1 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "Sending packet: #1 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "S1_REFRESH_SESSION_BOUND_NEW session_ordinal=3"),
+        _r65c_record(identity, "Sending packet: #2 FUN_SENDER_DEVICE_INFO"),
+        _r65c_record(identity, "Sending packet: #3 FUN_SENDER_PAIR"),
+        _r65c_record(identity, "Sending packet: #4 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(identity, "Sending packet: #5 FUN_SENDER_DPS_V4"),
+        _r65c_record(
+            identity,
+            "Received datapoint update, id: 8, type: DT_VALUE, length: 4",
+        ),
+        _r65c_record(
+            identity,
+            "Received datapoint update, id: 33, type: DT_BOOL, length: 1",
+        ),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=3"),
+    ]
+
+    parsed = parser(lines)
+
+    assert parsed[0] == identity
+    assert parsed[1] == {
+        "device_info": 1,
+        "pair": 1,
+        "device_status": 1,
+        "datapoint": 1,
+        "other": 0,
+    }
+    assert parsed[3:5] == ("NEW_SESSION", True)
+    assert parsed[5] == [
+        {"dp_id": 8, "types": ["DT_VALUE"], "encoded_lengths": [4]},
+        {"dp_id": 33, "types": ["DT_BOOL"], "encoded_lengths": [1]},
+    ]
+    rendered = repr(parsed)
+    assert "payload" not in rendered.lower()
+
+
+def test_r66a_o14_overlapping_refresh_lifecycles_are_rejected() -> None:
+    parser = _r66a_owner_parser()["parse_owner_refresh_lifecycle"]
+    identity = "tuya-ble-session-" + "q" * 16
+    lines = [
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "S1_REFRESH_SESSION_BOUND_NEW session_ordinal=1"),
+        _r65c_record(identity, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(identity, "S1_REFRESH_COMPLETED session_ordinal=1"),
+    ]
+    with pytest.raises(ValueError, match="refresh_lifecycle"):
+        parser(lines)
+
+
+def test_r66a_o5_to_o13_trial_parser_preserves_provenance_and_timeout() -> None:
+    payload = {
+        "trial_kind": "COLD",
+        "owner_press_observed": True,
+        "request_completed": True,
+        "session_provenance": "REUSED_SESSION",
+        "counts": {
+            "device_info": 0,
+            "pair": 0,
+            "device_status": 1,
+            "datapoint": 0,
+            "other": 0,
+        },
+        "reported_dp_ids": [8],
+        "per_dp": [{"dp_id": 8, "types": ["DT_VALUE"], "encoded_lengths": [4]}],
+        "current_session_provenance": True,
+        "retained_confirmation_observed": True,
+        "hold_active_after_refresh": True,
+        "ambiguous": False,
+        "failure_class": "PROVENANCE_MISMATCH",
+    }
+    result = access._parse_owner_refresh_trial_result(
+        json.dumps(payload).encode("ascii")
+    )
+    assert result.trial_kind is access.OwnerRefreshTrialKind.COLD
+    assert result.session_provenance is access.RefreshSessionProvenance.REUSED_SESSION
+    assert result.failure_class is access.OwnerRefreshFailureClass.PROVENANCE_MISMATCH
+
+    timeout = dict(payload)
+    timeout.update(
+        owner_press_observed=False,
+        request_completed=False,
+        session_provenance=None,
+        counts={name: 0 for name in payload["counts"]},
+        reported_dp_ids=[],
+        per_dp=[],
+        current_session_provenance=None,
+        retained_confirmation_observed=False,
+        hold_active_after_refresh=None,
+        failure_class="OWNER_PRESS_NOT_OBSERVED",
+    )
+    parsed_timeout = access._parse_owner_refresh_trial_result(
+        json.dumps(timeout).encode("ascii")
+    )
+    assert parsed_timeout.owner_press_observed is False
+    assert parsed_timeout.counts == access.RefreshPacketCounts(0, 0, 0, 0, 0)
+
+    retained = dict(payload)
+    retained.update(
+        trial_kind="RETAINED",
+        session_provenance="NEW_SESSION",
+    )
+    parsed_retained = access._parse_owner_refresh_trial_result(
+        json.dumps(retained).encode("ascii")
+    )
+    assert parsed_retained.session_provenance is (
+        access.RefreshSessionProvenance.NEW_SESSION
+    )
+    assert parsed_retained.failure_class is (
+        access.OwnerRefreshFailureClass.PROVENANCE_MISMATCH
+    )
+
+    with_value = dict(payload)
+    with_value["per_dp"] = [
+        {
+            "dp_id": 8,
+            "types": ["DT_VALUE"],
+            "encoded_lengths": [4],
+            "value": 1,
+        }
+    ]
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._parse_owner_refresh_trial_result(json.dumps(with_value).encode("ascii"))
+
+
+def test_r66a_o19_release_observer_has_no_device_operation() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    observer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe_release"
+    )
+    calls = [
+        node
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "command"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert all(node.args[0].value != "call_service" for node in calls)
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "press"
+        for node in ast.walk(observer)
+    )
+
+
+def test_r66a_o15_to_o20_partial_sequence_reconstructs_without_replay(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, r64, restore = _r65_advance_to_live(r65_bundles)
+    assert controller.begin_hardware_observation().trials == ()
+    assert controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.RETAINED)
+    assert controller.observe_hardware_release().normal_release_observed is True
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    evidence = reconstructed.hardware_observation
+    assert evidence is not None
+    assert len(evidence.trials) == 2
+    assert len(evidence.releases) == 1
+    assert evidence.zero_write_aggregate is True
+    assert (
+        reconstructed.state
+        is access.FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+    )
+    third = reconstructed.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert third.trial_kind is access.OwnerRefreshTrialKind.COLD
+    assert len(reconstructed.hardware_observation.trials) == 3
+    reconstructed.stage_restore(restore)
+    reconstructed.restore_pr41(restore.manifest)
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed.close()
+    assert [name for name, _detail in broker.calls].count("owner_refresh_trial") == 2
+
+
+def test_r66a_failed_observation_stops_before_another_remote_wait(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    broker.owner_trial_failure = access.OwnerRefreshFailureClass.PROVENANCE_MISMATCH
+    result = controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert result.failure_class is access.OwnerRefreshFailureClass.PROVENANCE_MISMATCH
+    before = len(broker.calls)
+    with pytest.raises(access.LifecycleControllerError, match="OBSERVATION_INVALID"):
+        controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.RETAINED)
+    assert len(broker.calls) == before
+    controller.close()
+
+
+def test_r66a_o15_o16_exact_plan_caps_before_remote_wait(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    for index, kind in enumerate(access._R66_TRIAL_SEQUENCE, start=1):
+        controller.observe_owner_refresh_trial(kind)
+        if index in access._R66_RELEASE_AFTER_TRIAL_COUNTS:
+            controller.observe_hardware_release()
+    complete = controller.finish_hardware_observation()
+    assert complete.phase is access.HardwareObservationPhase.COMPLETE
+    assert len(complete.trials) == 15
+    assert len(complete.releases) == 10
+    before = len(broker.calls)
+    with pytest.raises(access.LifecycleControllerError, match="OBSERVATION_INVALID"):
+        controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert len(broker.calls) == before
+    controller.close()
+
+
+def test_r66a_o18_legacy_feature_journal_has_no_synthetic_hardware_evidence(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    assert controller._journal is not None
+    assert controller._journal.schema_version == 1
+    assert controller.hardware_observation is None
+    controller.close()
+
+
+def test_r66a_o21_o22_automated_collector_and_restore_predecessors_unchanged() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    automated = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_validation"
+    )
+    assert (
+        sum(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "press"
+            for node in ast.walk(automated)
+        )
+        == 2
+    )
+    assert access._FEATURE_ACTION_PREDECESSORS[
+        access.FeatureValidationAction.RESTORE_TRANSFER
+    ] >= {
+        access.FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
+        access.FeatureValidationState.LIVE_VALIDATION_CONSUMED,
+    }
 
 
 def test_r65g_warm_retained_confirmation_is_required_for_live_pass() -> None:
