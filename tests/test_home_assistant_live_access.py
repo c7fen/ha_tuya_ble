@@ -14222,7 +14222,7 @@ def _r66a_embedded_function(name: str) -> object:
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
-    namespace: dict[str, object] = {}
+    namespace: dict[str, object] = {"re": __import__("re")}
     exec(  # noqa: S102 - isolated repository-owned helper definition only.
         compile(
             ast.fix_missing_locations(ast.Module([function], type_ignores=[])),
@@ -14277,11 +14277,18 @@ def test_r66a_o2_to_o4_only_exact_owned_button_event_can_start_trial() -> None:
     owner_press_event = _r66a_embedded_function("owner_press_event")
     selected = "button.selected_refresh_status"
 
-    def event(entity_id: object, *, service: str = "press") -> dict[str, object]:
+    def event(
+        entity_id: object,
+        *,
+        service: str = "press",
+        user_id: object = "a" * 32,
+        parent_id: object = None,
+    ) -> dict[str, object]:
         return {
             "type": "event",
             "event": {
                 "event_type": "call_service",
+                "context": {"user_id": user_id, "parent_id": parent_id},
                 "data": {
                     "domain": "button",
                     "service": service,
@@ -14293,7 +14300,22 @@ def test_r66a_o2_to_o4_only_exact_owned_button_event_can_start_trial() -> None:
     assert owner_press_event(event(selected), selected) is True
     assert owner_press_event(event("button.foreign_refresh_status"), selected) is False
     assert owner_press_event(event(selected, service="turn_on"), selected) is False
+    assert owner_press_event(event(selected, user_id=None), selected) is False
+    assert owner_press_event(event(selected, parent_id="b" * 32), selected) is False
     assert owner_press_event({"type": "event", "event": {}}, selected) is False
+
+
+def test_r66a_o4_exact_s1_resolution_is_unique_and_fail_closed() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    resolver = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "resolve_owner_refresh_target"
+    )
+    source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, resolver)
+    assert source is not None
+    assert "if len(eligible) != 1: raise ValueError('ownership')" in source
 
 
 def test_r66a_o2_to_o12_exact_lifecycle_metadata_is_value_free() -> None:
@@ -14450,6 +14472,58 @@ def test_r66a_o19_release_observer_has_no_device_operation() -> None:
         and node.func.id == "press"
         for node in ast.walk(observer)
     )
+    source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
+    assert source is not None
+    assert "wait_for_connection_state(ws, connection_id, 'off', hold + 5)" in source
+    assert "wait_for_connection_state(ws, connection_id, 'on', 5)" in source
+
+
+def test_r66a_selected_current_session_provenance_uses_runtime_value_source() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    observer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
+    )
+    source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
+    assert source is not None
+    assert "get('value_source') == 'current_session'" in source
+    assignment = next(
+        node
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "current_session_provenance"
+            for target in node.targets
+        )
+    )
+    assert "before_last" not in ast.unparse(assignment.value)
+
+
+def test_r66a_release_transition_requires_exact_selected_connection_entity() -> None:
+    connection_state_event = _r66a_embedded_function("connection_state_event")
+    selected = "binary_sensor.selected_bluetooth_connection"
+
+    def event(entity_id: str, old: str, new: str) -> dict[str, object]:
+        return {
+            "type": "event",
+            "event": {
+                "event_type": "state_changed",
+                "data": {
+                    "entity_id": entity_id,
+                    "old_state": {"state": old},
+                    "new_state": {"state": new},
+                },
+            },
+        }
+
+    assert connection_state_event(event(selected, "on", "off"), selected, "off")
+    assert not connection_state_event(
+        event("binary_sensor.foreign_connection", "on", "off"), selected, "off"
+    )
+    assert not connection_state_event(event(selected, "off", "off"), selected, "off")
 
 
 def test_r66a_o15_to_o20_partial_sequence_reconstructs_without_replay(

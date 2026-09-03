@@ -10271,6 +10271,14 @@ def owner_press_event(value, entity_id):
     data = event.get('data')
     if not isinstance(data, dict) or data.get('domain') != 'button' or data.get('service') != 'press':
         return False
+    context = event.get('context')
+    if (
+        not isinstance(context, dict)
+        or not isinstance(context.get('user_id'), str)
+        or re.fullmatch(r'[0-9a-f]{32}', context['user_id']) is None
+        or context.get('parent_id') is not None
+    ):
+        return False
     service_data = data.get('service_data')
     target = data.get('target')
     candidates = []
@@ -10292,6 +10300,37 @@ def wait_for_owner_press(ws, entity_id, timeout_seconds=60):
         except socket.timeout:
             break
         if owner_press_event(value, entity_id):
+            ws.sock.settimeout(15)
+            return True
+    ws.sock.settimeout(15)
+    return False
+
+def connection_state_event(value, entity_id, expected_state):
+    if not isinstance(value, dict) or value.get('type') != 'event':
+        return False
+    event = value.get('event')
+    if not isinstance(event, dict) or event.get('event_type') != 'state_changed':
+        return False
+    data = event.get('data')
+    if not isinstance(data, dict) or data.get('entity_id') != entity_id:
+        return False
+    old_state = data.get('old_state'); new_state = data.get('new_state')
+    return (
+        isinstance(old_state, dict)
+        and isinstance(new_state, dict)
+        and old_state.get('state') != expected_state
+        and new_state.get('state') == expected_state
+    )
+
+def wait_for_connection_state(ws, entity_id, expected_state, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        ws.sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            value = ws.recv()
+        except socket.timeout:
+            break
+        if connection_state_event(value, entity_id, expected_state):
             ws.sock.settimeout(15)
             return True
     ws.sock.settimeout(15)
@@ -10417,15 +10456,26 @@ def observe_owner_trial(kind):
         result['request_completed'] = completed
         result['per_dp'] = rows
         result['reported_dp_ids'] = [row['dp_id'] for row in rows]
-        result['current_session_provenance'] = state(last_id).get('state') != before_last if completed else None
-        result['retained_confirmation_observed'] = any(stamp(state(entity)) != before_dp[dp] for dp, entity in dp_entities.items())
+        after_dp = {dp: state(entity) for dp, entity in dp_entities.items()}
+        confirmed_ids = sorted(set(result['reported_dp_ids']) & set(dp_entities))
+        result['current_session_provenance'] = (
+            bool(confirmed_ids)
+            and all(
+                isinstance(after_dp[dp].get('attributes'), dict)
+                and after_dp[dp]['attributes'].get('value_source') == 'current_session'
+                for dp in confirmed_ids
+            )
+        ) if completed else None
+        result['retained_confirmation_observed'] = any(
+            stamp(after_dp[dp]) != before_dp[dp] for dp in confirmed_ids
+        )
         result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
         expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
         if counts['datapoint'] or counts['other']:
             result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
         elif provenance != expected:
             result['failure_class'] = 'PROVENANCE_MISMATCH'
-        elif not completed or counts['device_status'] != 1 or not rows or result['current_session_provenance'] is not True:
+        elif not completed or counts['device_status'] != 1 or not rows or state(last_id).get('state') == before_last or result['current_session_provenance'] is not True:
             result['failure_class'] = 'REQUEST_FAILED'
         elif result['hold_active_after_refresh'] is not True:
             result['failure_class'] = 'HOLD_NOT_ACTIVE'
@@ -10463,27 +10513,15 @@ def observe_release():
             result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
         prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        ws.command('subscribe_events', event_type='state_changed')
         stream=LogStream(); window = LogWindow(stream, ws); window.start()
-        time.sleep(hold + 5)
-        lines = window.finish(); window = None
-        records = []
-        for raw in lines:
-            match = LOG_RE.fullmatch(re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n')))
-            if match: records.append(match.groups())
-        released = {
-            identity for identity, _message in records
-            if any(message.startswith(prefix) for record_identity, message in records if record_identity == identity for prefix in ('Disconnecting', 'Disconnected from device;'))
-        }
-        released = {identity for identity in released if any(record_identity == identity and message.startswith('Disconnecting') for record_identity, message in records) and any(record_identity == identity and message.startswith('Disconnected from device;') for record_identity, message in records)}
-        result['normal_release_observed'] = len(released) == 1 and state(connection_id).get('state') == 'off'
-        identity = next(iter(released)) if len(released) == 1 else None
-        window = LogWindow(stream, ws); window.start(); time.sleep(5)
-        post = window.finish(); window = None
-        post_records = []
-        for raw in post:
-            match = LOG_RE.fullmatch(re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n')))
-            if match: post_records.append(match.groups())
-        result['automatic_reconnect_observed'] = state(connection_id).get('state') != 'off' or identity is not None and any(record_identity == identity and message.startswith(('Connecting;', 'Connected;', 'Successfully connected', 'Scheduling reconnect;', 'Reconnect,')) for record_identity, message in post_records)
+        selected_released = wait_for_connection_state(ws, connection_id, 'off', hold + 5)
+        window.finish(); window = None
+        result['normal_release_observed'] = selected_released and state(connection_id).get('state') == 'off'
+        window = LogWindow(stream, ws); window.start()
+        selected_reconnected = wait_for_connection_state(ws, connection_id, 'on', 5)
+        window.finish(); window = None
+        result['automatic_reconnect_observed'] = selected_reconnected or state(connection_id).get('state') != 'off'
         if result['automatic_reconnect_observed']:
             result['failure_class'] = 'AUTOMATIC_RECONNECT_OBSERVED'
         elif not result['normal_release_observed']:
