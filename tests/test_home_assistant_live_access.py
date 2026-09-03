@@ -13206,6 +13206,33 @@ def test_r65e_b4_real_malformed_package_is_preserved_as_indeterminate(
     assert after == before
 
 
+def test_r65e_feature_pr41_source_generation_is_accepted_by_remote_backup(
+    tmp_path: Path,
+) -> None:
+    """The Feature controller's exact commit authority is a valid generation."""
+    integration = tmp_path / "custom_components" / "tuya_ble"
+    integration.mkdir(parents=True)
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
+    context = _r36_backup_payload(source_generation=access.PR41_RESTORE_COMMIT)
+
+    created = _run_synthetic_remote_program(tmp_path, "backup", context)
+    inspected = _run_synthetic_remote_program(
+        tmp_path,
+        "inspect_retained_backup",
+        {
+            **context,
+            "restore_marker_owned": False,
+        },
+    )
+
+    assert created["success"] is True
+    assert created["source_generation"] == access.PR41_RESTORE_COMMIT
+    assert inspected == {
+        "classification": "OWNED_BY_RETAINED_LIFECYCLE",
+        "retired": False,
+    }
+
+
 def test_r65e_b5_b6_to_b12_owned_backup_reconciles_and_retires_once(
     r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
 ) -> None:

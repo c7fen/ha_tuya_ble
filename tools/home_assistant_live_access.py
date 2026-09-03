@@ -6660,7 +6660,11 @@ def validate_backup_context(value):
         or not isinstance(value['lifecycle_generation'], str)
         or re.fullmatch('[0-9a-f]{32}', value['lifecycle_generation']) is None
         or not isinstance(value['source_generation'], str)
-        or re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+        or (
+            re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+            and value['source_generation']
+            != '4f73a9b008dcb89134bc41001c486f06d6056867'
+        )
         or any(
             not isinstance(value.get(name), str)
             or re.fullmatch(pattern, value[name]) is None
@@ -6701,7 +6705,11 @@ def read_backup_identity_fd(context, package_fd):
         or not isinstance(value['lifecycle_generation'], str)
         or re.fullmatch('[0-9a-f]{32}', value['lifecycle_generation']) is None
         or not isinstance(value['source_generation'], str)
-        or re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+        or (
+            re.fullmatch('[0-9a-f]{32}', value['source_generation']) is None
+            and value['source_generation']
+            != '4f73a9b008dcb89134bc41001c486f06d6056867'
+        )
         or not isinstance(value['backup_generation'], str)
         or re.fullmatch('[0-9a-f]{32}', value['backup_generation']) is None
         or not isinstance(value['file_count'], int)
