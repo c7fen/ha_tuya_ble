@@ -30,7 +30,7 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Self, TextIO
+from typing import Any, Never, Self, TextIO
 
 REPAIRS_RESPONSE_SHAPE_INVALID = "REPAIRS_RESPONSE_SHAPE_INVALID"
 ADMISSION_COLLECTOR = "ADMISSION_COLLECTOR"
@@ -54,14 +54,18 @@ _LIFECYCLE_STATE_ROOT: Path | None = None
 _LIFECYCLE_ANCHOR_NAME = "anchor.json"
 _LIFECYCLE_JOURNAL_NAME = "journal.json"
 _LIFECYCLE_LOCK_NAME = "journal.lock"
+_FEATURE_VALIDATION_JOURNAL_NAME = "feature-validation.json"
 _DISABLE_DURABLE_LIFECYCLE_FOR_TESTS = False
 PR45_CANDIDATE_COMMIT = "835f602cc6a73bf224b5d134b3e0c96021696138"
 PR45_CANDIDATE_TREE = "2e25fc0971fe0dd6ab698b796454f7970be9b257"
 PR41_RESTORE_COMMIT = "4f73a9b008dcb89134bc41001c486f06d6056867"
 PR41_RESTORE_TREE = "463ed8553da01eae591de611e76e45392ad9e7bf"
+R64_RUNTIME_COMMIT = "c5c9cda147972c5e08cc9ba2958c4235b9f2eb68"
+R64_RUNTIME_TREE = "ab9c29acf5d95b161ae6786804c71935e1aa79a0"
 _AUTHORITY_MANIFEST_DIGESTS = {
     "candidate": "c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075",
     "restore": "2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2",
+    "r64_runtime": "0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb",
 }
 _HELPER_FILES = frozenset(
     {
@@ -190,17 +194,19 @@ class RemoteRootProfile(StrEnum):
 
 
 class SourceState(StrEnum):
-    """The two exact repository authorities accepted by the control plane."""
+    """The exact repository authorities accepted by bounded control planes."""
 
     CANDIDATE = "candidate"
     RESTORE = "restore"
+    R64_RUNTIME = "r64_runtime"
 
 
 class CurrentSourceClassification(StrEnum):
-    """Bounded comparison against the two repository-owned manifests."""
+    """Bounded comparison against repository-owned runtime manifests."""
 
     EXACT_PR41 = "EXACT_PR41"
     EXACT_PR45 = "EXACT_PR45"
+    EXACT_R64 = "EXACT_R64"
     OTHER = "OTHER"
     INDETERMINATE = "INDETERMINATE"
 
@@ -304,6 +310,59 @@ class ResearchOperation(StrEnum):
 
     CHECK_READINESS = "check_readiness"
     RUN_FIXED_INVENTORY = "run_fixed_inventory"
+
+
+class FeatureValidationAction(StrEnum):
+    """One-shot operations in the separate exact-R64 validation lifecycle."""
+
+    INITIAL_SOURCE = "initial_source"
+    INITIAL_REPAIRS = "initial_repairs"
+    BACKUP = "backup"
+    R64_TRANSFER = "r64_transfer"
+    R64_INSTALL = "r64_install"
+    R64_INVENTORY = "r64_inventory"
+    R64_CORE_CHECK = "r64_core_check"
+    R64_RESTART = "r64_restart"
+    R64_READINESS = "r64_readiness"
+    R64_POST_RESTART_INVENTORY = "r64_post_restart_inventory"
+    LIVE_VALIDATION = "live_validation"
+    RESTORE_TRANSFER = "restore_transfer"
+    RESTORE_INSTALL = "restore_install"
+    RESTORE_INVENTORY = "restore_inventory"
+    RESTORE_CORE_CHECK = "restore_core_check"
+    REMOVAL_RESTART = "removal_restart"
+    RESTORE_READINESS = "restore_readiness"
+    FEATURE_ABSENCE = "feature_absence"
+    POST_RESTORE_REPAIRS = "post_restore_repairs"
+    FINAL_ACCEPTANCE = "final_acceptance"
+
+
+class FeatureValidationState(StrEnum):
+    """Durable stages for the exact-R64 validation path only."""
+
+    BASELINE = "BASELINE"
+    INITIAL_SOURCE_VERIFIED = "INITIAL_SOURCE_VERIFIED"
+    INITIAL_REPAIRS_PASS = "INITIAL_REPAIRS_PASS"
+    R64_BACKUP_VERIFIED = "R64_BACKUP_VERIFIED"
+    R64_STAGED = "R64_STAGED"
+    R64_INSTALLED = "R64_INSTALLED"
+    R64_INVENTORY_VERIFIED = "R64_INVENTORY_VERIFIED"
+    R64_CORE_CHECKED = "R64_CORE_CHECKED"
+    R64_RESTART_CONSUMED = "R64_RESTART_CONSUMED"
+    R64_READY = "R64_READY"
+    R64_POST_RESTART_INVENTORY_VERIFIED = "R64_POST_RESTART_INVENTORY_VERIFIED"
+    LIVE_VALIDATION_CONSUMED = "LIVE_VALIDATION_CONSUMED"
+    RESTORE_STAGED = "RESTORE_STAGED"
+    PR41_RESTORED = "PR41_RESTORED"
+    RESTORE_INVENTORY_VERIFIED = "RESTORE_INVENTORY_VERIFIED"
+    RESTORE_CORE_CHECKED = "RESTORE_CORE_CHECKED"
+    REMOVAL_RESTART_CONSUMED = "REMOVAL_RESTART_CONSUMED"
+    PR41_READY = "PR41_READY"
+    FEATURE_ABSENCE_VERIFIED = "FEATURE_ABSENCE_VERIFIED"
+    POST_RESTORE_REPAIRS_PASS = "POST_RESTORE_REPAIRS_PASS"
+    COMPLETE_NORMAL = "COMPLETE_NORMAL"
+    RESTORE_REQUIRED = "RESTORE_REQUIRED"
+    RESTORE_FAILED = "RESTORE_FAILED"
 
 
 class ResearchFailureCategory(StrEnum):
@@ -1079,6 +1138,20 @@ class _RemotePhaseAResearchCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class _FeatureValidationCapability:
+    """One exact feature-lifecycle operation bound to a broker session."""
+
+    controller: object = field(repr=False)
+    issuer: object = field(repr=False)
+    lifecycle_generation: object = field(repr=False)
+    source_generation: object = field(repr=False)
+    session_generation: object = field(repr=False)
+    action: FeatureValidationAction
+    issuance_identity: object = field(repr=False)
+    backup_identity: object = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _EvidenceOrigin:
     """Internal provenance for one sanitized evidence object."""
 
@@ -1165,19 +1238,19 @@ class SourceManifest:
 
     @property
     def authority_commit(self) -> str:
-        return (
-            PR45_CANDIDATE_COMMIT
-            if self.state is SourceState.CANDIDATE
-            else PR41_RESTORE_COMMIT
-        )
+        return {
+            SourceState.CANDIDATE: PR45_CANDIDATE_COMMIT,
+            SourceState.RESTORE: PR41_RESTORE_COMMIT,
+            SourceState.R64_RUNTIME: R64_RUNTIME_COMMIT,
+        }[self.state]
 
     @property
     def authority_tree(self) -> str:
-        return (
-            PR45_CANDIDATE_TREE
-            if self.state is SourceState.CANDIDATE
-            else PR41_RESTORE_TREE
-        )
+        return {
+            SourceState.CANDIDATE: PR45_CANDIDATE_TREE,
+            SourceState.RESTORE: PR41_RESTORE_TREE,
+            SourceState.R64_RUNTIME: R64_RUNTIME_TREE,
+        }[self.state]
 
 
 @dataclass(frozen=True)
@@ -1269,6 +1342,105 @@ class CurrentSourceInventoryResult:
     def root_profile(self) -> RemoteRootProfile | None:
         """Return the bounded resolved profile for a successful inspection."""
         return self.evidence.root_profile if self.evidence is not None else None
+
+
+class RefreshStatusFailureClass(StrEnum):
+    """Identifier-free outcome classes for the fixed live validation."""
+
+    OWNERSHIP_NOT_PROVEN = "OWNERSHIP_NOT_PROVEN"
+    PRECONDITION_NOT_PROVEN = "PRECONDITION_NOT_PROVEN"
+    LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
+    COLD_STATE_NOT_PROVEN = "COLD_STATE_NOT_PROVEN"
+    COLD_REQUEST_FAILED = "COLD_REQUEST_FAILED"
+    WARM_REQUEST_FAILED = "WARM_REQUEST_FAILED"
+    RETAINED_CONFIRMATION_NOT_OBSERVED = "RETAINED_CONFIRMATION_NOT_OBSERVED"
+    DATAPOINT_WRITE_DETECTED = "DATAPOINT_WRITE_DETECTED"
+    HOLD_RELEASE_NOT_OBSERVED = "HOLD_RELEASE_NOT_OBSERVED"
+    AUTOMATIC_RECONNECT_OBSERVED = "AUTOMATIC_RECONNECT_OBSERVED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshPacketCounts:
+    """Sanitized outbound logical-packet counts for one press window."""
+
+    device_info: int
+    pair: int
+    device_status: int
+    datapoint: int
+    other: int
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshPressResult:
+    """Sanitized result for one explicitly consumed Refresh Status press."""
+
+    service_success: bool
+    counts: RefreshPacketCounts
+    last_status_update_advanced: bool
+    retained_confirmation_changed_dp_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshHoldResult:
+    """Sanitized passive On-Demand hold/release observation."""
+
+    warm_immediately_after_press: bool
+    normal_release_observed: bool
+    automatic_reconnect_observed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshStatusLiveValidationResult:
+    """Only public aggregate returned by the fixed remote validation."""
+
+    eligible_s1_count: int
+    selected: bool
+    refresh_button_present: bool
+    policy_on_demand: bool
+    ble_control_enabled: bool
+    hold_time_valid: bool
+    cold: RefreshPressResult
+    warm: RefreshPressResult
+    same_authenticated_session_reused: bool
+    hold: RefreshHoldResult
+    ambiguous: bool
+    failure_class: RefreshStatusFailureClass | None
+    conditional_omission_observed: bool
+
+    @property
+    def passed(self) -> bool:
+        """Return the exact cold, warm, hold, and non-actuation predicate."""
+        return (
+            self.selected is True
+            and self.refresh_button_present is True
+            and self.policy_on_demand is True
+            and self.ble_control_enabled is True
+            and self.hold_time_valid is True
+            and self.cold.service_success is True
+            and self.cold.counts.device_info == 1
+            and self.cold.counts.pair == 1
+            and self.cold.counts.device_status == 1
+            and self.cold.counts.datapoint == 0
+            and self.cold.last_status_update_advanced is True
+            and self.warm.service_success is True
+            and self.warm.counts.device_info == 0
+            and self.warm.counts.pair == 0
+            and self.warm.counts.device_status == 1
+            and self.warm.counts.datapoint == 0
+            and self.warm.last_status_update_advanced is True
+            and self.same_authenticated_session_reused is True
+            and self.hold == RefreshHoldResult(True, True, False)
+            and self.ambiguous is False
+            and self.failure_class is None
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureAbsenceResult:
+    """Post-restore proof that the R64 runtime entity is not active."""
+
+    refresh_button_active: bool
 
 
 def _source_inventory_exact(result: object, expected_count: int) -> bool:
@@ -1752,6 +1924,16 @@ class _DurableLifecycleJournal:
         try:
             self._secure_directory()
             self._acquire_lock()
+            try:
+                os.stat(
+                    _FEATURE_VALIDATION_JOURNAL_NAME,
+                    dir_fd=self._root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise LifecycleControllerError("LIFECYCLE_MODE_CONFLICT") from None
             newly_created = False
             anchor = self._read_anchor()
             record = self._read_record()
@@ -3512,6 +3694,412 @@ class _DurableLifecycleJournal:
             raise failures[0]
 
 
+class _DurableFeatureValidationJournal:
+    """Small durable ledger for the separate exact-R64 lifecycle."""
+
+    _FIELDS = frozenset(
+        {
+            "schema_version",
+            "revision",
+            "lifecycle_generation",
+            "active",
+            "state",
+            "terminal",
+            "authorities",
+            "consumed_actions",
+            "operations",
+            "backup_identity",
+            "restart_results",
+        }
+    )
+
+    def __init__(self) -> None:
+        self._directory = _fixed_lifecycle_state_root()
+        self._root_fd: int | None = None
+        self._lock_fd: int | None = None
+        self._closed = False
+        self.reconstructed = False
+        try:
+            self._directory.parent.mkdir(parents=True, exist_ok=True)
+            parent_fd = os.open(
+                self._directory.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                try:
+                    os.mkdir(self._directory.name, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                self._root_fd = os.open(
+                    self._directory.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            finally:
+                os.close(parent_fd)
+            details = os.fstat(self._root_fd)
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o700
+            ):
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            self._lock_fd = os.open(
+                _LIFECYCLE_LOCK_NAME,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._root_fd,
+            )
+            lock_details = os.fstat(self._lock_fd)
+            if (
+                not stat.S_ISREG(lock_details.st_mode)
+                or lock_details.st_uid != os.getuid()
+                or stat.S_IMODE(lock_details.st_mode) != 0o600
+                or lock_details.st_nlink != 1
+            ):
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                os.stat(
+                    _LIFECYCLE_JOURNAL_NAME, dir_fd=self._root_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise LifecycleControllerError("LIFECYCLE_MODE_CONFLICT") from None
+            record = self._read()
+            if record is None:
+                record = {
+                    "schema_version": 1,
+                    "revision": 0,
+                    "lifecycle_generation": secrets.token_hex(16),
+                    "active": True,
+                    "state": FeatureValidationState.BASELINE.value,
+                    "terminal": None,
+                    "authorities": {
+                        "r64_commit": R64_RUNTIME_COMMIT,
+                        "r64_tree": R64_RUNTIME_TREE,
+                        "pr41_commit": PR41_RESTORE_COMMIT,
+                        "pr41_tree": PR41_RESTORE_TREE,
+                    },
+                    "consumed_actions": [],
+                    "operations": {},
+                    "backup_identity": None,
+                    "restart_results": {},
+                }
+                self._write(record, replace=False)
+            else:
+                self.reconstructed = True
+                self._validate(record)
+                if record["active"] is not True:
+                    raise LifecycleControllerError(
+                        "FEATURE_TERMINAL_RETAINED"
+                    ) from None
+            self._record = record
+        except BaseException:
+            self.close()
+            raise
+
+    def _read(self) -> dict[str, object] | None:
+        try:
+            descriptor = os.open(
+                _FEATURE_VALIDATION_JOURNAL_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._root_fd,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_nlink != 1
+                or details.st_size > _MAX_LIFECYCLE_JOURNAL_BYTES
+            ):
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            raw = b""
+            while len(raw) <= _MAX_LIFECYCLE_JOURNAL_BYTES:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(descriptor)
+        return _strict_json_object(raw)
+
+    @classmethod
+    def _validate(cls, record: dict[str, object]) -> None:
+        valid_actions = {action.value for action in FeatureValidationAction}
+        valid_phases = {
+            "intent_durable",
+            "dispatch_started",
+            "result_durable",
+            "transition_committed",
+            "ambiguous",
+        }
+        backup = record.get("backup_identity")
+        backup_valid = backup is None or (
+            isinstance(backup, dict)
+            and set(backup)
+            == {
+                "lifecycle_generation",
+                "source_generation",
+                "backup_generation",
+                "manifest_identity",
+                "backup_digest",
+            }
+            and backup.get("lifecycle_generation") == record.get("lifecycle_generation")
+            and backup.get("source_generation") == PR41_RESTORE_COMMIT
+            and backup.get("manifest_identity")
+            == _AUTHORITY_MANIFEST_DIGESTS[SourceState.RESTORE.value]
+            and isinstance(backup.get("backup_generation"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", backup["backup_generation"]) is not None
+            and isinstance(backup.get("backup_digest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", backup["backup_digest"]) is not None
+        )
+        if (
+            set(record) != cls._FIELDS
+            or record.get("schema_version") != 1
+            or not _exact_non_bool_int(record.get("revision"))
+            or not isinstance(record.get("lifecycle_generation"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", record["lifecycle_generation"]) is None
+            or type(record.get("active")) is not bool
+            or record.get("state")
+            not in {state.value for state in FeatureValidationState}
+            or record.get("terminal")
+            not in {
+                None,
+                FeatureValidationState.COMPLETE_NORMAL.value,
+                FeatureValidationState.RESTORE_FAILED.value,
+            }
+            or record.get("authorities")
+            != {
+                "r64_commit": R64_RUNTIME_COMMIT,
+                "r64_tree": R64_RUNTIME_TREE,
+                "pr41_commit": PR41_RESTORE_COMMIT,
+                "pr41_tree": PR41_RESTORE_TREE,
+            }
+            or not isinstance(record.get("consumed_actions"), list)
+            or len(record["consumed_actions"]) != len(set(record["consumed_actions"]))
+            or any(item not in valid_actions for item in record["consumed_actions"])
+            or not isinstance(record.get("operations"), dict)
+            or any(
+                key not in valid_actions or value not in valid_phases
+                for key, value in record["operations"].items()
+            )
+            or set(record["operations"]) != set(record["consumed_actions"])
+            or not isinstance(record.get("restart_results"), dict)
+            or any(
+                key
+                not in {
+                    FeatureValidationAction.R64_RESTART.value,
+                    FeatureValidationAction.REMOVAL_RESTART.value,
+                }
+                or value
+                not in {
+                    RestartDispatchOutcome.RESPONSE_ACCEPTED.value,
+                    RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN.value,
+                }
+                for key, value in record["restart_results"].items()
+            )
+            or not backup_valid
+            or record.get("active") is True
+            and record.get("terminal") is not None
+            or record.get("active") is False
+            and (
+                record.get("terminal") is None
+                or record.get("terminal") != record.get("state")
+            )
+        ):
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+    def _write(self, record: dict[str, object], *, replace: bool = True) -> None:
+        self._validate(record)
+        name = f".{_FEATURE_VALIDATION_JOURNAL_NAME}.{secrets.token_hex(8)}"
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=self._root_fd,
+        )
+        try:
+            raw = json.dumps(record, separators=(",", ":"), sort_keys=True).encode(
+                "ascii"
+            )
+            offset = 0
+            while offset < len(raw):
+                written = os.write(descriptor, raw[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, "short_write")
+                offset += written
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            if not replace:
+                try:
+                    os.stat(
+                        _FEATURE_VALIDATION_JOURNAL_NAME,
+                        dir_fd=self._root_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise LifecycleControllerError("FEATURE_JOURNAL_EXISTS") from None
+            os.replace(
+                name,
+                _FEATURE_VALIDATION_JOURNAL_NAME,
+                src_dir_fd=self._root_fd,
+                dst_dir_fd=self._root_fd,
+            )
+            os.fsync(self._root_fd)
+        finally:
+            try:
+                os.unlink(name, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
+
+    @property
+    def state(self) -> FeatureValidationState:
+        return FeatureValidationState(self._record["state"])
+
+    @property
+    def lifecycle_generation(self) -> str:
+        return self._record["lifecycle_generation"]
+
+    @property
+    def consumed_actions(self) -> frozenset[FeatureValidationAction]:
+        return frozenset(
+            FeatureValidationAction(item) for item in self._record["consumed_actions"]
+        )
+
+    def committed(self, action: FeatureValidationAction) -> bool:
+        return self._record["operations"].get(action.value) == "transition_committed"
+
+    def operation_phase(self, action: FeatureValidationAction) -> str | None:
+        return self._record["operations"].get(action.value)
+
+    def _mutate(self, callback: Callable[[dict[str, object]], None]) -> None:
+        record = copy.deepcopy(self._record)
+        callback(record)
+        record["revision"] += 1
+        self._write(record)
+        self._record = record
+
+    def begin(self, action: FeatureValidationAction) -> None:
+        if action in self.consumed_actions:
+            raise LifecycleControllerError("FEATURE_ACTION_ALREADY_CONSUMED") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            record["consumed_actions"].append(action.value)
+            record["operations"][action.value] = "intent_durable"
+
+        self._mutate(mutate)
+
+    def mark(self, action: FeatureValidationAction, phase: str) -> None:
+        if phase not in {"dispatch_started", "result_durable", "transition_committed"}:
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) not in {
+                "intent_durable",
+                "dispatch_started",
+                "result_durable",
+            }:
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = phase
+
+        self._mutate(mutate)
+
+    def transition(
+        self, state: FeatureValidationState, action: FeatureValidationAction
+    ) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) != "result_durable":
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = "transition_committed"
+            record["state"] = state.value
+
+        self._mutate(mutate)
+
+    def record_restart(
+        self, action: FeatureValidationAction, result: RestartResult
+    ) -> None:
+        if action not in {
+            FeatureValidationAction.R64_RESTART,
+            FeatureValidationAction.REMOVAL_RESTART,
+        } or result.dispatch_outcome not in {
+            RestartDispatchOutcome.RESPONSE_ACCEPTED,
+            RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+        }:
+            raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+
+        def mutate(record: dict[str, object]) -> None:
+            record["restart_results"][action.value] = result.dispatch_outcome.value
+
+        self._mutate(mutate)
+
+    def restart_outcome(
+        self, action: FeatureValidationAction
+    ) -> RestartDispatchOutcome | None:
+        value = self._record["restart_results"].get(action.value)
+        return None if value is None else RestartDispatchOutcome(value)
+
+    def require_restore(self, action: FeatureValidationAction) -> None:
+        """Durably consume an uncertain operation and permit only restoration."""
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["operations"].get(action.value) not in {
+                "intent_durable",
+                "dispatch_started",
+                "result_durable",
+            }:
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            record["operations"][action.value] = "ambiguous"
+            record["state"] = FeatureValidationState.RESTORE_REQUIRED.value
+
+        self._mutate(mutate)
+
+    def bind_backup(self, result: BackupResult) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            if record["backup_identity"] is not None:
+                raise LifecycleControllerError("FEATURE_BACKUP_ALREADY_BOUND") from None
+            record["backup_identity"] = {
+                "lifecycle_generation": result.lifecycle_generation,
+                "source_generation": result.source_generation,
+                "backup_generation": result.backup_generation,
+                "manifest_identity": result.manifest_identity,
+                "backup_digest": result.backup_digest,
+            }
+
+        self._mutate(mutate)
+
+    def terminal(self, state: FeatureValidationState) -> None:
+        def mutate(record: dict[str, object]) -> None:
+            record["state"] = state.value
+            record["terminal"] = state.value
+            record["active"] = False
+
+        self._mutate(mutate)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor_name in ("_lock_fd", "_root_fd"):
+            descriptor = getattr(self, descriptor_name)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, descriptor_name, None)
+
+
 def _source_path_allowed(path: object, state: SourceState) -> bool:
     if not isinstance(path, str) or not path or "\\" in path:
         return False
@@ -4764,6 +5352,108 @@ def _parse_remote_phase_a_readiness_result(
     )
 
 
+def _parse_refresh_status_live_validation_result(
+    private_output: bytes,
+) -> RefreshStatusLiveValidationResult:
+    """Parse the fixed aggregate without retaining remote identifiers or logs."""
+    value = _exact_payload(private_output)
+    if set(value) != {
+        "eligible_s1_count",
+        "selected",
+        "refresh_button_present",
+        "policy_on_demand",
+        "ble_control_enabled",
+        "hold_time_valid",
+        "cold",
+        "warm",
+        "same_authenticated_session_reused",
+        "hold",
+        "ambiguous",
+        "failure_class",
+        "conditional_omission_observed",
+    }:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+
+    def parse_counts(payload: object) -> RefreshPacketCounts:
+        names = ("device_info", "pair", "device_status", "datapoint", "other")
+        if not isinstance(payload, dict) or set(payload) != set(names):
+            raise ValueError
+        result = RefreshPacketCounts(*(_count(payload[name]) for name in names))
+        if any(item > 8 for item in asdict(result).values()):
+            raise ValueError
+        return result
+
+    def parse_press(payload: object) -> RefreshPressResult:
+        if not isinstance(payload, dict) or set(payload) != {
+            "service_success",
+            "counts",
+            "last_status_update_advanced",
+            "retained_confirmation_changed_dp_ids",
+        }:
+            raise ValueError
+        ids = payload["retained_confirmation_changed_dp_ids"]
+        if (
+            not isinstance(ids, list)
+            or any(type(item) is not int or item not in {8, 33, 34, 36} for item in ids)
+            or ids != sorted(set(ids))
+        ):
+            raise ValueError
+        return RefreshPressResult(
+            _bool(payload["service_success"]),
+            parse_counts(payload["counts"]),
+            _bool(payload["last_status_update_advanced"]),
+            tuple(ids),
+        )
+
+    try:
+        cold = parse_press(value["cold"])
+        warm = parse_press(value["warm"])
+        hold_value = value["hold"]
+        if not isinstance(hold_value, dict) or set(hold_value) != {
+            "warm_immediately_after_press",
+            "normal_release_observed",
+            "automatic_reconnect_observed",
+        }:
+            raise ValueError
+        failure = value["failure_class"]
+        result = RefreshStatusLiveValidationResult(
+            _count(value["eligible_s1_count"]),
+            _bool(value["selected"]),
+            _bool(value["refresh_button_present"]),
+            _bool(value["policy_on_demand"]),
+            _bool(value["ble_control_enabled"]),
+            _bool(value["hold_time_valid"]),
+            cold,
+            warm,
+            _bool(value["same_authenticated_session_reused"]),
+            RefreshHoldResult(
+                _bool(hold_value["warm_immediately_after_press"]),
+                _bool(hold_value["normal_release_observed"]),
+                _bool(hold_value["automatic_reconnect_observed"]),
+            ),
+            _bool(value["ambiguous"]),
+            None if failure is None else RefreshStatusFailureClass(failure),
+            _bool(value["conditional_omission_observed"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    if (
+        result.eligible_s1_count > 64
+        or result.cold.counts.device_status > 1
+        or result.warm.counts.device_status > 1
+        or result.cold.counts.device_status + result.warm.counts.device_status > 2
+    ):
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return result
+
+
+def _parse_feature_absence_result(private_output: bytes) -> FeatureAbsenceResult:
+    value = _exact_payload(private_output)
+    if set(value) != {"refresh_button_active"}:
+        raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL") from None
+    return FeatureAbsenceResult(_bool(value["refresh_button_active"]))
+
+
 @dataclass(frozen=True)
 class DecodedRepairs:
     """Internal strict decode result; invalid shapes never substitute an empty list."""
@@ -5217,6 +5907,10 @@ def expected_manifest(value):
             '4f73a9b008dcb89134bc41001c486f06d6056867',
             '463ed8553da01eae591de611e76e45392ad9e7bf',
         ),
+        'r64_runtime': (
+            'c5c9cda147972c5e08cc9ba2958c4235b9f2eb68',
+            'ab9c29acf5d95b161ae6786804c71935e1aa79a0',
+        ),
     }
     if state not in authorities or (
         manifest.get('authority_commit'), manifest.get('authority_tree')
@@ -5249,6 +5943,7 @@ def expected_manifest(value):
     fingerprints = {
         'candidate': 'c1599dcd1cdc1201cd320c316059159a1948d5f58d4bdaa4c64ea3c4a0390075',
         'restore': '2d1dd79288b90f0d12c5c35449e6ed5d02c53433335dedd68377c81809731ac2',
+        'r64_runtime': '0dfc05ed3703073cc0a1709e3298a692985d202460c035cc8bf81396b39d54cb',
     }
     if hashlib.sha256(canonical).hexdigest() != fingerprints[state]:
         raise ValueError('fingerprint')
@@ -6585,7 +7280,7 @@ def activate(value, restoring=False):
     if restoring != (state == 'restore') or inventory_stage() != expected:
         raise ValueError('stage')
     staged = STAGE / 'integration'
-    if not restoring:
+    if state == 'candidate':
         replace_root_relative(STAGE / 'helper', staged / '.phase_a_tools')
     if inventory_deployment(staged) != expected:
         raise ValueError('assembled')
@@ -7855,6 +8550,448 @@ print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
 """
 
 
+_REMOTE_REFRESH_STATUS_PROGRAM = r"""
+import base64
+import json
+import os
+import queue
+import re
+import socket
+import struct
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+LOGGER = 'custom_components.tuya_ble.tuya_ble.tuya_ble'
+EMPTY_COUNTS = {'device_info': 0, 'pair': 0, 'device_status': 0, 'datapoint': 0, 'other': 0}
+EMPTY_PRESS = {
+    'service_success': False,
+    'counts': dict(EMPTY_COUNTS),
+    'last_status_update_advanced': False,
+    'retained_confirmation_changed_dp_ids': [],
+}
+
+def strict_json(raw):
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise ValueError('duplicate')
+            value[key] = item
+        return value
+    return json.loads(raw, object_pairs_hook=pairs)
+
+def headers():
+    token = os.environ.get('SUPERVISOR_TOKEN')
+    if not token:
+        raise ValueError('context')
+    return {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
+
+def http_json(path, method='GET', data=None, limit=1024 * 1024):
+    body = None if data is None else json.dumps(data, separators=(',', ':')).encode()
+    request = urllib.request.Request(
+        'http://supervisor/core/api' + path,
+        data=body,
+        headers=headers(),
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read(limit + 1)
+        if len(raw) > limit or response.getcode() // 100 != 2:
+            raise ValueError('response')
+    return strict_json(raw.decode())
+
+class WebSocket:
+    def __init__(self):
+        self.sock = socket.create_connection(('supervisor', 80), timeout=15)
+        key = base64.b64encode(os.urandom(16)).decode()
+        token = os.environ.get('SUPERVISOR_TOKEN')
+        request = (
+            'GET /core/websocket HTTP/1.1\r\nHost: supervisor\r\nUpgrade: websocket\r\n'
+            'Connection: Upgrade\r\nSec-WebSocket-Key: ' + key + '\r\n'
+            'Sec-WebSocket-Version: 13\r\nAuthorization: Bearer ' + token + '\r\n\r\n'
+        )
+        self.sock.sendall(request.encode('ascii'))
+        response = b''
+        while b'\r\n\r\n' not in response and len(response) <= 16384:
+            response += self.sock.recv(4096)
+        if not response.startswith(b'HTTP/1.1 101'):
+            raise ValueError('websocket')
+        self.next_id = 1
+        first = self.recv()
+        if first.get('type') == 'auth_required':
+            self.send({'type': 'auth', 'access_token': token})
+            first = self.recv()
+        if first.get('type') != 'auth_ok':
+            raise ValueError('websocket_auth')
+
+    def _read(self, size):
+        value = b''
+        while len(value) < size:
+            part = self.sock.recv(size - len(value))
+            if not part:
+                raise ValueError('websocket_closed')
+            value += part
+        return value
+
+    def send(self, value):
+        data = json.dumps(value, separators=(',', ':')).encode()
+        mask = os.urandom(4)
+        length = len(data)
+        head = bytearray([0x81])
+        if length < 126:
+            head.append(0x80 | length)
+        elif length < 65536:
+            head.append(0x80 | 126); head.extend(struct.pack('>H', length))
+        else:
+            head.append(0x80 | 127); head.extend(struct.pack('>Q', length))
+        masked = bytes(item ^ mask[index % 4] for index, item in enumerate(data))
+        self.sock.sendall(bytes(head) + mask + masked)
+
+    def recv(self):
+        while True:
+            first, second = self._read(2)
+            opcode = first & 0x0f
+            length = second & 0x7f
+            if length == 126:
+                length = struct.unpack('>H', self._read(2))[0]
+            elif length == 127:
+                length = struct.unpack('>Q', self._read(8))[0]
+            if length > 2 * 1024 * 1024 or second & 0x80:
+                raise ValueError('websocket_frame')
+            data = self._read(length)
+            if opcode == 9:
+                self._send_control(10, data); continue
+            if opcode != 1:
+                raise ValueError('websocket_frame')
+            value = strict_json(data.decode())
+            if not isinstance(value, dict):
+                raise ValueError('websocket_shape')
+            return value
+
+    def _send_control(self, opcode, data):
+        mask = os.urandom(4)
+        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(data)]) + mask + bytes(
+            item ^ mask[index % 4] for index, item in enumerate(data)
+        ))
+
+    def command(self, kind, **fields):
+        identifier = self.next_id; self.next_id += 1
+        self.send({'id': identifier, 'type': kind, **fields})
+        while True:
+            value = self.recv()
+            if value.get('id') != identifier:
+                continue
+            if value.get('type') != 'result' or value.get('success') is not True:
+                raise ValueError('websocket_command')
+            return value.get('result')
+
+    def close(self):
+        try: self._send_control(8, b'')
+        except Exception: pass
+        try: self.sock.close()
+        except Exception: pass
+
+class LogStream:
+    def __init__(self):
+        request = urllib.request.Request(
+            'http://supervisor/core/logs/follow',
+            headers={**headers(), 'Accept': 'text/plain', 'Range': 'entries=-1:1'},
+        )
+        self.response = urllib.request.urlopen(request, timeout=30)
+        self.lines = queue.Queue(maxsize=512)
+        self.overflow = False
+        self.closed = False
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        try:
+            while not self.closed:
+                line = self.response.readline(4097)
+                if not line:
+                    break
+                if len(line) > 4096:
+                    self.overflow = True; break
+                try: self.lines.put_nowait(line.decode('utf-8', 'replace'))
+                except queue.Full: self.overflow = True; break
+        except Exception:
+            if not self.closed: self.overflow = True
+
+    def drain(self):
+        result = []
+        while True:
+            try: result.append(self.lines.get_nowait())
+            except queue.Empty: break
+        if self.overflow:
+            raise ValueError('log_overflow')
+        return result
+
+    def close(self):
+        self.closed = True
+        try: self.response.close()
+        except Exception: pass
+        self.thread.join(timeout=1)
+
+def entries_by_key(entities, device_id, domain, key):
+    return [entry for entry in entities if (
+        isinstance(entry, dict)
+        and entry.get('di') == device_id
+        and entry.get('pl') == 'tuya_ble'
+        and entry.get('tk') == key
+        and isinstance(entry.get('ei'), str)
+        and entry['ei'].startswith(domain + '.')
+    )]
+
+def state(entity_id):
+    value = http_json('/states/' + entity_id)
+    if not isinstance(value, dict) or value.get('entity_id') != entity_id:
+        raise ValueError('state')
+    return value
+
+def stamp(value):
+    attributes = value.get('attributes')
+    if not isinstance(attributes, dict):
+        return None
+    return attributes.get('last_confirmed_at', value.get('state'))
+
+LOG_RE = re.compile(
+    r'^.*\[custom_components\.tuya_ble\.tuya_ble\.tuya_ble\] '
+    r'(tuya-ble-session-[ghjkmnpqrstuvwxyz]{16}): (.*)$'
+)
+SEND_RE = re.compile(r'^Sending packet: #[0-9]+ ([A-Z0-9_]+)(?: in response to #[0-9]+)?$')
+
+def parse_lines(lines, required_identity=None):
+    records = []
+    for raw in lines:
+        raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
+        match = LOG_RE.fullmatch(raw)
+        if match: records.append((match.group(1), match.group(2)))
+    identities = {identity for identity, message in records if (
+        SEND_RE.fullmatch(message)
+        or message.startswith(('Connecting;', 'Connected;', 'Successfully connected', 'Disconnecting', 'Disconnected from device;', 'Scheduling reconnect;', 'Reconnect,'))
+    )}
+    if required_identity is not None and any(item != required_identity for item in identities):
+        raise ValueError('multiple_identity')
+    if required_identity is None:
+        if len(identities) != 1: raise ValueError('identity')
+        required_identity = next(iter(identities))
+    counts = dict(EMPTY_COUNTS)
+    events = []
+    for identity, message in records:
+        if identity != required_identity: continue
+        sent = SEND_RE.fullmatch(message)
+        if sent:
+            code = sent.group(1)
+            name = {
+                'FUN_SENDER_DEVICE_INFO': 'device_info',
+                'FUN_SENDER_PAIR': 'pair',
+                'FUN_SENDER_DEVICE_STATUS': 'device_status',
+                'FUN_SENDER_DPS': 'datapoint',
+                'FUN_SENDER_DPS_V4': 'datapoint',
+            }.get(code, 'other')
+            counts[name] += 1
+        for prefix, event in (
+            ('Connecting;', 'connecting'), ('Connected;', 'connected'),
+            ('Successfully connected', 'authenticated'), ('Disconnecting', 'disconnecting'),
+            ('Disconnected from device;', 'disconnected'), ('Scheduling reconnect;', 'reconnect'),
+            ('Reconnect,', 'reconnect'),
+        ):
+            if message.startswith(prefix): events.append(event)
+    return required_identity, counts, events
+
+def all_sessions_quiescent(lines):
+    active = {}
+    for raw in lines:
+        raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
+        match = LOG_RE.fullmatch(raw)
+        if not match: continue
+        identity, message = match.groups()
+        if SEND_RE.fullmatch(message) or message.startswith(
+            ('Connecting;', 'Connected;', 'Successfully connected',
+             'Disconnecting', 'Scheduling reconnect;', 'Reconnect,')
+        ):
+            active[identity] = True
+        if message.startswith('Disconnected from device;'):
+            active[identity] = False
+    return not any(active.values())
+
+def press(ws, entity_id):
+    ws.command('call_service', domain='button', service='press',
+               target={'entity_id': entity_id}, return_response=False)
+
+def observe_press(stream, last_id, previous):
+    deadline = time.monotonic() + 30
+    lines = []
+    current = previous
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        lines.extend(stream.drain())
+        current = state(last_id).get('state')
+        if current != previous:
+            time.sleep(0.8)
+            lines.extend(stream.drain())
+            break
+    return lines, current
+
+def empty_result():
+    return {
+        'eligible_s1_count': 0, 'selected': False,
+        'refresh_button_present': False, 'policy_on_demand': False,
+        'ble_control_enabled': False, 'hold_time_valid': False,
+        'cold': dict(EMPTY_PRESS), 'warm': dict(EMPTY_PRESS),
+        'same_authenticated_session_reused': False,
+        'hold': {'warm_immediately_after_press': False,
+                 'normal_release_observed': False,
+                 'automatic_reconnect_observed': False},
+        'ambiguous': False, 'failure_class': None,
+        'conditional_omission_observed': False,
+    }
+
+def run_validation():
+    result = empty_result(); ws = stream = None; prior_level = None
+    try:
+        ws = WebSocket()
+        display = ws.command('config/entity_registry/list_for_display')
+        devices = ws.command('config/device_registry/list')
+        if not isinstance(display, dict) or not isinstance(display.get('entities'), list) or not isinstance(devices, list):
+            raise ValueError('registry')
+        entities = display['entities']; device_map = {item.get('id'): item for item in devices if isinstance(item, dict)}
+        config_entries = http_json('/config/config_entries/entry?domain=tuya_ble')
+        if not isinstance(config_entries, list): raise ValueError('entries')
+        entry_map = {item.get('entry_id'): item for item in config_entries if isinstance(item, dict) and item.get('state') == 'loaded'}
+        eligible = []
+        for entry_id in sorted(entry_map):
+            diagnostic = http_json('/diagnostics/config_entry/' + entry_id)
+            data = diagnostic.get('data') if isinstance(diagnostic, dict) else None
+            options = data.get('options') if isinstance(data, dict) else None
+            if isinstance(options, dict) and options.get('category') == 'jtmspro' and options.get('product_id') == 'xqeob8h6':
+                eligible.append((entry_id, options))
+        result['eligible_s1_count'] = len(eligible)
+        if not eligible:
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'; return result
+        entry_id, options = eligible[0]
+        owned_devices = [item.get('id') for item in devices if (
+            isinstance(item, dict) and isinstance(item.get('id'), str)
+            and isinstance(item.get('config_entries'), list)
+            and entry_id in item['config_entries']
+        )]
+        if len(owned_devices) != 1:
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'; return result
+        device_id = owned_devices[0]
+        owned = entries_by_key(entities, device_id, 'button', 'refresh_status')
+        if len(owned) != 1:
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'; return result
+        button_id = owned[0]['ei']
+        if state(button_id).get('state') == 'unavailable':
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'; return result
+        result['selected'] = True; result['refresh_button_present'] = True
+        result['policy_on_demand'] = options.get('connection_mode') == 'on_demand'
+        result['ble_control_enabled'] = options.get('ble_control_enabled') is True
+        hold = options.get('on_demand_connection_hold_time', 15)
+        result['hold_time_valid'] = type(hold) is int and 15 <= hold <= 105
+        if not (result['policy_on_demand'] and result['ble_control_enabled'] and result['hold_time_valid']):
+            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        last_entities = entries_by_key(entities, device_id, 'sensor', 'last_status_update')
+        if len(last_entities) != 1:
+            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        last_id = last_entities[0]['ei']
+        dp_entities = {}
+        for dp, domain, key in ((8, 'sensor', 'battery'), (33, 'switch', 'automatic_lock'), (34, 'select', 'unlock_switch'), (36, 'number', 'auto_lock_time')):
+            matches = entries_by_key(entities, device_id, domain, key)
+            if len(matches) == 1: dp_entities[dp] = matches[0]['ei']
+        info = ws.command('logger/log_info')
+        levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
+        if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
+            result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
+        prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
+        ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        stream = LogStream()
+        time.sleep(hold + 5); quiescence = stream.drain()
+        if not all_sessions_quiescent(quiescence):
+            result['failure_class'] = 'COLD_STATE_NOT_PROVEN'; return result
+        before_last = state(last_id).get('state')
+        before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
+        stream.drain(); press(ws, button_id)
+        cold_lines, after_cold = observe_press(stream, last_id, before_last)
+        identity, cold_counts, cold_events = parse_lines(cold_lines)
+        changed_cold = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
+        result['cold'] = {'service_success': True, 'counts': cold_counts,
+                          'last_status_update_advanced': after_cold != before_last,
+                          'retained_confirmation_changed_dp_ids': changed_cold}
+        result['conditional_omission_observed'] = bool(dp_entities) and len(changed_cold) < len(dp_entities)
+        if cold_counts['datapoint']:
+            result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
+        if not (cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1 and cold_events.count('connecting') == 1 and cold_events.count('connected') == 1 and cold_events.count('authenticated') == 1 and not any(event in cold_events for event in ('disconnecting', 'disconnected', 'reconnect')) and result['cold']['last_status_update_advanced']):
+            result['failure_class'] = 'COLD_REQUEST_FAILED'; return result
+        delay = min(1.1, max(0.1, hold / 4)); time.sleep(delay)
+        before_warm = after_cold; before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
+        stream.drain(); press(ws, button_id)
+        warm_lines, after_warm = observe_press(stream, last_id, before_warm)
+        _, warm_counts, warm_events = parse_lines(warm_lines, identity)
+        changed_warm = sorted(dp for dp, entity in dp_entities.items() if stamp(state(entity)) != before_dp[dp])
+        result['warm'] = {'service_success': True, 'counts': warm_counts,
+                          'last_status_update_advanced': after_warm != before_warm,
+                          'retained_confirmation_changed_dp_ids': changed_warm}
+        if warm_counts['datapoint']:
+            result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
+        result['same_authenticated_session_reused'] = not any(event in warm_events for event in ('connecting', 'connected', 'authenticated', 'disconnecting', 'disconnected', 'reconnect'))
+        if not (warm_counts['device_info'] == 0 and warm_counts['pair'] == 0 and warm_counts['device_status'] == 1 and result['same_authenticated_session_reused']):
+            result['failure_class'] = 'WARM_REQUEST_FAILED'; return result
+        if not result['warm']['last_status_update_advanced']:
+            result['failure_class'] = 'RETAINED_CONFIRMATION_NOT_OBSERVED'; return result
+        result['hold']['warm_immediately_after_press'] = True
+        time.sleep(hold + 5); _, _, release_events = parse_lines(stream.drain(), identity)
+        result['hold']['normal_release_observed'] = 'disconnecting' in release_events and 'disconnected' in release_events
+        if not result['hold']['normal_release_observed']:
+            result['failure_class'] = 'HOLD_RELEASE_NOT_OBSERVED'; return result
+        time.sleep(5); _, _, post_events = parse_lines(stream.drain(), identity)
+        result['hold']['automatic_reconnect_observed'] = any(event in post_events for event in ('connecting', 'connected', 'authenticated', 'reconnect'))
+        if result['hold']['automatic_reconnect_observed']:
+            result['failure_class'] = 'AUTOMATIC_RECONNECT_OBSERVED'; return result
+        return result
+    except Exception:
+        result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'; return result
+    finally:
+        if stream is not None: stream.close()
+        if ws is not None:
+            if prior_level is not None:
+                try:
+                    ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                except Exception:
+                    result['ambiguous'] = True
+                    result['failure_class'] = 'AMBIGUOUS'
+            ws.close()
+
+def feature_absence():
+    ws = WebSocket()
+    try:
+        display = ws.command('config/entity_registry/list_for_display')
+        entities = display.get('entities') if isinstance(display, dict) else None
+        if not isinstance(entities, list): raise ValueError('registry')
+        active = False
+        for entry in entities:
+            if isinstance(entry, dict) and entry.get('pl') == 'tuya_ble' and entry.get('tk') == 'refresh_status' and isinstance(entry.get('ei'), str) and entry['ei'].startswith('button.'):
+                try:
+                    active = active or state(entry['ei']).get('state') != 'unavailable'
+                except urllib.error.HTTPError as error:
+                    if error.code != 404: raise
+        return {'refresh_button_active': active}
+    finally:
+        ws.close()
+
+operation = sys.argv[1]
+try:
+    result = run_validation() if operation == 'refresh_status_live_validation' else feature_absence() if operation == 'feature_absence' else None
+    if result is None: raise ValueError('operation')
+except Exception:
+    result = {'error_class': 'OPERATION_FAILED', 'error_scope': 'OTHER', 'error_reason': 'VALIDATION'}
+print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
+"""
+
+
 def _spawn_private_wrapper(wrapper_path: Path) -> tuple[int, int]:
     """Fork a controlling PTY and execute exactly the pre-validated wrapper path."""
     child_pid, master_fd = pty.fork()
@@ -7974,6 +9111,7 @@ class PrivateInteractiveSessionBroker:
             or controller.__class__
             not in {
                 FullPreflightLifecycleController,
+                RefreshStatusLiveValidationController,
                 RetainedAnchorContinuityInspector,
                 RetainedTerminalLifecycleInspector,
             }
@@ -8095,6 +9233,37 @@ class PrivateInteractiveSessionBroker:
         ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_RESEARCH_CAPABILITY_INVALID"
+            ) from None
+        if consume:
+            binding.issuer.consumed.append(capability)
+        return capability
+
+    def _require_feature_capability(
+        self,
+        capability: object,
+        actions: frozenset[FeatureValidationAction],
+        *,
+        consume: bool = False,
+    ) -> _FeatureValidationCapability:
+        """Validate one fixed feature action without widening LifecycleAction."""
+        binding = self._controller_binding
+        if (
+            type(capability) is not _FeatureValidationCapability
+            or binding is None
+            or self._state is not BrokerState.SESSION_ACTIVE
+            or self._session_generation is not binding.session_generation
+            or capability.controller is not binding.controller
+            or capability.issuer is not binding.issuer.identity
+            or capability.lifecycle_generation is not binding.lifecycle_generation
+            or capability.session_generation is not binding.session_generation
+            or capability.source_generation is None
+            or capability.action not in actions
+            or capability.issuance_identity is None
+            or not any(capability is issued for issued in binding.issuer.issued)
+            or any(capability is consumed for consumed in binding.issuer.consumed)
+        ):
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_FEATURE_CAPABILITY_INVALID"
             ) from None
         if consume:
             binding.issuer.consumed.append(capability)
@@ -8569,6 +9738,111 @@ class PrivateInteractiveSessionBroker:
                 DispatchFailureStage.RESPONSE_WAIT, error
             ) from None
 
+    def __execute_refresh_feature_operation(
+        self,
+        operation: str,
+        *,
+        _capability: object,
+    ) -> bytes:
+        """Run one parameter-free exact-R64 validation operation."""
+        actions = {
+            "refresh_status_live_validation": FeatureValidationAction.LIVE_VALIDATION,
+            "feature_absence": FeatureValidationAction.FEATURE_ABSENCE,
+        }
+        action = actions.get(operation)
+        if action is None:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_FEATURE_INVALID"
+            ) from None
+        self._require_feature_capability(_capability, frozenset({action}), consume=True)
+        if self._state is not BrokerState.SESSION_ACTIVE:
+            raise SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_NOT_ACTIVE") from None
+        start_payload, start_frame = self._new_frame("FEATURE_START")
+        end_payload, end_frame = self._new_frame("FEATURE_END")
+        program_bytes = _REMOTE_REFRESH_STATUS_PROGRAM.encode("utf-8")
+        program_digest = hashlib.sha256(program_bytes).hexdigest()
+        encoded_program = base64.b64encode(program_bytes).decode("ascii")
+        chunks = tuple(
+            encoded_program[index : index + _TRANSFER_CHUNK_SIZE]
+            for index in range(0, len(encoded_program), _TRANSFER_CHUNK_SIZE)
+        )
+        if not chunks or len(chunks) > 256:
+            raise SessionBrokerError(
+                "PRIVATE_INTERACTIVE_SESSION_FEATURE_INVALID"
+            ) from None
+        bootstrap_body = (
+            "try:\n"
+            " count=int(sys.stdin.readline())\n"
+            " source=''.join(sys.stdin.readline().strip() for _ in range(count))\n"
+            " raw=base64.b64decode(source,validate=True)\n"
+            " expected=os.environ.pop('HA_R65_PROGRAM_SHA256')\n"
+            " assert hashlib.sha256(raw).hexdigest()==expected\n"
+            " exec(compile(raw,'<ha-r65-feature>','exec'))\n"
+            "except Exception:\n"
+            ' print(\'{"error_class":"OPERATION_FAILED","error_scope":"BOOTSTRAP",'
+            '"error_reason":"UNKNOWN"}\',flush=True)\n'
+        )
+        bootstrap = "import base64,hashlib,os,sys;exec(" + repr(bootstrap_body) + ")"
+        command = (
+            f"{self._frame_printf(start_payload)}; "
+            f"HA_R65_PROGRAM_SHA256={program_digest} "
+            f"python3 -c {shlex.quote(bootstrap)} {operation}; "
+            f"{self._frame_printf(end_payload)}\n"
+        )
+        try:
+            self._ensure_echo_disabled()
+            self.__write_wire(
+                _PrivateWirePacket(command.encode("ascii"), self.__wire_issuer)
+            )
+            self._read_until(start_frame)
+            self.__write_wire(
+                _PrivateWirePacket(
+                    (str(len(chunks)) + "\n").encode("ascii"), self.__wire_issuer
+                )
+            )
+            for chunk in chunks:
+                self.__write_wire(
+                    _PrivateWirePacket(
+                        (chunk + "\n").encode("ascii"), self.__wire_issuer
+                    )
+                )
+            return self._read_until(
+                end_frame,
+                timeout_seconds=(
+                    360.0 if action is FeatureValidationAction.LIVE_VALIDATION else 40.0
+                ),
+            )
+        except SessionBrokerError as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_WAIT, error
+            ) from None
+
+    def _run_s1_refresh_status_live_validation(
+        self, *, _capability: object = None
+    ) -> RefreshStatusLiveValidationResult:
+        output = self.__execute_refresh_feature_operation(
+            "refresh_status_live_validation", _capability=_capability
+        )
+        try:
+            return _parse_refresh_status_live_validation_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _verify_refresh_feature_absent(
+        self, *, _capability: object = None
+    ) -> FeatureAbsenceResult:
+        output = self.__execute_refresh_feature_operation(
+            "feature_absence", _capability=_capability
+        )
+        try:
+            return _parse_feature_absence_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
     def _invoke_remote_phase_a_research(
         self,
         baseline: AuditSnapshot,
@@ -8668,7 +9942,7 @@ class PrivateInteractiveSessionBroker:
         action = (
             LifecycleAction.CANDIDATE_TRANSFER
             if isinstance(bundle, SourceBundle)
-            and bundle.state is SourceState.CANDIDATE
+            and bundle.state in {SourceState.CANDIDATE, SourceState.R64_RUNTIME}
             else LifecycleAction.RESTORE_TRANSFER
         )
         capability = self._require_capability(_capability, frozenset({action}))
@@ -8697,10 +9971,10 @@ class PrivateInteractiveSessionBroker:
         capability = self._require_capability(
             _capability, frozenset({LifecycleAction.CANDIDATE_INSTALL})
         )
-        if (
-            not isinstance(manifest, SourceManifest)
-            or manifest.state is not SourceState.CANDIDATE
-        ):
+        if not isinstance(manifest, SourceManifest) or manifest.state not in {
+            SourceState.CANDIDATE,
+            SourceState.R64_RUNTIME,
+        }:
             raise SourceBundleError("CANDIDATE_MANIFEST_REQUIRED") from None
         output = self.__execute_bounded_operation(
             BoundedOperation.INSTALL,
@@ -8719,7 +9993,7 @@ class PrivateInteractiveSessionBroker:
             ),
         )
         if result.installation_success and result.manifest_match:
-            self._active_source_state = SourceState.CANDIDATE
+            self._active_source_state = manifest.state
         return _bind_evidence_origin(result, capability)
 
     def _verify_source_inventory(
@@ -8728,7 +10002,7 @@ class PrivateInteractiveSessionBroker:
         action = (
             LifecycleAction.CANDIDATE_INVENTORY
             if isinstance(manifest, SourceManifest)
-            and manifest.state is SourceState.CANDIDATE
+            and manifest.state in {SourceState.CANDIDATE, SourceState.R64_RUNTIME}
             else LifecycleAction.RESTORE_INVENTORY
         )
         capability = self._require_capability(_capability, frozenset({action}))
@@ -8753,7 +10027,8 @@ class PrivateInteractiveSessionBroker:
         self._require_source_inspection_capability(_capability, consume=True)
         if (
             not isinstance(candidate_manifest, SourceManifest)
-            or candidate_manifest.state is not SourceState.CANDIDATE
+            or candidate_manifest.state
+            not in {SourceState.CANDIDATE, SourceState.R64_RUNTIME}
             or not isinstance(restore_manifest, SourceManifest)
             or restore_manifest.state is not SourceState.RESTORE
         ):
@@ -8784,7 +10059,12 @@ class PrivateInteractiveSessionBroker:
                 candidate_result, len(candidate_manifest.entries)
             ):
                 return CurrentSourceInventoryResult(
-                    CurrentSourceClassification.EXACT_PR45, candidate_result
+                    (
+                        CurrentSourceClassification.EXACT_PR45
+                        if candidate_manifest.state is SourceState.CANDIDATE
+                        else CurrentSourceClassification.EXACT_R64
+                    ),
+                    candidate_result,
                 )
         except (SessionBrokerError, SourceBundleError, TypeError, ValueError) as error:
             failure = _bounded_dispatch_failure(DispatchFailureStage.UNKNOWN, error)
@@ -8854,6 +10134,10 @@ class PrivateInteractiveSessionBroker:
                 1: LifecycleAction.CANDIDATE_CORE_CHECK_1,
                 2: LifecycleAction.CANDIDATE_CORE_CHECK_2,
             },
+            SourceState.R64_RUNTIME: {
+                1: LifecycleAction.CANDIDATE_CORE_CHECK_1,
+                2: LifecycleAction.CANDIDATE_CORE_CHECK_2,
+            },
             SourceState.RESTORE: {
                 1: LifecycleAction.RESTORE_CORE_CHECK_1,
                 2: LifecycleAction.RESTORE_CORE_CHECK_2,
@@ -8877,6 +10161,7 @@ class PrivateInteractiveSessionBroker:
         state = self._active_source_state
         action = {
             SourceState.CANDIDATE: LifecycleAction.ACTIVATION_RESTART,
+            SourceState.R64_RUNTIME: LifecycleAction.ACTIVATION_RESTART,
             SourceState.RESTORE: LifecycleAction.REMOVAL_RESTART,
         }.get(state)
         capability = self._require_capability(
@@ -8898,6 +10183,7 @@ class PrivateInteractiveSessionBroker:
     ) -> CoreReadinessResult:
         action = {
             SourceState.CANDIDATE: LifecycleAction.CANDIDATE_READINESS,
+            SourceState.R64_RUNTIME: LifecycleAction.CANDIDATE_READINESS,
             SourceState.RESTORE: LifecycleAction.RESTORE_READINESS,
         }.get(self._active_source_state)
         capability = self._require_capability(
@@ -11339,6 +12625,917 @@ class FullPreflightLifecycleController:
         if result.phase == "reconciled_unknown" and self._journal is not None:
             self._journal.close()
         return result
+
+
+_FEATURE_ACTION_PREDECESSORS: dict[
+    FeatureValidationAction, frozenset[FeatureValidationState]
+] = {
+    FeatureValidationAction.INITIAL_SOURCE: frozenset(
+        {FeatureValidationState.BASELINE}
+    ),
+    FeatureValidationAction.INITIAL_REPAIRS: frozenset(
+        {FeatureValidationState.INITIAL_SOURCE_VERIFIED}
+    ),
+    FeatureValidationAction.BACKUP: frozenset(
+        {FeatureValidationState.INITIAL_REPAIRS_PASS}
+    ),
+    FeatureValidationAction.R64_TRANSFER: frozenset(
+        {FeatureValidationState.R64_BACKUP_VERIFIED}
+    ),
+    FeatureValidationAction.R64_INSTALL: frozenset({FeatureValidationState.R64_STAGED}),
+    FeatureValidationAction.R64_INVENTORY: frozenset(
+        {FeatureValidationState.R64_INSTALLED}
+    ),
+    FeatureValidationAction.R64_CORE_CHECK: frozenset(
+        {FeatureValidationState.R64_INVENTORY_VERIFIED}
+    ),
+    FeatureValidationAction.R64_RESTART: frozenset(
+        {FeatureValidationState.R64_CORE_CHECKED}
+    ),
+    FeatureValidationAction.R64_READINESS: frozenset(
+        {FeatureValidationState.R64_RESTART_CONSUMED}
+    ),
+    FeatureValidationAction.R64_POST_RESTART_INVENTORY: frozenset(
+        {FeatureValidationState.R64_READY}
+    ),
+    FeatureValidationAction.LIVE_VALIDATION: frozenset(
+        {FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED}
+    ),
+    FeatureValidationAction.RESTORE_TRANSFER: frozenset(
+        {
+            FeatureValidationState.R64_INSTALLED,
+            FeatureValidationState.R64_INVENTORY_VERIFIED,
+            FeatureValidationState.R64_CORE_CHECKED,
+            FeatureValidationState.R64_RESTART_CONSUMED,
+            FeatureValidationState.R64_READY,
+            FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
+            FeatureValidationState.LIVE_VALIDATION_CONSUMED,
+            FeatureValidationState.RESTORE_REQUIRED,
+        }
+    ),
+    FeatureValidationAction.RESTORE_INSTALL: frozenset(
+        {FeatureValidationState.RESTORE_STAGED}
+    ),
+    FeatureValidationAction.RESTORE_INVENTORY: frozenset(
+        {FeatureValidationState.PR41_RESTORED}
+    ),
+    FeatureValidationAction.RESTORE_CORE_CHECK: frozenset(
+        {FeatureValidationState.RESTORE_INVENTORY_VERIFIED}
+    ),
+    FeatureValidationAction.REMOVAL_RESTART: frozenset(
+        {FeatureValidationState.RESTORE_CORE_CHECKED}
+    ),
+    FeatureValidationAction.RESTORE_READINESS: frozenset(
+        {FeatureValidationState.REMOVAL_RESTART_CONSUMED}
+    ),
+    FeatureValidationAction.FEATURE_ABSENCE: frozenset(
+        {FeatureValidationState.PR41_READY}
+    ),
+    FeatureValidationAction.POST_RESTORE_REPAIRS: frozenset(
+        {FeatureValidationState.FEATURE_ABSENCE_VERIFIED}
+    ),
+    FeatureValidationAction.FINAL_ACCEPTANCE: frozenset(
+        {FeatureValidationState.POST_RESTORE_REPAIRS_PASS}
+    ),
+}
+
+_FEATURE_TO_LIFECYCLE_ACTION = {
+    FeatureValidationAction.INITIAL_REPAIRS: LifecycleAction.INITIAL_REPAIRS,
+    FeatureValidationAction.BACKUP: LifecycleAction.BACKUP,
+    FeatureValidationAction.R64_TRANSFER: LifecycleAction.CANDIDATE_TRANSFER,
+    FeatureValidationAction.R64_INSTALL: LifecycleAction.CANDIDATE_INSTALL,
+    FeatureValidationAction.R64_INVENTORY: LifecycleAction.CANDIDATE_INVENTORY,
+    FeatureValidationAction.R64_CORE_CHECK: LifecycleAction.CANDIDATE_CORE_CHECK_1,
+    FeatureValidationAction.R64_RESTART: LifecycleAction.ACTIVATION_RESTART,
+    FeatureValidationAction.R64_READINESS: LifecycleAction.CANDIDATE_READINESS,
+    FeatureValidationAction.R64_POST_RESTART_INVENTORY: (
+        LifecycleAction.CANDIDATE_INVENTORY
+    ),
+    FeatureValidationAction.RESTORE_TRANSFER: LifecycleAction.RESTORE_TRANSFER,
+    FeatureValidationAction.RESTORE_INSTALL: LifecycleAction.RESTORE_INSTALL,
+    FeatureValidationAction.RESTORE_INVENTORY: LifecycleAction.RESTORE_INVENTORY,
+    FeatureValidationAction.RESTORE_CORE_CHECK: LifecycleAction.RESTORE_CORE_CHECK_1,
+    FeatureValidationAction.REMOVAL_RESTART: LifecycleAction.REMOVAL_RESTART,
+    FeatureValidationAction.RESTORE_READINESS: LifecycleAction.RESTORE_READINESS,
+    FeatureValidationAction.POST_RESTORE_REPAIRS: (
+        LifecycleAction.POST_RESTORE_REPAIRS
+    ),
+}
+
+
+class RefreshStatusLiveValidationController:
+    """One durable, parameter-free exact-R64 validation and PR41 restoration."""
+
+    _FORWARD_ACTIONS = frozenset(
+        {
+            FeatureValidationAction.INITIAL_SOURCE,
+            FeatureValidationAction.INITIAL_REPAIRS,
+            FeatureValidationAction.BACKUP,
+            FeatureValidationAction.R64_TRANSFER,
+            FeatureValidationAction.R64_INSTALL,
+            FeatureValidationAction.R64_INVENTORY,
+            FeatureValidationAction.R64_CORE_CHECK,
+            FeatureValidationAction.R64_RESTART,
+            FeatureValidationAction.R64_READINESS,
+            FeatureValidationAction.R64_POST_RESTART_INVENTORY,
+            FeatureValidationAction.LIVE_VALIDATION,
+        }
+    )
+
+    def __init__(self, broker: Any) -> None:
+        if (
+            getattr(broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(broker, "_session_generation", None) is None
+            or not callable(getattr(broker, "_register_lifecycle_controller", None))
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        self._broker = broker
+        self._session_generation = broker._session_generation
+        durable_required = not _DISABLE_DURABLE_LIFECYCLE_FOR_TESTS and (
+            type(broker) is PrivateInteractiveSessionBroker
+            or getattr(broker, "_durable_lifecycle_test", False) is True
+        )
+        self._journal = _DurableFeatureValidationJournal() if durable_required else None
+        if self._journal is not None and self._journal.reconstructed:
+            for action, predecessor, successor in (
+                (
+                    FeatureValidationAction.R64_RESTART,
+                    FeatureValidationState.R64_CORE_CHECKED,
+                    FeatureValidationState.R64_RESTART_CONSUMED,
+                ),
+                (
+                    FeatureValidationAction.REMOVAL_RESTART,
+                    FeatureValidationState.RESTORE_CORE_CHECKED,
+                    FeatureValidationState.REMOVAL_RESTART_CONSUMED,
+                ),
+            ):
+                if (
+                    self._journal.state is predecessor
+                    and self._journal.operation_phase(action) == "result_durable"
+                    and self._journal.restart_outcome(action) is not None
+                ):
+                    self._journal.transition(successor, action)
+        self._state = (
+            self._journal.state
+            if self._journal is not None
+            else FeatureValidationState.BASELINE
+        )
+        self._lifecycle_generation = (
+            self._journal.lifecycle_generation
+            if self._journal is not None
+            else object()
+        )
+        self._r64_source_generation = R64_RUNTIME_COMMIT
+        self._restore_source_generation = PR41_RESTORE_COMMIT
+        try:
+            self._capability_issuer = broker._register_lifecycle_controller(
+                self,
+                self._lifecycle_generation,
+                self._session_generation,
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            if self._journal is not None:
+                self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        if type(self._capability_issuer) is not _CapabilityIssuer:
+            if self._journal is not None:
+                self._journal.close()
+            raise LifecycleControllerError("LIFECYCLE_SESSION_REQUIRED") from None
+        self._consumed = (
+            set(self._journal.consumed_actions) if self._journal is not None else set()
+        )
+        self._r64_bundle: SourceBundle | None = None
+        self._r64_manifest: SourceManifest | None = None
+        self._restore_bundle: SourceBundle | None = None
+        self._restore_manifest: SourceManifest | None = None
+        self._restore_inventory: SourceInventoryResult | None = None
+        self._restore_core_check: CoreCheckResult | None = None
+        self._removal_restart: RestartResult | None = None
+        self._restore_readiness: CoreReadinessResult | None = None
+        self._feature_absence: FeatureAbsenceResult | None = None
+        self._restore_repairs: RepairsEvidence | None = None
+        self._live_result: RefreshStatusLiveValidationResult | None = None
+        if (
+            self._journal is not None
+            and type(broker) is PrivateInteractiveSessionBroker
+        ):
+            self._restore_broker_runtime_state()
+
+    @property
+    def state(self) -> FeatureValidationState:
+        return self._journal.state if self._journal is not None else self._state
+
+    def _restore_broker_runtime_state(self) -> None:
+        if self.state in {
+            FeatureValidationState.R64_INSTALLED,
+            FeatureValidationState.R64_INVENTORY_VERIFIED,
+            FeatureValidationState.R64_CORE_CHECKED,
+            FeatureValidationState.R64_RESTART_CONSUMED,
+            FeatureValidationState.R64_READY,
+            FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED,
+            FeatureValidationState.LIVE_VALIDATION_CONSUMED,
+            FeatureValidationState.RESTORE_REQUIRED,
+            FeatureValidationState.RESTORE_STAGED,
+        }:
+            self._broker._active_source_state = SourceState.R64_RUNTIME
+        elif self.state in {
+            FeatureValidationState.PR41_RESTORED,
+            FeatureValidationState.RESTORE_INVENTORY_VERIFIED,
+            FeatureValidationState.RESTORE_CORE_CHECKED,
+            FeatureValidationState.REMOVAL_RESTART_CONSUMED,
+            FeatureValidationState.PR41_READY,
+            FeatureValidationState.FEATURE_ABSENCE_VERIFIED,
+            FeatureValidationState.POST_RESTORE_REPAIRS_PASS,
+        }:
+            self._broker._active_source_state = SourceState.RESTORE
+        if FeatureValidationAction.R64_RESTART in self._consumed:
+            self._broker._restarted_states.add(SourceState.R64_RUNTIME)
+        if FeatureValidationAction.REMOVAL_RESTART in self._consumed:
+            self._broker._restarted_states.add(SourceState.RESTORE)
+
+    def _assert_session(self) -> None:
+        if (
+            getattr(self._broker, "state", None) is not BrokerState.SESSION_ACTIVE
+            or getattr(self._broker, "_session_generation", None)
+            is not self._session_generation
+        ):
+            raise LifecycleControllerError("LIFECYCLE_SESSION_CHANGED") from None
+
+    def _require(self, action: FeatureValidationAction) -> None:
+        self._assert_session()
+        if (
+            action in self._consumed
+            or self.state not in _FEATURE_ACTION_PREDECESSORS[action]
+            or self._journal is not None
+            and self._journal.reconstructed
+            and action in self._FORWARD_ACTIONS
+        ):
+            raise LifecycleControllerError("FEATURE_TRANSITION_INVALID") from None
+
+    def _begin(self, action: FeatureValidationAction) -> None:
+        self._require(action)
+        if self._journal is not None:
+            self._journal.begin(action)
+        self._consumed.add(action)
+
+    def _mark(self, action: FeatureValidationAction, phase: str) -> None:
+        if self._journal is not None:
+            self._journal.mark(action, phase)
+
+    def _advance(
+        self, state: FeatureValidationState, action: FeatureValidationAction
+    ) -> None:
+        if self._journal is not None:
+            self._journal.transition(state, action)
+        self._state = state
+
+    def _source_generation(self, action: FeatureValidationAction) -> object:
+        if action in {
+            FeatureValidationAction.RESTORE_TRANSFER,
+            FeatureValidationAction.RESTORE_INSTALL,
+            FeatureValidationAction.RESTORE_INVENTORY,
+            FeatureValidationAction.RESTORE_CORE_CHECK,
+            FeatureValidationAction.REMOVAL_RESTART,
+            FeatureValidationAction.RESTORE_READINESS,
+            FeatureValidationAction.FEATURE_ABSENCE,
+            FeatureValidationAction.POST_RESTORE_REPAIRS,
+            FeatureValidationAction.FINAL_ACCEPTANCE,
+            FeatureValidationAction.BACKUP,
+            FeatureValidationAction.INITIAL_SOURCE,
+            FeatureValidationAction.INITIAL_REPAIRS,
+        }:
+            return self._restore_source_generation
+        return self._r64_source_generation
+
+    def _shared_capability(
+        self, action: FeatureValidationAction
+    ) -> _LifecycleCapability:
+        capability = _LifecycleCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._source_generation(action),
+            self._session_generation,
+            _FEATURE_TO_LIFECYCLE_ACTION[action],
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        return capability
+
+    def _dispatch_shared(
+        self,
+        action: FeatureValidationAction,
+        callback: Callable[[_LifecycleCapability], Any],
+    ) -> Any:
+        self._begin(action)
+        capability = self._shared_capability(action)
+        self._mark(action, "dispatch_started")
+        try:
+            result = callback(capability)
+        except BaseException:
+            self._require_restoration(action)
+            raise
+        self._mark(action, "result_durable")
+        return result
+
+    def _dispatch_feature(
+        self,
+        action: FeatureValidationAction,
+        callback: Callable[[_FeatureValidationCapability], Any],
+    ) -> Any:
+        self._begin(action)
+        capability = _FeatureValidationCapability(
+            self,
+            self._capability_issuer.identity,
+            self._lifecycle_generation,
+            self._source_generation(action),
+            self._session_generation,
+            action,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        self._mark(action, "dispatch_started")
+        try:
+            result = callback(capability)
+        except BaseException:
+            self._require_restoration(action)
+            raise
+        self._mark(action, "result_durable")
+        return result
+
+    def _require_restoration(self, action: FeatureValidationAction) -> None:
+        if self._journal is not None:
+            self._journal.require_restore(action)
+        self._state = FeatureValidationState.RESTORE_REQUIRED
+
+    @staticmethod
+    def _repairs_pass(value: object) -> bool:
+        return (
+            isinstance(value, RepairsEvidence)
+            and value.shape_valid is True
+            and value.relevant_count == 0
+            and value.critical_count == 0
+            and _exact_non_bool_int(value.relevant_count)
+            and _exact_non_bool_int(value.critical_count)
+        )
+
+    @staticmethod
+    def _bundle_pass(value: object, count: int) -> bool:
+        if isinstance(value, TransferResult):
+            return (
+                value.success is True
+                and value.file_count == count
+                and value.manifest_match is True
+                and value.regular_files_only is True
+            )
+        if isinstance(value, InstallResult):
+            return (
+                value.installation_success is True
+                and value.expected_file_count == count
+                and value.installed_file_count == count
+                and value.manifest_match is True
+            )
+        return False
+
+    @staticmethod
+    def _core_pass(value: object) -> bool:
+        return (
+            isinstance(value, CoreCheckResult)
+            and value.attempt_ordinal == 1
+            and type(value.http_status) is int
+            and 200 <= value.http_status <= 299
+            and value.result == "ok"
+            and value.check_passed is True
+            and value.error_class is None
+        )
+
+    @staticmethod
+    def _readiness_pass(value: object) -> bool:
+        return (
+            isinstance(value, CoreReadinessResult)
+            and value.core_reachable is True
+            and value.core_running is True
+            and value.integration_loaded is True
+            and value.timed_out is False
+        )
+
+    def inspect_initial_source(
+        self, r64_manifest: SourceManifest, restore_manifest: SourceManifest
+    ) -> CurrentSourceInventoryResult:
+        self._begin(FeatureValidationAction.INITIAL_SOURCE)
+        capability = _SourceInspectionCapability(
+            self,
+            self._capability_issuer.identity,
+            self._session_generation,
+            secrets.token_hex(16),
+        )
+        self._capability_issuer.issued.append(capability)
+        self._mark(FeatureValidationAction.INITIAL_SOURCE, "dispatch_started")
+        try:
+            result = self._broker._inspect_current_source(
+                r64_manifest, restore_manifest, _capability=capability
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._require_restoration(FeatureValidationAction.INITIAL_SOURCE)
+            raise LifecycleControllerError("INITIAL_SOURCE_NOT_EXACT_PR41") from None
+        if result.classification is not CurrentSourceClassification.EXACT_PR41:
+            self._require_restoration(FeatureValidationAction.INITIAL_SOURCE)
+            raise LifecycleControllerError("INITIAL_SOURCE_NOT_EXACT_PR41") from None
+        self._mark(FeatureValidationAction.INITIAL_SOURCE, "result_durable")
+        self._r64_manifest = r64_manifest
+        self._restore_manifest = restore_manifest
+        self._advance(
+            FeatureValidationState.INITIAL_SOURCE_VERIFIED,
+            FeatureValidationAction.INITIAL_SOURCE,
+        )
+        return result
+
+    def admit_initial_repairs(self) -> RepairsEvidence:
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.INITIAL_REPAIRS,
+                lambda capability: self._broker._collect_resolution_info(
+                    RepairsGate.INITIAL, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            raise LifecycleControllerError("INITIAL_REPAIRS_ADMISSION_FAILED") from None
+        if not self._repairs_pass(result):
+            self._require_restoration(FeatureValidationAction.INITIAL_REPAIRS)
+            raise LifecycleControllerError("INITIAL_REPAIRS_ADMISSION_FAILED") from None
+        self._advance(
+            FeatureValidationState.INITIAL_REPAIRS_PASS,
+            FeatureValidationAction.INITIAL_REPAIRS,
+        )
+        return result
+
+    def create_backup(self, manifest: SourceManifest) -> BackupResult:
+        if (
+            manifest != self._restore_manifest
+            or manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.BACKUP,
+                lambda capability: self._broker._create_private_backup(
+                    manifest, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
+        if not (
+            isinstance(result, BackupResult)
+            and result.success is True
+            and result.file_count == len(manifest.entries)
+            and result.manifest_match is True
+            and result.regular_files_only is True
+            and result.lifecycle_generation == str(self._lifecycle_generation)
+            and result.source_generation == str(self._restore_source_generation)
+            and result.manifest_identity == _source_manifest_digest(manifest.entries)
+            and re.fullmatch(r"[0-9a-f]{32}", result.backup_generation)
+            and re.fullmatch(r"[0-9a-f]{64}", result.backup_digest)
+        ):
+            self._require_restoration(FeatureValidationAction.BACKUP)
+            raise LifecycleControllerError("BACKUP_VERIFICATION_FAILED") from None
+        if self._journal is not None:
+            self._journal.bind_backup(result)
+        self._advance(
+            FeatureValidationState.R64_BACKUP_VERIFIED,
+            FeatureValidationAction.BACKUP,
+        )
+        return result
+
+    def stage_r64(self, bundle: SourceBundle) -> TransferResult:
+        if bundle.state is not SourceState.R64_RUNTIME:
+            raise LifecycleControllerError("R64_BUNDLE_INVALID") from None
+        validate_source_bundle(bundle)
+        result = self._dispatch_shared(
+            FeatureValidationAction.R64_TRANSFER,
+            lambda capability: self._broker._transfer_source_bundle(
+                bundle, _capability=capability
+            ),
+        )
+        if not self._bundle_pass(result, len(bundle.files)):
+            self._require_restoration(FeatureValidationAction.R64_TRANSFER)
+            raise LifecycleControllerError("R64_TRANSFER_FAILED") from None
+        self._r64_bundle = bundle
+        self._r64_manifest = bundle.manifest
+        self._advance(
+            FeatureValidationState.R64_STAGED, FeatureValidationAction.R64_TRANSFER
+        )
+        return result
+
+    def install_r64(self, manifest: SourceManifest) -> InstallResult:
+        if (
+            manifest != self._r64_manifest
+            or manifest.state is not SourceState.R64_RUNTIME
+        ):
+            raise LifecycleControllerError("R64_MANIFEST_INVALID") from None
+        result = self._dispatch_shared(
+            FeatureValidationAction.R64_INSTALL,
+            lambda capability: self._broker._install_staged_source(
+                manifest, _capability=capability
+            ),
+        )
+        if not self._bundle_pass(result, len(manifest.entries)):
+            self._require_restoration(FeatureValidationAction.R64_INSTALL)
+            raise LifecycleControllerError("R64_INSTALL_FAILED") from None
+        self._advance(
+            FeatureValidationState.R64_INSTALLED, FeatureValidationAction.R64_INSTALL
+        )
+        return result
+
+    def verify_r64_inventory(self, manifest: SourceManifest) -> SourceInventoryResult:
+        if manifest != self._r64_manifest:
+            raise LifecycleControllerError("R64_MANIFEST_INVALID") from None
+        action = (
+            FeatureValidationAction.R64_INVENTORY
+            if self.state is FeatureValidationState.R64_INSTALLED
+            else FeatureValidationAction.R64_POST_RESTART_INVENTORY
+        )
+        result = self._dispatch_shared(
+            action,
+            lambda capability: self._broker._verify_source_inventory(
+                manifest, _capability=capability
+            ),
+        )
+        if not _source_inventory_exact(result, len(manifest.entries)):
+            self._require_restoration(action)
+            raise LifecycleControllerError("R64_INVENTORY_FAILED") from None
+        target = (
+            FeatureValidationState.R64_INVENTORY_VERIFIED
+            if action is FeatureValidationAction.R64_INVENTORY
+            else FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+        )
+        self._advance(target, action)
+        return result
+
+    def check_r64_core(self) -> CoreCheckResult:
+        result = self._dispatch_shared(
+            FeatureValidationAction.R64_CORE_CHECK,
+            lambda capability: self._broker._check_core(1, _capability=capability),
+        )
+        if not self._core_pass(result):
+            self._require_restoration(FeatureValidationAction.R64_CORE_CHECK)
+            raise LifecycleControllerError("R64_CORE_CHECK_FAILED") from None
+        self._advance(
+            FeatureValidationState.R64_CORE_CHECKED,
+            FeatureValidationAction.R64_CORE_CHECK,
+        )
+        return result
+
+    def restart_for_r64(self) -> RestartResult:
+        result = self._dispatch_shared(
+            FeatureValidationAction.R64_RESTART,
+            lambda capability: self._broker._restart_core(_capability=capability),
+        )
+        if not isinstance(result, RestartResult) or result.dispatch_outcome not in {
+            RestartDispatchOutcome.RESPONSE_ACCEPTED,
+            RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+        }:
+            self._require_restoration(FeatureValidationAction.R64_RESTART)
+            raise LifecycleControllerError("R64_RESTART_FAILED") from None
+        if self._journal is not None:
+            self._journal.record_restart(FeatureValidationAction.R64_RESTART, result)
+        self._advance(
+            FeatureValidationState.R64_RESTART_CONSUMED,
+            FeatureValidationAction.R64_RESTART,
+        )
+        return result
+
+    def await_r64_readiness(self) -> CoreReadinessResult:
+        result = self._dispatch_shared(
+            FeatureValidationAction.R64_READINESS,
+            lambda capability: self._broker._wait_for_core_readiness(
+                _capability=capability
+            ),
+        )
+        if not self._readiness_pass(result):
+            self._require_restoration(FeatureValidationAction.R64_READINESS)
+            raise LifecycleControllerError("R64_READINESS_FAILED") from None
+        self._advance(
+            FeatureValidationState.R64_READY, FeatureValidationAction.R64_READINESS
+        )
+        return result
+
+    def run_s1_refresh_status_live_validation(
+        self,
+    ) -> RefreshStatusLiveValidationResult:
+        try:
+            result = self._dispatch_feature(
+                FeatureValidationAction.LIVE_VALIDATION,
+                lambda capability: self._broker._run_s1_refresh_status_live_validation(
+                    _capability=capability
+                ),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            zero = RefreshPacketCounts(0, 0, 0, 0, 0)
+            result = RefreshStatusLiveValidationResult(
+                0,
+                False,
+                False,
+                False,
+                False,
+                False,
+                RefreshPressResult(False, zero, False),
+                RefreshPressResult(False, zero, False),
+                False,
+                RefreshHoldResult(False, False, False),
+                True,
+                RefreshStatusFailureClass.AMBIGUOUS,
+                False,
+            )
+            self._live_result = result
+            return result
+        if not isinstance(result, RefreshStatusLiveValidationResult):
+            self._require_restoration(FeatureValidationAction.LIVE_VALIDATION)
+            raise LifecycleControllerError("LIVE_VALIDATION_RESULT_INVALID") from None
+        self._live_result = result
+        self._advance(
+            FeatureValidationState.LIVE_VALIDATION_CONSUMED,
+            FeatureValidationAction.LIVE_VALIDATION,
+        )
+        return result
+
+    def stage_restore(self, bundle: SourceBundle) -> TransferResult:
+        if bundle.state is not SourceState.RESTORE:
+            raise LifecycleControllerError("RESTORE_BUNDLE_INVALID") from None
+        validate_source_bundle(bundle)
+        result = self._dispatch_shared(
+            FeatureValidationAction.RESTORE_TRANSFER,
+            lambda capability: self._broker._transfer_source_bundle(
+                bundle, _capability=capability
+            ),
+        )
+        if not self._bundle_pass(result, len(bundle.files)):
+            self._restore_failed()
+        self._restore_bundle = bundle
+        self._restore_manifest = bundle.manifest
+        self._advance(
+            FeatureValidationState.RESTORE_STAGED,
+            FeatureValidationAction.RESTORE_TRANSFER,
+        )
+        return result
+
+    def _restore_failed(self) -> Never:
+        self._state = FeatureValidationState.RESTORE_FAILED
+        if self._journal is not None:
+            self._journal.terminal(FeatureValidationState.RESTORE_FAILED)
+            self._journal.close()
+        raise LifecycleControllerError("LIFECYCLE_RESTORE_FAILED") from None
+
+    def restore_pr41(self, manifest: SourceManifest) -> InstallResult:
+        if (
+            not isinstance(manifest, SourceManifest)
+            or manifest.state is not SourceState.RESTORE
+        ):
+            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+        try:
+            validate_source_manifest(manifest)
+        except SourceBundleError:
+            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+        if (
+            self._restore_manifest is None
+            and self.state is FeatureValidationState.RESTORE_STAGED
+        ):
+            self._restore_manifest = manifest
+        if manifest != self._restore_manifest:
+            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.RESTORE_INSTALL,
+                lambda capability: self._broker._install_staged_restore(
+                    manifest, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._restore_failed()
+        if not self._bundle_pass(result, len(manifest.entries)):
+            self._restore_failed()
+        self._advance(
+            FeatureValidationState.PR41_RESTORED,
+            FeatureValidationAction.RESTORE_INSTALL,
+        )
+        return result
+
+    def verify_restore_inventory(
+        self, manifest: SourceManifest
+    ) -> SourceInventoryResult:
+        if (
+            self._restore_manifest is None
+            and self.state is FeatureValidationState.PR41_RESTORED
+        ):
+            try:
+                validate_source_manifest(manifest)
+            except SourceBundleError:
+                raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+            self._restore_manifest = manifest
+        if manifest != self._restore_manifest:
+            raise LifecycleControllerError("RESTORE_MANIFEST_INVALID") from None
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.RESTORE_INVENTORY,
+                lambda capability: self._broker._verify_source_inventory(
+                    manifest, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, SourceBundleError, TypeError, ValueError):
+            self._restore_failed()
+        if not _source_inventory_exact(result, len(manifest.entries)):
+            self._restore_failed()
+        self._restore_inventory = result
+        self._advance(
+            FeatureValidationState.RESTORE_INVENTORY_VERIFIED,
+            FeatureValidationAction.RESTORE_INVENTORY,
+        )
+        return result
+
+    def check_restore_core(self) -> CoreCheckResult:
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.RESTORE_CORE_CHECK,
+                lambda capability: self._broker._check_core(1, _capability=capability),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._restore_failed()
+        if not self._core_pass(result):
+            self._restore_failed()
+        self._restore_core_check = result
+        self._advance(
+            FeatureValidationState.RESTORE_CORE_CHECKED,
+            FeatureValidationAction.RESTORE_CORE_CHECK,
+        )
+        return result
+
+    def restart_for_restore(self) -> RestartResult:
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.REMOVAL_RESTART,
+                lambda capability: self._broker._restart_core(_capability=capability),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._restore_failed()
+        if not isinstance(result, RestartResult) or result.dispatch_outcome not in {
+            RestartDispatchOutcome.RESPONSE_ACCEPTED,
+            RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+        }:
+            self._restore_failed()
+        self._removal_restart = result
+        if self._journal is not None:
+            self._journal.record_restart(
+                FeatureValidationAction.REMOVAL_RESTART, result
+            )
+        self._advance(
+            FeatureValidationState.REMOVAL_RESTART_CONSUMED,
+            FeatureValidationAction.REMOVAL_RESTART,
+        )
+        return result
+
+    def await_restore_readiness(self) -> CoreReadinessResult:
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.RESTORE_READINESS,
+                lambda capability: self._broker._wait_for_core_readiness(
+                    _capability=capability
+                ),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._restore_failed()
+        if not self._readiness_pass(result):
+            self._restore_failed()
+        self._restore_readiness = result
+        self._advance(
+            FeatureValidationState.PR41_READY,
+            FeatureValidationAction.RESTORE_READINESS,
+        )
+        return result
+
+    def verify_refresh_feature_absent(self) -> FeatureAbsenceResult:
+        try:
+            result = self._dispatch_feature(
+                FeatureValidationAction.FEATURE_ABSENCE,
+                lambda capability: self._broker._verify_refresh_feature_absent(
+                    _capability=capability
+                ),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._restore_failed()
+        if not isinstance(result, FeatureAbsenceResult) or result.refresh_button_active:
+            self._restore_failed()
+        self._feature_absence = result
+        self._advance(
+            FeatureValidationState.FEATURE_ABSENCE_VERIFIED,
+            FeatureValidationAction.FEATURE_ABSENCE,
+        )
+        return result
+
+    def admit_post_restore_repairs(self) -> RepairsEvidence:
+        try:
+            result = self._dispatch_shared(
+                FeatureValidationAction.POST_RESTORE_REPAIRS,
+                lambda capability: self._broker._collect_resolution_info(
+                    RepairsGate.POST_ROLLBACK, _capability=capability
+                ),
+            )
+        except (SessionBrokerError, TypeError, ValueError):
+            self._restore_failed()
+        if not self._repairs_pass(result):
+            self._restore_failed()
+        self._restore_repairs = result
+        self._advance(
+            FeatureValidationState.POST_RESTORE_REPAIRS_PASS,
+            FeatureValidationAction.POST_RESTORE_REPAIRS,
+        )
+        return result
+
+    def _final_proof(self) -> FinalRestoreProof:
+        def committed(action: FeatureValidationAction) -> bool:
+            return self._journal is not None and self._journal.committed(action)
+
+        restart = self._removal_restart
+        if restart is None and self._journal is not None:
+            outcome = self._journal.restart_outcome(
+                FeatureValidationAction.REMOVAL_RESTART
+            )
+            if outcome is not None:
+                restart = RestartResult(outcome, None, None)
+        restart_acceptable = isinstance(restart, RestartResult) and (
+            restart.dispatch_outcome
+            in {
+                RestartDispatchOutcome.RESPONSE_ACCEPTED,
+                RestartDispatchOutcome.DISPATCHED_RESPONSE_UNKNOWN,
+            }
+        )
+        inventory_exact = committed(FeatureValidationAction.RESTORE_INVENTORY) or (
+            self._restore_inventory is not None
+            and self._restore_manifest is not None
+            and _source_inventory_exact(
+                self._restore_inventory, len(self._restore_manifest.entries)
+            )
+        )
+        readiness = self._restore_readiness
+        repairs = self._restore_repairs
+        return FinalRestoreProof(
+            inventory_exact,
+            inventory_exact,
+            committed(FeatureValidationAction.RESTORE_CORE_CHECK)
+            or self._core_pass(self._restore_core_check),
+            FeatureValidationAction.REMOVAL_RESTART in self._consumed,
+            restart_acceptable,
+            restart_acceptable
+            and (
+                committed(FeatureValidationAction.RESTORE_READINESS)
+                or self._readiness_pass(readiness)
+            ),
+            committed(FeatureValidationAction.RESTORE_READINESS)
+            or readiness is not None
+            and readiness.core_reachable is True,
+            committed(FeatureValidationAction.RESTORE_READINESS)
+            or readiness is not None
+            and readiness.core_running is True,
+            committed(FeatureValidationAction.RESTORE_READINESS)
+            or readiness is not None
+            and readiness.integration_loaded is True,
+            committed(FeatureValidationAction.RESTORE_READINESS)
+            or readiness is not None
+            and readiness.timed_out is False,
+            committed(FeatureValidationAction.FEATURE_ABSENCE)
+            or self._feature_absence == FeatureAbsenceResult(False),
+            committed(FeatureValidationAction.POST_RESTORE_REPAIRS)
+            or repairs is not None
+            and repairs.shape_valid is True,
+            committed(FeatureValidationAction.POST_RESTORE_REPAIRS)
+            or repairs is not None
+            and repairs.relevant_count == 0,
+            committed(FeatureValidationAction.POST_RESTORE_REPAIRS)
+            or repairs is not None
+            and repairs.critical_count == 0,
+        )
+
+    def complete(self) -> FinalRestoreProof:
+        action = FeatureValidationAction.FINAL_ACCEPTANCE
+        self._begin(action)
+        proof = self._final_proof()
+        self._mark(action, "dispatch_started")
+        self._mark(action, "result_durable")
+        if not proof.complete:
+            self._restore_failed()
+        self._advance(FeatureValidationState.COMPLETE_NORMAL, action)
+        if self._journal is not None:
+            self._journal.terminal(FeatureValidationState.COMPLETE_NORMAL)
+            self._journal.close()
+        return proof
+
+    def close(self) -> None:
+        if self._journal is not None:
+            self._journal.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def _private_spec_from_stream(stream: TextIO) -> dict[str, object]:

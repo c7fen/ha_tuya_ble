@@ -1025,6 +1025,7 @@ def _synthetic_r30_source_authorities(
                 "test_r62f_",
                 "test_r63s_",
                 "test_r63t_",
+                "test_r65_",
             )
         ),
     )
@@ -11637,3 +11638,475 @@ def test_r62f_c11_transport_ambiguity_has_no_http_status() -> None:
     assert raised.value.reason is access.PreflightFailureReason.TRANSPORT_AMBIGUOUS
     assert raised.value.http_status is None
     controller.close()
+
+
+def _r65_git_bundle(state: access.SourceState, commit: str) -> access.SourceBundle:
+    output = subprocess.check_output(
+        ["git", "ls-tree", "-rz", commit, "custom_components/tuya_ble"]
+    )
+    files = []
+    entries = []
+    for row in output.rstrip(b"\0").split(b"\0"):
+        metadata, raw_path = row.split(b"\t", 1)
+        mode, kind, object_id = metadata.split()
+        assert mode == b"100644" and kind == b"blob"
+        content = subprocess.check_output(
+            ["git", "cat-file", "blob", object_id.decode("ascii")]
+        )
+        path = "integration/" + raw_path.decode("utf-8").removeprefix(
+            "custom_components/tuya_ble/"
+        )
+        files.append(access.SourceBundleFile(path, content))
+        entries.append(
+            access.SourceManifestEntry(
+                path, len(content), hashlib.sha256(content).hexdigest()
+            )
+        )
+    manifest = access.SourceManifest(state, tuple(entries))
+    return access.build_source_bundle(state, tuple(files), manifest)
+
+
+def _r65_packet_parser() -> object:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    selected = [ast.Import(names=[ast.alias("re")])]
+    wanted_assignments = {"EMPTY_COUNTS", "LOG_RE", "SEND_RE"}
+    for node in tree.body:
+        if (
+            (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id in wanted_assignments
+                    for target in node.targets
+                )
+            )
+            or isinstance(node, ast.FunctionDef)
+            and node.name in {"parse_lines", "all_sessions_quiescent"}
+        ):
+            selected.append(node)
+    namespace: dict[str, object] = {}
+    module = ast.fix_missing_locations(ast.Module(selected, type_ignores=[]))
+    exec(  # noqa: S102 - execute only the isolated repository-owned parser AST.
+        compile(module, "<r65-parser>", "exec"),
+        namespace,
+    )
+    return namespace
+
+
+class _R65ScriptedBroker(_R32ScriptedBroker):
+    def _consume_feature_capability(
+        self, capability: object, action: access.FeatureValidationAction
+    ) -> None:
+        binding = self._controller_binding
+        if (
+            type(capability) is not access._FeatureValidationCapability
+            or binding is None
+            or capability.controller is not binding[0]
+            or capability.issuer is not binding[1].identity
+            or capability.lifecycle_generation is not binding[2]
+            or capability.session_generation is not binding[3]
+            or capability.action is not action
+            or not any(capability is issued for issued in binding[1].issued)
+            or any(capability is consumed for consumed in binding[1].consumed)
+        ):
+            raise access.SessionBrokerError("SYNTHETIC_FEATURE_CAPABILITY_INVALID")
+        binding[1].consumed.append(capability)
+
+    def _create_private_backup(
+        self, manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.BackupResult:
+        self._consume_capability(_capability, access.LifecycleAction.BACKUP)
+        assert isinstance(_capability, access._LifecycleCapability)
+        self.calls.append(("backup", None))
+        return access.BackupResult(
+            True,
+            len(manifest.entries),
+            True,
+            True,
+            str(_capability.lifecycle_generation),
+            str(_capability.source_generation),
+            "c" * 32,
+            access._source_manifest_digest(manifest.entries),
+            "d" * 64,
+        )
+
+    def _inspect_current_source(
+        self,
+        candidate_manifest: access.SourceManifest,
+        restore_manifest: access.SourceManifest,
+        *,
+        _capability: object = None,
+    ) -> access.CurrentSourceInventoryResult:
+        assert candidate_manifest.state is access.SourceState.R64_RUNTIME
+        assert restore_manifest.state is access.SourceState.RESTORE
+        self._consume_source_inspection_capability(_capability)
+        self.calls.append(("current_source_inventory", None))
+        return access.CurrentSourceInventoryResult(
+            access.CurrentSourceClassification.EXACT_PR41,
+            access.SourceInventoryResult(
+                len(restore_manifest.entries),
+                len(restore_manifest.entries),
+                True,
+                0,
+                0,
+            ),
+        )
+
+    def _transfer_source_bundle(
+        self, bundle: access.SourceBundle, *, _capability: object = None
+    ) -> access.TransferResult:
+        self._consume_capability(
+            _capability,
+            (
+                access.LifecycleAction.CANDIDATE_TRANSFER
+                if bundle.state is access.SourceState.R64_RUNTIME
+                else access.LifecycleAction.RESTORE_TRANSFER
+            ),
+        )
+        return self._next(
+            "transfer",
+            bundle.state,
+            access.TransferResult(True, len(bundle.files), True, True),
+        )
+
+    def _verify_source_inventory(
+        self, manifest: access.SourceManifest, *, _capability: object = None
+    ) -> access.SourceInventoryResult:
+        self._consume_capability(
+            _capability,
+            (
+                access.LifecycleAction.CANDIDATE_INVENTORY
+                if manifest.state is access.SourceState.R64_RUNTIME
+                else access.LifecycleAction.RESTORE_INVENTORY
+            ),
+        )
+        count = len(manifest.entries)
+        return self._next(
+            "inventory",
+            manifest.state,
+            access.SourceInventoryResult(count, count, True, 0, 0),
+        )
+
+    def _run_s1_refresh_status_live_validation(
+        self, *, _capability: object = None
+    ) -> access.RefreshStatusLiveValidationResult:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.LIVE_VALIDATION
+        )
+        self.calls.append(("live_validation", None))
+        cold = access.RefreshPressResult(
+            True, access.RefreshPacketCounts(1, 1, 1, 0, 0), True, (8, 33)
+        )
+        warm = access.RefreshPressResult(
+            True, access.RefreshPacketCounts(0, 0, 1, 0, 0), True, (8,)
+        )
+        return access.RefreshStatusLiveValidationResult(
+            4,
+            True,
+            True,
+            True,
+            True,
+            True,
+            cold,
+            warm,
+            True,
+            access.RefreshHoldResult(True, True, False),
+            False,
+            None,
+            False,
+        )
+
+    def _verify_refresh_feature_absent(
+        self, *, _capability: object = None
+    ) -> access.FeatureAbsenceResult:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.FEATURE_ABSENCE
+        )
+        self.calls.append(("feature_absence", None))
+        return access.FeatureAbsenceResult(False)
+
+
+def _r65_advance_to_live() -> tuple[
+    access.RefreshStatusLiveValidationController,
+    _R65ScriptedBroker,
+    access.SourceBundle,
+    access.SourceBundle,
+]:
+    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
+    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    controller = access.RefreshStatusLiveValidationController(broker)
+    controller.inspect_initial_source(r64.manifest, restore.manifest)
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_r64(r64)
+    controller.install_r64(r64.manifest)
+    controller.verify_r64_inventory(r64.manifest)
+    controller.check_r64_core()
+    controller.restart_for_r64()
+    controller.await_r64_readiness()
+    controller.verify_r64_inventory(r64.manifest)
+    return controller, broker, r64, restore
+
+
+def test_r65_c1_to_c6_exact_authorities_are_distinct_and_closed() -> None:
+    candidate = _r30_manifest()
+    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
+    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+
+    assert candidate.authority_commit == access.PR45_CANDIDATE_COMMIT
+    assert candidate.authority_tree == access.PR45_CANDIDATE_TREE
+    assert restore.manifest.authority_commit == access.PR41_RESTORE_COMMIT
+    assert restore.manifest.authority_tree == access.PR41_RESTORE_TREE
+    access.validate_source_bundle(r64)
+    access.validate_source_bundle(restore)
+    assert r64.manifest.state is access.SourceState.R64_RUNTIME
+    assert restore.manifest.state is access.SourceState.RESTORE
+    assert r64.manifest != restore.manifest
+    assert set(access.SourceState) == {
+        access.SourceState.CANDIDATE,
+        access.SourceState.RESTORE,
+        access.SourceState.R64_RUNTIME,
+    }
+    wrong = access.SourceManifest(
+        access.SourceState.R64_RUNTIME,
+        (replace(r64.manifest.entries[0], sha256="0" * 64),) + r64.manifest.entries[1:],
+    )
+    with pytest.raises(access.SourceBundleError, match="AUTHORITY"):
+        access.validate_source_manifest(wrong)
+
+
+def test_r65_c7_to_c9_api_and_result_boundary_are_private_and_fixed() -> None:
+    method = (
+        access.RefreshStatusLiveValidationController.run_s1_refresh_status_live_validation
+    )
+    assert tuple(inspect.signature(method).parameters) == ("self",)
+    assert not any(
+        name.startswith(("call_service", "get_logs"))
+        for name in dir(access.RefreshStatusLiveValidationController)
+    )
+    sentinel = SYNTHETIC_FORBIDDEN_TRANSCRIPT_SENTINELS[2]
+    payload = {
+        "eligible_s1_count": 1,
+        "selected": True,
+        "refresh_button_present": True,
+        "policy_on_demand": True,
+        "ble_control_enabled": True,
+        "hold_time_valid": True,
+        "cold": {
+            "service_success": True,
+            "counts": {
+                "device_info": 1,
+                "pair": 1,
+                "device_status": 1,
+                "datapoint": 0,
+                "other": 0,
+            },
+            "last_status_update_advanced": True,
+            "retained_confirmation_changed_dp_ids": [],
+        },
+        "warm": {
+            "service_success": True,
+            "counts": {
+                "device_info": 0,
+                "pair": 0,
+                "device_status": 1,
+                "datapoint": 0,
+                "other": 0,
+            },
+            "last_status_update_advanced": True,
+            "retained_confirmation_changed_dp_ids": [],
+        },
+        "same_authenticated_session_reused": True,
+        "hold": {
+            "warm_immediately_after_press": True,
+            "normal_release_observed": True,
+            "automatic_reconnect_observed": False,
+        },
+        "ambiguous": False,
+        "failure_class": None,
+        "conditional_omission_observed": False,
+        "raw_logs": sentinel,
+    }
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL") as raised:
+        access._parse_refresh_status_live_validation_result(
+            json.dumps(payload).encode()
+        )
+    assert sentinel not in repr(raised.value)
+
+
+def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
+    parser = _r65_packet_parser()
+    parse_lines = parser["parse_lines"]
+    all_sessions_quiescent = parser["all_sessions_quiescent"]
+    first = "tuya-ble-session-" + "g" * 16
+    prefix = "2026-01-01 [custom_components.tuya_ble.tuya_ble.tuya_ble] " + first + ": "
+    identity, counts, _events = parse_lines(
+        [
+            prefix + "Sending packet: #1 FUN_SENDER_DEVICE_INFO\n",
+            prefix + "Sending packet: #2 FUN_SENDER_PAIR\n",
+            prefix + "Sending packet: #3 FUN_SENDER_DEVICE_STATUS in response to #2\n",
+            prefix + "Sending packet: #4 FUN_SENDER_DPS\n",
+            prefix + "Sending packet: #5 FUN_SENDER_DPS_V4\n",
+            prefix + "Sending packet: #6 FUN_SENDER_LOCK\n",
+        ]
+    )
+    assert identity == first
+    assert counts == {
+        "device_info": 1,
+        "pair": 1,
+        "device_status": 1,
+        "datapoint": 2,
+        "other": 1,
+    }
+    second = "tuya-ble-session-" + "h" * 16
+    with pytest.raises(ValueError, match="multiple_identity"):
+        parse_lines(
+            [
+                prefix + "Sending packet: #1 FUN_SENDER_DEVICE_STATUS\n",
+                "2026 [custom_components.tuya_ble.tuya_ble.tuya_ble] "
+                + second
+                + ": Connecting; synthetic\n",
+            ],
+            first,
+        )
+    assert not all_sessions_quiescent([prefix + "Connecting; synthetic\n"])
+    assert all_sessions_quiescent(
+        [
+            prefix + "Connecting; synthetic\n",
+            prefix + "Disconnected from device; synthetic\n",
+        ]
+    )
+    cold = access.RefreshPressResult(
+        True, access.RefreshPacketCounts(1, 1, 1, 0, 0), True
+    )
+    warm = access.RefreshPressResult(
+        True, access.RefreshPacketCounts(0, 0, 1, 0, 0), True
+    )
+    result = access.RefreshStatusLiveValidationResult(
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        cold,
+        warm,
+        True,
+        access.RefreshHoldResult(True, True, False),
+        False,
+        None,
+        False,
+    )
+    assert result.passed
+
+
+def test_r65_c14_to_c19_two_press_operation_and_exact_restore() -> None:
+    controller, broker, _r64, restore = _r65_advance_to_live()
+    result = controller.run_s1_refresh_status_live_validation()
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
+        controller.run_s1_refresh_status_live_validation()
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_refresh_feature_absent()
+    controller.admit_post_restore_repairs()
+    proof = controller.complete()
+
+    assert result.passed
+    assert proof.complete
+    assert [name for name, _detail in broker.calls].count("live_validation") == 1
+    assert "disconnect" not in {name for name, _detail in broker.calls}
+    assert [detail for name, detail in broker.calls if name == "transfer"] == [
+        access.SourceState.R64_RUNTIME,
+        access.SourceState.RESTORE,
+    ]
+
+
+def test_r65_c15_c16_c20_ambiguous_live_operation_cannot_be_replayed() -> None:
+    controller, broker, _r64, restore = _r65_advance_to_live()
+
+    def fail_once(*, _capability: object = None) -> object:
+        broker._consume_feature_capability(
+            _capability, access.FeatureValidationAction.LIVE_VALIDATION
+        )
+        broker.calls.append(("live_validation", None))
+        raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+
+    broker._run_s1_refresh_status_live_validation = fail_once
+    result = controller.run_s1_refresh_status_live_validation()
+    controller.close()
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+
+    assert result.ambiguous
+    assert result.failure_class is access.RefreshStatusFailureClass.AMBIGUOUS
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
+        reconstructed.run_s1_refresh_status_live_validation()
+    reconstructed.stage_restore(restore)
+    assert [name for name, _detail in broker.calls].count("live_validation") == 1
+    assert not any(name == "live_validation" for name, _detail in replacement.calls)
+    reconstructed.close()
+
+
+def test_r65_c20_interrupted_activation_restart_is_restore_only() -> None:
+    r64 = _r65_git_bundle(access.SourceState.R64_RUNTIME, access.R64_RUNTIME_COMMIT)
+    restore = _r65_git_bundle(access.SourceState.RESTORE, access.PR41_RESTORE_COMMIT)
+    broker = _R65ScriptedBroker()
+    broker._durable_lifecycle_test = True
+    controller = access.RefreshStatusLiveValidationController(broker)
+    controller.inspect_initial_source(r64.manifest, restore.manifest)
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_r64(r64)
+    controller.install_r64(r64.manifest)
+    controller.verify_r64_inventory(r64.manifest)
+    controller.check_r64_core()
+    broker.queue(
+        "restart", access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+    )
+    with pytest.raises(access.SessionBrokerError, match="TIMEOUT"):
+        controller.restart_for_r64()
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
+        reconstructed.restart_for_r64()
+    reconstructed.stage_restore(restore)
+
+    assert [name for name, _detail in broker.calls].count("restart") == 1
+    assert not any(name == "restart" for name, _detail in replacement.calls)
+    reconstructed.close()
+
+
+def test_r65_c20_restoration_and_final_proof_survive_reconstruction() -> None:
+    controller, _broker, _r64, restore = _r65_advance_to_live()
+    controller.run_s1_refresh_status_live_validation()
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.close()
+
+    second_broker = _R65ScriptedBroker()
+    second_broker._durable_lifecycle_test = True
+    second = access.RefreshStatusLiveValidationController(second_broker)
+    second.verify_restore_inventory(restore.manifest)
+    second.check_restore_core()
+    second.restart_for_restore()
+    second.await_restore_readiness()
+    second.verify_refresh_feature_absent()
+    second.admit_post_restore_repairs()
+    second.close()
+
+    final_broker = _R65ScriptedBroker()
+    final_broker._durable_lifecycle_test = True
+    final = access.RefreshStatusLiveValidationController(final_broker)
+    proof = final.complete()
+
+    assert proof.complete
+    assert final.state is access.FeatureValidationState.COMPLETE_NORMAL
