@@ -12432,6 +12432,7 @@ def test_r65_c10_to_c13_packet_parser_is_exact_and_ambiguity_closed() -> None:
         access.RefreshPacketCounts(0, 0, 1, 0, 0),
         access.RefreshSessionProvenance.REUSED_SESSION,
         True,
+        (8,),
     )
     result = access.RefreshStatusLiveValidationResult(
         1,
@@ -12859,7 +12860,7 @@ def test_r65c_public_result_retains_classification_but_not_session_ordinal() -> 
             },
             "session_provenance": "REUSED_SESSION",
             "last_status_update_advanced": False,
-            "retained_confirmation_changed_dp_ids": [],
+            "retained_confirmation_changed_dp_ids": [8],
         },
         "same_authenticated_session": True,
         "hold": {
@@ -13586,10 +13587,10 @@ def test_r65g_t1_complete_feature_terminal_is_admitted_with_bounded_metadata(
         state=access.FeatureValidationState.COMPLETE_NORMAL,
         terminal=access.FeatureValidationState.COMPLETE_NORMAL,
         active=False,
-        schema_version=1,
+        schema_version=2,
         final_restore_complete=True,
         live_result_durability=(
-            access.FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
+            access.FeatureLiveResultDurabilityClassification.DURABLY_AVAILABLE
         ),
     )
     rendered = repr(inspector.metadata)
@@ -13793,6 +13794,30 @@ def test_r65g_final_proof_incomplete_terminal_is_rejected_without_mutation(
     journal.write_text(json.dumps(record), encoding="ascii")
     before = journal.read_bytes()
 
+    with pytest.raises(
+        access.LifecycleControllerError, match="FEATURE_JOURNAL_INVALID"
+    ):
+        _r65g_feature_inspector()
+
+    assert journal.read_bytes() == before
+
+
+def test_r65g_schema1_terminal_string_without_final_proof_cannot_retire(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _generation, r64, restore = _r65g_complete_feature_terminal(r65_bundles)
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    record = json.loads(journal.read_text(encoding="ascii"))
+    record["schema_version"] = 1
+    del record["live_result"]
+    del record["final_restore_complete"]
+    record["consumed_actions"].remove(
+        access.FeatureValidationAction.FINAL_ACCEPTANCE.value
+    )
+    del record["operations"][access.FeatureValidationAction.FINAL_ACCEPTANCE.value]
+    journal.write_text(json.dumps(record), encoding="ascii")
+    before = journal.read_bytes()
+
     inspector, _broker = _r65g_feature_inspector()
     assert inspector.metadata.final_restore_complete is False
     assert (
@@ -13805,7 +13830,6 @@ def test_r65g_final_proof_incomplete_terminal_is_rejected_without_mutation(
     with pytest.raises(access.LifecycleControllerError, match="NOT_AUTHORIZED"):
         inspector.retire_terminal()
     inspector.close()
-
     assert journal.read_bytes() == before
 
 
@@ -13829,3 +13853,167 @@ def test_r65g_public_inspector_surface_has_no_paths_ids_or_mutation_bypass() -> 
             access.RetainedFeatureValidationTerminalInspector.retire_terminal
         ).parameters
     ) == ("self",)
+
+
+def test_r65g_schema1_r65e_terminal_remains_inspectable_without_live_result(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    _r65g_complete_feature_terminal(r65_bundles)
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    record = json.loads(journal.read_text(encoding="ascii"))
+    record["schema_version"] = 1
+    del record["live_result"]
+    del record["final_restore_complete"]
+    journal.write_text(json.dumps(record), encoding="ascii")
+
+    inspector, _broker = _r65g_feature_inspector()
+
+    assert inspector.metadata.schema_version == 1
+    assert inspector.metadata.final_restore_complete is True
+    assert inspector.metadata.live_result_durability is (
+        access.FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
+    )
+    inspector.close()
+
+
+def test_r65g_live_result_is_sanitized_durable_and_reconstructed_once(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, r64, restore = _r65_advance_to_live(r65_bundles)
+    live = controller.run_s1_refresh_status_live_validation()
+    expected = access._durable_refresh_status_live_result(live)
+    assert controller.durable_live_result == expected
+    controller.close()
+
+    journal = access._LIFECYCLE_STATE_ROOT / access._FEATURE_VALIDATION_JOURNAL_NAME
+    retained = journal.read_text(encoding="ascii")
+    for forbidden in (
+        "retained_confirmation_changed_dp_ids",
+        "entity_id",
+        "device_id",
+        "entry_id",
+        "session_ordinal",
+    ):
+        assert forbidden not in retained
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.source_classification = access.CurrentSourceClassification.EXACT_R64
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+
+    assert reconstructed.durable_live_result == expected
+    assert reconstructed.durable_live_result is not None
+    assert reconstructed.durable_live_result.retained_confirmation_observed is True
+    assert reconstructed.durable_live_result.zero_write_gate is True
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION"):
+        reconstructed.run_s1_refresh_status_live_validation()
+    reconstructed.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    reconstructed.close()
+
+
+def test_r65g_ambiguous_live_result_is_durable_before_restoration(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+
+    def ambiguous(*, _capability: object = None) -> object:
+        broker._consume_feature_capability(
+            _capability, access.FeatureValidationAction.LIVE_VALIDATION
+        )
+        raise access.SessionBrokerError("SYNTHETIC_AMBIGUOUS_RESULT")
+
+    broker._run_s1_refresh_status_live_validation = ambiguous
+    result = controller.run_s1_refresh_status_live_validation()
+
+    assert result.ambiguous is True
+    assert controller.durable_live_result is not None
+    assert controller.durable_live_result.ambiguous is True
+    assert controller.durable_live_result.failure_class is (
+        access.RefreshStatusFailureClass.AMBIGUOUS
+    )
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    assert reconstructed.durable_live_result is not None
+    assert reconstructed.durable_live_result.ambiguous is True
+    reconstructed.close()
+
+
+def test_r65g_warm_retained_confirmation_is_required_for_live_pass() -> None:
+    zero = access.RefreshPacketCounts(0, 0, 1, 0, 0)
+    result = access.RefreshStatusLiveValidationResult(
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        access.RefreshPressResult(
+            True,
+            access.RefreshPacketCounts(1, 1, 1, 0, 0),
+            access.RefreshSessionProvenance.NEW_SESSION,
+            True,
+            (8,),
+        ),
+        access.RefreshPressResult(
+            True,
+            zero,
+            access.RefreshSessionProvenance.REUSED_SESSION,
+            True,
+            (),
+        ),
+        True,
+        access.RefreshHoldResult(True, True, False),
+        False,
+        access.RefreshStatusFailureClass.RETAINED_CONFIRMATION_NOT_OBSERVED,
+        False,
+    )
+
+    assert result.passed is False
+    durable = access._durable_refresh_status_live_result(result)
+    assert durable.warm_passed is False
+    assert durable.retained_confirmation_observed is False
+
+
+@pytest.mark.parametrize("window", ("cold", "warm"))
+def test_r65g_unexpected_sender_fails_zero_write_gate(window: str) -> None:
+    cold_counts = access.RefreshPacketCounts(1, 1, 1, 0, int(window == "cold"))
+    warm_counts = access.RefreshPacketCounts(0, 0, 1, 0, int(window == "warm"))
+    result = access.RefreshStatusLiveValidationResult(
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        access.RefreshPressResult(
+            True,
+            cold_counts,
+            access.RefreshSessionProvenance.NEW_SESSION,
+            True,
+            (8,),
+        ),
+        access.RefreshPressResult(
+            True,
+            warm_counts,
+            access.RefreshSessionProvenance.REUSED_SESSION,
+            True,
+            (8,),
+        ),
+        True,
+        access.RefreshHoldResult(True, True, False),
+        False,
+        access.RefreshStatusFailureClass.ZERO_WRITE_GATE_FAILED,
+        False,
+    )
+
+    assert result.passed is False
+    assert access._durable_refresh_status_live_result(result).zero_write_gate is False
+    assert "cold_counts['datapoint'] or cold_counts['other']" in (
+        access._REMOTE_REFRESH_STATUS_PROGRAM
+    )
+    assert "warm_counts['datapoint'] or warm_counts['other']" in (
+        access._REMOTE_REFRESH_STATUS_PROGRAM
+    )

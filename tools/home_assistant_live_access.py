@@ -1398,6 +1398,7 @@ class RefreshStatusFailureClass(StrEnum):
     WARM_REQUEST_FAILED = "WARM_REQUEST_FAILED"
     RETAINED_CONFIRMATION_NOT_OBSERVED = "RETAINED_CONFIRMATION_NOT_OBSERVED"
     DATAPOINT_WRITE_DETECTED = "DATAPOINT_WRITE_DETECTED"
+    ZERO_WRITE_GATE_FAILED = "ZERO_WRITE_GATE_FAILED"
     HOLD_RELEASE_NOT_OBSERVED = "HOLD_RELEASE_NOT_OBSERVED"
     AUTOMATIC_RECONNECT_OBSERVED = "AUTOMATIC_RECONNECT_OBSERVED"
     AMBIGUOUS = "AMBIGUOUS"
@@ -1473,18 +1474,108 @@ class RefreshStatusLiveValidationResult:
             and self.cold.counts.pair == 1
             and self.cold.counts.device_status == 1
             and self.cold.counts.datapoint == 0
+            and self.cold.counts.other == 0
             and self.cold.session_provenance is RefreshSessionProvenance.NEW_SESSION
             and self.warm.service_success is True
             and self.warm.counts.device_info == 0
             and self.warm.counts.pair == 0
             and self.warm.counts.device_status == 1
             and self.warm.counts.datapoint == 0
+            and self.warm.counts.other == 0
             and self.warm.session_provenance is RefreshSessionProvenance.REUSED_SESSION
+            and bool(self.warm.retained_confirmation_changed_dp_ids)
             and self.same_authenticated_session is True
             and self.hold == RefreshHoldResult(True, True, False)
             and self.ambiguous is False
             and self.failure_class is None
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DurableRefreshStatusLiveResult:
+    """Identifier-free live result reconstructed from the feature journal."""
+
+    passed: bool
+    eligible_s1_count: int
+    selected: bool
+    refresh_button_present: bool
+    policy_on_demand: bool
+    ble_control_enabled: bool
+    hold_time_valid: bool
+    cold_service_success: bool
+    cold_passed: bool
+    cold_counts: RefreshPacketCounts
+    cold_provenance: RefreshSessionProvenance | None
+    warm_service_success: bool
+    warm_passed: bool
+    warm_counts: RefreshPacketCounts
+    warm_provenance: RefreshSessionProvenance | None
+    same_authenticated_session: bool
+    cold_retained_confirmation_observed: bool
+    retained_confirmation_observed: bool
+    conditional_omission_observed: bool
+    warm_immediately_after_press: bool
+    normal_release_observed: bool
+    automatic_reconnect_observed: bool
+    zero_write_gate: bool
+    ambiguous: bool
+    failure_class: RefreshStatusFailureClass | None
+
+
+def _durable_refresh_status_live_result(
+    result: RefreshStatusLiveValidationResult,
+) -> DurableRefreshStatusLiveResult:
+    """Project one runtime result to the strict durable public-safe shape."""
+    cold = result.cold
+    warm = result.warm
+    zero_write = (
+        cold.counts.datapoint == 0
+        and cold.counts.other == 0
+        and warm.counts.datapoint == 0
+        and warm.counts.other == 0
+    )
+    cold_passed = (
+        cold.service_success is True
+        and cold.counts == RefreshPacketCounts(1, 1, 1, 0, 0)
+        and cold.session_provenance is RefreshSessionProvenance.NEW_SESSION
+    )
+    warm_confirmation = bool(warm.retained_confirmation_changed_dp_ids)
+    warm_passed = (
+        warm.service_success is True
+        and warm.counts == RefreshPacketCounts(0, 0, 1, 0, 0)
+        and warm.session_provenance is RefreshSessionProvenance.REUSED_SESSION
+        and result.same_authenticated_session is True
+        and warm_confirmation
+    )
+    return DurableRefreshStatusLiveResult(
+        passed=result.passed,
+        eligible_s1_count=result.eligible_s1_count,
+        selected=result.selected,
+        refresh_button_present=result.refresh_button_present,
+        policy_on_demand=result.policy_on_demand,
+        ble_control_enabled=result.ble_control_enabled,
+        hold_time_valid=result.hold_time_valid,
+        cold_service_success=cold.service_success,
+        cold_passed=cold_passed,
+        cold_counts=cold.counts,
+        cold_provenance=cold.session_provenance,
+        warm_service_success=warm.service_success,
+        warm_passed=warm_passed,
+        warm_counts=warm.counts,
+        warm_provenance=warm.session_provenance,
+        same_authenticated_session=result.same_authenticated_session,
+        cold_retained_confirmation_observed=bool(
+            cold.retained_confirmation_changed_dp_ids
+        ),
+        retained_confirmation_observed=warm_confirmation,
+        conditional_omission_observed=result.conditional_omission_observed,
+        warm_immediately_after_press=result.hold.warm_immediately_after_press,
+        normal_release_observed=result.hold.normal_release_observed,
+        automatic_reconnect_observed=result.hold.automatic_reconnect_observed,
+        zero_write_gate=zero_write,
+        ambiguous=result.ambiguous,
+        failure_class=result.failure_class,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3767,10 +3858,202 @@ class _DurableLifecycleJournal:
             raise failures[0]
 
 
+_DURABLE_REFRESH_LIVE_RESULT_FIELDS = frozenset(
+    {
+        "passed",
+        "eligible_s1_count",
+        "selected",
+        "refresh_button_present",
+        "policy_on_demand",
+        "ble_control_enabled",
+        "hold_time_valid",
+        "cold_service_success",
+        "cold_passed",
+        "cold_counts",
+        "cold_provenance",
+        "warm_service_success",
+        "warm_passed",
+        "warm_counts",
+        "warm_provenance",
+        "same_authenticated_session",
+        "cold_retained_confirmation_observed",
+        "retained_confirmation_observed",
+        "conditional_omission_observed",
+        "warm_immediately_after_press",
+        "normal_release_observed",
+        "automatic_reconnect_observed",
+        "zero_write_gate",
+        "ambiguous",
+        "failure_class",
+    }
+)
+
+
+def _durable_refresh_live_result_record(
+    result: DurableRefreshStatusLiveResult,
+) -> dict[str, object]:
+    """Encode only the allowlisted aggregate live-result fields."""
+
+    def counts(value: RefreshPacketCounts) -> dict[str, int]:
+        return asdict(value)
+
+    return {
+        "passed": result.passed,
+        "eligible_s1_count": result.eligible_s1_count,
+        "selected": result.selected,
+        "refresh_button_present": result.refresh_button_present,
+        "policy_on_demand": result.policy_on_demand,
+        "ble_control_enabled": result.ble_control_enabled,
+        "hold_time_valid": result.hold_time_valid,
+        "cold_service_success": result.cold_service_success,
+        "cold_passed": result.cold_passed,
+        "cold_counts": counts(result.cold_counts),
+        "cold_provenance": (
+            None if result.cold_provenance is None else result.cold_provenance.value
+        ),
+        "warm_service_success": result.warm_service_success,
+        "warm_passed": result.warm_passed,
+        "warm_counts": counts(result.warm_counts),
+        "warm_provenance": (
+            None if result.warm_provenance is None else result.warm_provenance.value
+        ),
+        "same_authenticated_session": result.same_authenticated_session,
+        "cold_retained_confirmation_observed": (
+            result.cold_retained_confirmation_observed
+        ),
+        "retained_confirmation_observed": result.retained_confirmation_observed,
+        "conditional_omission_observed": result.conditional_omission_observed,
+        "warm_immediately_after_press": result.warm_immediately_after_press,
+        "normal_release_observed": result.normal_release_observed,
+        "automatic_reconnect_observed": result.automatic_reconnect_observed,
+        "zero_write_gate": result.zero_write_gate,
+        "ambiguous": result.ambiguous,
+        "failure_class": (
+            None if result.failure_class is None else result.failure_class.value
+        ),
+    }
+
+
+def _parse_durable_refresh_live_result(
+    value: object,
+) -> DurableRefreshStatusLiveResult:
+    """Strictly decode one identifier-free durable live result."""
+    if not isinstance(value, dict) or set(value) != _DURABLE_REFRESH_LIVE_RESULT_FIELDS:
+        raise ValueError("durable_live_result")
+
+    def boolean(name: str) -> bool:
+        item = value[name]
+        if type(item) is not bool:
+            raise ValueError("durable_live_result")
+        return item
+
+    def counts(name: str) -> RefreshPacketCounts:
+        item = value[name]
+        names = ("device_info", "pair", "device_status", "datapoint", "other")
+        if not isinstance(item, dict) or set(item) != set(names):
+            raise ValueError("durable_live_result")
+        result = RefreshPacketCounts(*(_count(item[field]) for field in names))
+        if any(count > 8 for count in asdict(result).values()):
+            raise ValueError("durable_live_result")
+        return result
+
+    eligible = _count(value["eligible_s1_count"])
+    if eligible > 64:
+        raise ValueError("durable_live_result")
+    try:
+        cold_provenance = (
+            None
+            if value["cold_provenance"] is None
+            else RefreshSessionProvenance(value["cold_provenance"])
+        )
+        warm_provenance = (
+            None
+            if value["warm_provenance"] is None
+            else RefreshSessionProvenance(value["warm_provenance"])
+        )
+        failure_class = (
+            None
+            if value["failure_class"] is None
+            else RefreshStatusFailureClass(value["failure_class"])
+        )
+    except (TypeError, ValueError):
+        raise ValueError("durable_live_result") from None
+    result = DurableRefreshStatusLiveResult(
+        passed=boolean("passed"),
+        eligible_s1_count=eligible,
+        selected=boolean("selected"),
+        refresh_button_present=boolean("refresh_button_present"),
+        policy_on_demand=boolean("policy_on_demand"),
+        ble_control_enabled=boolean("ble_control_enabled"),
+        hold_time_valid=boolean("hold_time_valid"),
+        cold_service_success=boolean("cold_service_success"),
+        cold_passed=boolean("cold_passed"),
+        cold_counts=counts("cold_counts"),
+        cold_provenance=cold_provenance,
+        warm_service_success=boolean("warm_service_success"),
+        warm_passed=boolean("warm_passed"),
+        warm_counts=counts("warm_counts"),
+        warm_provenance=warm_provenance,
+        same_authenticated_session=boolean("same_authenticated_session"),
+        cold_retained_confirmation_observed=boolean(
+            "cold_retained_confirmation_observed"
+        ),
+        retained_confirmation_observed=boolean("retained_confirmation_observed"),
+        conditional_omission_observed=boolean("conditional_omission_observed"),
+        warm_immediately_after_press=boolean("warm_immediately_after_press"),
+        normal_release_observed=boolean("normal_release_observed"),
+        automatic_reconnect_observed=boolean("automatic_reconnect_observed"),
+        zero_write_gate=boolean("zero_write_gate"),
+        ambiguous=boolean("ambiguous"),
+        failure_class=failure_class,
+    )
+    cold_passed = (
+        result.cold_service_success
+        and result.cold_counts == RefreshPacketCounts(1, 1, 1, 0, 0)
+        and result.cold_provenance is RefreshSessionProvenance.NEW_SESSION
+    )
+    warm_passed = (
+        result.warm_service_success
+        and result.warm_counts == RefreshPacketCounts(0, 0, 1, 0, 0)
+        and result.warm_provenance is RefreshSessionProvenance.REUSED_SESSION
+        and result.same_authenticated_session
+        and result.retained_confirmation_observed
+    )
+    zero_write = (
+        result.cold_counts.datapoint == 0
+        and result.cold_counts.other == 0
+        and result.warm_counts.datapoint == 0
+        and result.warm_counts.other == 0
+    )
+    passed = (
+        result.selected
+        and result.refresh_button_present
+        and result.policy_on_demand
+        and result.ble_control_enabled
+        and result.hold_time_valid
+        and cold_passed
+        and warm_passed
+        and result.warm_immediately_after_press
+        and result.normal_release_observed
+        and not result.automatic_reconnect_observed
+        and zero_write
+        and not result.ambiguous
+        and result.failure_class is None
+    )
+    if (
+        result.cold_passed is not cold_passed
+        or result.warm_passed is not warm_passed
+        or result.zero_write_gate is not zero_write
+        or result.passed is not passed
+    ):
+        raise ValueError("durable_live_result")
+    return result
+
+
 class _DurableFeatureValidationJournal:
     """Small durable ledger for the separate exact-R64 lifecycle."""
 
-    _FIELDS = frozenset(
+    _V1_FIELDS = frozenset(
         {
             "schema_version",
             "revision",
@@ -3786,6 +4069,7 @@ class _DurableFeatureValidationJournal:
             "source_classification",
         }
     )
+    _FIELDS = _V1_FIELDS | {"live_result", "final_restore_complete"}
 
     def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
         self._directory = _fixed_lifecycle_state_root()
@@ -3970,6 +4254,31 @@ class _DurableFeatureValidationJournal:
             "ambiguous",
         }
         backup = record.get("backup_identity")
+        schema_version = record.get("schema_version")
+        expected_fields = {
+            1: cls._V1_FIELDS,
+            2: cls._FIELDS,
+        }.get(schema_version)
+        live_result_valid = schema_version == 1
+        if schema_version == 2:
+            live_result = record.get("live_result")
+            try:
+                parsed_live_result = (
+                    None
+                    if live_result is None
+                    else _parse_durable_refresh_live_result(live_result)
+                )
+            except (SessionBrokerError, TypeError, ValueError):
+                parsed_live_result = False
+            live_result_valid = parsed_live_result is not False
+            if live_result is not None:
+                operations = record.get("operations")
+                live_result_valid = live_result_valid and (
+                    isinstance(operations, dict)
+                    and operations.get(FeatureValidationAction.LIVE_VALIDATION.value)
+                    in {"ambiguous", "result_durable", "transition_committed"}
+                )
+        final_restore_complete = record.get("final_restore_complete")
         backup_valid = backup is None or (
             isinstance(backup, dict)
             and set(backup)
@@ -3990,8 +4299,8 @@ class _DurableFeatureValidationJournal:
             and re.fullmatch(r"[0-9a-f]{64}", backup["backup_digest"]) is not None
         )
         if (
-            set(record) != cls._FIELDS
-            or record.get("schema_version") != 1
+            expected_fields is None
+            or set(record) != expected_fields
             or not _exact_non_bool_int(record.get("revision"))
             or not isinstance(record.get("lifecycle_generation"), str)
             or re.fullmatch(r"[0-9a-f]{32}", record["lifecycle_generation"]) is None
@@ -4035,6 +4344,9 @@ class _DurableFeatureValidationJournal:
                 for key, value in record["restart_results"].items()
             )
             or not backup_valid
+            or not live_result_valid
+            or schema_version == 2
+            and type(final_restore_complete) is not bool
             or record.get("source_classification")
             not in {
                 None,
@@ -4048,6 +4360,13 @@ class _DurableFeatureValidationJournal:
                 record.get("terminal") is None
                 or record.get("terminal") != record.get("state")
             )
+            or schema_version == 2
+            and final_restore_complete is True
+            and not cls._final_restore_complete(record)
+            or schema_version == 2
+            and record.get("active") is False
+            and record.get("terminal") == FeatureValidationState.COMPLETE_NORMAL.value
+            and final_restore_complete is not True
         ):
             raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
 
@@ -4119,6 +4438,19 @@ class _DurableFeatureValidationJournal:
     @property
     def final_restore_complete(self) -> bool:
         return self._final_restore_complete(self._record)
+
+    @property
+    def live_result(self) -> DurableRefreshStatusLiveResult | None:
+        value = self._record.get("live_result")
+        return None if value is None else _parse_durable_refresh_live_result(value)
+
+    @property
+    def live_result_durability(self) -> FeatureLiveResultDurabilityClassification:
+        return (
+            FeatureLiveResultDurabilityClassification.DURABLY_AVAILABLE
+            if self.live_result is not None
+            else FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
+        )
 
     @property
     def lifecycle_generation(self) -> str:
@@ -4198,6 +4530,28 @@ class _DurableFeatureValidationJournal:
 
         def mutate(record: dict[str, object]) -> None:
             record["restart_results"][action.value] = result.dispatch_outcome.value
+
+        self._mutate(mutate)
+
+    def record_live_result(self, result: RefreshStatusLiveValidationResult) -> None:
+        """Durably retain one sanitized live result before restoration starts."""
+        durable = _durable_refresh_status_live_result(result)
+
+        def mutate(record: dict[str, object]) -> None:
+            phase = record["operations"].get(
+                FeatureValidationAction.LIVE_VALIDATION.value
+            )
+            if phase not in {"ambiguous", "result_durable", "transition_committed"}:
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
+            if record.get("live_result") is not None:
+                raise LifecycleControllerError(
+                    "FEATURE_LIVE_RESULT_ALREADY_DURABLE"
+                ) from None
+            if record["schema_version"] == 1:
+                record["schema_version"] = 2
+                record["live_result"] = None
+                record["final_restore_complete"] = False
+            record["live_result"] = _durable_refresh_live_result_record(durable)
 
         self._mutate(mutate)
 
@@ -4340,6 +4694,10 @@ class _DurableFeatureValidationJournal:
             record["state"] = state.value
             record["terminal"] = state.value
             record["active"] = False
+            if record["schema_version"] == 2:
+                record["final_restore_complete"] = (
+                    state is FeatureValidationState.COMPLETE_NORMAL
+                )
 
         self._mutate(mutate)
 
@@ -9327,6 +9685,7 @@ def empty_result():
 
 def run_validation():
     result = empty_result(); ws = stream = window = None; prior_level = None
+    retained_confirmation_missing = False
     try:
         ws = WebSocket()
         display = ws.command('config/entity_registry/list_for_display')
@@ -9404,8 +9763,8 @@ def run_validation():
                           'last_status_update_advanced': after_cold != before_last,
                           'retained_confirmation_changed_dp_ids': changed_cold}
         result['conditional_omission_observed'] = bool(dp_entities) and len(changed_cold) < len(dp_entities)
-        if cold_counts['datapoint']:
-            result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
+        if cold_counts['datapoint'] or cold_counts['other']:
+            result['failure_class'] = 'ZERO_WRITE_GATE_FAILED'; return result
         if cold_provenance != 'NEW_SESSION':
             result['failure_class'] = 'COLD_SESSION_PROVENANCE_FAILED'; return result
         if not (cold_completed and state(connection_id).get('state') == 'on' and cold_counts['device_info'] == 1 and cold_counts['pair'] == 1 and cold_counts['device_status'] == 1):
@@ -9425,8 +9784,9 @@ def run_validation():
                           'session_provenance': warm_provenance,
                           'last_status_update_advanced': after_warm != before_warm,
                           'retained_confirmation_changed_dp_ids': changed_warm}
-        if warm_counts['datapoint']:
-            result['failure_class'] = 'DATAPOINT_WRITE_DETECTED'; return result
+        if warm_counts['datapoint'] or warm_counts['other']:
+            result['failure_class'] = 'ZERO_WRITE_GATE_FAILED'; return result
+        retained_confirmation_missing = not bool(changed_warm)
         result['same_authenticated_session'] = warm_session == cold_session
         if warm_provenance != 'REUSED_SESSION' or not result['same_authenticated_session']:
             result['failure_class'] = 'WARM_SESSION_PROVENANCE_FAILED'; return result
@@ -9445,6 +9805,8 @@ def run_validation():
         result['hold']['automatic_reconnect_observed'] = state(connection_id).get('state') != 'off' or any(event in post_events for event in ('connecting', 'connected', 'authenticated', 'reconnect'))
         if result['hold']['automatic_reconnect_observed']:
             result['failure_class'] = 'AUTOMATIC_RECONNECT_OBSERVED'; return result
+        if retained_confirmation_missing:
+            result['failure_class'] = 'RETAINED_CONFIRMATION_NOT_OBSERVED'; return result
         return result
     except LogBoundaryNotEstablished:
         result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
@@ -13427,9 +13789,7 @@ class RetainedFeatureValidationTerminalInspector:
             active=self._journal.active,
             schema_version=self._journal.schema_version,
             final_restore_complete=self._journal.final_restore_complete,
-            live_result_durability=(
-                FeatureLiveResultDurabilityClassification.NOT_DURABLY_AVAILABLE
-            ),
+            live_result_durability=self._journal.live_result_durability,
         )
 
     def _assert_session_binding(self) -> None:
@@ -13744,6 +14104,9 @@ class RefreshStatusLiveValidationController:
         self._feature_absence: FeatureAbsenceResult | None = None
         self._restore_repairs: RepairsEvidence | None = None
         self._live_result: RefreshStatusLiveValidationResult | None = None
+        self._durable_live_result = (
+            self._journal.live_result if self._journal is not None else None
+        )
         self._exact_pr41_source_proven = False
         self._feature_backup_classification: FeatureBackupClassification | None = None
         self._feature_backup_identity = (
@@ -13758,6 +14121,11 @@ class RefreshStatusLiveValidationController:
     @property
     def state(self) -> FeatureValidationState:
         return self._journal.state if self._journal is not None else self._state
+
+    @property
+    def durable_live_result(self) -> DurableRefreshStatusLiveResult | None:
+        """Return only the reconstructed identifier-free live result."""
+        return self._durable_live_result
 
     def _restore_broker_runtime_state(self) -> None:
         if self.state in {
@@ -14196,11 +14564,17 @@ class RefreshStatusLiveValidationController:
                 False,
             )
             self._live_result = result
+            if self._journal is not None:
+                self._journal.record_live_result(result)
+                self._durable_live_result = self._journal.live_result
             return result
         if not isinstance(result, RefreshStatusLiveValidationResult):
             self._require_restoration(FeatureValidationAction.LIVE_VALIDATION)
             raise LifecycleControllerError("LIVE_VALIDATION_RESULT_INVALID") from None
         self._live_result = result
+        if self._journal is not None:
+            self._journal.record_live_result(result)
+            self._durable_live_result = self._journal.live_result
         self._advance(
             FeatureValidationState.LIVE_VALIDATION_CONSUMED,
             FeatureValidationAction.LIVE_VALIDATION,
