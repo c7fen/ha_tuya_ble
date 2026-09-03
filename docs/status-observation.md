@@ -2,8 +2,10 @@
 
 This integration contains passive, metadata-only research instrumentation for
 characterising the S1 Device Status exchange. It observes requests that the
-existing protocol path already sends; it does not add a request, retry,
-reconnect, polling task, entity, service, or `Refresh Status` button.
+existing protocol path already sends; the observation layer itself does not add
+a request, retry, reconnect, polling task, entity, or service. The exact S1
+`Refresh Status` button uses this same metadata-only layer to bind its one
+explicit request to one current-session ACK and DP-batch boundary.
 
 The request generation is owned by the exact BLE session and the actual
 outgoing request sequence. Device Status ACK correlation is exact when the
@@ -34,6 +36,7 @@ its existing one-shot automatic status request and marker semantics. A second
 explicit `update()` in a retained session creates a new observation generation
 without resetting the automatic marker.
 
-This is a repository-only prerequisite. It has not been deployed and provides
-no physical or Home Assistant evidence. A separate SHA-bound deployment and
-physical Phase-A inventory gate is required.
+The observation contract was the repository-only Phase-A prerequisite. Its
+later remote inventory does not make a DP batch proof of physical state, and
+the Refresh Status implementation likewise makes no motor-movement claim.
+A separate SHA-bound live-validation gate remains required.

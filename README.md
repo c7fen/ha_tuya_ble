@@ -118,6 +118,13 @@ private mode-`0600` Home Assistant Store record. There is no product-wide or
 global fallback. Missing, incomplete, foreign, or ambiguous material fails
 closed before a Bluetooth command is written.
 
+S1 also exposes a diagnostic **Refresh Status** button. Each press sends one
+non-actuating Device Status request with no automatic retry or replay. Only
+valid values actually reported by the exact current session refresh the
+last-confirmed Battery, Auto-Lock, Authentication Mode, and Auto-Lock Delay;
+omitted values retain their prior value and timestamp. The normal configured
+On-Demand Connection Hold Time remains active after the request.
+
 S1 Motor State is a read-only `binary_sensor`, not a switch. Its registry
 migration is ownership-safe, but automations that refer to the old switch
 entity ID may require an update.
