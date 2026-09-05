@@ -14865,11 +14865,12 @@ def _r66c_installation(count: int = 4) -> dict[str, object]:
     for node in tree.body:
         if isinstance(
             node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)
-        ):
-            definitions.append(node)
-        elif isinstance(node, ast.Assign) and all(
-            isinstance(target, ast.Name) and target.id.isupper()
-            for target in node.targets
+        ) or (
+            isinstance(node, ast.Assign)
+            and all(
+                isinstance(target, ast.Name) and target.id.isupper()
+                for target in node.targets
+            )
         ):
             definitions.append(node)
     ns: dict[str, object] = {}
