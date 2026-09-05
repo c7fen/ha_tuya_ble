@@ -10639,7 +10639,7 @@ def empty_owner_trial(kind):
 def empty_owner_preflight(kind):
     return {
         'ready': False, 'trial_kind': kind, 'eligible_s1_count': 0,
-        'selected': False, 'refresh_button_present': False,
+        'selected': R66_CONTEXT['bound'] is not None, 'refresh_button_present': False,
         'policy_on_demand': False, 'ble_control_enabled': False,
         'hold_time_valid': False, 'connection_precondition_proven': False,
         'failure_class': None, 'target_bound': R66_CONTEXT['bound'] is not None,
@@ -15612,6 +15612,8 @@ class RefreshStatusLiveValidationController:
                 False,
                 False,
                 OwnerRefreshFailureClass.AMBIGUOUS,
+                self.target_bound,
+                False,
             )
         return result
 

@@ -15183,6 +15183,25 @@ def test_r66c_m13_m16_private_binding_survives_controller_reconstruction(
     assert reconstructed.target_bound
     assert reconstructed._owner_context["bound"] == bound
     assert len(reconstructed.hardware_observation.trials) == 1
+    resolver = ns["resolve_owner_refresh_target"]
+    ns["resolve_owner_refresh_target"] = lambda ws: [
+        item for item in resolver(ws) if item["fingerprint"] != bound
+    ]
+    lost = ns["preflight_owner_trial"]("RETAINED")
+    envelope = json.dumps(
+        {"result": lost, "private_context": ns["R66_CONTEXT"]}
+    ).encode()
+    decoded = access.PrivateInteractiveSessionBroker._decode_owner_response(
+        replacement,
+        envelope,
+        reconstructed._hardware_capability(),
+        "owner_refresh_preflight",
+    )
+    assert not decoded.ready
+    assert decoded.target_bound and not decoded.same_private_target
+    assert decoded.failure_class is access.OwnerRefreshFailureClass.OWNERSHIP_NOT_PROVEN
+    assert reconstructed.target_bound and not reconstructed.same_private_target
+    assert reconstructed._owner_context["bound"] == bound
     altered = copy.deepcopy(reconstructed._owner_context)
     altered["bound"] = next(item for item in altered["approved"] if item != bound)
     with pytest.raises(ValueError, match="owner_context"):
