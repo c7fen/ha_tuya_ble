@@ -14172,11 +14172,16 @@ def test_r66a_red1_public_owner_refresh_observer_exists() -> None:
 
 
 def test_r66b_red1_parent_has_no_public_owner_trial_preflight() -> None:
+    parent = "85a3080ee9671a27bd3aaf26e4fafc6fe7bf2478"
+    if subprocess.run(
+        ["git", "cat-file", "-e", f"{parent}^{{commit}}"], check=False
+    ).returncode:
+        pytest.skip("exact R66A parent is unavailable in this shallow checkout")
     parent = subprocess.check_output(
         [
             "git",
             "show",
-            "85a3080ee9671a27bd3aaf26e4fafc6fe7bf2478:tools/home_assistant_live_access.py",
+            f"{parent}:tools/home_assistant_live_access.py",
         ],
         text=True,
     )
