@@ -12236,6 +12236,40 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
             failure,
         )
 
+    def _preflight_owner_refresh_status_trial(
+        self,
+        trial_kind: access.OwnerRefreshTrialKind,
+        *,
+        _capability: object = None,
+    ) -> access.OwnerRefreshTrialPreflight:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        self.calls.append(("owner_refresh_preflight", trial_kind))
+        connection_matches = getattr(self, "preflight_connection_matches", True)
+        ownership_matches = getattr(self, "preflight_ownership_matches", True)
+        ready = connection_matches and ownership_matches
+        return access.OwnerRefreshTrialPreflight(
+            ready,
+            trial_kind,
+            1 if ownership_matches else 0,
+            ownership_matches,
+            ownership_matches,
+            ownership_matches,
+            ownership_matches,
+            ownership_matches,
+            connection_matches,
+            (
+                None
+                if ready
+                else (
+                    access.OwnerRefreshFailureClass.PRECONDITION_NOT_PROVEN
+                    if not connection_matches
+                    else access.OwnerRefreshFailureClass.OWNERSHIP_NOT_PROVEN
+                )
+            ),
+        )
+
     def _observe_owner_refresh_release(
         self, *, _capability: object = None
     ) -> access.OwnerRefreshReleaseResult:
@@ -14135,6 +14169,116 @@ def test_r66a_red1_public_owner_refresh_observer_exists() -> None:
     """The exact R65H parent has no observer-only owner-press API."""
     method = access.RefreshStatusLiveValidationController.observe_owner_refresh_trial
     assert tuple(inspect.signature(method).parameters) == ("self", "trial_kind")
+
+
+def test_r66b_red1_parent_has_no_public_owner_trial_preflight() -> None:
+    parent = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "85a3080ee9671a27bd3aaf26e4fafc6fe7bf2478:tools/home_assistant_live_access.py",
+        ],
+        text=True,
+    )
+    assert "preflight_owner_refresh_trial" not in parent
+
+
+def test_r66b_red2_observer_alone_proves_connection_precondition() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    observer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
+    )
+    assert (
+        "state(connection_id).get('state') != expected_state"
+        in ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
+    )
+
+
+def test_r66b_preflight_cold_and_retained_require_the_matching_connection(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    cold = controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert cold.ready is True
+    assert cold.connection_precondition_proven is True
+    assert controller.hardware_observation.trials == ()
+    assert controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    retained = controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.RETAINED
+    )
+    assert retained.ready is True
+    assert retained.connection_precondition_proven is True
+    assert [name for name, _detail in broker.calls].count(
+        "owner_refresh_preflight"
+    ) == 2
+    controller.close()
+
+
+def test_r66b_preflight_connection_or_ownership_failure_is_not_ready(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    broker.preflight_connection_matches = False
+    cold = controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert cold.ready is False
+    assert cold.failure_class is access.OwnerRefreshFailureClass.PRECONDITION_NOT_PROVEN
+    assert controller.hardware_observation.trials == ()
+    broker.preflight_connection_matches = True
+    broker.preflight_ownership_matches = False
+    ownership = controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    )
+    assert ownership.ready is False
+    assert ownership.eligible_s1_count == 0
+    assert ownership.selected is False
+    assert controller.hardware_observation.trials == ()
+    controller.close()
+
+
+def test_r66b_preflight_source_is_read_only_and_observer_rechecks() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    preflight = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "preflight_owner_trial"
+    )
+    source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, preflight)
+    assert source is not None
+    assert "resolve_owner_refresh_target(ws)" in source
+    assert "press(" not in source
+    assert "call_service" not in source
+    assert "LogStream" not in source
+    assert "logger/" not in source
+    controller = access.RefreshStatusLiveValidationController
+    assert "begin_hardware_item" not in inspect.getsource(
+        controller.preflight_owner_refresh_trial
+    )
+    observer = inspect.getsource(controller.observe_owner_refresh_trial)
+    assert "_observe_owner_refresh_status_trial" in observer
+
+
+def test_r66b_observer_rechecks_after_a_successful_preflight(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    assert controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).ready
+    broker.owner_trial_failure = access.OwnerRefreshFailureClass.PRECONDITION_NOT_PROVEN
+    result = controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert (
+        result.failure_class is access.OwnerRefreshFailureClass.PRECONDITION_NOT_PROVEN
+    )
+    assert broker.calls[-2:] == [
+        ("owner_refresh_preflight", access.OwnerRefreshTrialKind.COLD),
+        ("owner_refresh_trial", access.OwnerRefreshTrialKind.COLD),
+    ]
+    controller.close()
 
 
 def test_r66a_red2_automated_collector_is_not_the_owner_observer() -> None:

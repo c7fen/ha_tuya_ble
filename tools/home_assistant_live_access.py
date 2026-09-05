@@ -1448,6 +1448,22 @@ class OwnerRefreshFailureClass(StrEnum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshTrialPreflight:
+    """Identifier-free readiness for the next owner-operated R66 press."""
+
+    ready: bool
+    trial_kind: OwnerRefreshTrialKind
+    eligible_s1_count: int
+    selected: bool
+    refresh_button_present: bool
+    policy_on_demand: bool
+    ble_control_enabled: bool
+    hold_time_valid: bool
+    connection_precondition_proven: bool
+    failure_class: OwnerRefreshFailureClass | None
+
+
 class HardwareObservationPhase(StrEnum):
     """Durable R66 owner-operated observation progress."""
 
@@ -4307,6 +4323,62 @@ def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult
         )
     ):
         raise ValueError("owner_refresh_trial")
+    return result
+
+
+def _parse_owner_refresh_trial_preflight_payload(
+    value: object,
+) -> OwnerRefreshTrialPreflight:
+    """Strictly decode bounded, read-only R66 owner-trial readiness."""
+    fields = {
+        "ready",
+        "trial_kind",
+        "eligible_s1_count",
+        "selected",
+        "refresh_button_present",
+        "policy_on_demand",
+        "ble_control_enabled",
+        "hold_time_valid",
+        "connection_precondition_proven",
+        "failure_class",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("owner_refresh_preflight")
+    try:
+        result = OwnerRefreshTrialPreflight(
+            _bool(value["ready"]),
+            OwnerRefreshTrialKind(value["trial_kind"]),
+            _count(value["eligible_s1_count"]),
+            _bool(value["selected"]),
+            _bool(value["refresh_button_present"]),
+            _bool(value["policy_on_demand"]),
+            _bool(value["ble_control_enabled"]),
+            _bool(value["hold_time_valid"]),
+            _bool(value["connection_precondition_proven"]),
+            (
+                None
+                if value["failure_class"] is None
+                else OwnerRefreshFailureClass(value["failure_class"])
+            ),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("owner_refresh_preflight") from None
+    if (
+        result.eligible_s1_count > 1
+        or result.ready
+        != (
+            result.eligible_s1_count == 1
+            and result.selected
+            and result.refresh_button_present
+            and result.policy_on_demand
+            and result.ble_control_enabled
+            and result.hold_time_valid
+            and result.connection_precondition_proven
+            and result.failure_class is None
+        )
+        or result.ready != (result.failure_class is None)
+    ):
+        raise ValueError("owner_refresh_preflight")
     return result
 
 
@@ -10421,6 +10493,39 @@ def empty_owner_trial(kind):
         'failure_class': None,
     }
 
+def empty_owner_preflight(kind):
+    return {
+        'ready': False, 'trial_kind': kind, 'eligible_s1_count': 0,
+        'selected': False, 'refresh_button_present': False,
+        'policy_on_demand': False, 'ble_control_enabled': False,
+        'hold_time_valid': False, 'connection_precondition_proven': False,
+        'failure_class': None,
+    }
+
+def preflight_owner_trial(kind):
+    result = empty_owner_preflight(kind); ws = None
+    try:
+        ws = WebSocket()
+        _button_id, connection_id, _last_id, _dp_entities, _hold = resolve_owner_refresh_target(ws)
+        result.update({
+            'eligible_s1_count': 1, 'selected': True,
+            'refresh_button_present': True, 'policy_on_demand': True,
+            'ble_control_enabled': True, 'hold_time_valid': True,
+        })
+        expected_state = 'off' if kind == 'COLD' else 'on'
+        result['connection_precondition_proven'] = state(connection_id).get('state') == expected_state
+        if not result['connection_precondition_proven']:
+            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        result['ready'] = True
+        return result
+    except ValueError as error:
+        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+        return result
+    except Exception:
+        result['failure_class'] = 'AMBIGUOUS'; return result
+    finally:
+        if ws is not None: ws.close()
+
 def observe_owner_trial(kind):
     result = empty_owner_trial(kind); ws = stream = window = None; prior_level = None
     try:
@@ -10728,9 +10833,9 @@ def feature_absence():
 
 operation = sys.argv[1]
 try:
-    if operation == 'owner_refresh_trial':
+    if operation in {'owner_refresh_trial', 'owner_refresh_preflight'}:
         kind = os.environ.pop('HA_R66_TRIAL_KIND', '')
-        result = observe_owner_trial(kind) if kind in {'COLD', 'RETAINED'} else None
+        result = (observe_owner_trial(kind) if operation == 'owner_refresh_trial' else preflight_owner_trial(kind)) if kind in {'COLD', 'RETAINED'} else None
     elif operation == 'owner_refresh_release':
         result = observe_release()
     else:
@@ -11561,15 +11666,16 @@ class PrivateInteractiveSessionBroker:
         actions = {
             "refresh_status_live_validation": FeatureValidationAction.LIVE_VALIDATION,
             "feature_absence": FeatureValidationAction.FEATURE_ABSENCE,
+            "owner_refresh_preflight": FeatureValidationAction.HARDWARE_OBSERVATION,
             "owner_refresh_trial": FeatureValidationAction.HARDWARE_OBSERVATION,
             "owner_refresh_release": FeatureValidationAction.HARDWARE_OBSERVATION,
         }
         action = actions.get(operation)
         if (
             action is None
-            or operation == "owner_refresh_trial"
+            or operation in {"owner_refresh_preflight", "owner_refresh_trial"}
             and type(trial_kind) is not OwnerRefreshTrialKind
-            or operation != "owner_refresh_trial"
+            or operation not in {"owner_refresh_preflight", "owner_refresh_trial"}
             and trial_kind is not None
         ):
             raise SessionBrokerError(
@@ -11686,6 +11792,19 @@ class PrivateInteractiveSessionBroker:
         )
         try:
             return _parse_owner_refresh_trial_result(output)
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _preflight_owner_refresh_status_trial(
+        self, trial_kind: OwnerRefreshTrialKind, *, _capability: object = None
+    ) -> OwnerRefreshTrialPreflight:
+        output = self.__execute_refresh_feature_operation(
+            "owner_refresh_preflight", trial_kind=trial_kind, _capability=_capability
+        )
+        try:
+            return _parse_owner_refresh_trial_preflight_payload(output)
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -15185,6 +15304,54 @@ class RefreshStatusLiveValidationController:
                 observation.trials + (result,),
                 observation.releases,
                 observation.zero_write_aggregate and result.zero_write,
+            )
+        return result
+
+    def preflight_owner_refresh_trial(
+        self, trial_kind: OwnerRefreshTrialKind
+    ) -> OwnerRefreshTrialPreflight:
+        """Read only the exact next R66 owner-press admission conditions."""
+        if type(trial_kind) is not OwnerRefreshTrialKind:
+            raise LifecycleControllerError("OWNER_REFRESH_TRIAL_KIND_INVALID") from None
+        observation = self.hardware_observation
+        if (
+            self.state is not FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+            or observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or len(observation.trials) >= len(_R66_TRIAL_SEQUENCE)
+            or trial_kind is not _R66_TRIAL_SEQUENCE[len(observation.trials)]
+            or any(item.failure_class is not None for item in observation.trials)
+            or any(item.failure_class is not None for item in observation.releases)
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INVALID"
+            ) from None
+        due_releases = sum(
+            point <= len(observation.trials)
+            for point in _R66_RELEASE_AFTER_TRIAL_COUNTS
+        )
+        if len(observation.releases) != due_releases:
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_RELEASE_REQUIRED"
+            ) from None
+        try:
+            result = self._broker._preflight_owner_refresh_status_trial(
+                trial_kind, _capability=self._hardware_capability()
+            )
+            if not isinstance(result, OwnerRefreshTrialPreflight):
+                raise TypeError
+        except (SessionBrokerError, TypeError, ValueError):
+            result = OwnerRefreshTrialPreflight(
+                False,
+                trial_kind,
+                0,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                OwnerRefreshFailureClass.AMBIGUOUS,
             )
         return result
 
