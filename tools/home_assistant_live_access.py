@@ -1462,6 +1462,8 @@ class OwnerRefreshTrialPreflight:
     hold_time_valid: bool
     connection_precondition_proven: bool
     failure_class: OwnerRefreshFailureClass | None
+    target_bound: bool = False
+    same_private_target: bool = False
 
 
 class HardwareObservationPhase(StrEnum):
@@ -4341,6 +4343,8 @@ def _parse_owner_refresh_trial_preflight_payload(
         "hold_time_valid",
         "connection_precondition_proven",
         "failure_class",
+        "target_bound",
+        "same_private_target",
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("owner_refresh_preflight")
@@ -4360,15 +4364,19 @@ def _parse_owner_refresh_trial_preflight_payload(
                 if value["failure_class"] is None
                 else OwnerRefreshFailureClass(value["failure_class"])
             ),
+            _bool(value["target_bound"]),
+            _bool(value["same_private_target"]),
         )
     except (TypeError, ValueError):
         raise ValueError("owner_refresh_preflight") from None
     if (
-        result.eligible_s1_count > 1
+        result.selected != result.target_bound
+        or result.same_private_target
+        and not result.target_bound
         or result.ready
         != (
-            result.eligible_s1_count == 1
-            and result.selected
+            result.eligible_s1_count >= 1
+            and (not result.target_bound or result.same_private_target)
             and result.refresh_button_present
             and result.policy_on_demand
             and result.ble_control_enabled
@@ -4529,6 +4537,26 @@ def _parse_hardware_observation(value: object) -> DurableHardwareObservation:
     return DurableHardwareObservation(phase, trials, releases, zero_write)
 
 
+def _validate_owner_context(value: object) -> None:
+    """Validate private lifecycle-scoped digests, outside public evidence."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"salt", "approved", "bound"}
+        or not isinstance(value["salt"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["salt"]) is None
+        or not isinstance(value["approved"], list)
+        or len(value["approved"]) > 256
+        or any(
+            not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            for item in value["approved"]
+        )
+        or value["approved"] != sorted(set(value["approved"]))
+        or value["bound"] is not None
+        and value["bound"] not in value["approved"]
+    ):
+        raise ValueError("owner_context")
+
+
 class _DurableFeatureValidationJournal:
     """Small durable ledger for the separate exact-R64 lifecycle."""
 
@@ -4549,7 +4577,8 @@ class _DurableFeatureValidationJournal:
         }
     )
     _V2_FIELDS = _V1_FIELDS | {"live_result", "final_restore_complete"}
-    _FIELDS = _V2_FIELDS | {"hardware_observation"}
+    _V3_FIELDS = _V2_FIELDS | {"hardware_observation"}
+    _FIELDS = _V3_FIELDS | {"owner_context"}
 
     def __init__(self, *, _retained_terminal_inspection: bool = False) -> None:
         self._directory = _fixed_lifecycle_state_root()
@@ -4738,7 +4767,8 @@ class _DurableFeatureValidationJournal:
         expected_fields = {
             1: cls._V1_FIELDS,
             2: cls._V2_FIELDS,
-            3: cls._FIELDS,
+            3: cls._V3_FIELDS,
+            4: cls._FIELDS,
         }.get(schema_version)
         live_result_valid = schema_version == 1
         if schema_version == 2:
@@ -4760,7 +4790,7 @@ class _DurableFeatureValidationJournal:
                     in {"ambiguous", "result_durable", "transition_committed"}
                 )
         hardware_observation_valid = schema_version in {1, 2}
-        if schema_version == 3:
+        if schema_version in {3, 4}:
             live_result = record.get("live_result")
             try:
                 parsed_live_result = (
@@ -4788,6 +4818,11 @@ class _DurableFeatureValidationJournal:
                     )
                     == "transition_committed"
                 )
+        if schema_version == 4:
+            try:
+                _validate_owner_context(record.get("owner_context"))
+            except ValueError:
+                raise LifecycleControllerError("FEATURE_JOURNAL_INVALID") from None
         final_restore_complete = record.get("final_restore_complete")
         backup_valid = backup is None or (
             isinstance(backup, dict)
@@ -4856,7 +4891,7 @@ class _DurableFeatureValidationJournal:
             or not backup_valid
             or not live_result_valid
             or not hardware_observation_valid
-            or schema_version in {2, 3}
+            or schema_version in {2, 3, 4}
             and type(final_restore_complete) is not bool
             or record.get("source_classification")
             not in {
@@ -4871,10 +4906,10 @@ class _DurableFeatureValidationJournal:
                 record.get("terminal") is None
                 or record.get("terminal") != record.get("state")
             )
-            or schema_version in {2, 3}
+            or schema_version in {2, 3, 4}
             and final_restore_complete is True
             and not cls._final_restore_complete(record)
-            or schema_version in {2, 3}
+            or schema_version in {2, 3, 4}
             and record.get("active") is False
             and record.get("terminal") == FeatureValidationState.COMPLETE_NORMAL.value
             and final_restore_complete is not True
@@ -5115,6 +5150,29 @@ class _DurableFeatureValidationJournal:
 
         self._mutate(mutate)
 
+    @property
+    def owner_context(self) -> dict[str, object] | None:
+        value = self._record.get("owner_context")
+        return None if value is None else copy.deepcopy(value)
+
+    def record_owner_context(self, context: dict[str, object]) -> None:
+        _validate_owner_context(context)
+
+        def mutate(record: dict[str, object]) -> None:
+            if record["schema_version"] not in {3, 4}:
+                raise LifecycleControllerError("FEATURE_HARDWARE_OBSERVATION_INVALID")
+            previous = record.get("owner_context")
+            if (
+                previous is not None
+                and previous["bound"] is not None
+                and context != previous
+            ):
+                raise LifecycleControllerError("FEATURE_OWNER_TARGET_CHANGED")
+            record["schema_version"] = 4
+            record["owner_context"] = copy.deepcopy(context)
+
+        self._mutate(mutate)
+
     def begin_hardware_item(self, operation: str, ordinal: int) -> None:
         """Durably reserve one external observation before its bounded wait."""
 
@@ -5351,7 +5409,7 @@ class _DurableFeatureValidationJournal:
             record["state"] = state.value
             record["terminal"] = state.value
             record["active"] = False
-            if record["schema_version"] in {2, 3}:
+            if record["schema_version"] in {2, 3, 4}:
                 record["final_restore_complete"] = (
                     state is FeatureValidationState.COMPLETE_NORMAL
                 )
@@ -9907,6 +9965,7 @@ print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
 _REMOTE_REFRESH_STATUS_PROGRAM = r"""
 import base64
 import json
+import hashlib
 import os
 import queue
 import re
@@ -10377,6 +10436,57 @@ def wait_for_owner_press(ws, entity_id, timeout_seconds=60):
     ws.sock.settimeout(15)
     return False
 
+class OwnerWebSocket(WebSocket):
+    def __init__(self):
+        self.pending = []
+        super().__init__()
+
+    def recv(self):
+        if self.pending: return self.pending.pop(0)
+        return super().recv()
+
+    def command(self, kind, **fields):
+        identifier = self.next_id; self.next_id += 1
+        self.send({'id': identifier, 'type': kind, **fields})
+        while True:
+            value = super().recv()
+            if value.get('type') == 'event':
+                if len(self.pending) >= 256: raise ValueError('event_overflow')
+                self.pending.append(value)
+                continue
+            if value.get('id') != identifier: continue
+            if value.get('type') != 'result' or value.get('success') is not True:
+                raise ValueError('websocket_command')
+            return value.get('result')
+
+
+def wait_for_owner_target(ws, candidates, selected, kind, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    allowed = {item['fingerprint'] for item in selected}
+    while time.monotonic() < deadline:
+        ws.sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try: value = ws.recv()
+        except socket.timeout: break
+        matches = [item for item in candidates if item['valid'] and owner_press_event(value, item['button'])]
+        if not matches: continue
+        if len(matches) != 1 or matches[0]['fingerprint'] not in allowed:
+            raise ValueError('ownership')
+        chosen = matches[0]
+        # Admission is re-read at the actual owner event; no stale preflight proof.
+        if not owner_candidate_ready(chosen, kind): raise ValueError('precondition')
+        ws.sock.settimeout(15)
+        return chosen
+    ws.sock.settimeout(15)
+    return None
+
+def reject_overlapping_owner_calls(ws, candidates):
+    # The logger boundary command preserves subscribed events in ws.pending.
+    pending = list(ws.pending)
+    for value in pending:
+        if any(item['valid'] and owner_press_event(value, item['button']) for item in candidates):
+            raise ValueError('refresh_lifecycle')
+
+
 def connection_state_event(value, entity_id, expected_state):
     if not isinstance(value, dict) or value.get('type') != 'event':
         return False
@@ -10458,8 +10568,20 @@ def resolve_owner_refresh_target(ws):
         options = data.get('options') if isinstance(data, dict) else None
         if isinstance(options, dict) and options.get('category') == 'jtmspro' and options.get('product_id') == 'xqeob8h6':
             eligible.append((item['entry_id'], options))
-    if len(eligible) != 1: raise ValueError('ownership')
-    entry_id, options = eligible[0]
+    if not eligible: raise ValueError('ownership')
+    candidates = []
+    for entry_id, options in eligible:
+        try:
+            candidate = owner_candidate(entities, devices, entry_id, options)
+        except ValueError:
+            candidate = {'valid': False, 'fingerprint': None}
+        candidates.append(candidate)
+    fingerprints = [item['fingerprint'] for item in candidates if item['valid']]
+    buttons = [item['button'] for item in candidates if item['valid']]
+    if len(fingerprints) != len(set(fingerprints)) or len(buttons) != len(set(buttons)): raise ValueError('ownership')
+    return candidates
+
+def owner_candidate(entities, devices, entry_id, options):
     owned_devices = [item.get('id') for item in devices if (
         isinstance(item, dict) and isinstance(item.get('id'), str)
         and isinstance(item.get('config_entries'), list)
@@ -10472,15 +10594,36 @@ def resolve_owner_refresh_target(ws):
     last_updates = entries_by_key(entities, device_id, 'sensor', 'last_status_update')
     if len(buttons) != 1 or len(connections) != 1 or len(last_updates) != 1: raise ValueError('ownership')
     button_id = buttons[0]['ei']; connection_id = connections[0]['ei']
-    if state(button_id).get('state') == 'unavailable': raise ValueError('ownership')
     hold = options.get('on_demand_connection_hold_time', 15)
-    if options.get('connection_mode') != 'on_demand' or options.get('ble_control_enabled') is not True or type(hold) is not int or not 15 <= hold <= 105:
-        raise ValueError('precondition')
     dp_entities = {}
     for dp, domain, key in ((8, 'sensor', 'battery'), (33, 'switch', 'automatic_lock'), (34, 'select', 'unlock_switch'), (36, 'number', 'auto_lock_time')):
         matches = entries_by_key(entities, device_id, domain, key)
         if len(matches) == 1: dp_entities[dp] = matches[0]['ei']
-    return button_id, connection_id, last_updates[0]['ei'], dp_entities, hold
+    identity = [entry_id, device_id, button_id, connection_id, last_updates[0]['ei']]
+    fingerprint = hashlib.sha256((R66_CONTEXT['salt'] + json.dumps(identity, separators=(',', ':'))).encode()).hexdigest()
+    return {'valid': True, 'fingerprint': fingerprint, 'button': button_id,
+            'connection': connection_id, 'last': last_updates[0]['ei'],
+            'dp': dp_entities, 'hold': hold, 'options': options}
+
+def owner_candidates_for_trial(candidates, kind):
+    bound = R66_CONTEXT['bound']
+    if bound is None:
+        if kind != 'COLD': raise ValueError('ownership')
+        selected = candidates
+    else:
+        selected = [item for item in candidates if item['fingerprint'] == bound]
+        if len(selected) != 1: raise ValueError('ownership')
+    if not all(item['valid'] for item in selected): raise ValueError('ownership')
+    return selected
+
+def owner_candidate_ready(candidate, kind):
+    options = candidate['options']; hold = candidate['hold']
+    if options.get('connection_mode') != 'on_demand' or options.get('ble_control_enabled') is not True or type(hold) is not int or not 15 <= hold <= 105:
+        raise ValueError('precondition')
+    if state(candidate['button']).get('state') == 'unavailable': raise ValueError('ownership')
+    expected_state = 'off' if kind == 'COLD' else 'on'
+    return state(candidate['connection']).get('state') == expected_state
+
 
 def empty_owner_trial(kind):
     return {
@@ -10499,23 +10642,29 @@ def empty_owner_preflight(kind):
         'selected': False, 'refresh_button_present': False,
         'policy_on_demand': False, 'ble_control_enabled': False,
         'hold_time_valid': False, 'connection_precondition_proven': False,
-        'failure_class': None,
+        'failure_class': None, 'target_bound': R66_CONTEXT['bound'] is not None,
+        'same_private_target': False,
     }
 
 def preflight_owner_trial(kind):
     result = empty_owner_preflight(kind); ws = None
     try:
         ws = WebSocket()
-        _button_id, connection_id, _last_id, _dp_entities, _hold = resolve_owner_refresh_target(ws)
+        candidates = resolve_owner_refresh_target(ws)
+        result['eligible_s1_count'] = len(candidates)
+        selected = owner_candidates_for_trial(candidates, kind)
+        result['selected'] = R66_CONTEXT['bound'] is not None
+        result['same_private_target'] = result['selected']
+        checks = [owner_candidate_ready(candidate, kind) for candidate in selected]
         result.update({
-            'eligible_s1_count': 1, 'selected': True,
             'refresh_button_present': True, 'policy_on_demand': True,
             'ble_control_enabled': True, 'hold_time_valid': True,
+            'connection_precondition_proven': all(checks),
         })
-        expected_state = 'off' if kind == 'COLD' else 'on'
-        result['connection_precondition_proven'] = state(connection_id).get('state') == expected_state
-        if not result['connection_precondition_proven']:
+        if not all(checks):
             result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        if R66_CONTEXT['bound'] is None:
+            R66_CONTEXT['approved'] = sorted(item['fingerprint'] for item in selected)
         result['ready'] = True
         return result
     except ValueError as error:
@@ -10529,10 +10678,12 @@ def preflight_owner_trial(kind):
 def observe_owner_trial(kind):
     result = empty_owner_trial(kind); ws = stream = window = None; prior_level = None
     try:
-        ws = WebSocket()
-        button_id, connection_id, last_id, dp_entities, _hold = resolve_owner_refresh_target(ws)
-        expected_state = 'off' if kind == 'COLD' else 'on'
-        if state(connection_id).get('state') != expected_state:
+        ws = OwnerWebSocket()
+        candidates = resolve_owner_refresh_target(ws)
+        selected = owner_candidates_for_trial(candidates, kind)
+        if R66_CONTEXT['bound'] is None and sorted(item['fingerprint'] for item in selected) != R66_CONTEXT['approved']:
+            raise ValueError('ownership')
+        if not all(owner_candidate_ready(item, kind) for item in selected):
             result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
         info = ws.command('logger/log_info')
         levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
@@ -10542,15 +10693,23 @@ def observe_owner_trial(kind):
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
         ws.command('subscribe_events', event_type='call_service')
         stream=LogStream(); window = LogWindow(stream, ws); window.start()
-        before_last = state(last_id).get('state')
-        before_dp = {dp: stamp(state(entity)) for dp, entity in dp_entities.items()}
+        before = {item['fingerprint']: (
+            state(item['last']).get('state'),
+            {dp: stamp(state(entity)) for dp, entity in item['dp'].items()}
+        ) for item in selected}
         discard_before_owner_lifecycle(stream)
-        if not wait_for_owner_press(ws, button_id, 60):
+        chosen = wait_for_owner_target(ws, candidates, selected, kind, 60)
+        if chosen is None:
             result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
         result['owner_press_observed'] = True
+        R66_CONTEXT['bound'] = chosen['fingerprint']
+        button_id = chosen['button']; connection_id = chosen['connection']
+        last_id = chosen['last']; dp_entities = chosen['dp']
+        before_last, before_dp = before[chosen['fingerprint']]
         try:
             window.wait_for_refresh_terminal(30)
             lines = window.finish(); window = None
+            reject_overlapping_owner_calls(ws, candidates)
             _identity, counts, _events, provenance, completed, rows = parse_owner_refresh_lifecycle(lines)
         except ValueError as error:
             if str(error) == 'refresh_lifecycle':
@@ -10608,8 +10767,12 @@ def observe_release():
               'ambiguous': False, 'failure_class': None}
     ws = stream = window = None; prior_level = None
     try:
-        ws = WebSocket()
-        _button_id, connection_id, _last_id, _dp_entities, hold = resolve_owner_refresh_target(ws)
+        ws = OwnerWebSocket()
+        if R66_CONTEXT['bound'] is None: raise ValueError('ownership')
+        selected = owner_candidates_for_trial(resolve_owner_refresh_target(ws), 'RETAINED')
+        candidate = selected[0]
+        if not owner_candidate_ready(candidate, 'RETAINED'): raise ValueError('precondition')
+        connection_id = candidate['connection']; hold = candidate['hold']
         if state(connection_id).get('state') != 'on':
             result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
         info = ws.command('logger/log_info')
@@ -10832,6 +10995,7 @@ def feature_absence():
         ws.close()
 
 operation = sys.argv[1]
+R66_CONTEXT = json.loads(base64.b64decode(os.environ.pop('HA_R66_CONTEXT', 'e30=')))
 try:
     if operation in {'owner_refresh_trial', 'owner_refresh_preflight'}:
         kind = os.environ.pop('HA_R66_TRIAL_KIND', '')
@@ -10843,6 +11007,8 @@ try:
     if result is None: raise ValueError('operation')
 except Exception:
     result = {'error_class': 'OPERATION_FAILED', 'error_scope': 'OTHER', 'error_reason': 'VALIDATION'}
+if operation in {'owner_refresh_trial', 'owner_refresh_preflight', 'owner_refresh_release'}:
+    result = {'result': result, 'private_context': R66_CONTEXT}
 print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
 """
 
@@ -11713,6 +11879,13 @@ class PrivateInteractiveSessionBroker:
         trial_environment = (
             "" if trial_kind is None else f"HA_R66_TRIAL_KIND={trial_kind.value} "
         )
+        if action is FeatureValidationAction.HARDWARE_OBSERVATION:
+            context = _capability.controller._owner_context
+            _validate_owner_context(context)
+            encoded_context = base64.b64encode(
+                json.dumps(context, separators=(",", ":")).encode()
+            ).decode("ascii")
+            trial_environment += f"HA_R66_CONTEXT={shlex.quote(encoded_context)} "
         command = (
             f"{self._frame_printf(start_payload)}; "
             f"HA_R65_PROGRAM_SHA256={program_digest} {trial_environment}"
@@ -11779,6 +11952,23 @@ class PrivateInteractiveSessionBroker:
                 DispatchFailureStage.RESPONSE_PARSE, error
             ) from None
 
+    def _decode_owner_response(
+        self, output: bytes, capability: object, operation: str
+    ) -> object:
+        payload = _exact_payload(output)
+        if set(payload) != {"result", "private_context"}:
+            raise ValueError("owner_response")
+        parser = {
+            "owner_refresh_trial": _parse_owner_refresh_trial_payload,
+            "owner_refresh_preflight": _parse_owner_refresh_trial_preflight_payload,
+            "owner_refresh_release": _parse_owner_refresh_release_payload,
+        }[operation]
+        result = parser(payload["result"])
+        capability.controller._accept_owner_context(
+            payload["private_context"], result, operation
+        )
+        return result
+
     def _observe_owner_refresh_status_trial(
         self,
         trial_kind: OwnerRefreshTrialKind,
@@ -11791,7 +11981,9 @@ class PrivateInteractiveSessionBroker:
             _capability=_capability,
         )
         try:
-            return _parse_owner_refresh_trial_result(output)
+            return self._decode_owner_response(
+                output, _capability, "owner_refresh_trial"
+            )
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -11804,7 +11996,9 @@ class PrivateInteractiveSessionBroker:
             "owner_refresh_preflight", trial_kind=trial_kind, _capability=_capability
         )
         try:
-            return _parse_owner_refresh_trial_preflight_payload(output)
+            return self._decode_owner_response(
+                output, _capability, "owner_refresh_preflight"
+            )
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -11817,7 +12011,9 @@ class PrivateInteractiveSessionBroker:
             "owner_refresh_release", _capability=_capability
         )
         try:
-            return _parse_owner_refresh_release_result(output)
+            return self._decode_owner_response(
+                output, _capability, "owner_refresh_release"
+            )
         except (SessionBrokerError, TypeError, ValueError) as error:
             raise _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
@@ -15184,6 +15380,15 @@ class RefreshStatusLiveValidationController:
         self._hardware_observation: DurableHardwareObservation | None = (
             self._journal.hardware_observation if self._journal is not None else None
         )
+        retained_context = (
+            self._journal.owner_context if self._journal is not None else None
+        )
+        self._owner_context = retained_context or {
+            "salt": secrets.token_hex(16),
+            "approved": [],
+            "bound": None,
+        }
+        self._same_private_target = False
         self._exact_pr41_source_proven = False
         self._feature_backup_classification: FeatureBackupClassification | None = None
         self._feature_backup_identity = (
@@ -15212,6 +15417,53 @@ class RefreshStatusLiveValidationController:
             if self._journal is not None
             else self._hardware_observation
         )
+
+    @property
+    def target_bound(self) -> bool:
+        return self._owner_context["bound"] is not None
+
+    @property
+    def same_private_target(self) -> bool:
+        return self._same_private_target
+
+    def _accept_owner_context(
+        self, context: object, result: object, operation: str
+    ) -> None:
+        _validate_owner_context(context)
+        previous = self._owner_context
+        if context["salt"] != previous["salt"]:
+            raise ValueError("owner_context")
+        if previous["bound"] is not None and context != previous:
+            raise ValueError("owner_context")
+        if operation == "owner_refresh_preflight":
+            if context["bound"] != previous["bound"] or not isinstance(
+                result, OwnerRefreshTrialPreflight
+            ):
+                raise ValueError("owner_context")
+            if result.ready and (
+                not context["approved"]
+                or result.target_bound != (context["bound"] is not None)
+            ):
+                raise ValueError("owner_context")
+        elif operation == "owner_refresh_trial":
+            if context["approved"] != previous["approved"] or not isinstance(
+                result, OwnerRefreshTrialResult
+            ):
+                raise ValueError("owner_context")
+            if (
+                previous["bound"] is None
+                and (context["bound"] is not None) != result.owner_press_observed
+            ):
+                raise ValueError("owner_context")
+        elif operation == "owner_refresh_release":
+            if context != previous or not isinstance(result, OwnerRefreshReleaseResult):
+                raise ValueError("owner_context")
+        else:
+            raise ValueError("owner_context")
+        if self._journal is not None:
+            self._journal.record_owner_context(context)
+        self._owner_context = copy.deepcopy(context)
+        self._same_private_target = self.target_bound and result.failure_class is None
 
     def _hardware_capability(self) -> _FeatureValidationCapability:
         capability = _FeatureValidationCapability(
@@ -15272,9 +15524,16 @@ class RefreshStatusLiveValidationController:
             raise LifecycleControllerError(
                 "FEATURE_HARDWARE_RELEASE_REQUIRED"
             ) from None
+        if type(self._broker) is PrivateInteractiveSessionBroker and (
+            not self._owner_context["approved"]
+            or observation.trials
+            and not self.target_bound
+        ):
+            raise LifecycleControllerError("FEATURE_OWNER_TARGET_REQUIRED") from None
         ordinal = len(observation.trials) + 1
         if self._journal is not None:
             self._journal.begin_hardware_item("trial", ordinal)
+        self._same_private_target = False
         try:
             result = self._broker._observe_owner_refresh_status_trial(
                 trial_kind, _capability=self._hardware_capability()
@@ -15334,6 +15593,7 @@ class RefreshStatusLiveValidationController:
             raise LifecycleControllerError(
                 "FEATURE_HARDWARE_RELEASE_REQUIRED"
             ) from None
+        self._same_private_target = False
         try:
             result = self._broker._preflight_owner_refresh_status_trial(
                 trial_kind, _capability=self._hardware_capability()
@@ -15372,6 +15632,7 @@ class RefreshStatusLiveValidationController:
         ordinal = len(observation.releases) + 1
         if self._journal is not None:
             self._journal.begin_hardware_item("release", ordinal)
+        self._same_private_target = False
         try:
             result = self._broker._observe_owner_refresh_release(
                 _capability=self._hardware_capability()

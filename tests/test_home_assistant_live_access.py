@@ -1030,6 +1030,7 @@ def _synthetic_r30_source_authorities(
                 "test_r65g_",
                 "test_r65h_",
                 "test_r66a_",
+                "test_r66c_",
             )
         ),
     )
@@ -14196,8 +14197,10 @@ def test_r66b_red2_observer_alone_proves_connection_precondition() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
     )
     assert (
-        "state(connection_id).get('state') != expected_state"
-        in ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
+        "owner_candidate_ready(chosen, kind)" in access._REMOTE_REFRESH_STATUS_PROGRAM
+    )
+    assert "owner_candidate_ready(item, kind)" in ast.get_source_segment(
+        access._REMOTE_REFRESH_STATUS_PROGRAM, observer
     )
 
 
@@ -14418,7 +14421,7 @@ def test_r66a_o1_observer_source_has_no_refresh_or_generic_service_dispatch() ->
     source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
     assert source is not None
     assert source.index("discard_before_owner_lifecycle(stream)") < source.index(
-        "wait_for_owner_press(ws, button_id, 60)"
+        "wait_for_owner_target(ws, candidates, selected, kind, 60)"
     )
 
 
@@ -14464,7 +14467,8 @@ def test_r66a_o4_exact_s1_resolution_is_unique_and_fail_closed() -> None:
     )
     source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, resolver)
     assert source is not None
-    assert "if len(eligible) != 1: raise ValueError('ownership')" in source
+    assert "if not eligible: raise ValueError('ownership')" in source
+    assert "if len(eligible) != 1" not in source
 
 
 def test_r66a_o2_to_o12_exact_lifecycle_metadata_is_value_free() -> None:
@@ -14852,3 +14856,402 @@ def test_r65g_unexpected_sender_fails_zero_write_gate(window: str) -> None:
     assert "warm_counts['datapoint'] or warm_counts['other']" in (
         access._REMOTE_REFRESH_STATUS_PROGRAM
     )
+
+
+def _r66c_installation(count: int = 4) -> dict[str, object]:
+    """Four visibly synthetic S1s with independent registry and policy state."""
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    definitions = []
+    for node in tree.body:
+        if isinstance(
+            node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)
+        ):
+            definitions.append(node)
+        elif isinstance(node, ast.Assign) and all(
+            isinstance(target, ast.Name) and target.id.isupper()
+            for target in node.targets
+        ):
+            definitions.append(node)
+    ns: dict[str, object] = {}
+    exec(  # noqa: S102 - repository-owned definitions with synthetic transports.
+        compile(ast.Module(definitions, type_ignores=[]), "<r66c-synthetic>", "exec"),
+        ns,
+    )
+    entries, devices, entities, states, options, calls = [], [], [], {}, {}, []
+    for index in range(1, count + 1):
+        entry = f"SYNTHETIC_ENTRY_{index}"
+        device = f"SYNTHETIC_DEVICE_{index}"
+        entries.append({"entry_id": entry, "state": "loaded"})
+        devices.append({"id": device, "config_entries": [entry]})
+        options[entry] = {
+            "category": "jtmspro",
+            "product_id": "xqeob8h6",
+            "connection_mode": "on_demand",
+            "ble_control_enabled": True,
+            "on_demand_connection_hold_time": 15,
+        }
+        for domain, key, value in [
+            ("button", "refresh_status", "unknown"),
+            ("binary_sensor", "bluetooth_connection", "off"),
+            ("sensor", "last_status_update", "synthetic-before"),
+        ]:
+            entity = f"{domain}.synthetic_{index}_{key}"
+            entities.append({"di": device, "pl": "tuya_ble", "tk": key, "ei": entity})
+            states[entity] = {"entity_id": entity, "state": value, "attributes": {}}
+
+    class SyntheticWS:
+        def command(self, command: str, **kwargs: object) -> object:
+            calls.append(command)
+            if command == "config/entity_registry/list_for_display":
+                return {"entities": entities}
+            if command == "config/device_registry/list":
+                return devices
+            raise AssertionError("SYNTHETIC_UNEXPECTED_IO")
+
+        def close(self) -> None:
+            pass
+
+    def http(path: str, method: str = "GET", **kwargs: object) -> object:
+        assert method == "GET"
+        calls.append("GET")
+        if path.startswith("/diagnostics/config_entry/"):
+            return {"data": {"options": options[path.rsplit("/", 1)[1]]}}
+        assert path == "/config/config_entries/entry?domain=tuya_ble"
+        return entries
+
+    ns.update(
+        WebSocket=SyntheticWS, http_json=http, state=lambda entity: states[entity]
+    )
+    ns["R66_CONTEXT"] = {"salt": "a" * 32, "approved": [], "bound": None}
+    ns["_synthetic_states"] = states
+    ns["_synthetic_calls"] = calls
+    return ns
+
+
+def test_r66c_red1_four_individually_valid_s1s_resolve() -> None:
+    one = _r66c_installation(1)
+    assert one["resolve_owner_refresh_target"](one["WebSocket"]())
+    four = _r66c_installation()
+    assert four["resolve_owner_refresh_target"](four["WebSocket"]())
+
+
+def test_r66c_red2_four_cold_ready_candidates_pass_preflight() -> None:
+    ns = _r66c_installation()
+    result = ns["preflight_owner_trial"]("COLD")
+    assert result["ready"] is True
+    assert result["eligible_s1_count"] == 4
+
+
+def _r66c_owner_event(entity: str) -> dict[str, object]:
+    return {
+        "type": "event",
+        "event": {
+            "event_type": "call_service",
+            "context": {"user_id": "a" * 32, "parent_id": None},
+            "data": {
+                "domain": "button",
+                "service": "press",
+                "service_data": {"entity_id": entity},
+            },
+        },
+    }
+
+
+def _r66c_observe(
+    ns: dict[str, object],
+    index: int,
+    kind: str = "COLD",
+    *,
+    overlap: bool = False,
+    changed: bool = False,
+) -> dict[str, object]:
+    """Exercise the full embedded observer with a synthetic owner event/log window."""
+    base = ns["WebSocket"]
+    entity = f"button.synthetic_{index}_refresh_status"
+    states = ns["_synthetic_states"]
+    event = _r66c_owner_event(entity)
+    synthetic_label = "tuya-ble-session-" + "n" * 16
+    lines = [
+        _r65c_record(synthetic_label, "S1_REFRESH_ACCEPTED"),
+        _r65c_record(
+            synthetic_label,
+            "S1_REFRESH_SESSION_BOUND_"
+            + ("NEW" if kind == "COLD" else "REUSED")
+            + " session_ordinal=1",
+        ),
+        _r65c_record(synthetic_label, "Sending packet: #1 FUN_SENDER_DEVICE_STATUS"),
+        _r65c_record(
+            synthetic_label,
+            "Received datapoint update, id: 8, type: DT_VALUE, length: 4",
+        ),
+        _r65c_record(synthetic_label, "S1_REFRESH_COMPLETED session_ordinal=1"),
+    ]
+    # The synthetic DP entity belongs to the selected registry device.
+    original_resolve = ns["resolve_owner_refresh_target"]
+
+    def resolve(ws: object) -> object:
+        candidates = original_resolve(ws)
+        for ordinal, candidate in enumerate(candidates, 1):
+            dp_entity = f"sensor.synthetic_{ordinal}_battery"
+            candidate["dp"] = {8: dp_entity}
+            states.setdefault(
+                dp_entity,
+                {
+                    "state": "synthetic-before",
+                    "attributes": {"value_source": "current_session"},
+                },
+            )
+        return candidates
+
+    ns["resolve_owner_refresh_target"] = resolve
+
+    class Socket:
+        def settimeout(self, timeout: float) -> None:
+            pass
+
+    class WS(base):
+        def __init__(self) -> None:
+            self.sock = Socket()
+            self.pending = []
+            self.sent = False
+
+        def recv(self) -> object:
+            if self.sent:
+                raise ns["socket"].timeout()
+            self.sent = True
+            if changed:
+                states[f"binary_sensor.synthetic_{index}_bluetooth_connection"][
+                    "state"
+                ] = "on"
+            return event
+
+        def command(self, command: str, **kwargs: object) -> object:
+            if command == "logger/log_info":
+                return [{"domain": "tuya_ble", "level": 20}]
+            if command in {"logger/integration_log_level", "subscribe_events"}:
+                ns["_synthetic_calls"].append(command)
+                return None
+            return super().command(command, **kwargs)
+
+    class Stream:
+        def take_available(self) -> list[object]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    class Window:
+        def __init__(self, stream: object, ws: object) -> None:
+            self.ws = ws
+            self.established = False
+            self.finish_attempted = False
+
+        def start(self) -> None:
+            self.established = True
+
+        def wait_for_refresh_terminal(self, seconds: int) -> None:
+            states[f"binary_sensor.synthetic_{index}_bluetooth_connection"][
+                "state"
+            ] = "on"
+            states[f"sensor.synthetic_{index}_last_status_update"][
+                "state"
+            ] = "synthetic-after"
+            states[f"sensor.synthetic_{index}_battery"]["state"] = "synthetic-after"
+
+        def finish(self) -> list[str]:
+            self.finish_attempted = True
+            if overlap:
+                self.ws.pending.append(
+                    _r66c_owner_event("button.synthetic_2_refresh_status")
+                )
+            return lines
+
+    ns.update(OwnerWebSocket=WS, LogStream=Stream, LogWindow=Window)
+    return ns["observe_owner_trial"](kind)
+
+
+@pytest.mark.parametrize("count", [1, 4])
+def test_r66c_m1_m5_m15_all_candidates_must_be_cold_ready(count: int) -> None:
+    ns = _r66c_installation(count)
+    ready = ns["preflight_owner_trial"]("COLD")
+    assert ready["eligible_s1_count"] == count
+    assert ready["ready"] and not ready["target_bound"] and not ready["selected"]
+    parsed = access._parse_owner_refresh_trial_preflight_payload(ready)
+    assert parsed.ready and not parsed.target_bound
+    ns["_synthetic_states"][f"binary_sensor.synthetic_{count}_bluetooth_connection"][
+        "state"
+    ] = "on"
+    failed = ns["preflight_owner_trial"]("COLD")
+    assert failed["eligible_s1_count"] == count
+    assert not failed["ready"]
+    assert failed["failure_class"] == "PRECONDITION_NOT_PROVEN"
+    assert set(ns["_synthetic_calls"]) <= {
+        "GET",
+        "config/entity_registry/list_for_display",
+        "config/device_registry/list",
+    }
+
+
+@pytest.mark.parametrize("index", [1, 4])
+def test_r66c_m6_m10_owner_selects_and_later_preflights_stay_bound(index: int) -> None:
+    ns = _r66c_installation()
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    candidates = ns["resolve_owner_refresh_target"](ns["WebSocket"]())
+    result = _r66c_observe(ns, index)
+    assert result["failure_class"] is None
+    assert result["owner_press_observed"]
+    assert ns["R66_CONTEXT"]["bound"] == candidates[index - 1]["fingerprint"]
+    # Other candidates may now have an incompatible connection state.
+    assert ns["preflight_owner_trial"]("RETAINED")["ready"]
+    ns["_synthetic_states"][f"binary_sensor.synthetic_{index}_bluetooth_connection"][
+        "state"
+    ] = "off"
+    for other in range(1, 5):
+        if other != index:
+            ns["_synthetic_states"][
+                f"binary_sensor.synthetic_{other}_bluetooth_connection"
+            ]["state"] = "on"
+    cold = ns["preflight_owner_trial"]("COLD")
+    assert cold["ready"] and cold["target_bound"] and cold["same_private_target"]
+    public = json.dumps([result, cold])
+    assert "synthetic_" not in public and "SYNTHETIC_" not in public
+    assert ns["R66_CONTEXT"]["bound"] not in public
+
+
+def test_r66c_m11_m14_foreign_press_and_missing_target_cannot_switch() -> None:
+    ns = _r66c_installation()
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    assert _r66c_observe(ns, 1)["failure_class"] is None
+    bound = ns["R66_CONTEXT"]["bound"]
+    foreign = _r66c_observe(ns, 4, "RETAINED")
+    assert foreign["failure_class"] == "OWNERSHIP_NOT_PROVEN"
+    assert ns["R66_CONTEXT"]["bound"] == bound
+    ns["R66_CONTEXT"]["bound"] = "f" * 64
+    lost = ns["preflight_owner_trial"]("COLD")
+    assert not lost["ready"] and lost["failure_class"] == "OWNERSHIP_NOT_PROVEN"
+    assert ns["R66_CONTEXT"]["bound"] == "f" * 64
+
+
+def test_r66c_overlap_and_state_change_fail_without_replay() -> None:
+    ns = _r66c_installation()
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    overlap = _r66c_observe(ns, 1, overlap=True)
+    assert overlap["failure_class"] == "OVERLAPPING_REFRESH"
+    ns = _r66c_installation()
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    changed = _r66c_observe(ns, 1, changed=True)
+    assert changed["failure_class"] == "PRECONDITION_NOT_PROVEN"
+
+
+def test_r66c_m13_m16_private_binding_survives_controller_reconstruction(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    ns = _r66c_installation()
+    ns["R66_CONTEXT"] = copy.deepcopy(controller._owner_context)
+    ready = ns["preflight_owner_trial"]("COLD")
+    capability = controller._hardware_capability()
+    envelope = json.dumps(
+        {"result": ready, "private_context": ns["R66_CONTEXT"]}
+    ).encode()
+    parsed = access.PrivateInteractiveSessionBroker._decode_owner_response(
+        broker, envelope, capability, "owner_refresh_preflight"
+    )
+    assert parsed.ready and not controller.target_bound
+    result = _r66c_observe(ns, 4)
+
+    def observe(kind: object, *, _capability: object) -> object:
+        envelope = json.dumps(
+            {"result": result, "private_context": ns["R66_CONTEXT"]}
+        ).encode()
+        return access.PrivateInteractiveSessionBroker._decode_owner_response(
+            broker, envelope, _capability, "owner_refresh_trial"
+        )
+
+    broker._observe_owner_refresh_status_trial = observe
+    controller.observe_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert controller.target_bound and controller.same_private_target
+    assert len(controller.hardware_observation.trials) == 1
+    bound = controller._owner_context["bound"]
+    assert bound not in repr(controller.hardware_observation)
+    controller.close()
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+    assert reconstructed.target_bound
+    assert reconstructed._owner_context["bound"] == bound
+    assert len(reconstructed.hardware_observation.trials) == 1
+    altered = copy.deepcopy(reconstructed._owner_context)
+    altered["bound"] = next(item for item in altered["approved"] if item != bound)
+    with pytest.raises(ValueError, match="owner_context"):
+        reconstructed._accept_owner_context(altered, parsed, "owner_refresh_preflight")
+    reconstructed.close()
+
+
+def test_r66c_m12_release_observes_only_bound_target() -> None:
+    ns = _r66c_installation()
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    assert _r66c_observe(ns, 4)["failure_class"] is None
+    observed = []
+
+    def wait(ws: object, entity: str, expected: str, timeout: int) -> bool:
+        observed.append((entity, expected))
+        assert entity == "binary_sensor.synthetic_4_bluetooth_connection"
+        if expected == "off":
+            ns["_synthetic_states"][entity]["state"] = "off"
+            return True
+        return False
+
+    ns["wait_for_connection_state"] = wait
+    result = ns["observe_release"]()
+    assert result["failure_class"] is None and result["normal_release_observed"]
+    assert len(observed) == 2
+
+
+def test_r66c_m20_m21_dry_restore_with_private_context_and_lost_retirement(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, r64, restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    ns = _r66c_installation()
+    ns["R66_CONTEXT"] = copy.deepcopy(controller._owner_context)
+    ready = ns["preflight_owner_trial"]("COLD")
+    controller._accept_owner_context(
+        ns["R66_CONTEXT"],
+        access._parse_owner_refresh_trial_preflight_payload(ready),
+        "owner_refresh_preflight",
+    )
+    assert controller.hardware_observation.trials == ()
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_refresh_feature_absent()
+    controller.admit_post_restore_repairs()
+    controller.inspect_feature_backup(restore.manifest)
+    broker.queue(
+        "feature_backup_retire",
+        access.SessionBrokerError("SYNTHETIC_RETIREMENT_RESPONSE_LOST"),
+    )
+    with pytest.raises(access.LifecycleControllerError, match="RETIREMENT_AMBIGUOUS"):
+        controller.retire_owned_feature_backup(restore.manifest)
+    controller.close()
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    replacement.feature_backup_classification = access.FeatureBackupClassification.NONE
+    recovered = access.RefreshStatusLiveValidationController(replacement)
+    recovered.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    assert (
+        recovered.inspect_feature_backup(restore.manifest).classification
+        is access.FeatureBackupClassification.NONE
+    )
+    assert recovered.complete().complete
+    assert recovered.state is access.FeatureValidationState.COMPLETE_NORMAL
+    assert not any(
+        name == "feature_backup_retire" for name, detail in replacement.calls
+    )
+    recovered.close()
