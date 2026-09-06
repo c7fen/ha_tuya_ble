@@ -14424,6 +14424,10 @@ def test_r66d_red_parent_started_the_listener_only_inside_the_post_press_observe
 ):
     """The pinned parent cannot see an event delivered before this call starts."""
     parent = "97a4b7d6faacdb3b57218296d85c47f350ea1714"
+    if subprocess.run(
+        ["git", "cat-file", "-e", f"{parent}^{{commit}}"], check=False
+    ).returncode:
+        pytest.skip("exact R66C parent is unavailable in this shallow checkout")
     source = subprocess.check_output(
         ["git", "show", f"{parent}:tools/home_assistant_live_access.py"], text=True
     )
