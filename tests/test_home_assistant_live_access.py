@@ -11936,6 +11936,7 @@ def _r65_log_boundary() -> dict[str, object]:
         "OWNER_WAIT_SECONDS",
         "READER_SHUTDOWN_WAIT_SECONDS",
         "REFRESH_TERMINAL_WAIT_SECONDS",
+        "WEBSOCKET_COMMAND_WAIT_SECONDS",
         "LOG_RE",
         "REFRESH_TERMINAL_RE",
         "LogStream",
