@@ -12213,6 +12213,11 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
             _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
         )
         self.calls.append(("owner_refresh_trial", trial_kind))
+        return self._owner_refresh_trial_result(trial_kind)
+
+    def _owner_refresh_trial_result(
+        self, trial_kind: access.OwnerRefreshTrialKind
+    ) -> access.OwnerRefreshTrialResult:
         cold = trial_kind is access.OwnerRefreshTrialKind.COLD
         failure = getattr(self, "owner_trial_failure", None)
         return access.OwnerRefreshTrialResult(
@@ -12236,6 +12241,34 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
             False,
             failure,
         )
+
+    def _arm_owner_refresh_status_trial(
+        self,
+        trial_kind: access.OwnerRefreshTrialKind,
+        armed_observer_id: str,
+        *,
+        _capability: object = None,
+    ) -> access.OwnerRefreshTrialArm:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        self.calls.append(("owner_refresh_arm", trial_kind))
+        self.armed_owner_trial = (trial_kind, armed_observer_id)
+        return access.OwnerRefreshTrialArm(
+            True, trial_kind, 4, False, False, True, 60, None
+        )
+
+    def _collect_owner_refresh_status_trial(
+        self, armed_observer_id: str, *, _capability: object = None
+    ) -> access.OwnerRefreshTrialResult:
+        self._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        trial_kind, expected_id = getattr(self, "armed_owner_trial", (None, None))
+        if armed_observer_id != expected_id:
+            raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_PROTOCOL")
+        self.calls.append(("owner_refresh_collect", trial_kind))
+        return self._owner_refresh_trial_result(trial_kind)
 
     def _preflight_owner_refresh_status_trial(
         self,
@@ -14384,6 +14417,144 @@ def _r66a_embedded_function(name: str) -> object:
         namespace,
     )
     return namespace[name]
+
+
+def test_r66d_red_parent_started_the_listener_only_inside_the_post_press_observer() -> (
+    None
+):
+    """The pinned parent cannot see an event delivered before this call starts."""
+    parent = "97a4b7d6faacdb3b57218296d85c47f350ea1714"
+    source = subprocess.check_output(
+        ["git", "show", f"{parent}:tools/home_assistant_live_access.py"], text=True
+    )
+    program = ast.literal_eval(
+        ast.parse(source)
+        .body[
+            next(
+                index
+                for index, node in enumerate(ast.parse(source).body)
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "_REMOTE_REFRESH_STATUS_PROGRAM"
+                    for target in node.targets
+                )
+            )
+        ]
+        .value
+    )
+    observer = next(
+        node
+        for node in ast.parse(program).body
+        if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
+    )
+    observer_source = ast.get_source_segment(program, observer)
+    assert observer_source is not None
+    assert observer_source.index("ws = OwnerWebSocket()") < observer_source.index(
+        "wait_for_owner_target(ws, candidates, selected, kind, 60)"
+    )
+    assert "arm_owner_trial" not in program
+
+
+def test_r66d_owner_press_between_arm_and_collect_is_one_existing_observation(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    assert controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).ready
+
+    armed = controller.arm_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+
+    assert armed.observer_armed is True
+    assert armed.connection_precondition_proven is True
+    assert [call[0] for call in broker.calls][-1] == "owner_refresh_arm"
+    assert len(controller.hardware_observation.trials) == 0
+
+    result = controller.collect_owner_refresh_trial()
+
+    assert result.owner_press_observed is True
+    assert result.request_completed is True
+    assert len(controller.hardware_observation.trials) == 1
+    assert [call[0] for call in broker.calls][-2:] == [
+        "owner_refresh_arm",
+        "owner_refresh_collect",
+    ]
+    assert not any(call[0] == "owner_refresh_trial" for call in broker.calls)
+    controller.close()
+
+
+def test_r66d_arm_establishes_the_listener_and_collect_never_recreates_it() -> None:
+    tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
+    arm = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "arm_owner_trial"
+    )
+    collect = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "collect_armed_owner_trial"
+    )
+    arm_source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, arm)
+    collect_source = ast.get_source_segment(
+        access._REMOTE_REFRESH_STATUS_PROGRAM, collect
+    )
+    assert arm_source is not None and collect_source is not None
+    assert arm_source.index("ws.command('subscribe_events'") < arm_source.index(
+        "os.fork()"
+    )
+    assert arm_source.index("window.start()") < arm_source.index("os.fork()")
+    assert "elif ws is not None" not in arm_source
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "command"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "call_service"
+        for node in ast.walk(arm)
+    )
+    assert "OwnerWebSocket" not in collect_source
+    assert "LogStream" not in collect_source
+
+
+def test_r66d_armed_interruption_is_consumed_as_one_ambiguous_trial(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access, "_DISABLE_DURABLE_LIFECYCLE_FOR_TESTS", False)
+    controller, _broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    assert controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).ready
+    assert controller.arm_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).observer_armed
+    assert controller._journal is not None
+    assert controller._journal.hardware_pending == {
+        "operation": "trial",
+        "ordinal": 1,
+        "armed": True,
+    }
+    controller.close()
+
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    reconstructed = access.RefreshStatusLiveValidationController(replacement)
+
+    observation = reconstructed.hardware_observation
+    assert observation is not None
+    assert len(observation.trials) == 1
+    assert (
+        observation.trials[0].failure_class is access.OwnerRefreshFailureClass.AMBIGUOUS
+    )
+    assert observation.trials[0].owner_press_observed is False
+    assert not any(name == "owner_refresh_arm" for name, _detail in replacement.calls)
+    reconstructed.close()
 
 
 def test_r66a_o1_observer_source_has_no_refresh_or_generic_service_dispatch() -> None:

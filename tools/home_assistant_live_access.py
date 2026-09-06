@@ -1466,6 +1466,20 @@ class OwnerRefreshTrialPreflight:
     same_private_target: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshTrialArm:
+    """Identifier-free proof that one R66 observer is already listening."""
+
+    observer_armed: bool
+    trial_kind: OwnerRefreshTrialKind
+    eligible_s1_count: int
+    target_bound: bool
+    same_private_target: bool
+    connection_precondition_proven: bool
+    deadline_seconds: int
+    failure_class: OwnerRefreshFailureClass | None
+
+
 class HardwareObservationPhase(StrEnum):
     """Durable R66 owner-operated observation progress."""
 
@@ -4390,6 +4404,49 @@ def _parse_owner_refresh_trial_preflight_payload(
     return result
 
 
+def _parse_owner_refresh_trial_arm_payload(value: object) -> OwnerRefreshTrialArm:
+    """Strictly decode the fixed, identifier-free R66 arm acknowledgement."""
+    fields = {
+        "observer_armed",
+        "trial_kind",
+        "eligible_s1_count",
+        "target_bound",
+        "same_private_target",
+        "connection_precondition_proven",
+        "deadline_seconds",
+        "failure_class",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("owner_refresh_arm")
+    try:
+        result = OwnerRefreshTrialArm(
+            _bool(value["observer_armed"]),
+            OwnerRefreshTrialKind(value["trial_kind"]),
+            _count(value["eligible_s1_count"]),
+            _bool(value["target_bound"]),
+            _bool(value["same_private_target"]),
+            _bool(value["connection_precondition_proven"]),
+            _count(value["deadline_seconds"]),
+            (
+                None
+                if value["failure_class"] is None
+                else OwnerRefreshFailureClass(value["failure_class"])
+            ),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("owner_refresh_arm") from None
+    if (
+        not 1 <= result.deadline_seconds <= 120
+        or result.same_private_target
+        and not result.target_bound
+        or result.observer_armed != (result.failure_class is None)
+        or result.observer_armed
+        and not result.connection_precondition_proven
+    ):
+        raise ValueError("owner_refresh_arm")
+    return result
+
+
 def _owner_refresh_release_record(
     result: OwnerRefreshReleaseResult,
 ) -> dict[str, object]:
@@ -4505,7 +4562,10 @@ def _parse_hardware_observation(value: object) -> DurableHardwareObservation:
         raise ValueError("hardware_observation")
     pending = value["pending"]
     if pending is not None:
-        if not isinstance(pending, dict) or set(pending) != {"operation", "ordinal"}:
+        if not isinstance(pending, dict) or set(pending) not in (
+            {"operation", "ordinal"},
+            {"operation", "ordinal", "armed"},
+        ):
             raise ValueError("hardware_observation")
         operation = pending["operation"]
         ordinal = pending["ordinal"]
@@ -4517,6 +4577,8 @@ def _parse_hardware_observation(value: object) -> DurableHardwareObservation:
             and ordinal != len(trials) + 1
             or operation == "release"
             and ordinal != len(releases) + 1
+            or "armed" in pending
+            and type(pending["armed"]) is not bool
         ):
             raise ValueError("hardware_observation")
     try:
@@ -5174,7 +5236,7 @@ class _DurableFeatureValidationJournal:
         self._mutate(mutate)
 
     def begin_hardware_item(self, operation: str, ordinal: int) -> None:
-        """Durably reserve one external observation before its bounded wait."""
+        """Durably reserve one external observation before it can be armed."""
 
         def mutate(record: dict[str, object]) -> None:
             hardware = record.get("hardware_observation")
@@ -5187,6 +5249,26 @@ class _DurableFeatureValidationJournal:
                     "FEATURE_HARDWARE_OBSERVATION_INVALID"
                 ) from None
             hardware["pending"] = {"operation": operation, "ordinal": ordinal}
+
+        self._mutate(mutate)
+
+    def arm_hardware_trial(self, ordinal: int) -> None:
+        """Make one reserved trial non-replayable before its arm dispatch."""
+
+        def mutate(record: dict[str, object]) -> None:
+            hardware = record.get("hardware_observation")
+            if not isinstance(hardware, dict) or hardware.get("pending") != {
+                "operation": "trial",
+                "ordinal": ordinal,
+            }:
+                raise LifecycleControllerError(
+                    "FEATURE_HARDWARE_OBSERVATION_INVALID"
+                ) from None
+            hardware["pending"] = {
+                "operation": "trial",
+                "ordinal": ordinal,
+                "armed": True,
+            }
 
         self._mutate(mutate)
 
@@ -5204,7 +5286,10 @@ class _DurableFeatureValidationJournal:
                 not isinstance(trials, list)
                 or len(trials) >= len(_R66_TRIAL_SEQUENCE)
                 or hardware.get("pending")
-                != {"operation": "trial", "ordinal": len(trials) + 1}
+                not in (
+                    {"operation": "trial", "ordinal": len(trials) + 1},
+                    {"operation": "trial", "ordinal": len(trials) + 1, "armed": True},
+                )
                 or result.trial_kind is not _R66_TRIAL_SEQUENCE[len(trials)]
             ):
                 raise LifecycleControllerError(
@@ -10762,6 +10847,202 @@ def observe_owner_trial(kind):
                 except Exception: result['ambiguous'] = True; result['failure_class'] = 'AMBIGUOUS'
             ws.close()
 
+def empty_owner_arm(kind):
+    return {
+        'observer_armed': False, 'trial_kind': kind, 'eligible_s1_count': 0,
+        'target_bound': R66_CONTEXT['bound'] is not None,
+        'same_private_target': R66_CONTEXT['bound'] is not None,
+        'connection_precondition_proven': False, 'deadline_seconds': 60,
+        'failure_class': None,
+    }
+
+def armed_owner_state_path(arm_id):
+    if re.fullmatch(r'[0-9a-f]{64}', arm_id) is None:
+        raise ValueError('armed_observer')
+    return '/tmp/.ha_tuya_ble_r66_' + arm_id
+
+def write_armed_owner_state(arm_id, value, *, create=False):
+    path = armed_owner_state_path(arm_id)
+    raw = json.dumps(value, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    if len(raw) > 16384: raise ValueError('armed_observer')
+    if create:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, raw); os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+    temporary = path + '.next'
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, raw); os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+
+def read_armed_owner_state(arm_id):
+    path = armed_owner_state_path(arm_id)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        raw = os.read(descriptor, 16385)
+    finally:
+        os.close(descriptor)
+    if not raw or len(raw) > 16384: raise ValueError('armed_observer')
+    value = json.loads(raw.decode('utf-8'))
+    if not isinstance(value, dict) or value.get('state') not in {'ARMED', 'RESULT'}:
+        raise ValueError('armed_observer')
+    return value
+
+def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, selected, before):
+    chosen = wait_for_owner_target(ws, candidates, selected, kind, 60)
+    if chosen is None:
+        result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
+    result['owner_press_observed'] = True
+    R66_CONTEXT['bound'] = chosen['fingerprint']
+    button_id = chosen['button']; connection_id = chosen['connection']
+    last_id = chosen['last']; dp_entities = chosen['dp']
+    before_last, before_dp = before[chosen['fingerprint']]
+    try:
+        window.wait_for_refresh_terminal(30)
+        lines = window.finish()
+        reject_overlapping_owner_calls(ws, candidates)
+        _identity, counts, _events, provenance, completed, rows = parse_owner_refresh_lifecycle(lines)
+    except ValueError as error:
+        if str(error) == 'refresh_lifecycle':
+            result['failure_class'] = 'OVERLAPPING_REFRESH'; return result
+        raise
+    result['counts'] = counts
+    result['session_provenance'] = provenance
+    result['request_completed'] = completed
+    result['per_dp'] = rows
+    result['reported_dp_ids'] = [row['dp_id'] for row in rows]
+    after_dp = {dp: state(entity) for dp, entity in dp_entities.items()}
+    confirmed_ids = sorted(set(result['reported_dp_ids']) & set(dp_entities))
+    result['current_session_provenance'] = (
+        bool(confirmed_ids) and all(
+            isinstance(after_dp[dp].get('attributes'), dict)
+            and after_dp[dp]['attributes'].get('value_source') == 'current_session'
+            for dp in confirmed_ids
+        )
+    ) if completed else None
+    result['retained_confirmation_observed'] = any(
+        stamp(after_dp[dp]) != before_dp[dp] for dp in confirmed_ids
+    )
+    result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
+    expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
+    if counts['datapoint'] or counts['other']:
+        result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
+    elif provenance != expected:
+        result['failure_class'] = 'PROVENANCE_MISMATCH'
+    elif not completed or counts['device_status'] != 1 or not rows or state(last_id).get('state') == before_last or result['current_session_provenance'] is not True:
+        result['failure_class'] = 'REQUEST_FAILED'
+    elif result['hold_active_after_refresh'] is not True:
+        result['failure_class'] = 'HOLD_NOT_ACTIVE'
+    return result
+
+def arm_owner_trial(kind, arm_id):
+    result = empty_owner_arm(kind); ws = stream = window = None; prior_level = None
+    handed_to_worker = False
+    try:
+        ws = OwnerWebSocket()
+        candidates = resolve_owner_refresh_target(ws)
+        result['eligible_s1_count'] = len(candidates)
+        selected = owner_candidates_for_trial(candidates, kind)
+        if R66_CONTEXT['bound'] is None and sorted(item['fingerprint'] for item in selected) != R66_CONTEXT['approved']:
+            raise ValueError('ownership')
+        if not all(owner_candidate_ready(item, kind) for item in selected):
+            raise ValueError('precondition')
+        info = ws.command('logger/log_info')
+        levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
+        if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
+            result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
+        prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
+        ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        ws.command('subscribe_events', event_type='call_service')
+        stream = LogStream(); window = LogWindow(stream, ws); window.start()
+        before = {item['fingerprint']: (
+            state(item['last']).get('state'),
+            {dp: stamp(state(entity)) for dp, entity in item['dp'].items()}
+        ) for item in selected}
+        discard_before_owner_lifecycle(stream)
+        write_armed_owner_state(arm_id, {'state': 'ARMED'}, create=True)
+        child = os.fork()
+        if child:
+            result.update({
+                'observer_armed': True,
+                'target_bound': R66_CONTEXT['bound'] is not None,
+                'same_private_target': R66_CONTEXT['bound'] is not None,
+                'connection_precondition_proven': True,
+            })
+            handed_to_worker = True
+            return result
+        try:
+            null = os.open('/dev/null', os.O_RDWR)
+            os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)
+            child_result = empty_owner_trial(kind)
+            try:
+                child_result = complete_armed_owner_trial(
+                    kind, child_result, ws, stream, window, candidates, selected, before
+                )
+            except LogBoundaryNotEstablished:
+                child_result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'
+            except ValueError as error:
+                child_result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+                child_result['ambiguous'] = child_result['failure_class'] == 'AMBIGUOUS'
+            except Exception:
+                child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
+            finally:
+                if window is not None and window.established and not window.finish_attempted:
+                    try: window.finish()
+                    except Exception: child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
+                if stream is not None: stream.close()
+                if prior_level is not None:
+                    try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                    except Exception: child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
+                ws.close()
+            write_armed_owner_state(arm_id, {
+                'state': 'RESULT', 'result': child_result, 'private_context': R66_CONTEXT,
+            })
+        except Exception:
+            try:
+                write_armed_owner_state(arm_id, {
+                    'state': 'RESULT', 'result': dict(empty_owner_trial(kind), ambiguous=True, failure_class='AMBIGUOUS'), 'private_context': R66_CONTEXT,
+                })
+            except Exception: pass
+        os._exit(0)
+    except LogBoundaryNotEstablished:
+        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
+    except ValueError as error:
+        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'; return result
+    except Exception:
+        result['failure_class'] = 'AMBIGUOUS'; return result
+    finally:
+        if not handed_to_worker:
+            if window is not None and window.established and not window.finish_attempted:
+                try: window.finish()
+                except Exception: pass
+            if stream is not None: stream.close()
+            if ws is not None:
+                if prior_level is not None:
+                    try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                    except Exception: pass
+                ws.close()
+        # Once forked, the bounded worker exclusively owns its inherited
+        # WebSocket, stream, window, and logger reset.  The parent must not
+        # send a WebSocket close frame while returning its ARM acknowledgement.
+
+def collect_armed_owner_trial(arm_id):
+    deadline = time.monotonic() + 95
+    while time.monotonic() < deadline:
+        state_value = read_armed_owner_state(arm_id)
+        if state_value['state'] == 'RESULT':
+            if set(state_value) != {'state', 'result', 'private_context'}:
+                raise ValueError('armed_observer')
+            os.unlink(armed_owner_state_path(arm_id))
+            return state_value['result'], state_value['private_context']
+        threading.Event().wait(0.1)
+    raise ValueError('armed_observer')
+
 def observe_release():
     result = {'normal_release_observed': False, 'automatic_reconnect_observed': False,
               'ambiguous': False, 'failure_class': None}
@@ -10997,9 +11278,16 @@ def feature_absence():
 operation = sys.argv[1]
 R66_CONTEXT = json.loads(base64.b64decode(os.environ.pop('HA_R66_CONTEXT', 'e30=')))
 try:
-    if operation in {'owner_refresh_trial', 'owner_refresh_preflight'}:
+    if operation in {'owner_refresh_trial', 'owner_refresh_preflight', 'owner_refresh_arm'}:
         kind = os.environ.pop('HA_R66_TRIAL_KIND', '')
-        result = (observe_owner_trial(kind) if operation == 'owner_refresh_trial' else preflight_owner_trial(kind)) if kind in {'COLD', 'RETAINED'} else None
+        arm_id = os.environ.pop('HA_R66_ARM_ID', '')
+        result = (
+            observe_owner_trial(kind) if operation == 'owner_refresh_trial'
+            else preflight_owner_trial(kind) if operation == 'owner_refresh_preflight'
+            else arm_owner_trial(kind, arm_id)
+        ) if kind in {'COLD', 'RETAINED'} else None
+    elif operation == 'owner_refresh_collect':
+        result, R66_CONTEXT = collect_armed_owner_trial(os.environ.pop('HA_R66_ARM_ID', ''))
     elif operation == 'owner_refresh_release':
         result = observe_release()
     else:
@@ -11007,7 +11295,7 @@ try:
     if result is None: raise ValueError('operation')
 except Exception:
     result = {'error_class': 'OPERATION_FAILED', 'error_scope': 'OTHER', 'error_reason': 'VALIDATION'}
-if operation in {'owner_refresh_trial', 'owner_refresh_preflight', 'owner_refresh_release'}:
+if operation in {'owner_refresh_trial', 'owner_refresh_preflight', 'owner_refresh_arm', 'owner_refresh_collect', 'owner_refresh_release'}:
     result = {'result': result, 'private_context': R66_CONTEXT}
 print(json.dumps(result, separators=(',', ':'), sort_keys=True), flush=True)
 """
@@ -11826,6 +12114,7 @@ class PrivateInteractiveSessionBroker:
         operation: str,
         *,
         trial_kind: OwnerRefreshTrialKind | None = None,
+        armed_observer_id: str | None = None,
         _capability: object,
     ) -> bytes:
         """Run one fixed exact-R64 validation or observer operation."""
@@ -11834,15 +12123,30 @@ class PrivateInteractiveSessionBroker:
             "feature_absence": FeatureValidationAction.FEATURE_ABSENCE,
             "owner_refresh_preflight": FeatureValidationAction.HARDWARE_OBSERVATION,
             "owner_refresh_trial": FeatureValidationAction.HARDWARE_OBSERVATION,
+            "owner_refresh_arm": FeatureValidationAction.HARDWARE_OBSERVATION,
+            "owner_refresh_collect": FeatureValidationAction.HARDWARE_OBSERVATION,
             "owner_refresh_release": FeatureValidationAction.HARDWARE_OBSERVATION,
         }
         action = actions.get(operation)
         if (
             action is None
-            or operation in {"owner_refresh_preflight", "owner_refresh_trial"}
+            or operation
+            in {"owner_refresh_preflight", "owner_refresh_trial", "owner_refresh_arm"}
             and type(trial_kind) is not OwnerRefreshTrialKind
-            or operation not in {"owner_refresh_preflight", "owner_refresh_trial"}
+            or operation
+            not in {
+                "owner_refresh_preflight",
+                "owner_refresh_trial",
+                "owner_refresh_arm",
+            }
             and trial_kind is not None
+            or operation in {"owner_refresh_arm", "owner_refresh_collect"}
+            and (
+                not isinstance(armed_observer_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", armed_observer_id) is None
+            )
+            or operation not in {"owner_refresh_arm", "owner_refresh_collect"}
+            and armed_observer_id is not None
         ):
             raise SessionBrokerError(
                 "PRIVATE_INTERACTIVE_SESSION_FEATURE_INVALID"
@@ -11879,6 +12183,8 @@ class PrivateInteractiveSessionBroker:
         trial_environment = (
             "" if trial_kind is None else f"HA_R66_TRIAL_KIND={trial_kind.value} "
         )
+        if armed_observer_id is not None:
+            trial_environment += f"HA_R66_ARM_ID={armed_observer_id} "
         if action is FeatureValidationAction.HARDWARE_OBSERVATION:
             context = _capability.controller._owner_context
             _validate_owner_context(context)
@@ -11961,6 +12267,8 @@ class PrivateInteractiveSessionBroker:
         parser = {
             "owner_refresh_trial": _parse_owner_refresh_trial_payload,
             "owner_refresh_preflight": _parse_owner_refresh_trial_preflight_payload,
+            "owner_refresh_arm": _parse_owner_refresh_trial_arm_payload,
+            "owner_refresh_collect": _parse_owner_refresh_trial_payload,
             "owner_refresh_release": _parse_owner_refresh_release_payload,
         }[operation]
         result = parser(payload["result"])
@@ -11968,6 +12276,43 @@ class PrivateInteractiveSessionBroker:
             payload["private_context"], result, operation
         )
         return result
+
+    def _arm_owner_refresh_status_trial(
+        self,
+        trial_kind: OwnerRefreshTrialKind,
+        armed_observer_id: str,
+        *,
+        _capability: object = None,
+    ) -> OwnerRefreshTrialArm:
+        output = self.__execute_refresh_feature_operation(
+            "owner_refresh_arm",
+            trial_kind=trial_kind,
+            armed_observer_id=armed_observer_id,
+            _capability=_capability,
+        )
+        try:
+            return self._decode_owner_response(output, _capability, "owner_refresh_arm")
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+
+    def _collect_owner_refresh_status_trial(
+        self, armed_observer_id: str, *, _capability: object = None
+    ) -> OwnerRefreshTrialResult:
+        output = self.__execute_refresh_feature_operation(
+            "owner_refresh_collect",
+            armed_observer_id=armed_observer_id,
+            _capability=_capability,
+        )
+        try:
+            return self._decode_owner_response(
+                output, _capability, "owner_refresh_collect"
+            )
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
 
     def _observe_owner_refresh_status_trial(
         self,
@@ -15275,6 +15620,34 @@ class RefreshStatusLiveValidationController:
         )
         self._journal = _DurableFeatureValidationJournal() if durable_required else None
         if self._journal is not None and self._journal.reconstructed:
+            pending = self._journal.hardware_pending
+            if (
+                self._journal.state
+                is FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+                and isinstance(pending, dict)
+                and pending.get("operation") == "trial"
+                and pending.get("armed") is True
+                and type(pending.get("ordinal")) is int
+                and 1 <= pending["ordinal"] <= len(_R66_TRIAL_SEQUENCE)
+            ):
+                # Process loss after arm intent cannot prove that the owner did
+                # not press. Consume the row as ambiguous; never re-arm it.
+                self._journal.record_hardware_trial(
+                    OwnerRefreshTrialResult(
+                        _R66_TRIAL_SEQUENCE[pending["ordinal"] - 1],
+                        False,
+                        False,
+                        None,
+                        RefreshPacketCounts(0, 0, 0, 0, 0),
+                        (),
+                        (),
+                        None,
+                        False,
+                        None,
+                        True,
+                        OwnerRefreshFailureClass.AMBIGUOUS,
+                    )
+                )
             for action in (
                 FeatureValidationAction.R64_TRANSFER,
                 FeatureValidationAction.R64_INSTALL,
@@ -15388,6 +15761,7 @@ class RefreshStatusLiveValidationController:
             "approved": [],
             "bound": None,
         }
+        self._armed_owner_trial: tuple[OwnerRefreshTrialKind, str] | None = None
         self._same_private_target = False
         self._exact_pr41_source_proven = False
         self._feature_backup_classification: FeatureBackupClassification | None = None
@@ -15445,7 +15819,14 @@ class RefreshStatusLiveValidationController:
                 or result.target_bound != (context["bound"] is not None)
             ):
                 raise ValueError("owner_context")
-        elif operation == "owner_refresh_trial":
+        elif operation == "owner_refresh_arm":
+            if (
+                context != previous
+                or not isinstance(result, OwnerRefreshTrialArm)
+                or result.target_bound != (context["bound"] is not None)
+            ):
+                raise ValueError("owner_context")
+        elif operation in {"owner_refresh_trial", "owner_refresh_collect"}:
             if context["approved"] != previous["approved"] or not isinstance(
                 result, OwnerRefreshTrialResult
             ):
@@ -15564,6 +15945,117 @@ class RefreshStatusLiveValidationController:
                 observation.releases,
                 observation.zero_write_aggregate and result.zero_write,
             )
+        return result
+
+    def arm_owner_refresh_trial(
+        self, trial_kind: OwnerRefreshTrialKind
+    ) -> OwnerRefreshTrialArm:
+        """Start exactly one bounded R66 listener before the owner is prompted."""
+        if type(trial_kind) is not OwnerRefreshTrialKind:
+            raise LifecycleControllerError("OWNER_REFRESH_TRIAL_KIND_INVALID") from None
+        observation = self.hardware_observation
+        if (
+            self._armed_owner_trial is not None
+            or self.state
+            is not FeatureValidationState.R64_POST_RESTART_INVENTORY_VERIFIED
+            or observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or len(observation.trials) >= len(_R66_TRIAL_SEQUENCE)
+            or trial_kind is not _R66_TRIAL_SEQUENCE[len(observation.trials)]
+            or any(item.failure_class is not None for item in observation.trials)
+            or any(item.failure_class is not None for item in observation.releases)
+        ):
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_OBSERVATION_INVALID"
+            ) from None
+        due_releases = sum(
+            point <= len(observation.trials)
+            for point in _R66_RELEASE_AFTER_TRIAL_COUNTS
+        )
+        if len(observation.releases) != due_releases:
+            raise LifecycleControllerError(
+                "FEATURE_HARDWARE_RELEASE_REQUIRED"
+            ) from None
+        if type(self._broker) is PrivateInteractiveSessionBroker and (
+            not self._owner_context["approved"]
+            or observation.trials
+            and not self.target_bound
+        ):
+            raise LifecycleControllerError("FEATURE_OWNER_TARGET_REQUIRED") from None
+        ordinal = len(observation.trials) + 1
+        if self._journal is not None:
+            self._journal.begin_hardware_item("trial", ordinal)
+            self._journal.arm_hardware_trial(ordinal)
+        self._same_private_target = False
+        armed_observer_id = secrets.token_hex(32)
+        try:
+            result = self._broker._arm_owner_refresh_status_trial(
+                trial_kind, armed_observer_id, _capability=self._hardware_capability()
+            )
+            if not isinstance(result, OwnerRefreshTrialArm):
+                raise TypeError
+        except (SessionBrokerError, TypeError, ValueError):
+            result = OwnerRefreshTrialArm(
+                False,
+                trial_kind,
+                0,
+                self.target_bound,
+                False,
+                False,
+                60,
+                OwnerRefreshFailureClass.AMBIGUOUS,
+            )
+        if result.observer_armed:
+            self._armed_owner_trial = (trial_kind, armed_observer_id)
+        return result
+
+    def collect_owner_refresh_trial(self) -> OwnerRefreshTrialResult:
+        """Collect the single result from an already listener-ready R66 trial."""
+        armed = self._armed_owner_trial
+        observation = self.hardware_observation
+        if (
+            armed is None
+            or observation is None
+            or observation.phase is not HardwareObservationPhase.ACTIVE
+            or armed[0] is not _R66_TRIAL_SEQUENCE[len(observation.trials)]
+        ):
+            raise LifecycleControllerError("FEATURE_OWNER_REFRESH_NOT_ARMED") from None
+        trial_kind, armed_observer_id = armed
+        self._same_private_target = False
+        try:
+            result = self._broker._collect_owner_refresh_status_trial(
+                armed_observer_id, _capability=self._hardware_capability()
+            )
+            if (
+                not isinstance(result, OwnerRefreshTrialResult)
+                or result.trial_kind is not trial_kind
+            ):
+                raise TypeError
+        except (SessionBrokerError, TypeError, ValueError):
+            result = OwnerRefreshTrialResult(
+                trial_kind,
+                False,
+                False,
+                None,
+                RefreshPacketCounts(0, 0, 0, 0, 0),
+                (),
+                (),
+                None,
+                False,
+                None,
+                True,
+                OwnerRefreshFailureClass.AMBIGUOUS,
+            )
+        if self._journal is not None:
+            self._journal.record_hardware_trial(result)
+        else:
+            self._hardware_observation = DurableHardwareObservation(
+                HardwareObservationPhase.ACTIVE,
+                observation.trials + (result,),
+                observation.releases,
+                observation.zero_write_aggregate and result.zero_write,
+            )
+        self._armed_owner_trial = None
         return result
 
     def preflight_owner_refresh_trial(
