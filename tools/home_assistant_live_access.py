@@ -25,7 +25,7 @@ import signal
 import stat
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
@@ -1430,6 +1430,19 @@ class OwnerRefreshTrialKind(StrEnum):
     RETAINED = "RETAINED"
 
 
+class OwnerRefreshArmBoundary(StrEnum):
+    """Identifier-free boundary reached while starting an owner observer."""
+
+    WORKER_SETUP = "WORKER_SETUP"
+    SUBSCRIPTION_SETUP = "SUBSCRIPTION_SETUP"
+    LOG_WINDOW_SETUP = "LOG_WINDOW_SETUP"
+    WORKER_READY = "WORKER_READY"
+    RESPONSE_WAIT = "RESPONSE_WAIT"
+    RESPONSE_DECODER = "RESPONSE_DECODER"
+    CONTROLLER_CONTEXT = "CONTROLLER_CONTEXT"
+    COMPLETE = "COMPLETE"
+
+
 class OwnerRefreshFailureClass(StrEnum):
     """Bounded outcomes for one observer-only owner Refresh trial."""
 
@@ -1537,9 +1550,17 @@ class OwnerRefreshTrialArm:
     eligible_s1_count: int
     target_bound: bool
     same_private_target: bool
-    connection_precondition_proven: bool
+    connection_precondition_proven: bool | None
     deadline_seconds: int
     failure_class: OwnerRefreshFailureClass | None
+    boundary: OwnerRefreshArmBoundary | None = None
+    worker_python_version: str | None = None
+    dispatch_stage: DispatchFailureStage | None = None
+    dispatch_class: DispatchFailureClass | None = None
+    remote_scope: RemoteFailureScope | None = None
+    remote_reason: RemoteFailureReason | None = None
+    worker_cleanup_complete: bool = False
+    worker_result_failure_class: OwnerRefreshFailureClass | None = None
 
 
 class HardwareObservationPhase(StrEnum):
@@ -4540,7 +4561,8 @@ def _parse_owner_refresh_trial_preflight_payload(
         or result.failure_class is OwnerRefreshFailureClass.HTTP_READ_FAILED
         and result.diagnostics.boundary is not OwnerRefreshPreflightBoundary.HTTP_READ
         or result.failure_class is OwnerRefreshFailureClass.READ_TIMEOUT
-        and result.diagnostics.boundary is not OwnerRefreshPreflightBoundary.READ_TIMEOUT
+        and result.diagnostics.boundary
+        is not OwnerRefreshPreflightBoundary.READ_TIMEOUT
         or result.failure_class is OwnerRefreshFailureClass.RESPONSE_SCHEMA_INVALID
         and result.diagnostics.boundary
         is not OwnerRefreshPreflightBoundary.RESPONSE_SCHEMA
@@ -4564,7 +4586,9 @@ def _parse_owner_refresh_trial_preflight_payload(
     return result
 
 
-def _parse_owner_refresh_trial_arm_payload(value: object) -> OwnerRefreshTrialArm:
+def _parse_owner_refresh_trial_arm_payload(
+    value: object, *, allow_local_diagnostics: bool = False
+) -> OwnerRefreshTrialArm:
     """Strictly decode the fixed, identifier-free R66 arm acknowledgement."""
     fields = {
         "observer_armed",
@@ -4575,22 +4599,71 @@ def _parse_owner_refresh_trial_arm_payload(value: object) -> OwnerRefreshTrialAr
         "connection_precondition_proven",
         "deadline_seconds",
         "failure_class",
+        "boundary",
+        "worker_python_version",
+        "dispatch_stage",
+        "dispatch_class",
+        "remote_scope",
+        "remote_reason",
+        "worker_cleanup_complete",
+        "worker_result_failure_class",
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("owner_refresh_arm")
     try:
+        connection_precondition = value["connection_precondition_proven"]
+        worker_python_version = value["worker_python_version"]
+        if connection_precondition is not None:
+            connection_precondition = _bool(connection_precondition)
+        if worker_python_version is not None and (
+            not isinstance(worker_python_version, str)
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", worker_python_version) is None
+        ):
+            raise ValueError
         result = OwnerRefreshTrialArm(
-            _bool(value["observer_armed"]),
-            OwnerRefreshTrialKind(value["trial_kind"]),
-            _count(value["eligible_s1_count"]),
-            _bool(value["target_bound"]),
-            _bool(value["same_private_target"]),
-            _bool(value["connection_precondition_proven"]),
-            _count(value["deadline_seconds"]),
-            (
+            observer_armed=_bool(value["observer_armed"]),
+            trial_kind=OwnerRefreshTrialKind(value["trial_kind"]),
+            eligible_s1_count=_count(value["eligible_s1_count"]),
+            target_bound=_bool(value["target_bound"]),
+            same_private_target=_bool(value["same_private_target"]),
+            connection_precondition_proven=connection_precondition,
+            deadline_seconds=_count(value["deadline_seconds"]),
+            failure_class=(
                 None
                 if value["failure_class"] is None
                 else OwnerRefreshFailureClass(value["failure_class"])
+            ),
+            boundary=(
+                None
+                if value["boundary"] is None
+                else OwnerRefreshArmBoundary(value["boundary"])
+            ),
+            worker_python_version=worker_python_version,
+            dispatch_stage=(
+                None
+                if value["dispatch_stage"] is None
+                else DispatchFailureStage(value["dispatch_stage"])
+            ),
+            dispatch_class=(
+                None
+                if value["dispatch_class"] is None
+                else DispatchFailureClass(value["dispatch_class"])
+            ),
+            remote_scope=(
+                None
+                if value["remote_scope"] is None
+                else RemoteFailureScope(value["remote_scope"])
+            ),
+            remote_reason=(
+                None
+                if value["remote_reason"] is None
+                else RemoteFailureReason(value["remote_reason"])
+            ),
+            worker_cleanup_complete=_bool(value["worker_cleanup_complete"]),
+            worker_result_failure_class=(
+                None
+                if value["worker_result_failure_class"] is None
+                else OwnerRefreshFailureClass(value["worker_result_failure_class"])
             ),
         )
     except (TypeError, ValueError):
@@ -4602,6 +4675,32 @@ def _parse_owner_refresh_trial_arm_payload(value: object) -> OwnerRefreshTrialAr
         or result.observer_armed != (result.failure_class is None)
         or result.observer_armed
         and not result.connection_precondition_proven
+        or result.observer_armed
+        and result.boundary is not OwnerRefreshArmBoundary.COMPLETE
+        or result.observer_armed
+        and result.worker_python_version is None
+        or not allow_local_diagnostics
+        and (
+            result.worker_cleanup_complete
+            or result.worker_result_failure_class is not None
+            or any(
+                item is not None
+                for item in (
+                    result.dispatch_stage,
+                    result.dispatch_class,
+                    result.remote_scope,
+                    result.remote_reason,
+                )
+            )
+        )
+        or (result.dispatch_stage is None) != (result.dispatch_class is None)
+        or (result.remote_scope is None) != (result.remote_reason is None)
+        or result.remote_scope is not None
+        and result.dispatch_class is not DispatchFailureClass.REMOTE_OPERATION
+        or not result.worker_cleanup_complete
+        and result.worker_result_failure_class is not None
+        or result.observer_armed
+        and result.worker_cleanup_complete
     ):
         raise ValueError("owner_refresh_arm")
     return result
@@ -10224,6 +10323,10 @@ import urllib.request
 
 LOGGER = 'custom_components.tuya_ble.tuya_ble.tuya_ble'
 BOUNDARY_LOGGER = 'ha_tuya_ble.r65_validation_boundary'
+OWNER_WAIT_SECONDS = 60
+WORKER_READY_SECONDS = 45
+COLLECT_WAIT_SECONDS = 95
+WORKER_POLL_SECONDS = 0.05
 EMPTY_COUNTS = {'device_info': 0, 'pair': 0, 'device_status': 0, 'datapoint': 0, 'other': 0}
 EMPTY_PRESS = {
     'service_success': False,
@@ -11103,8 +11206,11 @@ def empty_owner_arm(kind):
         'observer_armed': False, 'trial_kind': kind, 'eligible_s1_count': 0,
         'target_bound': R66_CONTEXT['bound'] is not None,
         'same_private_target': R66_CONTEXT['bound'] is not None,
-        'connection_precondition_proven': False, 'deadline_seconds': 60,
-        'failure_class': None,
+        'connection_precondition_proven': None, 'deadline_seconds': OWNER_WAIT_SECONDS,
+        'failure_class': None, 'boundary': 'WORKER_SETUP',
+        'worker_python_version': None, 'dispatch_stage': None,
+        'dispatch_class': None, 'remote_scope': None, 'remote_reason': None,
+        'worker_cleanup_complete': False, 'worker_result_failure_class': None,
     }
 
 def armed_owner_state_path(arm_id):
@@ -11140,12 +11246,14 @@ def read_armed_owner_state(arm_id):
         os.close(descriptor)
     if not raw or len(raw) > 16384: raise ValueError('armed_observer')
     value = json.loads(raw.decode('utf-8'))
-    if not isinstance(value, dict) or value.get('state') not in {'ARMED', 'RESULT'}:
+    if not isinstance(value, dict) or value.get('state') not in {'STARTING', 'ARMED', 'RESULT', 'FAILED'}:
         raise ValueError('armed_observer')
     return value
 
 def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, selected, before):
-    chosen = wait_for_owner_target(ws, candidates, selected, kind, 60)
+    chosen = wait_for_owner_target(
+        ws, candidates, selected, kind, OWNER_WAIT_SECONDS
+    )
     if chosen is None:
         result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
     result['owner_press_observed'] = True
@@ -11191,9 +11299,9 @@ def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, sel
         result['failure_class'] = 'HOLD_NOT_ACTIVE'
     return result
 
-def arm_owner_trial(kind, arm_id):
+def run_armed_owner_worker(kind, arm_id):
     result = empty_owner_arm(kind); ws = stream = window = None; prior_level = None
-    handed_to_worker = False
+    result['worker_python_version'] = '.'.join(str(item) for item in sys.version_info[:3])
     try:
         ws = OwnerWebSocket()
         candidates = resolve_owner_refresh_target(ws)
@@ -11203,6 +11311,8 @@ def arm_owner_trial(kind, arm_id):
             raise ValueError('ownership')
         if not all(owner_candidate_ready(item, kind) for item in selected):
             raise ValueError('precondition')
+        result['connection_precondition_proven'] = True
+        result['boundary'] = 'SUBSCRIPTION_SETUP'
         info = ws.command('logger/log_info')
         levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
         if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
@@ -11210,65 +11320,59 @@ def arm_owner_trial(kind, arm_id):
         prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
         ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
         ws.command('subscribe_events', event_type='call_service')
+        result['boundary'] = 'LOG_WINDOW_SETUP'
         stream = LogStream(); window = LogWindow(stream, ws); window.start()
         before = {item['fingerprint']: (
             state(item['last']).get('state'),
             {dp: stamp(state(entity)) for dp, entity in item['dp'].items()}
         ) for item in selected}
         discard_before_owner_lifecycle(stream)
-        write_armed_owner_state(arm_id, {'state': 'ARMED'}, create=True)
-        child = os.fork()
-        if child:
-            result.update({
-                'observer_armed': True,
-                'target_bound': R66_CONTEXT['bound'] is not None,
-                'same_private_target': R66_CONTEXT['bound'] is not None,
-                'connection_precondition_proven': True,
-            })
-            handed_to_worker = True
-            return result
+        result.update({
+            'observer_armed': True,
+            'target_bound': R66_CONTEXT['bound'] is not None,
+            'same_private_target': R66_CONTEXT['bound'] is not None,
+            'boundary': 'COMPLETE',
+        })
+        write_armed_owner_state(arm_id, {'state': 'ARMED', 'arm_result': result})
+        child_result = empty_owner_trial(kind)
         try:
-            null = os.open('/dev/null', os.O_RDWR)
-            os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)
-            child_result = empty_owner_trial(kind)
-            try:
-                child_result = complete_armed_owner_trial(
-                    kind, child_result, ws, stream, window, candidates, selected, before
-                )
-            except LogBoundaryNotEstablished:
-                child_result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'
-            except ValueError as error:
-                child_result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
-                child_result['ambiguous'] = child_result['failure_class'] == 'AMBIGUOUS'
-            except Exception:
-                child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
-            finally:
-                if window is not None and window.established and not window.finish_attempted:
-                    try: window.finish()
-                    except Exception: child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
-                if stream is not None: stream.close()
-                if prior_level is not None:
-                    try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
-                    except Exception: child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
-                ws.close()
-            write_armed_owner_state(arm_id, {
-                'state': 'RESULT', 'result': child_result, 'private_context': R66_CONTEXT,
-            })
+            child_result = complete_armed_owner_trial(
+                kind, child_result, ws, stream, window, candidates, selected, before
+            )
+        except LogBoundaryNotEstablished:
+            child_result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'
+        except ValueError as error:
+            child_result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+            child_result['ambiguous'] = child_result['failure_class'] == 'AMBIGUOUS'
         except Exception:
-            try:
-                write_armed_owner_state(arm_id, {
-                    'state': 'RESULT', 'result': dict(empty_owner_trial(kind), ambiguous=True, failure_class='AMBIGUOUS'), 'private_context': R66_CONTEXT,
-                })
-            except Exception: pass
-        os._exit(0)
+            child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
+        finally:
+            if window is not None and window.established and not window.finish_attempted:
+                try: window.finish()
+                except Exception:
+                    child_result['ambiguous'] = True
+                    if child_result['failure_class'] is None:
+                        child_result['failure_class'] = 'AMBIGUOUS'
+            if stream is not None: stream.close()
+            if prior_level is not None:
+                try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
+                except Exception:
+                    child_result['ambiguous'] = True
+                    if child_result['failure_class'] is None:
+                        child_result['failure_class'] = 'AMBIGUOUS'
+            ws.close()
+        write_armed_owner_state(arm_id, {
+            'state': 'RESULT', 'arm_result': result, 'result': child_result,
+            'private_context': R66_CONTEXT,
+        })
     except LogBoundaryNotEstablished:
-        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
+        result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'
     except ValueError as error:
-        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'; return result
+        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
     except Exception:
-        result['failure_class'] = 'AMBIGUOUS'; return result
+        result['failure_class'] = 'AMBIGUOUS'
     finally:
-        if not handed_to_worker:
+        if not result['observer_armed']:
             if window is not None and window.established and not window.finish_attempted:
                 try: window.finish()
                 except Exception: pass
@@ -11278,20 +11382,74 @@ def arm_owner_trial(kind, arm_id):
                     try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
                     except Exception: pass
                 ws.close()
-        # Once forked, the bounded worker exclusively owns its inherited
-        # WebSocket, stream, window, and logger reset.  The parent must not
-        # send a WebSocket close frame while returning its ARM acknowledgement.
+            write_armed_owner_state(arm_id, {
+                'state': 'FAILED', 'arm_result': result,
+                'private_context': R66_CONTEXT,
+            })
+
+def arm_owner_trial(kind, arm_id):
+    result = empty_owner_arm(kind)
+    state_created = False; child_started = False
+    try:
+        write_armed_owner_state(arm_id, {'state': 'STARTING'}, create=True)
+        state_created = True
+        child = os.fork()
+        if child == 0:
+            try:
+                null = os.open('/dev/null', os.O_RDWR)
+                os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)
+                if null > 2: os.close(null)
+                run_armed_owner_worker(kind, arm_id)
+            except Exception:
+                try:
+                    failed = empty_owner_arm(kind)
+                    failed['failure_class'] = 'AMBIGUOUS'
+                    write_armed_owner_state(arm_id, {
+                        'state': 'FAILED', 'arm_result': failed,
+                        'private_context': R66_CONTEXT,
+                    })
+                except Exception: pass
+            os._exit(0)
+        child_started = True
+        deadline = time.monotonic() + WORKER_READY_SECONDS
+        while time.monotonic() < deadline:
+            state_value = read_armed_owner_state(arm_id)
+            if state_value['state'] == 'ARMED':
+                if set(state_value) != {'state', 'arm_result'}: raise ValueError('armed_observer')
+                return state_value['arm_result']
+            if state_value['state'] == 'RESULT':
+                if set(state_value) != {'state', 'arm_result', 'result', 'private_context'}: raise ValueError('armed_observer')
+                return state_value['arm_result']
+            if state_value['state'] == 'FAILED':
+                if set(state_value) != {'state', 'arm_result', 'private_context'}: raise ValueError('armed_observer')
+                os.unlink(armed_owner_state_path(arm_id))
+                return state_value['arm_result']
+            threading.Event().wait(WORKER_POLL_SECONDS)
+        result['boundary'] = 'WORKER_READY'
+        result['failure_class'] = 'AMBIGUOUS'
+        return result
+    except ValueError:
+        result['boundary'] = 'WORKER_READY' if child_started else 'WORKER_SETUP'
+        result['failure_class'] = 'AMBIGUOUS'
+        return result
+    except Exception:
+        result['failure_class'] = 'AMBIGUOUS'
+        return result
+    finally:
+        if state_created and not child_started:
+            try: os.unlink(armed_owner_state_path(arm_id))
+            except Exception: pass
 
 def collect_armed_owner_trial(arm_id):
-    deadline = time.monotonic() + 95
+    deadline = time.monotonic() + COLLECT_WAIT_SECONDS
     while time.monotonic() < deadline:
         state_value = read_armed_owner_state(arm_id)
         if state_value['state'] == 'RESULT':
-            if set(state_value) != {'state', 'result', 'private_context'}:
+            if set(state_value) != {'state', 'arm_result', 'result', 'private_context'}:
                 raise ValueError('armed_observer')
             os.unlink(armed_owner_state_path(arm_id))
             return state_value['result'], state_value['private_context']
-        threading.Event().wait(0.1)
+        threading.Event().wait(WORKER_POLL_SECONDS)
     raise ValueError('armed_observer')
 
 def observe_release():
@@ -12512,20 +12670,30 @@ class PrivateInteractiveSessionBroker:
     def _decode_owner_response(
         self, output: bytes, capability: object, operation: str
     ) -> object:
-        payload = _exact_payload(output)
-        if set(payload) != {"result", "private_context"}:
-            raise ValueError("owner_response")
-        parser = {
-            "owner_refresh_trial": _parse_owner_refresh_trial_payload,
-            "owner_refresh_preflight": _parse_owner_refresh_trial_preflight_payload,
-            "owner_refresh_arm": _parse_owner_refresh_trial_arm_payload,
-            "owner_refresh_collect": _parse_owner_refresh_trial_payload,
-            "owner_refresh_release": _parse_owner_refresh_release_payload,
-        }[operation]
-        result = parser(payload["result"])
-        capability.controller._accept_owner_context(
-            payload["private_context"], result, operation
-        )
+        try:
+            payload = _exact_payload(output)
+            if set(payload) != {"result", "private_context"}:
+                raise ValueError("owner_response")
+            parser = {
+                "owner_refresh_trial": _parse_owner_refresh_trial_payload,
+                "owner_refresh_preflight": _parse_owner_refresh_trial_preflight_payload,
+                "owner_refresh_arm": _parse_owner_refresh_trial_arm_payload,
+                "owner_refresh_collect": _parse_owner_refresh_trial_payload,
+                "owner_refresh_release": _parse_owner_refresh_release_payload,
+            }[operation]
+            result = parser(payload["result"])
+        except (SessionBrokerError, KeyError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_PARSE, error
+            ) from None
+        try:
+            capability.controller._accept_owner_context(
+                payload["private_context"], result, operation
+            )
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESULT_VALIDATION, error
+            ) from None
         return result
 
     def _arm_owner_refresh_status_trial(
@@ -16246,23 +16414,67 @@ class RefreshStatusLiveValidationController:
             self._journal.arm_hardware_trial(ordinal)
         self._same_private_target = False
         armed_observer_id = secrets.token_hex(32)
+        cleanup_required = False
         try:
             result = self._broker._arm_owner_refresh_status_trial(
                 trial_kind, armed_observer_id, _capability=self._hardware_capability()
             )
             if not isinstance(result, OwnerRefreshTrialArm):
                 raise TypeError
-        except (SessionBrokerError, TypeError, ValueError):
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            cleanup_required = True
+            failure = _bounded_dispatch_failure(DispatchFailureStage.UNKNOWN, error)
+            boundary = {
+                DispatchFailureStage.RESPONSE_WAIT: OwnerRefreshArmBoundary.RESPONSE_WAIT,
+                DispatchFailureStage.RESPONSE_PARSE: OwnerRefreshArmBoundary.RESPONSE_DECODER,
+                DispatchFailureStage.RESULT_VALIDATION: (
+                    OwnerRefreshArmBoundary.CONTROLLER_CONTEXT
+                ),
+            }.get(failure.stage, OwnerRefreshArmBoundary.WORKER_READY)
             result = OwnerRefreshTrialArm(
                 False,
                 trial_kind,
                 0,
                 self.target_bound,
                 False,
-                False,
+                None,
                 60,
                 OwnerRefreshFailureClass.AMBIGUOUS,
+                boundary,
+                None,
+                failure.stage,
+                failure.failure_class,
+                failure.remote_failure_scope,
+                failure.remote_failure_reason,
             )
+        cleanup_required = cleanup_required or (
+            not result.observer_armed
+            and result.boundary is OwnerRefreshArmBoundary.WORKER_READY
+        )
+        if cleanup_required:
+            try:
+                worker_result = self._broker._collect_owner_refresh_status_trial(
+                    armed_observer_id, _capability=self._hardware_capability()
+                )
+                if not isinstance(worker_result, OwnerRefreshTrialResult):
+                    raise TypeError
+            except (SessionBrokerError, TypeError, ValueError):
+                pass
+            else:
+                if self._journal is not None:
+                    self._journal.record_hardware_trial(worker_result)
+                else:
+                    self._hardware_observation = DurableHardwareObservation(
+                        HardwareObservationPhase.ACTIVE,
+                        observation.trials + (worker_result,),
+                        observation.releases,
+                        observation.zero_write_aggregate and worker_result.zero_write,
+                    )
+                result = replace(
+                    result,
+                    worker_cleanup_complete=True,
+                    worker_result_failure_class=worker_result.failure_class,
+                )
         if result.observer_armed:
             self._armed_owner_trial = (trial_kind, armed_observer_id)
         return result
@@ -17602,6 +17814,47 @@ def _owner_preflight_report_payload(
         "final_outcome": report.final_outcome,
         "transitioned_to_ready": report.transitioned_to_ready,
     }
+
+
+def owner_refresh_public_json_record(value: object) -> dict[str, object]:
+    """Return one canonical JSON-safe record for the thin R66 runner."""
+    if type(value) is OwnerRefreshPreflightRunReport:
+        record = _owner_preflight_report_payload(value)
+    elif type(value) is OwnerRefreshTrialArm:
+        record = asdict(value)
+    elif type(value) is OwnerRefreshTrialResult:
+        record = _owner_refresh_trial_record(value)
+    elif type(value) is OwnerRefreshReleaseResult:
+        record = _owner_refresh_release_record(value)
+    else:
+        raise TypeError("owner_refresh_public_record")
+    encoded = json.dumps(
+        record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    decoded = json.loads(encoded.decode("ascii"))
+    if type(decoded) is not dict:
+        raise ValueError("owner_refresh_public_record")
+    if type(value) is OwnerRefreshPreflightRunReport:
+        observations = tuple(
+            _parse_owner_refresh_trial_preflight_payload(item)
+            for item in decoded["observations"]
+        )
+        if observations != value.observations:
+            raise ValueError("owner_refresh_public_record")
+    elif type(value) is OwnerRefreshTrialArm:
+        if (
+            _parse_owner_refresh_trial_arm_payload(
+                decoded, allow_local_diagnostics=True
+            )
+            != value
+        ):
+            raise ValueError("owner_refresh_public_record")
+    elif type(value) is OwnerRefreshTrialResult:
+        if _parse_owner_refresh_trial_payload(decoded) != value:
+            raise ValueError("owner_refresh_public_record")
+    elif _parse_owner_refresh_release_payload(decoded) != value:
+        raise ValueError("owner_refresh_public_record")
+    return decoded
 
 
 def _write_owner_preflight_report(report: OwnerRefreshPreflightRunReport) -> None:

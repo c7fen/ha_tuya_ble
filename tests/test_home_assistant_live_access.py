@@ -12,6 +12,7 @@ import io
 import json
 import os
 import pty
+import queue
 import select
 import shutil
 import stat
@@ -14533,6 +14534,11 @@ def test_r66d_arm_establishes_the_listener_and_collect_never_recreates_it() -> N
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "arm_owner_trial"
     )
+    worker = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_armed_owner_worker"
+    )
     collect = next(
         node
         for node in tree.body
@@ -14540,15 +14546,24 @@ def test_r66d_arm_establishes_the_listener_and_collect_never_recreates_it() -> N
         and node.name == "collect_armed_owner_trial"
     )
     arm_source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, arm)
+    worker_source = ast.get_source_segment(
+        access._REMOTE_REFRESH_STATUS_PROGRAM, worker
+    )
     collect_source = ast.get_source_segment(
         access._REMOTE_REFRESH_STATUS_PROGRAM, collect
     )
-    assert arm_source is not None and collect_source is not None
-    assert arm_source.index("ws.command('subscribe_events'") < arm_source.index(
-        "os.fork()"
+    assert arm_source is not None and worker_source is not None
+    assert collect_source is not None
+    assert "os.fork()" in arm_source
+    assert "OwnerWebSocket" not in arm_source
+    assert "LogStream" not in arm_source
+    assert "threading.Thread" not in arm_source
+    assert worker_source.index("ws = OwnerWebSocket()") < worker_source.index(
+        "stream = LogStream()"
     )
-    assert arm_source.index("window.start()") < arm_source.index("os.fork()")
-    assert "elif ws is not None" not in arm_source
+    assert worker_source.index("window.start()") < worker_source.index(
+        "'state': 'ARMED'"
+    )
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -14560,6 +14575,84 @@ def test_r66d_arm_establishes_the_listener_and_collect_never_recreates_it() -> N
     )
     assert "OwnerWebSocket" not in collect_source
     assert "LogStream" not in collect_source
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="fork warning starts in 3.12")
+def test_r66i_multithreaded_fork_can_contaminate_strict_pty_json() -> None:
+    """Reproduce the old ARM boundary with stdout and stderr on one real PTY."""
+    program = """
+import json, os, threading
+gate = threading.Event()
+thread = threading.Thread(target=gate.wait)
+thread.start()
+child = os.fork()
+if child == 0:
+    os._exit(0)
+os.waitpid(child, 0)
+print(json.dumps({'observer_armed': True}), flush=True)
+gate.set()
+thread.join()
+"""
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], stdout=slave, stderr=slave, close_fds=True
+    )
+    os.close(slave)
+    output = bytearray()
+    while process.poll() is None or select.select([master], [], [], 0)[0]:
+        ready, _, _ = select.select([master], [], [], 1)
+        if not ready:
+            continue
+        try:
+            output.extend(os.read(master, 4096))
+        except OSError:
+            break
+    os.close(master)
+    assert process.wait(timeout=5) == 0
+    assert b"DeprecationWarning" in output
+    with pytest.raises(access.SessionBrokerError, match="PROTOCOL"):
+        access._exact_payload(bytes(output))
+
+
+def test_r66i_post_fork_event_does_not_reach_inherited_thread_queue() -> None:
+    """Reproduce the old child assumption with a real process boundary."""
+    source: queue.Queue[str | None] = queue.Queue()
+    observed: queue.Queue[str] = queue.Queue()
+    stopped = threading.Event()
+
+    def reader() -> None:
+        while not stopped.is_set():
+            try:
+                item = source.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            observed.put(item)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        time.sleep(0.15)
+        try:
+            observed.get_nowait()
+        except queue.Empty:
+            os.write(write_fd, b"MISSING")
+        else:
+            os.write(write_fd, b"DELIVERED")
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    source.put("post-fork synthetic event")
+    assert os.read(read_fd, 16) == b"MISSING"
+    os.close(read_fd)
+    os.waitpid(child, 0)
+    stopped.set()
+    source.put(None)
+    thread.join(timeout=2)
 
 
 def test_r66d_armed_interruption_is_consumed_as_one_ambiguous_trial(
@@ -15281,6 +15374,452 @@ def _r66c_observe(
 
     ns.update(OwnerWebSocket=WS, LogStream=Stream, LogWindow=Window)
     return ns["observe_owner_trial"](kind)
+
+
+def _r66i_worker_boundary(
+    tmp_path: Path, kind: str, *, cleanup_failure: str | None = None
+) -> tuple[dict[str, object], str, Path, Path, Path, Path]:
+    """Build a device-impossible endpoint around the real forked worker path."""
+    ns = _r66c_installation(1)
+    states = ns["_synthetic_states"]
+    trigger = tmp_path / f"{kind.lower()}-owner-event"
+    listener_ready = tmp_path / f"{kind.lower()}-listener-ready"
+    stream_closed = tmp_path / f"{kind.lower()}-stream-closed"
+    websocket_closed = tmp_path / f"{kind.lower()}-websocket-closed"
+    current_stream: dict[str, object] = {}
+    entity = "button.synthetic_1_refresh_status"
+    identity = "tuya-ble-session-" + "r" * 16
+    messages = [
+        "S1_REFRESH_ACCEPTED",
+        "S1_REFRESH_SESSION_BOUND_"
+        + ("NEW" if kind == "COLD" else "REUSED")
+        + " session_ordinal=1",
+    ]
+    if kind == "COLD":
+        messages.extend(
+            [
+                "Sending packet: #1 FUN_SENDER_DEVICE_INFO",
+                "Sending packet: #2 FUN_SENDER_PAIR",
+            ]
+        )
+    messages.extend(
+        [
+            "Sending packet: #3 FUN_SENDER_DEVICE_STATUS",
+            "Received datapoint update, id: 8, type: DT_VALUE, length: 4",
+            "S1_REFRESH_COMPLETED session_ordinal=1",
+        ]
+    )
+    lines = [_r65c_record(identity, message) for message in messages]
+    original_resolve = ns["resolve_owner_refresh_target"]
+
+    def resolve(ws: object) -> object:
+        candidates = original_resolve(ws)
+        candidate = candidates[0]
+        battery = "sensor.synthetic_1_battery"
+        candidate["dp"] = {8: battery}
+        states.setdefault(
+            battery,
+            {
+                "state": "synthetic-before",
+                "attributes": {"value_source": "current_session"},
+            },
+        )
+        return candidates
+
+    ns["resolve_owner_refresh_target"] = resolve
+
+    class SyntheticSocket:
+        timeout = 1.0
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+    class WorkerWebSocket(ns["WebSocket"]):
+        def __init__(self) -> None:
+            self.pending = []
+            self.sock = SyntheticSocket()
+            self.sent = False
+
+        def recv(self) -> object:
+            deadline = time.monotonic() + self.sock.timeout
+            while time.monotonic() < deadline and not trigger.exists():
+                time.sleep(0.01)
+            if not trigger.exists() or self.sent:
+                raise ns["socket"].timeout()
+            self.sent = True
+
+            def publish_lifecycle() -> None:
+                time.sleep(0.05)
+                states["binary_sensor.synthetic_1_bluetooth_connection"]["state"] = "on"
+                states["sensor.synthetic_1_last_status_update"][
+                    "state"
+                ] = "synthetic-after"
+                states["sensor.synthetic_1_battery"]["state"] = "synthetic-after"
+                for line in lines:
+                    current_stream["value"].source.put(line)
+
+            threading.Thread(target=publish_lifecycle, daemon=True).start()
+            return _r66c_owner_event(entity)
+
+        def command(self, command: str, **kwargs: object) -> object:
+            if command == "logger/log_info":
+                return [{"domain": "tuya_ble", "level": 20}]
+            if command == "logger/integration_log_level":
+                if cleanup_failure == "logger" and kwargs.get("level") == "info":
+                    raise ValueError("synthetic logger cleanup")
+                return None
+            if command == "subscribe_events":
+                return None
+            if command == "call_service":
+                marker = kwargs["service_data"]["message"]
+                if cleanup_failure == "window" and "_END_" in marker:
+                    raise ValueError("synthetic window cleanup")
+                current_stream["value"].source.put(
+                    "2026 [ha_tuya_ble.r65_validation_boundary] " + marker + "\n"
+                )
+                return None
+            return super().command(command, **kwargs)
+
+        def close(self) -> None:
+            websocket_closed.touch()
+
+    class WorkerLogStream:
+        def __init__(self) -> None:
+            self.source: queue.Queue[str | None] = queue.Queue()
+            self.lines: queue.Queue[str] = queue.Queue(maxsize=512)
+            self.overflow = False
+            self.closed = False
+            current_stream["value"] = self
+            self.thread = threading.Thread(target=self._read, daemon=True)
+            self.thread.start()
+            listener_ready.touch()
+
+        def _read(self) -> None:
+            while not self.closed:
+                item = self.source.get()
+                if item is None:
+                    return
+                self.lines.put(item)
+
+        def take_available(self) -> list[str]:
+            result = []
+            while True:
+                try:
+                    result.append(self.lines.get_nowait())
+                except queue.Empty:
+                    return result
+
+        def until_marker(self, marker: str) -> list[str]:
+            result = []
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                line = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
+                if ns["marker_line"](line, marker):
+                    return result
+                result.append(line)
+            raise ValueError("log_marker")
+
+        def close(self) -> None:
+            self.closed = True
+            self.source.put(None)
+            self.thread.join(timeout=1)
+            stream_closed.touch()
+
+    ns.update(OwnerWebSocket=WorkerWebSocket, LogStream=WorkerLogStream)
+    ns["OWNER_WAIT_SECONDS"] = 1
+    ns["WORKER_READY_SECONDS"] = 3
+    ns["COLLECT_WAIT_SECONDS"] = 5
+    ns["WORKER_POLL_SECONDS"] = 0.01
+    arm_id = hashlib.sha256(f"{tmp_path}-{kind}".encode()).hexdigest()
+    return ns, arm_id, trigger, listener_ready, stream_closed, websocket_closed
+
+
+def test_r66i_real_worker_captures_post_arm_cold_and_retained_events(
+    tmp_path: Path,
+) -> None:
+    ns, cold_id, trigger, ready, stream_closed, websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD")
+    )
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+    cold_arm = ns["arm_owner_trial"]("COLD", cold_id)
+    assert cold_arm["observer_armed"] is True
+    assert cold_arm["boundary"] == "COMPLETE"
+    assert cold_arm["worker_python_version"] == ".".join(
+        str(item) for item in sys.version_info[:3]
+    )
+    assert ready.exists() and not trigger.exists()
+    trigger.touch()
+    cold, context = ns["collect_armed_owner_trial"](cold_id)
+    assert cold["owner_press_observed"] is True
+    assert cold["request_completed"] is True
+    assert cold["session_provenance"] == "NEW_SESSION"
+    assert cold["counts"] == {
+        "device_info": 1,
+        "pair": 1,
+        "device_status": 1,
+        "datapoint": 0,
+        "other": 0,
+    }
+    assert stream_closed.exists() and websocket_closed.exists()
+
+    ns["R66_CONTEXT"] = context
+    ns["_synthetic_states"]["binary_sensor.synthetic_1_bluetooth_connection"][
+        "state"
+    ] = "on"
+    retained_root = tmp_path / "retained"
+    retained_root.mkdir()
+    (
+        retained,
+        retained_id,
+        retained_trigger,
+        retained_ready,
+        retained_stream_closed,
+        retained_ws_closed,
+    ) = _r66i_worker_boundary(retained_root, "RETAINED")
+    retained["R66_CONTEXT"] = context
+    retained["_synthetic_states"]["binary_sensor.synthetic_1_bluetooth_connection"][
+        "state"
+    ] = "on"
+    assert retained["preflight_owner_trial"]("RETAINED")["ready"] is True
+    retained_arm = retained["arm_owner_trial"]("RETAINED", retained_id)
+    assert retained_arm["observer_armed"] is True and retained_ready.exists()
+    retained_trigger.touch()
+    retained_result, _ = retained["collect_armed_owner_trial"](retained_id)
+    assert retained_result["owner_press_observed"] is True
+    assert retained_result["request_completed"] is True
+    assert retained_result["session_provenance"] == "REUSED_SESSION"
+    assert retained_result["counts"] == {
+        "device_info": 0,
+        "pair": 0,
+        "device_status": 1,
+        "datapoint": 0,
+        "other": 0,
+    }
+    assert retained_stream_closed.exists() and retained_ws_closed.exists()
+
+
+def test_r66i_parent_that_misses_armed_state_still_returns_arm_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    ns, arm_id, trigger, _ready, _stream_closed, _websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD")
+    )
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+    ns["WORKER_POLL_SECONDS"] = 0.2
+    trigger.touch()
+    armed = ns["arm_owner_trial"]("COLD", arm_id)
+    assert set(armed) == set(ns["empty_owner_arm"]("COLD"))
+    assert armed["observer_armed"] is True
+    result, _context = ns["collect_armed_owner_trial"](arm_id)
+    assert result["owner_press_observed"] is True
+
+
+def test_r66i_real_worker_no_owner_timeout_is_specific_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    ns, arm_id, _trigger, ready, stream_closed, websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD")
+    )
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+    armed = ns["arm_owner_trial"]("COLD", arm_id)
+    assert armed["observer_armed"] is True and ready.exists()
+    result, context = ns["collect_armed_owner_trial"](arm_id)
+    assert result["failure_class"] == "OWNER_PRESS_NOT_OBSERVED"
+    assert result["owner_press_observed"] is False
+    assert result["counts"] == dict(ns["EMPTY_COUNTS"])
+    assert context["bound"] is None
+    assert stream_closed.exists() and websocket_closed.exists()
+    assert not Path(ns["armed_owner_state_path"](arm_id)).exists()
+
+
+@pytest.mark.parametrize("cleanup_failure", ["window", "logger"])
+def test_r66i_cleanup_failure_preserves_first_specific_worker_result(
+    tmp_path: Path, cleanup_failure: str
+) -> None:
+    ns, arm_id, _trigger, _ready, stream_closed, websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD", cleanup_failure=cleanup_failure)
+    )
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+    assert ns["arm_owner_trial"]("COLD", arm_id)["observer_armed"] is True
+    result, _context = ns["collect_armed_owner_trial"](arm_id)
+    assert result["failure_class"] == "OWNER_PRESS_NOT_OBSERVED"
+    assert result["ambiguous"] is True
+    assert stream_closed.exists() and websocket_closed.exists()
+
+
+def test_r66i_worker_setup_and_decoder_failures_retain_their_boundaries(
+    tmp_path: Path,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    ns, arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD")
+    )
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+
+    class FailedWorker:
+        def __init__(self) -> None:
+            raise ValueError("synthetic worker setup")
+
+    ns["OwnerWebSocket"] = FailedWorker
+    failed = ns["arm_owner_trial"]("COLD", arm_id)
+    assert failed["observer_armed"] is False
+    assert failed["boundary"] == "WORKER_SETUP"
+    assert failed["failure_class"] == "AMBIGUOUS"
+    assert failed["connection_precondition_proven"] is None
+    assert not Path(ns["armed_owner_state_path"](arm_id)).exists()
+
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    assert controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).ready
+    calls = 0
+
+    def decoder_failure(
+        trial_kind: access.OwnerRefreshTrialKind,
+        armed_observer_id: str,
+        *,
+        _capability: object = None,
+    ) -> access.OwnerRefreshTrialArm:
+        nonlocal calls
+        calls += 1
+        broker._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        raise access._DispatchFailure(
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.DispatchFailureClass.FRAMING,
+        )
+
+    broker._arm_owner_refresh_status_trial = decoder_failure
+    decoded = controller.arm_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert calls == 1
+    assert decoded.observer_armed is False
+    assert decoded.connection_precondition_proven is None
+    assert decoded.boundary is access.OwnerRefreshArmBoundary.RESPONSE_DECODER
+    assert decoded.dispatch_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    assert decoded.dispatch_class is access.DispatchFailureClass.FRAMING
+    controller.close()
+
+
+def test_r66i_public_runner_records_roundtrip_tuples_enums_and_metadata() -> None:
+    diagnostics = access.OwnerRefreshPreflightDiagnostics(
+        access.OwnerRefreshPreflightBoundary.COMPLETE,
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        15,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+        access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+    )
+    preflight = access.OwnerRefreshTrialPreflight(
+        True,
+        access.OwnerRefreshTrialKind.COLD,
+        1,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        None,
+        False,
+        False,
+        diagnostics,
+    )
+    report = access.OwnerRefreshPreflightRunReport(
+        "NOT_RETAINED",
+        (preflight,),
+        None,
+        access.OwnerRefreshPreflightRunOutcome.READY,
+        False,
+    )
+    arm = access.OwnerRefreshTrialArm(
+        True,
+        access.OwnerRefreshTrialKind.COLD,
+        1,
+        False,
+        False,
+        True,
+        60,
+        None,
+        access.OwnerRefreshArmBoundary.COMPLETE,
+        "3.13.11",
+    )
+    trial = access.OwnerRefreshTrialResult(
+        access.OwnerRefreshTrialKind.COLD,
+        True,
+        True,
+        access.RefreshSessionProvenance.NEW_SESSION,
+        access.RefreshPacketCounts(1, 1, 1, 0, 0),
+        (8,),
+        (access.OwnerRefreshDpMetadata(8, ("DT_VALUE",), (4,)),),
+        True,
+        True,
+        True,
+        False,
+        None,
+    )
+    release = access.OwnerRefreshReleaseResult(True, False, False, None)
+
+    report_record = access.owner_refresh_public_json_record(report)
+    assert (
+        tuple(
+            access._parse_owner_refresh_trial_preflight_payload(item)
+            for item in report_record["observations"]
+        )
+        == report.observations
+    )
+    arm_record = access.owner_refresh_public_json_record(arm)
+    assert access._parse_owner_refresh_trial_arm_payload(arm_record) == arm
+    reconciled_arm = replace(
+        arm,
+        observer_armed=False,
+        connection_precondition_proven=None,
+        failure_class=access.OwnerRefreshFailureClass.AMBIGUOUS,
+        boundary=access.OwnerRefreshArmBoundary.RESPONSE_DECODER,
+        worker_python_version=None,
+        dispatch_stage=access.DispatchFailureStage.RESPONSE_PARSE,
+        dispatch_class=access.DispatchFailureClass.FRAMING,
+        worker_cleanup_complete=True,
+        worker_result_failure_class=(
+            access.OwnerRefreshFailureClass.OWNER_PRESS_NOT_OBSERVED
+        ),
+    )
+    reconciled_record = access.owner_refresh_public_json_record(reconciled_arm)
+    assert (
+        access._parse_owner_refresh_trial_arm_payload(
+            reconciled_record, allow_local_diagnostics=True
+        )
+        == reconciled_arm
+    )
+    with pytest.raises(ValueError, match="owner_refresh_arm"):
+        access._parse_owner_refresh_trial_arm_payload(reconciled_record)
+    trial_record = access.owner_refresh_public_json_record(trial)
+    assert access._parse_owner_refresh_trial_payload(trial_record) == trial
+    release_record = access.owner_refresh_public_json_record(release)
+    assert access._parse_owner_refresh_release_payload(release_record) == release
+    for record in (
+        report_record,
+        arm_record,
+        reconciled_record,
+        trial_record,
+        release_record,
+    ):
+        assert json.loads(json.dumps(record, sort_keys=True)) == record
 
 
 @pytest.mark.parametrize("count", [1, 4])
