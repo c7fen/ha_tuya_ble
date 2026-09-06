@@ -11372,8 +11372,9 @@ def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, sel
         )
         result['owner_wait_completed'] = True
         stream.raise_if_failed()
-    except ValueError as error:
-        if str(error) in {'ownership', 'precondition'}: raise
+    except Exception as error:
+        if isinstance(error, ValueError) and str(error) in {'ownership', 'precondition'}:
+            raise
         failure = owner_observation_failure(error)
         result['observation_failure_class'] = failure
         result['failure_class'] = failure

@@ -15958,6 +15958,7 @@ def test_r66j_real_idle_reader_shutdown_is_prompt(tmp_path: Path) -> None:
     ("failure", "expected"),
     [
         ("websocket_frame", "WEBSOCKET_OBSERVATION_FAILED"),
+        ("websocket_transport", "WEBSOCKET_OBSERVATION_FAILED"),
         ("log_read_timeout", "LOG_READ_TIMEOUT"),
         ("log_stream_eof", "LOG_STREAM_EOF"),
         ("log_queue_overflow", "LOG_QUEUE_OVERFLOW"),
@@ -15970,11 +15971,13 @@ def test_r66j_worker_preserves_bounded_observation_failures(
     ns, arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
         _r66i_worker_boundary(tmp_path, "COLD")
     )
-    if failure == "websocket_frame":
+    if failure in {"websocket_frame", "websocket_transport"}:
         base = ns["OwnerWebSocket"]
 
         class BrokenWebSocket(base):
             def recv(self) -> object:
+                if failure == "websocket_transport":
+                    raise ConnectionResetError
                 raise ValueError("websocket_frame")
 
         ns["OwnerWebSocket"] = BrokenWebSocket
