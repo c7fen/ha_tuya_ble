@@ -15465,7 +15465,8 @@ def _r66i_worker_boundary(
             if command == "logger/log_info":
                 return [{"domain": "tuya_ble", "level": 20}]
             if command == "logger/integration_log_level":
-                if cleanup_failure == "logger" and kwargs.get("level") == "info":
+                assert kwargs.get("level") in {"DEBUG", "INFO"}
+                if cleanup_failure == "logger" and kwargs.get("level") == "INFO":
                     raise ValueError("synthetic logger cleanup")
                 return None
             if command == "subscribe_events":

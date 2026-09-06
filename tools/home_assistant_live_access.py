@@ -11317,8 +11317,8 @@ def run_armed_owner_worker(kind, arm_id):
         levels = [item.get('level') for item in info if isinstance(item, dict) and item.get('domain') == 'tuya_ble'] if isinstance(info, list) else []
         if len(levels) != 1 or levels[0] not in {0, 10, 20, 30, 40, 50}:
             result['failure_class'] = 'LOGGER_CONTROL_UNAVAILABLE'; return result
-        prior_level = {0: 'notset', 10: 'debug', 20: 'info', 30: 'warning', 40: 'error', 50: 'critical'}[levels[0]]
-        ws.command('logger/integration_log_level', integration='tuya_ble', level='debug', persistence='none')
+        prior_level = {0: 'NOTSET', 10: 'DEBUG', 20: 'INFO', 30: 'WARNING', 40: 'ERROR', 50: 'CRITICAL'}[levels[0]]
+        ws.command('logger/integration_log_level', integration='tuya_ble', level='DEBUG', persistence='none')
         ws.command('subscribe_events', event_type='call_service')
         result['boundary'] = 'LOG_WINDOW_SETUP'
         stream = LogStream(); window = LogWindow(stream, ws); window.start()
