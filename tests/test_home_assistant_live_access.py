@@ -12283,11 +12283,14 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
         connection_matches = getattr(self, "preflight_connection_matches", True)
         ownership_matches = getattr(self, "preflight_ownership_matches", True)
         ready = connection_matches and ownership_matches
+        candidate_count = 1 if ownership_matches else 0
+        checked = candidate_count
+        expected_on = trial_kind is access.OwnerRefreshTrialKind.RETAINED
         return access.OwnerRefreshTrialPreflight(
             ready,
             trial_kind,
             1 if ownership_matches else 0,
-            ownership_matches,
+            False,
             ownership_matches,
             ownership_matches,
             ownership_matches,
@@ -12301,6 +12304,40 @@ class _R65ScriptedBroker(_R32ScriptedBroker):
                     if not connection_matches
                     else access.OwnerRefreshFailureClass.OWNERSHIP_NOT_PROVEN
                 )
+            ),
+            diagnostics=access.OwnerRefreshPreflightDiagnostics(
+                (
+                    access.OwnerRefreshPreflightBoundary.COMPLETE
+                    if ready
+                    else access.OwnerRefreshPreflightBoundary.CANDIDATE_READINESS
+                ),
+                candidate_count,
+                checked,
+                1 if ready else 0,
+                checked if expected_on == connection_matches else 0,
+                checked if expected_on != connection_matches else 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                15 if ownership_matches else 0,
+                (
+                    access.OwnerRefreshPreflightCheck.CHECKED_PASSED
+                    if ownership_matches
+                    else access.OwnerRefreshPreflightCheck.CHECKED_FAILED
+                ),
+                access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+                access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+                access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+                access.OwnerRefreshPreflightCheck.CHECKED_PASSED,
+                (
+                    access.OwnerRefreshPreflightCheck.CHECKED_PASSED
+                    if connection_matches
+                    else access.OwnerRefreshPreflightCheck.CHECKED_FAILED
+                ),
             ),
         )
 
@@ -15260,12 +15297,235 @@ def test_r66c_m1_m5_m15_all_candidates_must_be_cold_ready(count: int) -> None:
     failed = ns["preflight_owner_trial"]("COLD")
     assert failed["eligible_s1_count"] == count
     assert not failed["ready"]
-    assert failed["failure_class"] == "PRECONDITION_NOT_PROVEN"
+    assert failed["failure_class"] == "WAITING_FOR_IDLE"
+    assert failed["diagnostics"]["connection_on_count"] == 1
+    assert failed["diagnostics"]["connection_off_count"] == count - 1
     assert set(ns["_synthetic_calls"]) <= {
         "GET",
         "config/entity_registry/list_for_display",
         "config/device_registry/list",
     }
+
+
+def test_r66g_preflight_aggregates_independent_candidate_failures() -> None:
+    ns = _r66c_installation()
+    ns["_synthetic_states"]["binary_sensor.synthetic_1_bluetooth_connection"][
+        "state"
+    ] = "on"
+    ns["_synthetic_states"]["button.synthetic_4_refresh_status"][
+        "state"
+    ] = "unavailable"
+    result = ns["preflight_owner_trial"]("COLD")
+    diagnostic = result["diagnostics"]
+    assert result["failure_class"] == "REFRESH_ENTITY_UNAVAILABLE"
+    assert diagnostic["candidates_checked"] == 4
+    assert diagnostic["connection_on_count"] == 1
+    assert diagnostic["connection_off_count"] == 3
+    assert diagnostic["refresh_unavailable_count"] == 1
+
+
+def test_r66g_missing_refresh_entity_has_its_own_failure() -> None:
+    ns = _r66c_installation(1)
+    entities = ns["WebSocket"]().command("config/entity_registry/list_for_display")[
+        "entities"
+    ]
+    entities[:] = [item for item in entities if item["tk"] != "refresh_status"]
+    result = ns["preflight_owner_trial"]("COLD")
+    assert result["failure_class"] == "REFRESH_ENTITY_UNAVAILABLE"
+    assert result["diagnostics"]["refresh_unavailable_count"] == 1
+    assert result["diagnostics"]["ownership_invalid_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "failure", "counter"),
+    [
+        ("connection_mode", "always", "POLICY_MISMATCH", "policy_mismatch_count"),
+        ("ble_control_enabled", False, "BLE_CONTROL_MISMATCH", "ble_mismatch_count"),
+        (
+            "on_demand_connection_hold_time",
+            5,
+            "HOLD_TIME_INVALID",
+            "hold_invalid_count",
+        ),
+    ],
+)
+def test_r66g_policy_ble_and_hold_are_distinct(
+    option: str, value: object, failure: str, counter: str
+) -> None:
+    ns = _r66c_installation(1)
+    entry = ns["resolve_owner_refresh_target"](ns["WebSocket"]())[0]
+    entry_id = "SYNTHETIC_ENTRY_1"
+    original_http = ns["http_json"]
+
+    def http(path: str, method: str = "GET", **kwargs: object) -> object:
+        response = original_http(path, method, **kwargs)
+        if path.endswith(entry_id):
+            response["data"]["options"][option] = value
+        return response
+
+    assert entry["valid"]
+    ns["http_json"] = http
+    result = ns["preflight_owner_trial"]("COLD")
+    assert result["failure_class"] == failure
+    assert result["diagnostics"][counter] == 1
+
+
+def test_r66g_http_schema_and_unevaluated_are_distinct() -> None:
+    ns = _r66c_installation(1)
+    ns["state"] = lambda entity: (_ for _ in ()).throw(
+        ns["urllib"].error.URLError("synthetic")
+    )
+    failed = ns["preflight_owner_trial"]("COLD")
+    assert failed["failure_class"] == "HTTP_READ_FAILED"
+    assert failed["diagnostics"]["boundary"] == "HTTP_READ"
+    assert failed["diagnostics"]["connection_check"] == "NOT_EVALUATED"
+
+    ns = _r66c_installation(1)
+    ns["state"] = lambda entity: (_ for _ in ()).throw(ns["socket"].timeout())
+    timed_out = ns["preflight_owner_trial"]("COLD")
+    assert timed_out["failure_class"] == "READ_TIMEOUT"
+    assert timed_out["diagnostics"]["boundary"] == "READ_TIMEOUT"
+
+    ns = _r66c_installation(1)
+    ns["state"] = lambda entity: (_ for _ in ()).throw(ValueError("state"))
+    malformed = ns["preflight_owner_trial"]("COLD")
+    assert malformed["failure_class"] == "RESPONSE_SCHEMA_INVALID"
+    assert malformed["diagnostics"]["boundary"] == "RESPONSE_SCHEMA"
+    assert malformed["failure_class"] != failed["failure_class"]
+
+
+def test_r66g_decoder_failure_survives_controller_boundary(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise access._DispatchFailure(
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.DispatchFailureClass.SCHEMA,
+        )
+
+    broker._preflight_owner_refresh_status_trial = fail
+    result = controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    assert result.failure_class is access.OwnerRefreshFailureClass.CONTEXT_FAILURE
+    assert result.diagnostics is not None
+    assert (
+        result.diagnostics.boundary
+        is access.OwnerRefreshPreflightBoundary.RESPONSE_DECODER
+    )
+    assert (
+        result.diagnostics.dispatch_stage is access.DispatchFailureStage.RESPONSE_PARSE
+    )
+    assert result.diagnostics.dispatch_class is access.DispatchFailureClass.SCHEMA
+    controller.close()
+
+
+def test_r66g_bounded_wait_persists_transition_and_rereads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ns = _r66c_installation(1)
+    connection = "binary_sensor.synthetic_1_bluetooth_connection"
+    ns["_synthetic_states"][connection]["state"] = "on"
+
+    class Controller:
+        calls = 0
+
+        def preflight_owner_refresh_trial(self, kind: object) -> object:
+            self.calls += 1
+            return access._parse_owner_refresh_trial_preflight_payload(
+                ns["preflight_owner_trial"](kind.value)
+            )
+
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+        ns["_synthetic_states"][connection]["state"] = "off"
+
+    monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path)
+    controller = Controller()
+    report = access.run_bounded_owner_refresh_preflight(
+        controller,
+        access.OwnerRefreshTrialKind.COLD,
+        _clock=lambda: clock[0],
+        _sleep=sleep,
+    )
+    assert controller.calls == 2
+    assert (
+        report.first_decisive_failure
+        is access.OwnerRefreshFailureClass.WAITING_FOR_IDLE
+    )
+    assert report.final_outcome is access.OwnerRefreshPreflightRunOutcome.READY
+    assert report.transitioned_to_ready is True
+    assert len(report.observations) == 2
+    assert access.read_owner_preflight_report() == report
+    assert report.original_preflight_reason == "NOT_RETAINED"
+
+
+def test_r66g_persistent_connection_stops_without_arm_or_press(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ns = _r66c_installation(1)
+    ns["_synthetic_states"]["binary_sensor.synthetic_1_bluetooth_connection"][
+        "state"
+    ] = "on"
+
+    class Controller:
+        calls: list[str] = []
+
+        def preflight_owner_refresh_trial(self, kind: object) -> object:
+            self.calls.append("preflight")
+            return access._parse_owner_refresh_trial_preflight_payload(
+                ns["preflight_owner_trial"](kind.value)
+            )
+
+    clock = [0.0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path)
+    controller = Controller()
+    report = access.run_bounded_owner_refresh_preflight(
+        controller,
+        access.OwnerRefreshTrialKind.COLD,
+        max_snapshots=3,
+        _clock=lambda: clock[0],
+        _sleep=sleep,
+    )
+    assert controller.calls == ["preflight", "preflight", "preflight"]
+    assert report.final_outcome is access.OwnerRefreshPreflightRunOutcome.WAIT_DEADLINE
+    assert all(not item.ready for item in report.observations)
+
+
+def test_r66g_report_survives_full_restore_and_controller_close(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+) -> None:
+    controller, _broker, r64, restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    report = access.run_bounded_owner_refresh_preflight(
+        controller, access.OwnerRefreshTrialKind.COLD
+    )
+    assert report.final_outcome is access.OwnerRefreshPreflightRunOutcome.READY
+    assert controller.hardware_observation.trials == ()
+
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.reconcile_interrupted_source(r64.manifest, restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.retire_owned_feature_backup(restore.manifest)
+    controller.inspect_feature_backup(restore.manifest)
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_refresh_feature_absent()
+    controller.admit_post_restore_repairs()
+    assert controller.complete().complete
+    controller.close()
+
+    assert access.read_owner_preflight_report() == report
 
 
 @pytest.mark.parametrize("index", [1, 4])

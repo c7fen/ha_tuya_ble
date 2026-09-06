@@ -1435,6 +1435,15 @@ class OwnerRefreshFailureClass(StrEnum):
 
     OWNERSHIP_NOT_PROVEN = "OWNERSHIP_NOT_PROVEN"
     PRECONDITION_NOT_PROVEN = "PRECONDITION_NOT_PROVEN"
+    WAITING_FOR_IDLE = "WAITING_FOR_IDLE"
+    REFRESH_ENTITY_UNAVAILABLE = "REFRESH_ENTITY_UNAVAILABLE"
+    POLICY_MISMATCH = "POLICY_MISMATCH"
+    BLE_CONTROL_MISMATCH = "BLE_CONTROL_MISMATCH"
+    HOLD_TIME_INVALID = "HOLD_TIME_INVALID"
+    HTTP_READ_FAILED = "HTTP_READ_FAILED"
+    READ_TIMEOUT = "READ_TIMEOUT"
+    RESPONSE_SCHEMA_INVALID = "RESPONSE_SCHEMA_INVALID"
+    CONTEXT_FAILURE = "CONTEXT_FAILURE"
     LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
     LOG_BOUNDARY_NOT_ESTABLISHED = "LOG_BOUNDARY_NOT_ESTABLISHED"
     OWNER_PRESS_NOT_OBSERVED = "OWNER_PRESS_NOT_OBSERVED"
@@ -1446,6 +1455,58 @@ class OwnerRefreshFailureClass(StrEnum):
     RELEASE_NOT_OBSERVED = "RELEASE_NOT_OBSERVED"
     AUTOMATIC_RECONNECT_OBSERVED = "AUTOMATIC_RECONNECT_OBSERVED"
     AMBIGUOUS = "AMBIGUOUS"
+
+
+class OwnerRefreshPreflightCheck(StrEnum):
+    """Whether one aggregate preflight dimension was actually evaluated."""
+
+    NOT_EVALUATED = "NOT_EVALUATED"
+    CHECKED_PASSED = "CHECKED_PASSED"
+    CHECKED_FAILED = "CHECKED_FAILED"
+
+
+class OwnerRefreshPreflightBoundary(StrEnum):
+    """Identifier-free boundary at which a preflight stopped."""
+
+    COMPLETE = "COMPLETE"
+    TARGET_RESOLUTION = "TARGET_RESOLUTION"
+    CANDIDATE_SELECTION = "CANDIDATE_SELECTION"
+    CANDIDATE_READINESS = "CANDIDATE_READINESS"
+    HTTP_READ = "HTTP_READ"
+    READ_TIMEOUT = "READ_TIMEOUT"
+    RESPONSE_SCHEMA = "RESPONSE_SCHEMA"
+    RESPONSE_DECODER = "RESPONSE_DECODER"
+    CONTROLLER_CONTEXT = "CONTROLLER_CONTEXT"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshPreflightDiagnostics:
+    """Sanitized aggregate diagnostics; never contains a device identifier."""
+
+    boundary: OwnerRefreshPreflightBoundary
+    candidate_count: int
+    candidates_checked: int
+    candidates_ready: int
+    connection_on_count: int
+    connection_off_count: int
+    connection_unknown_count: int
+    connection_unavailable_count: int
+    ownership_invalid_count: int
+    refresh_unavailable_count: int
+    policy_mismatch_count: int
+    ble_mismatch_count: int
+    hold_invalid_count: int
+    max_valid_hold_seconds: int
+    ownership_check: OwnerRefreshPreflightCheck
+    refresh_button_check: OwnerRefreshPreflightCheck
+    policy_check: OwnerRefreshPreflightCheck
+    ble_check: OwnerRefreshPreflightCheck
+    hold_check: OwnerRefreshPreflightCheck
+    connection_check: OwnerRefreshPreflightCheck
+    dispatch_stage: DispatchFailureStage | None = None
+    dispatch_class: DispatchFailureClass | None = None
+    remote_scope: RemoteFailureScope | None = None
+    remote_reason: RemoteFailureReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1464,6 +1525,7 @@ class OwnerRefreshTrialPreflight:
     failure_class: OwnerRefreshFailureClass | None
     target_bound: bool = False
     same_private_target: bool = False
+    diagnostics: OwnerRefreshPreflightDiagnostics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -4359,10 +4421,79 @@ def _parse_owner_refresh_trial_preflight_payload(
         "failure_class",
         "target_bound",
         "same_private_target",
+        "diagnostics",
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("owner_refresh_preflight")
     try:
+        diagnostic_value = value["diagnostics"]
+        diagnostic_fields = {
+            "boundary",
+            "candidate_count",
+            "candidates_checked",
+            "candidates_ready",
+            "connection_on_count",
+            "connection_off_count",
+            "connection_unknown_count",
+            "connection_unavailable_count",
+            "ownership_invalid_count",
+            "refresh_unavailable_count",
+            "policy_mismatch_count",
+            "ble_mismatch_count",
+            "hold_invalid_count",
+            "max_valid_hold_seconds",
+            "ownership_check",
+            "refresh_button_check",
+            "policy_check",
+            "ble_check",
+            "hold_check",
+            "connection_check",
+            "dispatch_stage",
+            "dispatch_class",
+            "remote_scope",
+            "remote_reason",
+        }
+        if (
+            not isinstance(diagnostic_value, dict)
+            or set(diagnostic_value) != diagnostic_fields
+        ):
+            raise ValueError
+
+        def optional_enum(enum: type[StrEnum], key: str) -> StrEnum | None:
+            item = diagnostic_value[key]
+            return None if item is None else enum(item)
+
+        diagnostics = OwnerRefreshPreflightDiagnostics(
+            OwnerRefreshPreflightBoundary(diagnostic_value["boundary"]),
+            *(
+                _count(diagnostic_value[key])
+                for key in (
+                    "candidate_count",
+                    "candidates_checked",
+                    "candidates_ready",
+                    "connection_on_count",
+                    "connection_off_count",
+                    "connection_unknown_count",
+                    "connection_unavailable_count",
+                    "ownership_invalid_count",
+                    "refresh_unavailable_count",
+                    "policy_mismatch_count",
+                    "ble_mismatch_count",
+                    "hold_invalid_count",
+                    "max_valid_hold_seconds",
+                )
+            ),
+            OwnerRefreshPreflightCheck(diagnostic_value["ownership_check"]),
+            OwnerRefreshPreflightCheck(diagnostic_value["refresh_button_check"]),
+            OwnerRefreshPreflightCheck(diagnostic_value["policy_check"]),
+            OwnerRefreshPreflightCheck(diagnostic_value["ble_check"]),
+            OwnerRefreshPreflightCheck(diagnostic_value["hold_check"]),
+            OwnerRefreshPreflightCheck(diagnostic_value["connection_check"]),
+            optional_enum(DispatchFailureStage, "dispatch_stage"),
+            optional_enum(DispatchFailureClass, "dispatch_class"),
+            optional_enum(RemoteFailureScope, "remote_scope"),
+            optional_enum(RemoteFailureReason, "remote_reason"),
+        )
         result = OwnerRefreshTrialPreflight(
             _bool(value["ready"]),
             OwnerRefreshTrialKind(value["trial_kind"]),
@@ -4380,11 +4511,40 @@ def _parse_owner_refresh_trial_preflight_payload(
             ),
             _bool(value["target_bound"]),
             _bool(value["same_private_target"]),
+            diagnostics,
         )
     except (TypeError, ValueError):
         raise ValueError("owner_refresh_preflight") from None
     if (
-        result.selected != result.target_bound
+        result.diagnostics.candidate_count != result.eligible_s1_count
+        or result.diagnostics.candidates_checked > result.diagnostics.candidate_count
+        or result.diagnostics.candidates_ready > result.diagnostics.candidates_checked
+        or sum(
+            (
+                result.diagnostics.connection_on_count,
+                result.diagnostics.connection_off_count,
+                result.diagnostics.connection_unknown_count,
+                result.diagnostics.connection_unavailable_count,
+            )
+        )
+        > result.diagnostics.candidates_checked
+        or result.ready
+        and result.diagnostics.boundary is not OwnerRefreshPreflightBoundary.COMPLETE
+        or result.failure_class is OwnerRefreshFailureClass.WAITING_FOR_IDLE
+        and (
+            result.trial_kind is not OwnerRefreshTrialKind.COLD
+            or result.diagnostics.connection_on_count < 1
+            or result.diagnostics.connection_unknown_count
+            or result.diagnostics.connection_unavailable_count
+        )
+        or result.failure_class is OwnerRefreshFailureClass.HTTP_READ_FAILED
+        and result.diagnostics.boundary is not OwnerRefreshPreflightBoundary.HTTP_READ
+        or result.failure_class is OwnerRefreshFailureClass.READ_TIMEOUT
+        and result.diagnostics.boundary is not OwnerRefreshPreflightBoundary.READ_TIMEOUT
+        or result.failure_class is OwnerRefreshFailureClass.RESPONSE_SCHEMA_INVALID
+        and result.diagnostics.boundary
+        is not OwnerRefreshPreflightBoundary.RESPONSE_SCHEMA
+        or result.selected != result.target_bound
         or result.same_private_target
         and not result.target_bound
         or result.ready
@@ -10658,8 +10818,9 @@ def resolve_owner_refresh_target(ws):
     for entry_id, options in eligible:
         try:
             candidate = owner_candidate(entities, devices, entry_id, options)
-        except ValueError:
-            candidate = {'valid': False, 'fingerprint': None}
+        except ValueError as error:
+            candidate = {'valid': False, 'fingerprint': None,
+                         'invalid_reason': 'refresh_entity' if str(error) == 'refresh_entity' else 'ownership'}
         candidates.append(candidate)
     fingerprints = [item['fingerprint'] for item in candidates if item['valid']]
     buttons = [item['button'] for item in candidates if item['valid']]
@@ -10677,7 +10838,8 @@ def owner_candidate(entities, devices, entry_id, options):
     buttons = entries_by_key(entities, device_id, 'button', 'refresh_status')
     connections = entries_by_key(entities, device_id, 'binary_sensor', 'bluetooth_connection')
     last_updates = entries_by_key(entities, device_id, 'sensor', 'last_status_update')
-    if len(buttons) != 1 or len(connections) != 1 or len(last_updates) != 1: raise ValueError('ownership')
+    if len(buttons) != 1: raise ValueError('refresh_entity')
+    if len(connections) != 1 or len(last_updates) != 1: raise ValueError('ownership')
     button_id = buttons[0]['ei']; connection_id = connections[0]['ei']
     hold = options.get('on_demand_connection_hold_time', 15)
     dp_entities = {}
@@ -10686,7 +10848,7 @@ def owner_candidate(entities, devices, entry_id, options):
         if len(matches) == 1: dp_entities[dp] = matches[0]['ei']
     identity = [entry_id, device_id, button_id, connection_id, last_updates[0]['ei']]
     fingerprint = hashlib.sha256((R66_CONTEXT['salt'] + json.dumps(identity, separators=(',', ':'))).encode()).hexdigest()
-    return {'valid': True, 'fingerprint': fingerprint, 'button': button_id,
+    return {'valid': True, 'invalid_reason': None, 'fingerprint': fingerprint, 'button': button_id,
             'connection': connection_id, 'last': last_updates[0]['ei'],
             'dp': dp_entities, 'hold': hold, 'options': options}
 
@@ -10722,6 +10884,11 @@ def empty_owner_trial(kind):
     }
 
 def empty_owner_preflight(kind):
+    checks = {
+        'ownership_check': 'NOT_EVALUATED', 'refresh_button_check': 'NOT_EVALUATED',
+        'policy_check': 'NOT_EVALUATED', 'ble_check': 'NOT_EVALUATED',
+        'hold_check': 'NOT_EVALUATED', 'connection_check': 'NOT_EVALUATED',
+    }
     return {
         'ready': False, 'trial_kind': kind, 'eligible_s1_count': 0,
         'selected': R66_CONTEXT['bound'] is not None, 'refresh_button_present': False,
@@ -10729,6 +10896,17 @@ def empty_owner_preflight(kind):
         'hold_time_valid': False, 'connection_precondition_proven': False,
         'failure_class': None, 'target_bound': R66_CONTEXT['bound'] is not None,
         'same_private_target': False,
+        'diagnostics': {
+            'boundary': 'TARGET_RESOLUTION', 'candidate_count': 0,
+            'candidates_checked': 0, 'candidates_ready': 0,
+            'connection_on_count': 0, 'connection_off_count': 0,
+            'connection_unknown_count': 0, 'connection_unavailable_count': 0,
+            'ownership_invalid_count': 0, 'refresh_unavailable_count': 0,
+            'policy_mismatch_count': 0, 'ble_mismatch_count': 0,
+            'hold_invalid_count': 0, 'max_valid_hold_seconds': 0,
+            **checks, 'dispatch_stage': None, 'dispatch_class': None,
+            'remote_scope': None, 'remote_reason': None,
+        },
     }
 
 def preflight_owner_trial(kind):
@@ -10737,23 +10915,96 @@ def preflight_owner_trial(kind):
         ws = WebSocket()
         candidates = resolve_owner_refresh_target(ws)
         result['eligible_s1_count'] = len(candidates)
-        selected = owner_candidates_for_trial(candidates, kind)
+        diagnostic = result['diagnostics']; diagnostic['candidate_count'] = len(candidates)
+        diagnostic['boundary'] = 'CANDIDATE_SELECTION'
+        bound = R66_CONTEXT['bound']
+        if bound is None:
+            if kind != 'COLD': raise ValueError('ownership')
+            selected = candidates
+        else:
+            selected = [item for item in candidates if item['fingerprint'] == bound]
+            if len(selected) != 1: raise ValueError('ownership')
         result['selected'] = R66_CONTEXT['bound'] is not None
         result['same_private_target'] = result['selected']
-        checks = [owner_candidate_ready(candidate, kind) for candidate in selected]
+        diagnostic['boundary'] = 'CANDIDATE_READINESS'
+        for candidate in selected:
+            diagnostic['candidates_checked'] += 1
+            if not candidate['valid']:
+                if candidate.get('invalid_reason') == 'refresh_entity':
+                    diagnostic['refresh_unavailable_count'] += 1
+                else: diagnostic['ownership_invalid_count'] += 1
+                continue
+            options = candidate['options']; hold = candidate['hold']
+            policy_ok = options.get('connection_mode') == 'on_demand'
+            ble_ok = options.get('ble_control_enabled') is True
+            hold_ok = type(hold) is int and 15 <= hold <= 105
+            if not policy_ok: diagnostic['policy_mismatch_count'] += 1
+            if not ble_ok: diagnostic['ble_mismatch_count'] += 1
+            if not hold_ok: diagnostic['hold_invalid_count'] += 1
+            if hold_ok: diagnostic['max_valid_hold_seconds'] = max(diagnostic['max_valid_hold_seconds'], hold)
+            button = state(candidate['button']).get('state')
+            if button == 'unavailable': diagnostic['refresh_unavailable_count'] += 1
+            connection = state(candidate['connection']).get('state')
+            if connection == 'on': diagnostic['connection_on_count'] += 1
+            elif connection == 'off': diagnostic['connection_off_count'] += 1
+            elif connection == 'unavailable': diagnostic['connection_unavailable_count'] += 1
+            else: diagnostic['connection_unknown_count'] += 1
+            expected = 'off' if kind == 'COLD' else 'on'
+            if policy_ok and ble_ok and hold_ok and button != 'unavailable' and connection == expected:
+                diagnostic['candidates_ready'] += 1
+        for key, count_key in (
+            ('ownership_check', 'ownership_invalid_count'),
+            ('refresh_button_check', 'refresh_unavailable_count'),
+            ('policy_check', 'policy_mismatch_count'), ('ble_check', 'ble_mismatch_count'),
+            ('hold_check', 'hold_invalid_count'),
+        ):
+            diagnostic[key] = 'CHECKED_FAILED' if diagnostic[count_key] else 'CHECKED_PASSED'
+        connection_bad = (diagnostic['connection_unknown_count'] + diagnostic['connection_unavailable_count']
+                          + (diagnostic['connection_on_count'] if kind == 'COLD' else diagnostic['connection_off_count']))
+        diagnostic['connection_check'] = 'CHECKED_FAILED' if connection_bad else 'CHECKED_PASSED'
         result.update({
-            'refresh_button_present': True, 'policy_on_demand': True,
-            'ble_control_enabled': True, 'hold_time_valid': True,
-            'connection_precondition_proven': all(checks),
+            'refresh_button_present': not diagnostic['refresh_unavailable_count'],
+            'policy_on_demand': not diagnostic['policy_mismatch_count'],
+            'ble_control_enabled': not diagnostic['ble_mismatch_count'],
+            'hold_time_valid': not diagnostic['hold_invalid_count'],
+            'connection_precondition_proven': not connection_bad,
         })
-        if not all(checks):
-            result['failure_class'] = 'PRECONDITION_NOT_PROVEN'; return result
+        if diagnostic['ownership_invalid_count']:
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'; return result
+        if diagnostic['refresh_unavailable_count']:
+            result['failure_class'] = 'REFRESH_ENTITY_UNAVAILABLE'; return result
+        if diagnostic['policy_mismatch_count']:
+            result['failure_class'] = 'POLICY_MISMATCH'; return result
+        if diagnostic['ble_mismatch_count']:
+            result['failure_class'] = 'BLE_CONTROL_MISMATCH'; return result
+        if diagnostic['hold_invalid_count']:
+            result['failure_class'] = 'HOLD_TIME_INVALID'; return result
+        if connection_bad:
+            sole_idle = kind == 'COLD' and diagnostic['connection_on_count'] > 0 and not (
+                diagnostic['connection_unknown_count'] or diagnostic['connection_unavailable_count'])
+            result['failure_class'] = 'WAITING_FOR_IDLE' if sole_idle else 'PRECONDITION_NOT_PROVEN'
+            return result
         if R66_CONTEXT['bound'] is None:
             R66_CONTEXT['approved'] = sorted(item['fingerprint'] for item in selected)
+        diagnostic['boundary'] = 'COMPLETE'
         result['ready'] = True
         return result
+    except socket.timeout:
+        result['diagnostics']['boundary'] = 'READ_TIMEOUT'
+        result['failure_class'] = 'READ_TIMEOUT'; return result
+    except urllib.error.HTTPError:
+        result['diagnostics']['boundary'] = 'HTTP_READ'
+        result['failure_class'] = 'HTTP_READ_FAILED'; return result
+    except urllib.error.URLError as error:
+        result['diagnostics']['boundary'] = 'READ_TIMEOUT' if isinstance(error.reason, socket.timeout) else 'HTTP_READ'
+        result['failure_class'] = 'READ_TIMEOUT' if isinstance(error.reason, socket.timeout) else 'HTTP_READ_FAILED'; return result
     except ValueError as error:
-        result['failure_class'] = 'OWNERSHIP_NOT_PROVEN' if str(error) == 'ownership' else 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
+        if str(error) == 'ownership':
+            result['failure_class'] = 'OWNERSHIP_NOT_PROVEN'
+        elif str(error) in {'state', 'registry', 'entries'}:
+            result['diagnostics']['boundary'] = 'RESPONSE_SCHEMA'
+            result['failure_class'] = 'RESPONSE_SCHEMA_INVALID'
+        else: result['failure_class'] = 'PRECONDITION_NOT_PROVEN' if str(error) == 'precondition' else 'AMBIGUOUS'
         return result
     except Exception:
         result['failure_class'] = 'AMBIGUOUS'; return result
@@ -12337,9 +12588,16 @@ class PrivateInteractiveSessionBroker:
     def _preflight_owner_refresh_status_trial(
         self, trial_kind: OwnerRefreshTrialKind, *, _capability: object = None
     ) -> OwnerRefreshTrialPreflight:
-        output = self.__execute_refresh_feature_operation(
-            "owner_refresh_preflight", trial_kind=trial_kind, _capability=_capability
-        )
+        try:
+            output = self.__execute_refresh_feature_operation(
+                "owner_refresh_preflight",
+                trial_kind=trial_kind,
+                _capability=_capability,
+            )
+        except (SessionBrokerError, TypeError, ValueError) as error:
+            raise _bounded_dispatch_failure(
+                DispatchFailureStage.RESPONSE_WAIT, error
+            ) from None
         try:
             return self._decode_owner_response(
                 output, _capability, "owner_refresh_preflight"
@@ -16092,6 +16350,39 @@ class RefreshStatusLiveValidationController:
             )
             if not isinstance(result, OwnerRefreshTrialPreflight):
                 raise TypeError
+        except _DispatchFailure as error:
+            boundary = (
+                OwnerRefreshPreflightBoundary.RESPONSE_DECODER
+                if error.stage
+                in {
+                    DispatchFailureStage.RESPONSE_PARSE,
+                    DispatchFailureStage.RESULT_VALIDATION,
+                }
+                else OwnerRefreshPreflightBoundary.CONTROLLER_CONTEXT
+            )
+            result = OwnerRefreshTrialPreflight(
+                False,
+                trial_kind,
+                0,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                OwnerRefreshFailureClass.CONTEXT_FAILURE,
+                self.target_bound,
+                False,
+                OwnerRefreshPreflightDiagnostics(
+                    boundary,
+                    *(0 for _ in range(13)),
+                    *(OwnerRefreshPreflightCheck.NOT_EVALUATED for _ in range(6)),
+                    error.stage,
+                    error.failure_class,
+                    error.remote_failure_scope,
+                    error.remote_failure_reason,
+                ),
+            )
         except (SessionBrokerError, TypeError, ValueError):
             result = OwnerRefreshTrialPreflight(
                 False,
@@ -16106,6 +16397,11 @@ class RefreshStatusLiveValidationController:
                 OwnerRefreshFailureClass.AMBIGUOUS,
                 self.target_bound,
                 False,
+                OwnerRefreshPreflightDiagnostics(
+                    OwnerRefreshPreflightBoundary.CONTROLLER_CONTEXT,
+                    *(0 for _ in range(13)),
+                    *(OwnerRefreshPreflightCheck.NOT_EVALUATED for _ in range(6)),
+                ),
             )
         return result
 
@@ -17270,6 +17566,229 @@ class RefreshStatusLiveValidationController:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class OwnerRefreshPreflightRunOutcome(StrEnum):
+    """Terminal state of the bounded read-only preflight runner."""
+
+    READY = "READY"
+    BLOCKED = "BLOCKED"
+    WAIT_DEADLINE = "WAIT_DEADLINE"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerRefreshPreflightRunReport:
+    """Durable sanitized evidence saved before any later lifecycle action."""
+
+    original_preflight_reason: str
+    observations: tuple[OwnerRefreshTrialPreflight, ...]
+    first_decisive_failure: OwnerRefreshFailureClass | None
+    final_outcome: OwnerRefreshPreflightRunOutcome
+    transitioned_to_ready: bool
+
+
+_OWNER_PREFLIGHT_REPORT_NAME = "r66-owner-preflight-report.json"
+_MAX_OWNER_PREFLIGHT_REPORT_BYTES = 64 * 1024
+
+
+def _owner_preflight_report_payload(
+    report: OwnerRefreshPreflightRunReport,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "original_preflight_reason": report.original_preflight_reason,
+        "observations": [asdict(item) for item in report.observations],
+        "first_decisive_failure": report.first_decisive_failure,
+        "final_outcome": report.final_outcome,
+        "transitioned_to_ready": report.transitioned_to_ready,
+    }
+
+
+def _write_owner_preflight_report(report: OwnerRefreshPreflightRunReport) -> None:
+    """Atomically save the ordinary identifier-free report at one fixed path."""
+    root = _fixed_lifecycle_state_root()
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise OSError
+        payload = json.dumps(
+            _owner_preflight_report_payload(report),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        if len(payload) > _MAX_OWNER_PREFLIGHT_REPORT_BYTES:
+            raise OSError
+        temporary = root / f".{_OWNER_PREFLIGHT_REPORT_NAME}-{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, root / _OWNER_PREFLIGHT_REPORT_NAME)
+        root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+    except OSError:
+        raise LifecycleControllerError("OWNER_PREFLIGHT_REPORT_INVALID") from None
+    finally:
+        try:
+            temporary.unlink()
+        except (FileNotFoundError, UnboundLocalError):
+            pass
+
+
+def read_owner_preflight_report() -> OwnerRefreshPreflightRunReport:
+    """Strictly reread the saved report; this is the runner's durability gate."""
+    path = _fixed_lifecycle_state_root() / _OWNER_PREFLIGHT_REPORT_NAME
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > _MAX_OWNER_PREFLIGHT_REPORT_BYTES
+        ):
+            raise OSError
+        value = json.loads(path.read_bytes().decode("ascii"))
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "original_preflight_reason",
+            "observations",
+            "first_decisive_failure",
+            "final_outcome",
+            "transitioned_to_ready",
+        }:
+            raise ValueError
+        original = value["original_preflight_reason"]
+        observations = value["observations"]
+        if (
+            value["schema_version"] != 1
+            or original != "NOT_RETAINED"
+            or not isinstance(observations, list)
+            or not 1 <= len(observations) <= 16
+            or type(value["transitioned_to_ready"]) is not bool
+        ):
+            raise ValueError
+        return OwnerRefreshPreflightRunReport(
+            original,
+            tuple(
+                _parse_owner_refresh_trial_preflight_payload(item)
+                for item in observations
+            ),
+            (
+                None
+                if value["first_decisive_failure"] is None
+                else OwnerRefreshFailureClass(value["first_decisive_failure"])
+            ),
+            OwnerRefreshPreflightRunOutcome(value["final_outcome"]),
+            value["transitioned_to_ready"],
+        )
+    except (OSError, UnicodeError, TypeError, ValueError):
+        raise LifecycleControllerError("OWNER_PREFLIGHT_REPORT_INVALID") from None
+
+
+def run_bounded_owner_refresh_preflight(
+    controller: RefreshStatusLiveValidationController,
+    trial_kind: OwnerRefreshTrialKind,
+    *,
+    max_snapshots: int = 12,
+    wait_allowance_seconds: int = 15,
+    poll_seconds: int = 15,
+    _clock: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> OwnerRefreshPreflightRunReport:
+    """Preflight, persist, and only wait for an already-connected COLD target."""
+    if (
+        type(max_snapshots) is not int
+        or not 2 <= max_snapshots <= 16
+        or type(wait_allowance_seconds) is not int
+        or not 0 <= wait_allowance_seconds <= 60
+        or type(poll_seconds) is not int
+        or not 5 <= poll_seconds <= 60
+    ):
+        raise LifecycleControllerError("OWNER_PREFLIGHT_RUN_INVALID") from None
+
+    observations: list[OwnerRefreshTrialPreflight] = []
+    first_failure: OwnerRefreshFailureClass | None = None
+
+    def save(
+        result: OwnerRefreshTrialPreflight, outcome: OwnerRefreshPreflightRunOutcome
+    ) -> OwnerRefreshPreflightRunReport:
+        nonlocal first_failure
+        observations.append(result)
+        if first_failure is None and result.failure_class is not None:
+            first_failure = result.failure_class
+        report = OwnerRefreshPreflightRunReport(
+            "NOT_RETAINED",
+            tuple(observations),
+            first_failure,
+            outcome,
+            observations[0].ready is False and result.ready,
+        )
+        _write_owner_preflight_report(report)
+        return read_owner_preflight_report()
+
+    result = controller.preflight_owner_refresh_trial(trial_kind)
+    report = save(
+        result,
+        (
+            OwnerRefreshPreflightRunOutcome.READY
+            if result.ready
+            else OwnerRefreshPreflightRunOutcome.BLOCKED
+        ),
+    )
+    diagnostic = result.diagnostics
+    if (
+        result.ready
+        or trial_kind is not OwnerRefreshTrialKind.COLD
+        or result.failure_class is not OwnerRefreshFailureClass.WAITING_FOR_IDLE
+        or diagnostic is None
+    ):
+        return report
+
+    deadline_seconds = min(
+        180, diagnostic.max_valid_hold_seconds + wait_allowance_seconds
+    )
+    deadline = _clock() + deadline_seconds
+    while len(observations) < max_snapshots and _clock() < deadline:
+        _sleep(min(poll_seconds, max(0, deadline - _clock())))
+        result = controller.preflight_owner_refresh_trial(trial_kind)
+        outcome = (
+            OwnerRefreshPreflightRunOutcome.READY
+            if result.ready
+            else (
+                OwnerRefreshPreflightRunOutcome.WAIT_DEADLINE
+                if len(observations) + 1 >= max_snapshots or _clock() >= deadline
+                else OwnerRefreshPreflightRunOutcome.BLOCKED
+            )
+        )
+        report = save(result, outcome)
+        if (
+            result.ready
+            or result.failure_class is not OwnerRefreshFailureClass.WAITING_FOR_IDLE
+        ):
+            return report
+    return report
 
 
 def _private_spec_from_stream(stream: TextIO) -> dict[str, object]:
