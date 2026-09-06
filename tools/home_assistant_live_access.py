@@ -1459,6 +1459,16 @@ class OwnerRefreshFailureClass(StrEnum):
     CONTEXT_FAILURE = "CONTEXT_FAILURE"
     LOGGER_CONTROL_UNAVAILABLE = "LOGGER_CONTROL_UNAVAILABLE"
     LOG_BOUNDARY_NOT_ESTABLISHED = "LOG_BOUNDARY_NOT_ESTABLISHED"
+    WEBSOCKET_OBSERVATION_FAILED = "WEBSOCKET_OBSERVATION_FAILED"
+    LOG_READ_TIMEOUT = "LOG_READ_TIMEOUT"
+    LOG_STREAM_EOF = "LOG_STREAM_EOF"
+    LOG_QUEUE_OVERFLOW = "LOG_QUEUE_OVERFLOW"
+    LOG_READ_FAILED = "LOG_READ_FAILED"
+    END_MARKER_FAILED = "END_MARKER_FAILED"
+    READER_SHUTDOWN_FAILED = "READER_SHUTDOWN_FAILED"
+    LOGGER_RESET_FAILED = "LOGGER_RESET_FAILED"
+    RESULT_COLLECTION_FAILED = "RESULT_COLLECTION_FAILED"
+    LOCAL_DECODING_FAILED = "LOCAL_DECODING_FAILED"
     OWNER_PRESS_NOT_OBSERVED = "OWNER_PRESS_NOT_OBSERVED"
     OVERLAPPING_REFRESH = "OVERLAPPING_REFRESH"
     PROVENANCE_MISMATCH = "PROVENANCE_MISMATCH"
@@ -1595,6 +1605,10 @@ class OwnerRefreshTrialResult:
     hold_active_after_refresh: bool | None
     ambiguous: bool
     failure_class: OwnerRefreshFailureClass | None
+    owner_wait_completed: bool = False
+    observation_failure_class: OwnerRefreshFailureClass | None = None
+    worker_cleanup_complete: bool = False
+    cleanup_failure_class: OwnerRefreshFailureClass | None = None
 
     @property
     def zero_write(self) -> bool:
@@ -4292,10 +4306,24 @@ def _owner_refresh_trial_record(
         "failure_class": (
             None if result.failure_class is None else result.failure_class.value
         ),
+        "owner_wait_completed": result.owner_wait_completed,
+        "observation_failure_class": (
+            None
+            if result.observation_failure_class is None
+            else result.observation_failure_class.value
+        ),
+        "worker_cleanup_complete": result.worker_cleanup_complete,
+        "cleanup_failure_class": (
+            None
+            if result.cleanup_failure_class is None
+            else result.cleanup_failure_class.value
+        ),
     }
 
 
-def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult:
+def _parse_owner_refresh_trial_payload(
+    value: object, *, allow_legacy_completion: bool = False
+) -> OwnerRefreshTrialResult:
     """Strictly decode one bounded owner-operated Refresh result."""
     fields = {
         "trial_kind",
@@ -4310,9 +4338,23 @@ def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult
         "hold_active_after_refresh",
         "ambiguous",
         "failure_class",
+        "owner_wait_completed",
+        "observation_failure_class",
+        "worker_cleanup_complete",
+        "cleanup_failure_class",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    legacy_fields = fields - {
+        "owner_wait_completed",
+        "observation_failure_class",
+        "worker_cleanup_complete",
+        "cleanup_failure_class",
+    }
+    if not isinstance(value, dict) or (
+        set(value) != fields
+        and (not allow_legacy_completion or set(value) != legacy_fields)
+    ):
         raise ValueError("owner_refresh_trial")
+    legacy_completion = set(value) == legacy_fields
 
     def optional_bool(name: str) -> bool | None:
         item = value[name]
@@ -4378,6 +4420,16 @@ def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult
             if value["failure_class"] is None
             else OwnerRefreshFailureClass(value["failure_class"])
         )
+        observation_failure = (
+            None
+            if legacy_completion or value["observation_failure_class"] is None
+            else OwnerRefreshFailureClass(value["observation_failure_class"])
+        )
+        cleanup_failure = (
+            None
+            if legacy_completion or value["cleanup_failure_class"] is None
+            else OwnerRefreshFailureClass(value["cleanup_failure_class"])
+        )
         result = OwnerRefreshTrialResult(
             OwnerRefreshTrialKind(value["trial_kind"]),
             _bool(value["owner_press_observed"]),
@@ -4391,6 +4443,10 @@ def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult
             optional_bool("hold_active_after_refresh"),
             _bool(value["ambiguous"]),
             failure,
+            False if legacy_completion else _bool(value["owner_wait_completed"]),
+            observation_failure,
+            False if legacy_completion else _bool(value["worker_cleanup_complete"]),
+            cleanup_failure,
         )
     except (TypeError, ValueError):
         raise ValueError("owner_refresh_trial") from None
@@ -4420,6 +4476,16 @@ def _parse_owner_refresh_trial_payload(value: object) -> OwnerRefreshTrialResult
             or result.hold_active_after_refresh is not True
             or result.ambiguous
         )
+        or result.observation_failure_class is not None
+        and result.failure_class
+        not in {
+            result.observation_failure_class,
+            OwnerRefreshFailureClass.OWNER_PRESS_NOT_OBSERVED,
+        }
+        or result.cleanup_failure_class is not None
+        and not result.ambiguous
+        or result.worker_cleanup_complete
+        and result.cleanup_failure_class is not None
     ):
         raise ValueError("owner_refresh_trial")
     return result
@@ -4808,7 +4874,10 @@ def _parse_hardware_observation(value: object) -> DurableHardwareObservation:
         or len(releases_value) > len(_R66_RELEASE_AFTER_TRIAL_COUNTS)
     ):
         raise ValueError("hardware_observation")
-    trials = tuple(_parse_owner_refresh_trial_payload(item) for item in trials_value)
+    trials = tuple(
+        _parse_owner_refresh_trial_payload(item, allow_legacy_completion=True)
+        for item in trials_value
+    )
     releases = tuple(
         _parse_owner_refresh_release_payload(item) for item in releases_value
     )
@@ -10325,7 +10394,20 @@ LOGGER = 'custom_components.tuya_ble.tuya_ble.tuya_ble'
 BOUNDARY_LOGGER = 'ha_tuya_ble.r65_validation_boundary'
 OWNER_WAIT_SECONDS = 60
 WORKER_READY_SECONDS = 45
-COLLECT_WAIT_SECONDS = 95
+REFRESH_TERMINAL_WAIT_SECONDS = 30
+LOG_MARKER_WAIT_SECONDS = 10
+WEBSOCKET_COMMAND_WAIT_SECONDS = 15
+READER_SHUTDOWN_WAIT_SECONDS = 2
+RESULT_PUBLICATION_GRACE_SECONDS = 8
+LOG_STREAM_IDLE_SECONDS = (
+    OWNER_WAIT_SECONDS + REFRESH_TERMINAL_WAIT_SECONDS
+    + WEBSOCKET_COMMAND_WAIT_SECONDS + LOG_MARKER_WAIT_SECONDS
+)
+COLLECT_WAIT_SECONDS = (
+    OWNER_WAIT_SECONDS + REFRESH_TERMINAL_WAIT_SECONDS
+    + LOG_MARKER_WAIT_SECONDS + (2 * WEBSOCKET_COMMAND_WAIT_SECONDS)
+    + READER_SHUTDOWN_WAIT_SECONDS + RESULT_PUBLICATION_GRACE_SECONDS
+)
 WORKER_POLL_SECONDS = 0.05
 EMPTY_COUNTS = {'device_info': 0, 'pair': 0, 'device_status': 0, 'datapoint': 0, 'other': 0}
 EMPTY_PRESS = {
@@ -10463,9 +10545,17 @@ class LogStream:
             'http://supervisor/core/logs/follow?lines=1&no_colors',
             headers={**headers(), 'Accept': 'text/plain'},
         )
-        self.response = urllib.request.urlopen(request, timeout=30)
+        self.response = urllib.request.urlopen(
+            request, timeout=LOG_STREAM_IDLE_SECONDS
+        )
+        raw = getattr(getattr(self.response, 'fp', None), 'raw', None)
+        self.transport_socket = getattr(raw, '_sock', None)
+        if not isinstance(self.transport_socket, socket.socket):
+            self.response.close()
+            raise ValueError('log_transport')
         self.lines = queue.Queue(maxsize=512)
         self.overflow = False
+        self.failure = None
         self.closed = False
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
@@ -10475,29 +10565,36 @@ class LogStream:
             while not self.closed:
                 line = self.response.readline(4097)
                 if not line:
+                    if not self.closed: self.failure = 'log_stream_eof'
                     break
                 if len(line) > 4096:
-                    self.overflow = True; break
+                    self.failure = 'log_read_failed'; break
                 try: self.lines.put_nowait(line.decode('utf-8', 'replace'))
-                except queue.Full: self.overflow = True; break
+                except queue.Full:
+                    self.overflow = True
+                    self.failure = 'log_queue_overflow'; break
+        except socket.timeout:
+            if not self.closed: self.failure = 'log_read_timeout'
         except Exception:
-            if not self.closed: self.overflow = True
+            if not self.closed: self.failure = 'log_read_failed'
+
+    def raise_if_failed(self):
+        if self.failure is not None:
+            raise ValueError(self.failure)
 
     def take_available(self):
         result = []
         while True:
             try: result.append(self.lines.get_nowait())
             except queue.Empty: break
-        if self.overflow:
-            raise ValueError('log_overflow')
+        self.raise_if_failed()
         return result
 
     def until_marker(self, marker):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + LOG_MARKER_WAIT_SECONDS
         result = []
         while time.monotonic() < deadline:
-            if self.overflow:
-                raise ValueError('log_overflow')
+            self.raise_if_failed()
             try:
                 line = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
             except queue.Empty:
@@ -10509,9 +10606,12 @@ class LogStream:
 
     def close(self):
         self.closed = True
+        try: self.transport_socket.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
         try: self.response.close()
         except Exception: pass
-        self.thread.join(timeout=1)
+        self.thread.join(timeout=READER_SHUTDOWN_WAIT_SECONDS)
+        return not self.thread.is_alive()
 
 def marker_line(raw, marker):
     raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
@@ -10553,14 +10653,15 @@ class LogWindow:
             raise LogBoundaryNotEstablished() from None
         self.established = True
 
-    def wait_for_refresh_terminal(self, timeout_seconds=30):
+    def wait_for_refresh_terminal(
+        self, timeout_seconds=REFRESH_TERMINAL_WAIT_SECONDS
+    ):
         if not self.established or self.finish_attempted:
             raise ValueError('log_window')
         deadline = time.monotonic() + timeout_seconds
         refresh_identity = None
         while time.monotonic() < deadline:
-            if self.stream.overflow:
-                raise ValueError('log_overflow')
+            self.stream.raise_if_failed()
             try:
                 line = self.stream.lines.get(
                     timeout=max(0.01, deadline - time.monotonic())
@@ -10984,7 +11085,21 @@ def empty_owner_trial(kind):
         'retained_confirmation_observed': False,
         'hold_active_after_refresh': None, 'ambiguous': False,
         'failure_class': None,
+        'owner_wait_completed': False,
+        'observation_failure_class': None,
+        'worker_cleanup_complete': False,
+        'cleanup_failure_class': None,
     }
+
+def owner_observation_failure(error, *, finishing=False):
+    reason = str(error)
+    if reason == 'log_read_timeout': return 'LOG_READ_TIMEOUT'
+    if reason == 'log_stream_eof': return 'LOG_STREAM_EOF'
+    if reason == 'log_queue_overflow': return 'LOG_QUEUE_OVERFLOW'
+    if reason in {'log_read_failed', 'refresh_terminal'}: return 'LOG_READ_FAILED'
+    if finishing or reason in {'log_marker', 'log_window'}:
+        return 'END_MARKER_FAILED'
+    return 'WEBSOCKET_OBSERVATION_FAILED'
 
 def empty_owner_preflight(kind):
     checks = {
@@ -11251,9 +11366,19 @@ def read_armed_owner_state(arm_id):
     return value
 
 def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, selected, before):
-    chosen = wait_for_owner_target(
-        ws, candidates, selected, kind, OWNER_WAIT_SECONDS
-    )
+    try:
+        chosen = wait_for_owner_target(
+            ws, candidates, selected, kind, OWNER_WAIT_SECONDS
+        )
+        result['owner_wait_completed'] = True
+        stream.raise_if_failed()
+    except ValueError as error:
+        if str(error) in {'ownership', 'precondition'}: raise
+        failure = owner_observation_failure(error)
+        result['observation_failure_class'] = failure
+        result['failure_class'] = failure
+        result['ambiguous'] = True
+        return result
     if chosen is None:
         result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
     result['owner_press_observed'] = True
@@ -11262,7 +11387,7 @@ def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, sel
     last_id = chosen['last']; dp_entities = chosen['dp']
     before_last, before_dp = before[chosen['fingerprint']]
     try:
-        window.wait_for_refresh_terminal(30)
+        window.wait_for_refresh_terminal(REFRESH_TERMINAL_WAIT_SECONDS)
         lines = window.finish()
         reject_overlapping_owner_calls(ws, candidates)
         _identity, counts, _events, provenance, completed, rows = parse_owner_refresh_lifecycle(lines)
@@ -11348,19 +11473,31 @@ def run_armed_owner_worker(kind, arm_id):
             child_result['ambiguous'] = True; child_result['failure_class'] = 'AMBIGUOUS'
         finally:
             if window is not None and window.established and not window.finish_attempted:
-                try: window.finish()
-                except Exception:
+                try:
+                    window.finish()
+                except Exception as error:
+                    failure = owner_observation_failure(error, finishing=True)
+                    child_result['observation_failure_class'] = failure
                     child_result['ambiguous'] = True
                     if child_result['failure_class'] is None:
-                        child_result['failure_class'] = 'AMBIGUOUS'
-            if stream is not None: stream.close()
+                        child_result['failure_class'] = failure
+            if stream is not None and stream.close() is False:
+                child_result['cleanup_failure_class'] = 'READER_SHUTDOWN_FAILED'
+                child_result['ambiguous'] = True
+                if child_result['failure_class'] is None:
+                    child_result['failure_class'] = 'READER_SHUTDOWN_FAILED'
             if prior_level is not None:
                 try: ws.command('logger/integration_log_level', integration='tuya_ble', level=prior_level, persistence='none')
                 except Exception:
+                    if child_result['cleanup_failure_class'] is None:
+                        child_result['cleanup_failure_class'] = 'LOGGER_RESET_FAILED'
                     child_result['ambiguous'] = True
                     if child_result['failure_class'] is None:
-                        child_result['failure_class'] = 'AMBIGUOUS'
+                        child_result['failure_class'] = 'LOGGER_RESET_FAILED'
             ws.close()
+            child_result['worker_cleanup_complete'] = (
+                child_result['cleanup_failure_class'] is None
+            )
         write_armed_owner_state(arm_id, {
             'state': 'RESULT', 'arm_result': result, 'result': child_result,
             'private_context': R66_CONTEXT,
@@ -12724,14 +12861,7 @@ class PrivateInteractiveSessionBroker:
             armed_observer_id=armed_observer_id,
             _capability=_capability,
         )
-        try:
-            return self._decode_owner_response(
-                output, _capability, "owner_refresh_collect"
-            )
-        except (SessionBrokerError, TypeError, ValueError) as error:
-            raise _bounded_dispatch_failure(
-                DispatchFailureStage.RESPONSE_PARSE, error
-            ) from None
+        return self._decode_owner_response(output, _capability, "owner_refresh_collect")
 
     def _observe_owner_refresh_status_trial(
         self,
@@ -16501,6 +16631,32 @@ class RefreshStatusLiveValidationController:
                 or result.trial_kind is not trial_kind
             ):
                 raise TypeError
+        except _DispatchFailure as error:
+            failure_class = {
+                DispatchFailureStage.RESPONSE_WAIT: (
+                    OwnerRefreshFailureClass.RESULT_COLLECTION_FAILED
+                ),
+                DispatchFailureStage.RESPONSE_PARSE: (
+                    OwnerRefreshFailureClass.LOCAL_DECODING_FAILED
+                ),
+                DispatchFailureStage.RESULT_VALIDATION: (
+                    OwnerRefreshFailureClass.CONTEXT_FAILURE
+                ),
+            }.get(error.stage, OwnerRefreshFailureClass.RESULT_COLLECTION_FAILED)
+            result = OwnerRefreshTrialResult(
+                trial_kind,
+                False,
+                False,
+                None,
+                RefreshPacketCounts(0, 0, 0, 0, 0),
+                (),
+                (),
+                None,
+                False,
+                None,
+                True,
+                failure_class,
+            )
         except (SessionBrokerError, TypeError, ValueError):
             result = OwnerRefreshTrialResult(
                 trial_kind,

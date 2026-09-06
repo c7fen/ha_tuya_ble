@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 import traceback
+import types
+import urllib.request
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, asdict, replace
@@ -11929,6 +11931,11 @@ def _r65_log_boundary() -> dict[str, object]:
     tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
     names = {
         "BOUNDARY_LOGGER",
+        "LOG_MARKER_WAIT_SECONDS",
+        "LOG_STREAM_IDLE_SECONDS",
+        "OWNER_WAIT_SECONDS",
+        "READER_SHUTDOWN_WAIT_SECONDS",
+        "REFRESH_TERMINAL_WAIT_SECONDS",
         "LOG_RE",
         "REFRESH_TERMINAL_RE",
         "LogStream",
@@ -11966,6 +11973,8 @@ def _r65b_stream(boundary: dict[str, object]) -> object:
     stream = boundary["LogStream"].__new__(boundary["LogStream"])
     stream.lines = __import__("queue").Queue(maxsize=512)
     stream.overflow = False
+    stream.failure = None
+    stream.closed = False
     return stream
 
 
@@ -14527,6 +14536,58 @@ def test_r66d_owner_press_between_arm_and_collect_is_one_existing_observation(
     controller.close()
 
 
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        (
+            access.DispatchFailureStage.RESPONSE_WAIT,
+            access.OwnerRefreshFailureClass.RESULT_COLLECTION_FAILED,
+        ),
+        (
+            access.DispatchFailureStage.RESPONSE_PARSE,
+            access.OwnerRefreshFailureClass.LOCAL_DECODING_FAILED,
+        ),
+        (
+            access.DispatchFailureStage.RESULT_VALIDATION,
+            access.OwnerRefreshFailureClass.CONTEXT_FAILURE,
+        ),
+    ],
+)
+def test_r66j_collect_delivery_failures_remain_distinct(
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
+    stage: access.DispatchFailureStage,
+    expected: access.OwnerRefreshFailureClass,
+) -> None:
+    """F: collection, decoding, and context rejection are not clean no-press."""
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    assert controller.preflight_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).ready
+    assert controller.arm_owner_refresh_trial(
+        access.OwnerRefreshTrialKind.COLD
+    ).observer_armed
+
+    def fail_collect(
+        _armed_observer_id: str, *, _capability: object = None
+    ) -> access.OwnerRefreshTrialResult:
+        broker._consume_feature_capability(
+            _capability, access.FeatureValidationAction.HARDWARE_OBSERVATION
+        )
+        raise access._DispatchFailure(stage, access.DispatchFailureClass.FRAMING)
+
+    broker._collect_owner_refresh_status_trial = fail_collect
+    result = controller.collect_owner_refresh_trial()
+
+    assert result.failure_class is expected
+    assert result.ambiguous is True
+    assert result.owner_wait_completed is False
+    assert result.worker_cleanup_complete is False
+    assert result.counts == access.RefreshPacketCounts(0, 0, 0, 0, 0)
+    assert controller.hardware_observation.trials == (result,)
+    controller.close()
+
+
 def test_r66d_arm_establishes_the_listener_and_collect_never_recreates_it() -> None:
     tree = ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM)
     arm = next(
@@ -14852,6 +14913,10 @@ def test_r66a_o5_to_o13_trial_parser_preserves_provenance_and_timeout() -> None:
         "hold_active_after_refresh": True,
         "ambiguous": False,
         "failure_class": "PROVENANCE_MISMATCH",
+        "owner_wait_completed": True,
+        "observation_failure_class": None,
+        "worker_cleanup_complete": True,
+        "cleanup_failure_class": None,
     }
     result = access._parse_owner_refresh_trial_result(
         json.dumps(payload).encode("ascii")
@@ -15376,11 +15441,79 @@ def _r66c_observe(
     return ns["observe_owner_trial"](kind)
 
 
+@contextmanager
+def _r66j_real_log_stream_server() -> (
+    Generator[tuple[str, object, object, threading.Event]]
+):
+    """Serve one real quiet chunked log stream plus a bounded line publisher."""
+    pytest_socket.enable_socket()
+    lines: queue.Queue[bytes | None] = queue.Queue()
+    connected = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            assert self.path == "/stream"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            connected.set()
+            try:
+                while (line := lines.get()) is not None:
+                    self.wfile.write(f"{len(line):X}\r\n".encode("ascii"))
+                    self.wfile.write(line + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def do_POST(self) -> None:
+            assert self.path == "/publish"
+            length = int(self.headers.get("Content-Length", "0"))
+            line = self.rfile.read(length)
+            assert 0 < len(line) <= 4096
+            lines.put(line + b"\n")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def publish(line: str) -> None:
+        request = urllib.request.Request(
+            base + "/publish", data=line.rstrip("\r\n").encode("utf-8"), method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            assert response.status == 204
+
+    def end_stream() -> None:
+        lines.put(None)
+
+    try:
+        yield base + "/stream", publish, end_stream, connected
+    finally:
+        lines.put(None)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
 def _r66i_worker_boundary(
     tmp_path: Path, kind: str, *, cleanup_failure: str | None = None
 ) -> tuple[dict[str, object], str, Path, Path, Path, Path]:
     """Build a device-impossible endpoint around the real forked worker path."""
     ns = _r66c_installation(1)
+    ns["_production_log_stream"] = ns["LogStream"]
     states = ns["_synthetic_states"]
     trigger = tmp_path / f"{kind.lower()}-owner-event"
     listener_ready = tmp_path / f"{kind.lower()}-listener-ready"
@@ -15456,7 +15589,7 @@ def _r66i_worker_boundary(
                 ] = "synthetic-after"
                 states["sensor.synthetic_1_battery"]["state"] = "synthetic-after"
                 for line in lines:
-                    current_stream["value"].source.put(line)
+                    ns["_synthetic_publish_log"](line)
 
             threading.Thread(target=publish_lifecycle, daemon=True).start()
             return _r66c_owner_event(entity)
@@ -15475,7 +15608,7 @@ def _r66i_worker_boundary(
                 marker = kwargs["service_data"]["message"]
                 if cleanup_failure == "window" and "_END_" in marker:
                     raise ValueError("synthetic window cleanup")
-                current_stream["value"].source.put(
+                ns["_synthetic_publish_log"](
                     "2026 [ha_tuya_ble.r65_validation_boundary] " + marker + "\n"
                 )
                 return None
@@ -15489,8 +15622,10 @@ def _r66i_worker_boundary(
             self.source: queue.Queue[str | None] = queue.Queue()
             self.lines: queue.Queue[str] = queue.Queue(maxsize=512)
             self.overflow = False
+            self.failure = None
             self.closed = False
             current_stream["value"] = self
+            ns["_synthetic_publish_log"] = self.source.put
             self.thread = threading.Thread(target=self._read, daemon=True)
             self.thread.start()
             listener_ready.touch()
@@ -15510,6 +15645,10 @@ def _r66i_worker_boundary(
                 except queue.Empty:
                     return result
 
+        def raise_if_failed(self) -> None:
+            if self.failure is not None:
+                raise ValueError(self.failure)
+
         def until_marker(self, marker: str) -> list[str]:
             result = []
             deadline = time.monotonic() + 2
@@ -15520,11 +15659,12 @@ def _r66i_worker_boundary(
                 result.append(line)
             raise ValueError("log_marker")
 
-        def close(self) -> None:
+        def close(self) -> bool:
             self.closed = True
             self.source.put(None)
             self.thread.join(timeout=1)
             stream_closed.touch()
+            return not self.thread.is_alive()
 
     ns.update(OwnerWebSocket=WorkerWebSocket, LogStream=WorkerLogStream)
     ns["OWNER_WAIT_SECONDS"] = 1
@@ -15533,6 +15673,30 @@ def _r66i_worker_boundary(
     ns["WORKER_POLL_SECONDS"] = 0.01
     arm_id = hashlib.sha256(f"{tmp_path}-{kind}".encode()).hexdigest()
     return ns, arm_id, trigger, listener_ready, stream_closed, websocket_closed
+
+
+def _r66j_use_real_log_stream(
+    ns: dict[str, object], stream_url: str, publish: object
+) -> None:
+    """Replace only the synthetic stream seam with the production HTTP reader."""
+    real_urlopen = urllib.request.urlopen
+
+    def open_stream(_request: object, *, timeout: float) -> object:
+        return real_urlopen(stream_url, timeout=timeout)
+
+    ns["urllib"] = types.SimpleNamespace(
+        request=types.SimpleNamespace(
+            Request=urllib.request.Request,
+            urlopen=open_stream,
+        )
+    )
+    ns["headers"] = lambda: {}
+    ns["LogStream"] = ns["_production_log_stream"]
+    ns["_synthetic_publish_log"] = publish
+    ns["OWNER_WAIT_SECONDS"] = 60
+    ns["WORKER_READY_SECONDS"] = 45
+    ns["COLLECT_WAIT_SECONDS"] = 140
+    ns["WORKER_POLL_SECONDS"] = 0.05
 
 
 def test_r66i_real_worker_captures_post_arm_cold_and_retained_events(
@@ -15645,7 +15809,233 @@ def test_r66i_cleanup_failure_preserves_first_specific_worker_result(
     result, _context = ns["collect_armed_owner_trial"](arm_id)
     assert result["failure_class"] == "OWNER_PRESS_NOT_OBSERVED"
     assert result["ambiguous"] is True
+    if cleanup_failure == "window":
+        assert result["observation_failure_class"] == "END_MARKER_FAILED"
+        assert result["cleanup_failure_class"] is None
+        assert result["worker_cleanup_complete"] is True
+    else:
+        assert result["observation_failure_class"] is None
+        assert result["cleanup_failure_class"] == "LOGGER_RESET_FAILED"
+        assert result["worker_cleanup_complete"] is False
     assert stream_closed.exists() and websocket_closed.exists()
+
+
+@pytest.mark.timeout(75)
+def test_r66j_parent_idle_reproduces_reader_timeout_inside_full_owner_wait(
+    tmp_path: Path,
+) -> None:
+    """A: the former real 30s reader timeout expires inside the real 60s wait."""
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        _end_stream,
+        connected,
+    ):
+        ns, _arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+            _r66i_worker_boundary(tmp_path, "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        ns["LOG_STREAM_IDLE_SECONDS"] = 30
+        ws = ns["OwnerWebSocket"]()
+        candidates = ns["resolve_owner_refresh_target"](ws)
+        selected = ns["owner_candidates_for_trial"](candidates, "COLD")
+        stream = ns["LogStream"]()
+        window = ns["LogWindow"](stream, ws)
+        window.start()
+        assert connected.is_set()
+        started = time.monotonic()
+        assert (
+            ns["wait_for_owner_target"](
+                ws, candidates, selected, "COLD", ns["OWNER_WAIT_SECONDS"]
+            )
+            is None
+        )
+        assert time.monotonic() - started >= 59
+        with pytest.raises(ValueError, match="log_read_timeout"):
+            stream.raise_if_failed()
+        assert stream.overflow is False
+        assert stream.close() is True
+
+
+@pytest.mark.timeout(75)
+def test_r66j_real_worker_full_duration_no_press_is_clean(
+    tmp_path: Path,
+) -> None:
+    """B/D/F: full owner window, real HTTP reader, cleanup and result decoding."""
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        _end_stream,
+        connected,
+    ):
+        ns, arm_id, _trigger, ready, _stream_closed, websocket_closed = (
+            _r66i_worker_boundary(tmp_path, "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        assert ns["LOG_STREAM_IDLE_SECONDS"] == 115
+        assert ns["COLLECT_WAIT_SECONDS"] == 140
+        assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+        armed = ns["arm_owner_trial"]("COLD", arm_id)
+        assert armed["observer_armed"] is True
+        assert not ready.exists() and connected.is_set()
+        started = time.monotonic()
+        result, context = ns["collect_armed_owner_trial"](arm_id)
+        elapsed = time.monotonic() - started
+        assert 59 <= elapsed < ns["COLLECT_WAIT_SECONDS"]
+        assert result["failure_class"] == "OWNER_PRESS_NOT_OBSERVED"
+        assert result["owner_wait_completed"] is True
+        assert result["observation_failure_class"] is None
+        assert result["worker_cleanup_complete"] is True
+        assert result["cleanup_failure_class"] is None
+        assert result["ambiguous"] is False
+        assert result["owner_press_observed"] is False
+        assert result["counts"] == dict(ns["EMPTY_COUNTS"])
+        assert context["bound"] is None
+        assert websocket_closed.exists()
+        parsed = access._parse_owner_refresh_trial_payload(result)
+        assert (
+            parsed.failure_class
+            is access.OwnerRefreshFailureClass.OWNER_PRESS_NOT_OBSERVED
+        )
+        assert access.owner_refresh_public_json_record(parsed) == result
+
+
+@pytest.mark.timeout(50)
+def test_r66j_real_worker_captures_event_after_old_reader_cutoff(
+    tmp_path: Path,
+) -> None:
+    """C: a post-30s owner event and lifecycle remain visible to the worker."""
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        _end_stream,
+        connected,
+    ):
+        ns, arm_id, trigger, ready, _stream_closed, websocket_closed = (
+            _r66i_worker_boundary(tmp_path, "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+        armed = ns["arm_owner_trial"]("COLD", arm_id)
+        assert armed["observer_armed"] is True
+        assert not ready.exists() and connected.is_set()
+        time.sleep(31)
+        trigger.touch()
+        result, _context = ns["collect_armed_owner_trial"](arm_id)
+        assert result["owner_press_observed"] is True
+        assert result["request_completed"] is True
+        assert result["session_provenance"] == "NEW_SESSION"
+        assert result["owner_wait_completed"] is True
+        assert result["observation_failure_class"] is None
+        assert result["worker_cleanup_complete"] is True
+        assert result["cleanup_failure_class"] is None
+        assert result["ambiguous"] is False
+        assert websocket_closed.exists()
+
+
+def test_r66j_real_idle_reader_shutdown_is_prompt(tmp_path: Path) -> None:
+    """D: explicit transport shutdown interrupts the long idle read promptly."""
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        _end_stream,
+        connected,
+    ):
+        ns, _arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+            _r66i_worker_boundary(tmp_path, "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        stream = ns["LogStream"]()
+        assert connected.wait(2)
+        started = time.monotonic()
+        assert stream.close() is True
+        assert time.monotonic() - started < 2
+        assert stream.failure is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("websocket_frame", "WEBSOCKET_OBSERVATION_FAILED"),
+        ("log_read_timeout", "LOG_READ_TIMEOUT"),
+        ("log_stream_eof", "LOG_STREAM_EOF"),
+        ("log_queue_overflow", "LOG_QUEUE_OVERFLOW"),
+    ],
+)
+def test_r66j_worker_preserves_bounded_observation_failures(
+    tmp_path: Path, failure: str, expected: str
+) -> None:
+    """E: broken event/log channels never become clean no-press evidence."""
+    ns, arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+        _r66i_worker_boundary(tmp_path, "COLD")
+    )
+    if failure == "websocket_frame":
+        base = ns["OwnerWebSocket"]
+
+        class BrokenWebSocket(base):
+            def recv(self) -> object:
+                raise ValueError("websocket_frame")
+
+        ns["OwnerWebSocket"] = BrokenWebSocket
+    else:
+        base = ns["LogStream"]
+
+        class BrokenLogStream(base):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failure = failure
+
+        ns["LogStream"] = BrokenLogStream
+    assert ns["preflight_owner_trial"]("COLD")["ready"] is True
+    assert ns["arm_owner_trial"]("COLD", arm_id)["observer_armed"] is True
+    result, _context = ns["collect_armed_owner_trial"](arm_id)
+    assert result["owner_press_observed"] is False
+    assert result["failure_class"] == expected
+    assert result["observation_failure_class"] == expected
+    assert result["ambiguous"] is True
+    assert result["worker_cleanup_complete"] is True
+
+
+def test_r66j_real_stream_eof_and_queue_overflow_are_distinct(tmp_path: Path) -> None:
+    """E: the production HTTP reader does not collapse EOF into queue overflow."""
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        end_stream,
+        connected,
+    ):
+        ns, _arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+            _r66i_worker_boundary(tmp_path, "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        stream = ns["LogStream"]()
+        assert connected.wait(2)
+        end_stream()
+        stream.thread.join(timeout=2)
+        assert stream.failure == "log_stream_eof"
+        assert stream.overflow is False
+        assert stream.close() is True
+
+    with _r66j_real_log_stream_server() as (
+        stream_url,
+        publish,
+        _end_stream,
+        connected,
+    ):
+        ns, _arm_id, _trigger, _ready, _stream_closed, _websocket_closed = (
+            _r66i_worker_boundary(tmp_path / "overflow", "COLD")
+        )
+        _r66j_use_real_log_stream(ns, stream_url, publish)
+        stream = ns["LogStream"]()
+        assert connected.wait(2)
+        for ordinal in range(520):
+            publish(f"synthetic log line {ordinal}")
+        deadline = time.monotonic() + 3
+        while stream.failure is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert stream.failure == "log_queue_overflow"
+        assert stream.overflow is True
+        assert stream.close() is True
 
 
 def test_r66i_worker_setup_and_decoder_failures_retain_their_boundaries(
@@ -15773,6 +16163,10 @@ def test_r66i_public_runner_records_roundtrip_tuples_enums_and_metadata() -> Non
         True,
         False,
         None,
+        True,
+        None,
+        True,
+        None,
     )
     release = access.OwnerRefreshReleaseResult(True, False, False, None)
 
@@ -15811,6 +16205,26 @@ def test_r66i_public_runner_records_roundtrip_tuples_enums_and_metadata() -> Non
         access._parse_owner_refresh_trial_arm_payload(reconciled_record)
     trial_record = access.owner_refresh_public_json_record(trial)
     assert access._parse_owner_refresh_trial_payload(trial_record) == trial
+    legacy_trial_record = {
+        key: value
+        for key, value in trial_record.items()
+        if key
+        not in {
+            "owner_wait_completed",
+            "observation_failure_class",
+            "worker_cleanup_complete",
+            "cleanup_failure_class",
+        }
+    }
+    with pytest.raises(ValueError, match="owner_refresh_trial"):
+        access._parse_owner_refresh_trial_payload(legacy_trial_record)
+    assert access._parse_owner_refresh_trial_payload(
+        legacy_trial_record, allow_legacy_completion=True
+    ) == replace(
+        trial,
+        owner_wait_completed=False,
+        worker_cleanup_complete=False,
+    )
     release_record = access.owner_refresh_public_json_record(release)
     assert access._parse_owner_refresh_release_payload(release_record) == release
     for record in (
