@@ -17040,6 +17040,116 @@ def test_r66c_m13_m16_private_binding_survives_controller_reconstruction(
     reconstructed.close()
 
 
+@pytest.mark.parametrize("prior", [0, 10, 20, 30, 40, 50])
+@pytest.mark.parametrize("observation_fails", [False, True])
+def test_r66l_release_logger_schema_and_exact_restore(prior, observation_fails):
+    import voluptuous as vol
+    from homeassistant.components.logger.const import LOGSEVERITY
+
+    node = next(
+        n
+        for n in ast.parse(access._REMOTE_REFRESH_STATUS_PROGRAM).body
+        if isinstance(n, ast.FunctionDef) and n.name == "observe_release"
+    )
+    calls, levels, waits = [], [], []
+    connection = {"state": "on"}
+    candidate = {"connection": "binary_sensor.synthetic_release", "hold": 15}
+    schema = vol.Schema(
+        {
+            vol.Required("integration"): "tuya_ble",
+            vol.Required("level"): vol.In(LOGSEVERITY),
+            vol.Required("persistence"): "none",
+        }
+    )
+
+    class Endpoint:
+        def command(self, kind, **fields):
+            calls.append(kind)
+            if kind == "logger/log_info":
+                return [{"domain": "tuya_ble", "level": prior}]
+            if kind == "logger/integration_log_level":
+                levels.append(fields["level"])
+                schema(fields)
+                return None
+            assert kind == "subscribe_events"
+            assert fields == {"event_type": "state_changed"}
+
+        def close(self):
+            pass
+
+    class Window:
+        established = False
+        finish_attempted = False
+
+        def __init__(self, *_):
+            pass
+
+        def start(self):
+            self.established = True
+
+        def finish(self):
+            self.finish_attempted = True
+
+    class Stream:
+        def close(self):
+            pass
+
+    def wait(_ws, entity, expected, timeout):
+        waits.append((entity, expected, timeout))
+        if observation_fails:
+            raise ValueError("synthetic observation failure")
+        connection["state"] = "off"
+        return expected == "off"
+
+    ns = {
+        "OwnerWebSocket": Endpoint,
+        "R66_CONTEXT": {"bound": "synthetic-bound"},
+        "resolve_owner_refresh_target": lambda _: [candidate],
+        "owner_candidates_for_trial": lambda candidates, _: candidates,
+        "owner_candidate_ready": lambda *_: True,
+        "state": lambda _: connection,
+        "LogStream": Stream,
+        "LogWindow": Window,
+        "wait_for_connection_state": wait,
+        "LogBoundaryNotEstablished": type("SyntheticBoundary", (Exception,), {}),
+    }
+    exec(compile(ast.Module([node], type_ignores=[]), "<synthetic-r66l>", "exec"), ns)
+    result = ns["observe_release"]()
+    expected_level = {
+        0: "NOTSET",
+        10: "DEBUG",
+        20: "INFO",
+        30: "WARNING",
+        40: "ERROR",
+        50: "CRITICAL",
+    }[prior]
+    assert levels == ["DEBUG", expected_level]
+    assert LOGSEVERITY[levels[-1]] == prior
+    assert set(calls) <= {
+        "logger/log_info",
+        "logger/integration_log_level",
+        "subscribe_events",
+    }
+    if observation_fails:
+        assert result == {
+            "normal_release_observed": False,
+            "automatic_reconnect_observed": False,
+            "ambiguous": True,
+            "failure_class": "AMBIGUOUS",
+        }
+    else:
+        assert result == {
+            "normal_release_observed": True,
+            "automatic_reconnect_observed": False,
+            "ambiguous": False,
+            "failure_class": None,
+        }
+        assert waits == [
+            (candidate["connection"], "off", 20),
+            (candidate["connection"], "on", 5),
+        ]
+
+
 def test_r66c_m12_release_observes_only_bound_target() -> None:
     ns = _r66c_installation()
     assert ns["preflight_owner_trial"]("COLD")["ready"]
