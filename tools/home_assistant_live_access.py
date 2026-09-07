@@ -1469,6 +1469,8 @@ class OwnerRefreshFailureClass(StrEnum):
     LOGGER_RESET_FAILED = "LOGGER_RESET_FAILED"
     RESULT_COLLECTION_FAILED = "RESULT_COLLECTION_FAILED"
     LOCAL_DECODING_FAILED = "LOCAL_DECODING_FAILED"
+    WORKER_TERMINAL_FAILED = "WORKER_TERMINAL_FAILED"
+    RESULT_ENVELOPE_INVALID = "RESULT_ENVELOPE_INVALID"
     OWNER_PRESS_NOT_OBSERVED = "OWNER_PRESS_NOT_OBSERVED"
     OVERLAPPING_REFRESH = "OVERLAPPING_REFRESH"
     PROVENANCE_MISMATCH = "PROVENANCE_MISMATCH"
@@ -1609,6 +1611,7 @@ class OwnerRefreshTrialResult:
     observation_failure_class: OwnerRefreshFailureClass | None = None
     worker_cleanup_complete: bool = False
     cleanup_failure_class: OwnerRefreshFailureClass | None = None
+    completion_diagnostics: dict[str, object] | None = None
 
     @property
     def zero_write(self) -> bool:
@@ -4318,6 +4321,7 @@ def _owner_refresh_trial_record(
             if result.cleanup_failure_class is None
             else result.cleanup_failure_class.value
         ),
+        "completion_diagnostics": result.completion_diagnostics,
     }
 
 
@@ -4343,6 +4347,12 @@ def _parse_owner_refresh_trial_payload(
         "worker_cleanup_complete",
         "cleanup_failure_class",
     }
+    value = dict(value) if isinstance(value, dict) else value
+    diagnostics = (
+        value.pop("completion_diagnostics", None) if isinstance(value, dict) else None
+    )
+    if diagnostics is not None:
+        diagnostics = _parse_owner_completion_diagnostics(diagnostics)
     legacy_fields = fields - {
         "owner_wait_completed",
         "observation_failure_class",
@@ -4447,6 +4457,7 @@ def _parse_owner_refresh_trial_payload(
             observation_failure,
             False if legacy_completion else _bool(value["worker_cleanup_complete"]),
             cleanup_failure,
+            diagnostics,
         )
     except (TypeError, ValueError):
         raise ValueError("owner_refresh_trial") from None
@@ -4489,6 +4500,39 @@ def _parse_owner_refresh_trial_payload(
     ):
         raise ValueError("owner_refresh_trial")
     return result
+
+
+def _parse_owner_completion_diagnostics(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "worker_state",
+        "delivery",
+        "owner_wait_elapsed_ms",
+        "ping_count",
+    }:
+        raise ValueError("owner_completion")
+    if value["worker_state"] not in {
+        "STARTING",
+        "ARMED",
+        "RESULT",
+        "FAILED",
+        "UNAVAILABLE",
+    }:
+        raise ValueError("owner_completion")
+    if value["delivery"] not in {
+        "COMPLETE",
+        "COLLECTION_TIMEOUT",
+        "WORKER_FAILED",
+        "ENVELOPE_INVALID",
+        "SCHEMA_INVALID",
+        "CONTEXT_REJECTED",
+    }:
+        raise ValueError("owner_completion")
+    for key in ("owner_wait_elapsed_ms", "ping_count"):
+        if value[key] is not None and (
+            type(value[key]) is not int or not 0 <= value[key] <= 1000000
+        ):
+            raise ValueError("owner_completion")
+    return dict(value)
 
 
 def _parse_owner_refresh_trial_preflight_payload(
@@ -10472,13 +10516,20 @@ class WebSocket:
         if first.get('type') != 'auth_ok':
             raise ValueError('websocket_auth')
 
-    def _read(self, size):
+    def _remaining(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise socket.timeout()
+        self.sock.settimeout(remaining)
+
+    def _read(self, size, deadline):
         value = b''
         while len(value) < size:
+            self._remaining(deadline)
             part = self.sock.recv(size - len(value))
             if not part:
                 raise ValueError('websocket_closed')
             value += part
+            self.frame_bytes += len(part)
         return value
 
     def send(self, value):
@@ -10493,22 +10544,47 @@ class WebSocket:
         else:
             head.append(0x80 | 127); head.extend(struct.pack('>Q', length))
         masked = bytes(item ^ mask[index % 4] for index, item in enumerate(data))
-        self.sock.sendall(bytes(head) + mask + masked)
+        try:
+            self.sock.sendall(bytes(head) + mask + masked)
+        except OSError:
+            self.sock.close()
+            raise
 
-    def recv(self):
+    def recv(self, deadline=None):
+        if deadline is None:
+            deadline = getattr(self, 'receive_deadline', None)
+        if deadline is None: deadline = time.monotonic() + 15
+        try:
+            return self._recv_until(deadline)
+        except socket.timeout:
+            if self.frame_bytes:
+                self.sock.close()
+                raise ValueError('websocket_partial_frame') from None
+            raise
+
+    def _recv_until(self, deadline):
+        self.frame_bytes = 0
         while True:
-            first, second = self._read(2)
+            first, second = self._read(2, deadline)
             opcode = first & 0x0f
             length = second & 0x7f
             if length == 126:
-                length = struct.unpack('>H', self._read(2))[0]
+                length = struct.unpack('>H', self._read(2, deadline))[0]
             elif length == 127:
-                length = struct.unpack('>Q', self._read(8))[0]
+                length = struct.unpack('>Q', self._read(8, deadline))[0]
             if length > 2 * 1024 * 1024 or second & 0x80:
                 raise ValueError('websocket_frame')
-            data = self._read(length)
+            data = self._read(length, deadline)
+            self.frame_bytes = 0
+            self._remaining(deadline)
             if opcode == 9:
-                self._send_control(10, data); continue
+                self._send_control(10, data, deadline)
+                self.ping_count = getattr(self, 'ping_count', 0) + 1
+                self.frame_bytes = 0
+                continue
+            if opcode == 10:
+                self.frame_bytes = 0
+                continue
             if opcode != 1:
                 raise ValueError('websocket_frame')
             value = strict_json(data.decode())
@@ -10516,17 +10592,24 @@ class WebSocket:
                 raise ValueError('websocket_shape')
             return value
 
-    def _send_control(self, opcode, data):
+    def _send_control(self, opcode, data, deadline=None):
+        self._remaining(time.monotonic() + 15 if deadline is None else deadline)
         mask = os.urandom(4)
-        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(data)]) + mask + bytes(
-            item ^ mask[index % 4] for index, item in enumerate(data)
-        ))
+        try:
+            self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(data)]) + mask + bytes(
+                item ^ mask[index % 4] for index, item in enumerate(data)
+            ))
+        except OSError as error:
+            self.sock.close()
+            raise ValueError('websocket_send_failed') from None
 
     def command(self, kind, **fields):
+        deadline = time.monotonic() + 15
+        self._remaining(deadline)
         identifier = self.next_id; self.next_id += 1
         self.send({'id': identifier, 'type': kind, **fields})
         while True:
-            value = self.recv()
+            value = self.recv(deadline)
             if value.get('id') != identifier:
                 continue
             if value.get('type') != 'result' or value.get('success') is not True:
@@ -10890,15 +10973,19 @@ class OwnerWebSocket(WebSocket):
         self.pending = []
         super().__init__()
 
-    def recv(self):
+    def recv(self, deadline=None):
+        deadline = deadline if deadline is not None else getattr(self, 'receive_deadline', None)
+        if deadline is not None: self._remaining(deadline)
         if self.pending: return self.pending.pop(0)
-        return super().recv()
+        return super().recv(deadline)
 
     def command(self, kind, **fields):
+        deadline = time.monotonic() + 15
+        self._remaining(deadline)
         identifier = self.next_id; self.next_id += 1
         self.send({'id': identifier, 'type': kind, **fields})
         while True:
-            value = super().recv()
+            value = super().recv(deadline)
             if value.get('type') == 'event':
                 if len(self.pending) >= 256: raise ValueError('event_overflow')
                 self.pending.append(value)
@@ -10911,11 +10998,13 @@ class OwnerWebSocket(WebSocket):
 
 def wait_for_owner_target(ws, candidates, selected, kind, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
+    ws.receive_deadline = deadline
     allowed = {item['fingerprint'] for item in selected}
     while time.monotonic() < deadline:
         ws.sock.settimeout(max(0.01, deadline - time.monotonic()))
         try: value = ws.recv()
         except socket.timeout: break
+        if time.monotonic() >= deadline: break
         matches = [item for item in candidates if item['valid'] and owner_press_event(value, item['button'])]
         if not matches: continue
         if len(matches) != 1 or matches[0]['fingerprint'] not in allowed:
@@ -10923,8 +11012,10 @@ def wait_for_owner_target(ws, candidates, selected, kind, timeout_seconds):
         chosen = matches[0]
         # Admission is re-read at the actual owner event; no stale preflight proof.
         if not owner_candidate_ready(chosen, kind): raise ValueError('precondition')
+        ws.receive_deadline = None
         ws.sock.settimeout(15)
         return chosen
+    ws.receive_deadline = None
     ws.sock.settimeout(15)
     return None
 
@@ -10955,15 +11046,19 @@ def connection_state_event(value, entity_id, expected_state):
 
 def wait_for_connection_state(ws, entity_id, expected_state, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
+    ws.receive_deadline = deadline
     while time.monotonic() < deadline:
         ws.sock.settimeout(max(0.01, deadline - time.monotonic()))
         try:
             value = ws.recv()
         except socket.timeout:
             break
+        if time.monotonic() >= deadline: break
         if connection_state_event(value, entity_id, expected_state):
+            ws.receive_deadline = None
             ws.sock.settimeout(15)
             return True
+    ws.receive_deadline = None
     ws.sock.settimeout(15)
     return False
 
@@ -11089,6 +11184,7 @@ def empty_owner_trial(kind):
         'observation_failure_class': None,
         'worker_cleanup_complete': False,
         'cleanup_failure_class': None,
+        'completion_diagnostics': None,
     }
 
 def owner_observation_failure(error, *, finishing=False):
@@ -11366,6 +11462,11 @@ def read_armed_owner_state(arm_id):
     return value
 
 def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, selected, before):
+    started = time.monotonic()
+    result['completion_diagnostics'] = {
+        'worker_state': 'ARMED', 'delivery': 'COMPLETE',
+        'owner_wait_elapsed_ms': None, 'ping_count': None,
+    }
     try:
         chosen = wait_for_owner_target(
             ws, candidates, selected, kind, OWNER_WAIT_SECONDS
@@ -11380,6 +11481,10 @@ def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, sel
         result['failure_class'] = failure
         result['ambiguous'] = True
         return result
+    finally:
+        result['completion_diagnostics']['owner_wait_elapsed_ms'] = round((time.monotonic() - started) * 1000)
+        result['completion_diagnostics']['ping_count'] = getattr(ws, 'ping_count', 0)
+        ws.receive_deadline = None
     if chosen is None:
         result['failure_class'] = 'OWNER_PRESS_NOT_OBSERVED'; return result
     result['owner_press_observed'] = True
@@ -11499,6 +11604,8 @@ def run_armed_owner_worker(kind, arm_id):
             child_result['worker_cleanup_complete'] = (
                 child_result['cleanup_failure_class'] is None
             )
+        if child_result['completion_diagnostics'] is not None:
+            child_result['completion_diagnostics']['worker_state'] = 'RESULT'
         write_armed_owner_state(arm_id, {
             'state': 'RESULT', 'arm_result': result, 'result': child_result,
             'private_context': R66_CONTEXT,
@@ -11510,6 +11617,11 @@ def run_armed_owner_worker(kind, arm_id):
     except Exception:
         result['failure_class'] = 'AMBIGUOUS'
     finally:
+        if result['observer_armed'] and result['failure_class'] is not None:
+            write_armed_owner_state(arm_id, {
+                'state': 'FAILED', 'arm_result': result,
+                'private_context': R66_CONTEXT,
+            })
         if not result['observer_armed']:
             if window is not None and window.established and not window.finish_attempted:
                 try: window.finish()
@@ -11580,15 +11692,32 @@ def arm_owner_trial(kind, arm_id):
 
 def collect_armed_owner_trial(arm_id):
     deadline = time.monotonic() + COLLECT_WAIT_SECONDS
+    last_state = 'UNAVAILABLE'
     while time.monotonic() < deadline:
-        state_value = read_armed_owner_state(arm_id)
+        try:
+            state_value = read_armed_owner_state(arm_id)
+        except Exception:
+            return owner_collection_error('ENVELOPE_INVALID', last_state), R66_CONTEXT
+        last_state = state_value['state']
+        expected_fields = {
+            'STARTING': {'state'},
+            'ARMED': {'state', 'arm_result'},
+            'FAILED': {'state', 'arm_result', 'private_context'},
+            'RESULT': {'state', 'arm_result', 'result', 'private_context'},
+        }[last_state]
+        if set(state_value) != expected_fields:
+            return owner_collection_error('ENVELOPE_INVALID', last_state), R66_CONTEXT
+        if last_state == 'FAILED':
+            return owner_collection_error('WORKER_FAILED', last_state), R66_CONTEXT
         if state_value['state'] == 'RESULT':
-            if set(state_value) != {'state', 'arm_result', 'result', 'private_context'}:
-                raise ValueError('armed_observer')
             os.unlink(armed_owner_state_path(arm_id))
             return state_value['result'], state_value['private_context']
         threading.Event().wait(WORKER_POLL_SECONDS)
-    raise ValueError('armed_observer')
+    return owner_collection_error('COLLECTION_TIMEOUT', last_state), R66_CONTEXT
+
+def owner_collection_error(reason, last_state):
+    return {'error_class': 'OWNER_COLLECTION_FAILED', 'reason': reason,
+            'worker_state': last_state}
 
 def observe_release():
     result = {'normal_release_observed': False, 'automatic_reconnect_observed': False,
@@ -12808,10 +12937,53 @@ class PrivateInteractiveSessionBroker:
     def _decode_owner_response(
         self, output: bytes, capability: object, operation: str
     ) -> object:
+        delivery_boundary = "ENVELOPE_INVALID"
+        retained_diagnostics = None
         try:
             payload = _exact_payload(output)
             if set(payload) != {"result", "private_context"}:
                 raise ValueError("owner_response")
+            remote = payload["result"]
+            if (
+                operation == "owner_refresh_collect"
+                and isinstance(remote, dict)
+                and remote.get("error_class") == "OWNER_COLLECTION_FAILED"
+            ):
+                if set(remote) != {"error_class", "reason", "worker_state"}:
+                    raise ValueError("owner_response")
+                diagnostics = _parse_owner_completion_diagnostics(
+                    {
+                        "worker_state": remote["worker_state"],
+                        "delivery": remote["reason"],
+                        "owner_wait_elapsed_ms": None,
+                        "ping_count": None,
+                    }
+                )
+                if remote["reason"] not in {
+                    "COLLECTION_TIMEOUT",
+                    "WORKER_FAILED",
+                    "ENVELOPE_INVALID",
+                }:
+                    raise ValueError("owner_response")
+                error = _DispatchFailure(
+                    DispatchFailureStage.RESPONSE_WAIT,
+                    DispatchFailureClass.REMOTE_OPERATION,
+                )
+                error.owner_completion_diagnostics = diagnostics
+                raise error
+            if (
+                operation == "owner_refresh_collect"
+                and isinstance(remote, dict)
+                and remote.get("error_class") == "OPERATION_FAILED"
+            ):
+                if set(remote) != {"error_class", "error_scope", "error_reason"}:
+                    raise ValueError("owner_response")
+                RemoteFailureScope(remote["error_scope"])
+                RemoteFailureReason(remote["error_reason"])
+                raise _DispatchFailure(
+                    DispatchFailureStage.RESPONSE_WAIT,
+                    DispatchFailureClass.REMOTE_OPERATION,
+                )
             parser = {
                 "owner_refresh_trial": _parse_owner_refresh_trial_payload,
                 "owner_refresh_preflight": _parse_owner_refresh_trial_preflight_payload,
@@ -12819,19 +12991,47 @@ class PrivateInteractiveSessionBroker:
                 "owner_refresh_collect": _parse_owner_refresh_trial_payload,
                 "owner_refresh_release": _parse_owner_refresh_release_payload,
             }[operation]
+            delivery_boundary = "SCHEMA_INVALID"
+            if operation == "owner_refresh_collect" and isinstance(remote, dict):
+                try:
+                    retained_diagnostics = _parse_owner_completion_diagnostics(
+                        remote.get("completion_diagnostics")
+                    )
+                except (TypeError, ValueError):
+                    pass
             result = parser(payload["result"])
         except (SessionBrokerError, KeyError, TypeError, ValueError) as error:
-            raise _bounded_dispatch_failure(
+            failure = _bounded_dispatch_failure(
                 DispatchFailureStage.RESPONSE_PARSE, error
-            ) from None
+            )
+            if operation == "owner_refresh_collect" and not isinstance(
+                error, _DispatchFailure
+            ):
+                failure.owner_completion_diagnostics = {
+                    "worker_state": "UNAVAILABLE",
+                    "owner_wait_elapsed_ms": None,
+                    "ping_count": None,
+                    **(retained_diagnostics or {}),
+                    "delivery": delivery_boundary,
+                }
+            raise failure from None
         try:
             capability.controller._accept_owner_context(
                 payload["private_context"], result, operation
             )
         except (SessionBrokerError, TypeError, ValueError) as error:
-            raise _bounded_dispatch_failure(
+            failure = _bounded_dispatch_failure(
                 DispatchFailureStage.RESULT_VALIDATION, error
-            ) from None
+            )
+            if operation == "owner_refresh_collect":
+                failure.owner_completion_diagnostics = {
+                    "worker_state": "RESULT",
+                    "owner_wait_elapsed_ms": None,
+                    "ping_count": None,
+                    **(retained_diagnostics or {}),
+                    "delivery": "CONTEXT_REJECTED",
+                }
+            raise failure from None
         return result
 
     def _arm_owner_refresh_status_trial(
@@ -16644,6 +16844,15 @@ class RefreshStatusLiveValidationController:
                     OwnerRefreshFailureClass.CONTEXT_FAILURE
                 ),
             }.get(error.stage, OwnerRefreshFailureClass.RESULT_COLLECTION_FAILED)
+            diagnostics = getattr(error, "owner_completion_diagnostics", None)
+            if diagnostics is not None:
+                failure_class = {
+                    "COLLECTION_TIMEOUT": OwnerRefreshFailureClass.RESULT_COLLECTION_FAILED,
+                    "WORKER_FAILED": OwnerRefreshFailureClass.WORKER_TERMINAL_FAILED,
+                    "ENVELOPE_INVALID": OwnerRefreshFailureClass.RESULT_ENVELOPE_INVALID,
+                    "SCHEMA_INVALID": OwnerRefreshFailureClass.LOCAL_DECODING_FAILED,
+                    "CONTEXT_REJECTED": OwnerRefreshFailureClass.CONTEXT_FAILURE,
+                }[diagnostics["delivery"]]
             result = OwnerRefreshTrialResult(
                 trial_kind,
                 False,
@@ -16657,6 +16866,7 @@ class RefreshStatusLiveValidationController:
                 None,
                 True,
                 failure_class,
+                completion_diagnostics=diagnostics,
             )
         except (SessionBrokerError, TypeError, ValueError):
             result = OwnerRefreshTrialResult(

@@ -13,6 +13,7 @@ import json
 import os
 import pty
 import queue
+import socket
 import select
 import shutil
 import stat
@@ -15700,6 +15701,416 @@ def _r66j_use_real_log_stream(
     ns["WORKER_POLL_SECONDS"] = 0.05
 
 
+def _r66k_socket_code(program: str = access._REMOTE_REFRESH_STATUS_PROGRAM) -> dict:
+    names = {
+        "WebSocket",
+        "OwnerWebSocket",
+        "wait_for_owner_target",
+        "strict_json",
+        "owner_press_event",
+    }
+    tree = ast.parse(program)
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        or isinstance(node, (ast.FunctionDef, ast.ClassDef))
+        and node.name in names
+    ]
+    ns = {}
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(nodes, type_ignores=[])),
+            "<synthetic-r66k>",
+            "exec",
+        ),
+        ns,
+    )
+    return ns
+
+
+@pytest.mark.timeout(75)
+@pytest.mark.parametrize("parent", [True, False])
+def test_r66k_real_ping_full_owner_deadline(parent: bool) -> None:
+    program = access._REMOTE_REFRESH_STATUS_PROGRAM
+    if parent:
+        check = subprocess.run(
+            ["git", "cat-file", "-e", "9a02cc87cc939cd0b28101420aec4dec4949c7cb"],
+            capture_output=True,
+        )
+        if check.returncode:
+            pytest.skip("historical parent unavailable; candidate remains mandatory")
+        source = subprocess.check_output(
+            [
+                "git",
+                "show",
+                "9a02cc87cc939cd0b28101420aec4dec4949c7cb:tools/home_assistant_live_access.py",
+            ],
+            text=True,
+        )
+        program = next(
+            ast.literal_eval(n.value)
+            for n in ast.parse(source).body
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_REMOTE_REFRESH_STATUS_PROGRAM"
+                for t in n.targets
+            )
+        )
+    ns = _r66k_socket_code(program)
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["OwnerWebSocket"].__new__(ns["OwnerWebSocket"])
+    ws.sock = client
+    ws.pending = []
+    finished = threading.Event()
+    result = []
+
+    def wait_owner():
+        try:
+            result.append(ns["wait_for_owner_target"](ws, [], [], "COLD", 60))
+        except Exception as error:
+            result.append(type(error).__name__)
+        finally:
+            finished.set()
+
+    started = time.monotonic()
+    thread = threading.Thread(target=wait_owner)
+    thread.start()
+    try:
+        assert not finished.wait(30)
+        server.sendall(b"\x89\x00")
+        server.settimeout(2)
+        pong = server.recv(6)
+        assert pong[0] == 0x8A
+        if parent:
+            assert not finished.wait(32)
+        else:
+            assert finished.wait(32)
+            assert result == [None]
+            assert 59 <= time.monotonic() - started <= 62
+    finally:
+        server.close()
+        thread.join(2)
+        client.close()
+        assert not thread.is_alive()
+
+
+def test_r66k_partial_frame_is_transport_failure() -> None:
+    ns = _r66k_socket_code()
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["WebSocket"].__new__(ns["WebSocket"])
+    ws.sock = client
+    try:
+        server.sendall(b"\x81")
+        with pytest.raises(ValueError, match="websocket_partial_frame"):
+            ws.recv(time.monotonic() + 0.1)
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("frame", [b"\x81\x02{}", b"\x89\x00"])
+def test_r66k_complete_late_frame_is_deadline_not_partial(frame):
+    ns = _r66k_socket_code()
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["WebSocket"].__new__(ns["WebSocket"])
+    ws.sock = client
+    original_read = ws._read
+
+    def delayed_read(size, deadline):
+        value = original_read(size, deadline)
+        if size != 2 or ws.frame_bytes == len(frame):
+            time.sleep(0.03)
+        return value
+
+    ws._read = delayed_read
+    try:
+        server.sendall(frame)
+        with pytest.raises(socket.timeout):
+            ws.recv(time.monotonic() + 0.02)
+        assert client.fileno() >= 0
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("control", [True, False])
+def test_r66k_failed_frame_write_invalidates_stream(control):
+    ns = _r66k_socket_code()
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["WebSocket"].__new__(ns["WebSocket"])
+    ws.sock = client
+    server.close()
+    try:
+        with pytest.raises((ValueError, OSError)):
+            if control:
+                ws._send_control(10, b"")
+            else:
+                ws.send({"synthetic": True})
+        assert client.fileno() == -1
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_r66k_late_owner_rejected_and_connection_loss_not_clean(broken):
+    ns = _r66k_socket_code()
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["OwnerWebSocket"].__new__(ns["OwnerWebSocket"])
+    ws.sock, ws.pending = client, []
+    candidate = {
+        "valid": True,
+        "fingerprint": "synthetic",
+        "button": "button.synthetic",
+    }
+    ns["owner_candidate_ready"] = lambda *_: True
+    data = json.dumps(_r66c_owner_event(candidate["button"])).encode()
+    assert len(data) < 65536
+    original_read = ws._read
+
+    def delayed_payload(size, deadline):
+        value = original_read(size, deadline)
+        if size == len(data):
+            time.sleep(0.03)
+        return value
+
+    ws._read = delayed_payload
+    try:
+        if broken:
+            server.close()
+            with pytest.raises(ValueError, match="websocket_closed"):
+                ns["wait_for_owner_target"](ws, [candidate], [candidate], "COLD", 0.02)
+        else:
+            server.sendall(b"\x81\x7e" + len(data).to_bytes(2, "big") + data)
+            assert (
+                ns["wait_for_owner_target"](ws, [candidate], [candidate], "COLD", 0.02)
+                is None
+            )
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize(
+    "reason,state,expected",
+    [
+        ("COLLECTION_TIMEOUT", "ARMED", "RESULT_COLLECTION_FAILED"),
+        ("WORKER_FAILED", "FAILED", "WORKER_TERMINAL_FAILED"),
+        ("ENVELOPE_INVALID", "UNAVAILABLE", "RESULT_ENVELOPE_INVALID"),
+        ("ENVELOPE_INVALID", "STARTING", "RESULT_ENVELOPE_INVALID"),
+        ("ENVELOPE_INVALID", "ARMED", "RESULT_ENVELOPE_INVALID"),
+        ("ENVELOPE_INVALID", "RESULT", "RESULT_ENVELOPE_INVALID"),
+    ],
+)
+def test_r66k_remote_collection_errors_reach_controller(
+    r65_bundles, reason, state, expected
+):
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    controller.arm_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    ns = _r66c_installation()
+    ns["COLLECT_WAIT_SECONDS"] = 0.01
+    if reason == "ENVELOPE_INVALID" and state == "UNAVAILABLE":
+
+        def read(_arm_id):
+            raise ValueError("synthetic unreadable")
+
+        ns["read_armed_owner_state"] = read
+    elif reason == "ENVELOPE_INVALID":
+        ns["read_armed_owner_state"] = lambda _arm_id: {
+            "state": state,
+            "unexpected": True,
+        }
+    else:
+        ns["read_armed_owner_state"] = lambda _arm_id: (
+            {"state": state, "arm_result": {}}
+            if state == "ARMED"
+            else {"state": state, "arm_result": {}, "private_context": {}}
+        )
+    remote, _context = ns["collect_armed_owner_trial"]("synthetic")
+
+    def deliver(_arm_id, *, _capability):
+        raw = json.dumps(
+            {"result": remote, "private_context": controller._owner_context}
+        ).encode()
+        return access.PrivateInteractiveSessionBroker._decode_owner_response(
+            broker, raw, _capability, "owner_refresh_collect"
+        )
+
+    broker._collect_owner_refresh_status_trial = deliver
+    result = controller.collect_owner_refresh_trial()
+    assert result.failure_class.value == expected
+    assert result.completion_diagnostics["worker_state"] == state
+    assert result.completion_diagnostics["delivery"] == reason
+    assert result.ambiguous and not result.worker_cleanup_complete
+    assert (
+        access._parse_owner_refresh_trial_payload(
+            access.owner_refresh_public_json_record(result)
+        )
+        == result
+    )
+    controller.close()
+
+
+def test_r66k_repeated_ping_and_irrelevant_events_share_deadline():
+    ns = _r66k_socket_code()
+    pytest_socket.enable_socket()
+    client, server = socket.socketpair()
+    ws = ns["OwnerWebSocket"].__new__(ns["OwnerWebSocket"])
+    ws.sock, ws.pending = client, []
+    done = threading.Event()
+
+    def traffic():
+        try:
+            while not done.wait(0.02):
+                server.sendall(b"\x89\x00\x81\x02{}")
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=traffic)
+    thread.start()
+    started = time.monotonic()
+    try:
+        assert ns["wait_for_owner_target"](ws, [], [], "COLD", 0.2) is None
+        assert time.monotonic() - started < 0.5
+        assert ws.ping_count > 1
+    finally:
+        done.set()
+        thread.join(1)
+        client.close()
+        server.close()
+
+
+def _r66k_worker_heartbeat(ns: dict) -> None:
+    """Worker-owned real socket receive path with synthetic endpoint events."""
+    production = _r66k_socket_code()["OwnerWebSocket"]
+    base = ns["OwnerWebSocket"]
+
+    class HeartbeatSocket(base):
+        _remaining = production._remaining
+        _read = production._read
+        _recv_until = production._recv_until
+        _send_control = production._send_control
+
+        def __init__(self):
+            super().__init__()
+            self.sock, self.server = socket.socketpair()
+            self.pending = []
+            self.done = threading.Event()
+            synthetic_event_source = types.SimpleNamespace(
+                sock=types.SimpleNamespace(timeout=0.05), sent=False
+            )
+
+            def serve():
+                try:
+                    if self.done.wait(30):
+                        return
+                    self.server.sendall(b"\x89\x00")
+                    self.server.settimeout(3)
+                    assert self.server.recv(6)[0] == 0x8A
+                    while not self.done.is_set():
+                        try:
+                            event = base.recv(synthetic_event_source)
+                        except socket.timeout:
+                            continue
+                        data = json.dumps(event).encode()
+                        self.server.sendall(
+                            b"\x81\x7e" + len(data).to_bytes(2, "big") + data
+                        )
+                        return
+                except (OSError, ValueError):
+                    return
+
+            self.endpoint_thread = threading.Thread(target=serve, daemon=True)
+            self.endpoint_thread.start()
+
+        def recv(self):
+            return production.__mro__[1].recv(self)
+
+        def close(self):
+            self.done.set()
+            self.server.close()
+            self.sock.close()
+            self.endpoint_thread.join(2)
+            assert not self.endpoint_thread.is_alive()
+            super().close()
+
+    ns["OwnerWebSocket"] = HeartbeatSocket
+
+
+@pytest.mark.parametrize(
+    "fault,expected",
+    [
+        ("json", "RESULT_ENVELOPE_INVALID"),
+        ("schema", "LOCAL_DECODING_FAILED"),
+        ("context", "CONTEXT_FAILURE"),
+    ],
+)
+def test_r66k_invalid_delivery_is_not_activity_evidence(r65_bundles, fault, expected):
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    controller.arm_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+    ns = _r66c_installation()
+    trial = ns["empty_owner_trial"]("COLD")
+    trial["failure_class"] = "OWNER_PRESS_NOT_OBSERVED"
+    trial["completion_diagnostics"] = {
+        "worker_state": "RESULT",
+        "delivery": "COMPLETE",
+        "owner_wait_elapsed_ms": 60000,
+        "ping_count": 1,
+    }
+    context = copy.deepcopy(controller._owner_context)
+    if fault == "context":
+        context["bound"] = "synthetic-invalid"
+    if fault == "schema":
+        trial["counts"] = None
+    raw = (
+        b"{"
+        if fault == "json"
+        else json.dumps({"result": trial, "private_context": context}).encode()
+    )
+
+    def deliver(_arm_id, *, _capability):
+        return access.PrivateInteractiveSessionBroker._decode_owner_response(
+            broker, raw, _capability, "owner_refresh_collect"
+        )
+
+    broker._collect_owner_refresh_status_trial = deliver
+    result = controller.collect_owner_refresh_trial()
+    assert result.failure_class.value == expected
+    assert result.completion_diagnostics["delivery"] != "COMPLETE"
+    if fault != "json":
+        assert result.completion_diagnostics["worker_state"] == "RESULT"
+        assert result.completion_diagnostics["owner_wait_elapsed_ms"] == 60000
+        assert result.completion_diagnostics["ping_count"] == 1
+    assert result.ambiguous
+    controller.close()
+
+
+def test_r66k_handled_post_arm_failure_publishes_terminal(tmp_path):
+    ns, arm_id, *_ = _r66i_worker_boundary(tmp_path, "COLD")
+    base = ns["OwnerWebSocket"]
+
+    class BrokenClose(base):
+        def close(self):
+            super().close()
+            raise OSError("synthetic close failure")
+
+    ns["OwnerWebSocket"] = BrokenClose
+    assert ns["preflight_owner_trial"]("COLD")["ready"]
+    assert ns["arm_owner_trial"]("COLD", arm_id)["observer_armed"]
+    result, _ = ns["collect_armed_owner_trial"](arm_id)
+    assert result["reason"] == "WORKER_FAILED"
+    assert result["worker_state"] == "FAILED"
+
+
 def test_r66i_real_worker_captures_post_arm_cold_and_retained_events(
     tmp_path: Path,
 ) -> None:
@@ -15861,6 +16272,7 @@ def test_r66j_parent_idle_reproduces_reader_timeout_inside_full_owner_wait(
 @pytest.mark.timeout(75)
 def test_r66j_real_worker_full_duration_no_press_is_clean(
     tmp_path: Path,
+    r65_bundles: tuple[access.SourceBundle, access.SourceBundle],
 ) -> None:
     """B/D/F: full owner window, real HTTP reader, cleanup and result decoding."""
     with _r66j_real_log_stream_server() as (
@@ -15873,6 +16285,7 @@ def test_r66j_real_worker_full_duration_no_press_is_clean(
             _r66i_worker_boundary(tmp_path, "COLD")
         )
         _r66j_use_real_log_stream(ns, stream_url, publish)
+        _r66k_worker_heartbeat(ns)
         assert ns["LOG_STREAM_IDLE_SECONDS"] == 115
         assert ns["COLLECT_WAIT_SECONDS"] == 140
         assert ns["preflight_owner_trial"]("COLD")["ready"] is True
@@ -15899,6 +16312,30 @@ def test_r66j_real_worker_full_duration_no_press_is_clean(
             is access.OwnerRefreshFailureClass.OWNER_PRESS_NOT_OBSERVED
         )
         assert access.owner_refresh_public_json_record(parsed) == result
+        assert result["completion_diagnostics"]["ping_count"] == 1
+        assert (
+            59000 <= result["completion_diagnostics"]["owner_wait_elapsed_ms"] <= 62000
+        )
+        controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+        controller.begin_hardware_observation()
+        controller.preflight_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+        controller.arm_owner_refresh_trial(access.OwnerRefreshTrialKind.COLD)
+
+        def deliver(_arm_id, *, _capability):
+            envelope = json.dumps(
+                {"result": result, "private_context": controller._owner_context}
+            ).encode()
+            return access.PrivateInteractiveSessionBroker._decode_owner_response(
+                broker, envelope, _capability, "owner_refresh_collect"
+            )
+
+        broker._collect_owner_refresh_status_trial = deliver
+        delivered = controller.collect_owner_refresh_trial()
+        saved = json.loads(
+            json.dumps(access.owner_refresh_public_json_record(delivered))
+        )
+        assert saved == result
+        controller.close()
 
 
 @pytest.mark.timeout(50)
@@ -15916,6 +16353,7 @@ def test_r66j_real_worker_captures_event_after_old_reader_cutoff(
             _r66i_worker_boundary(tmp_path, "COLD")
         )
         _r66j_use_real_log_stream(ns, stream_url, publish)
+        _r66k_worker_heartbeat(ns)
         assert ns["preflight_owner_trial"]("COLD")["ready"] is True
         armed = ns["arm_owner_trial"]("COLD", arm_id)
         assert armed["observer_armed"] is True
