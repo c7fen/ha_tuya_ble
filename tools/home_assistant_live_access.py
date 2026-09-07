@@ -1476,6 +1476,8 @@ class OwnerRefreshFailureClass(StrEnum):
     PROVENANCE_MISMATCH = "PROVENANCE_MISMATCH"
     REQUEST_FAILED = "REQUEST_FAILED"
     PROTOCOL_WRITE_DETECTED = "PROTOCOL_WRITE_DETECTED"
+    FORBIDDEN_CONTROL_DETECTED = "FORBIDDEN_CONTROL_DETECTED"
+    UNCLASSIFIED_OUTBOUND_TRAFFIC = "UNCLASSIFIED_OUTBOUND_TRAFFIC"
     HOLD_NOT_ACTIVE = "HOLD_NOT_ACTIVE"
     RELEASE_NOT_OBSERVED = "RELEASE_NOT_OBSERVED"
     AUTOMATIC_RECONNECT_OBSERVED = "AUTOMATIC_RECONNECT_OBSERVED"
@@ -1612,11 +1614,21 @@ class OwnerRefreshTrialResult:
     worker_cleanup_complete: bool = False
     cleanup_failure_class: OwnerRefreshFailureClass | None = None
     completion_diagnostics: dict[str, object] | None = None
+    contract_evidence: dict[str, object] | None = None
 
     @property
     def zero_write(self) -> bool:
-        """Return whether no outbound datapoint or other packet was observed."""
-        return self.counts.datapoint == 0 and self.counts.other == 0
+        """Require no forbidden or unclassified traffic, not radio silence.
+
+        Legacy counts retain their original conservative meaning. Only versioned,
+        correlated evidence can distinguish automatic responses within ``other``.
+        """
+        if self.contract_evidence is None:
+            return self.counts.datapoint == 0 and self.counts.other == 0
+        return self.counts.datapoint == 0 and all(
+            row["classification"] == "MATCHED_AUTOMATIC_RESPONSE"
+            for row in self.contract_evidence["outbound_other"]
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4322,7 +4334,121 @@ def _owner_refresh_trial_record(
             else result.cleanup_failure_class.value
         ),
         "completion_diagnostics": result.completion_diagnostics,
+        **(
+            {}
+            if result.contract_evidence is None
+            else {"contract_evidence": result.contract_evidence}
+        ),
     }
+
+
+_OWNER_AUTOMATIC_RESPONSE_CODES = frozenset(
+    {
+        "FUN_RECEIVE_TIME1_REQ",
+        "FUN_RECEIVE_TIME2_REQ",
+        "FUN_RECEIVE_DP",
+        "FUN_RECEIVE_SIGN_DP",
+        "FUN_RECEIVE_TIME_DP",
+        "FUN_RECEIVE_SIGN_TIME_DP",
+        "FUN_RECEIVE_DP_V4",
+        "FUN_RECEIVE_TIME_DP_V4",
+    }
+)
+_OWNER_FORBIDDEN_CONTROL_CODES = frozenset(
+    {
+        "FUN_SENDER_UNBIND",
+        "FUN_SENDER_DEVICE_RESET",
+        "FUN_SENDER_OTA_START",
+        "FUN_SENDER_OTA_FILE",
+        "FUN_SENDER_OTA_OFFSET",
+        "FUN_SENDER_OTA_UPGRADE",
+        "FUN_SENDER_OTA_OVER",
+    }
+)
+_OWNER_RETAINED_TYPES = {8: "DT_VALUE", 33: "DT_BOOL", 34: "DT_ENUM", 36: "DT_VALUE"}
+
+
+def _validate_owner_contract_evidence(result: OwnerRefreshTrialResult) -> None:
+    """Validate additive R66P evidence without reinterpreting historical rows."""
+    evidence = result.contract_evidence
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {
+            "version",
+            "outbound_other",
+            "request_session_provenance",
+            "retained_confirmation_applicable",
+            "confirmed_dp_ids",
+            "retained_confirmation_valid",
+        }
+        or type(evidence["version"]) is not int
+        or evidence["version"] != 2
+    ):
+        raise ValueError("owner_contract_evidence")
+    rows = evidence["outbound_other"]
+    if not isinstance(rows, list) or len(rows) > 8:
+        raise ValueError("owner_contract_evidence")
+    keys = []
+    total = 0
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"code", "count", "classification"}:
+            raise ValueError("owner_contract_evidence")
+        code, classification = row["code"], row["classification"]
+        if not isinstance(code, str) or re.fullmatch(r"[A-Z0-9_]{1,64}", code) is None:
+            raise ValueError("owner_contract_evidence")
+        if (
+            classification
+            not in {"MATCHED_AUTOMATIC_RESPONSE", "FORBIDDEN_CONTROL", "UNCLASSIFIED"}
+            or type(row["count"]) is not int
+            or not 1 <= row["count"] <= 8
+        ):
+            raise ValueError("owner_contract_evidence")
+        if (
+            classification == "MATCHED_AUTOMATIC_RESPONSE"
+            and code not in _OWNER_AUTOMATIC_RESPONSE_CODES
+            or classification == "FORBIDDEN_CONTROL"
+            and code not in _OWNER_FORBIDDEN_CONTROL_CODES
+            or code in _OWNER_FORBIDDEN_CONTROL_CODES
+            and classification != "FORBIDDEN_CONTROL"
+        ):
+            raise ValueError("owner_contract_evidence")
+        keys.append((code, classification))
+        total += row["count"]
+    if keys != sorted(set(keys)) or total != result.counts.other:
+        raise ValueError("owner_contract_evidence")
+    expected_ids = [
+        row.dp_id
+        for row in result.per_dp
+        if row.dp_id in _OWNER_RETAINED_TYPES
+        and _OWNER_RETAINED_TYPES[row.dp_id] in row.types
+    ]
+    ids = evidence["confirmed_dp_ids"]
+    applicable = evidence["retained_confirmation_applicable"]
+    valid = evidence["retained_confirmation_valid"]
+    provenance = evidence["request_session_provenance"]
+    if (
+        type(provenance) is not bool
+        or type(applicable) is not bool
+        or not isinstance(ids, list)
+        or any(type(item) is not int for item in ids)
+        or ids != expected_ids
+        or applicable != bool(ids)
+        or (type(valid) is not bool if applicable else valid is not None)
+        or provenance != result.current_session_provenance
+        or provenance
+        and (not result.request_completed or not result.per_dp)
+        or result.retained_confirmation_observed != (valid is True)
+        or result.failure_class is None
+        and applicable
+        and valid is not True
+    ):
+        raise ValueError("owner_contract_evidence")
+    if result.failure_class is None and (
+        (result.counts.device_info, result.counts.pair, result.counts.device_status)
+        != ((1, 1, 1) if result.trial_kind is OwnerRefreshTrialKind.COLD else (0, 0, 1))
+    ):
+        raise ValueError("owner_contract_evidence")
 
 
 def _parse_owner_refresh_trial_payload(
@@ -4348,6 +4474,9 @@ def _parse_owner_refresh_trial_payload(
         "cleanup_failure_class",
     }
     value = dict(value) if isinstance(value, dict) else value
+    contract_evidence = (
+        value.pop("contract_evidence", None) if isinstance(value, dict) else None
+    )
     diagnostics = (
         value.pop("completion_diagnostics", None) if isinstance(value, dict) else None
     )
@@ -4458,6 +4587,7 @@ def _parse_owner_refresh_trial_payload(
             False if legacy_completion else _bool(value["worker_cleanup_complete"]),
             cleanup_failure,
             diagnostics,
+            contract_evidence,
         )
     except (TypeError, ValueError):
         raise ValueError("owner_refresh_trial") from None
@@ -4465,6 +4595,8 @@ def _parse_owner_refresh_trial_payload(
         OwnerRefreshTrialKind.COLD: RefreshSessionProvenance.NEW_SESSION,
         OwnerRefreshTrialKind.RETAINED: RefreshSessionProvenance.REUSED_SESSION,
     }[result.trial_kind]
+    if contract_evidence is not None:
+        _validate_owner_contract_evidence(result)
     if (
         not result.owner_press_observed
         and (
@@ -11098,6 +11230,8 @@ def parse_owner_refresh_lifecycle(lines):
     identity, counts, events, provenance, _ordinal, completed = parse_refresh_lifecycle(lines)
     metadata = {}
     inside = False
+    session_bound = False
+    status_requested = False
     for raw in lines:
         raw = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n'))
         match = LOG_RE.fullmatch(raw)
@@ -11111,8 +11245,12 @@ def parse_owner_refresh_lifecycle(lines):
             break
         if not inside:
             continue
+        if REFRESH_BOUND_RE.fullmatch(message):
+            session_bound = True
+        if session_bound and re.fullmatch(r'Sending packet: #[0-9]+ FUN_SENDER_DEVICE_STATUS', message):
+            status_requested = True
         dp = DP_RE.fullmatch(message)
-        if dp:
+        if dp and status_requested:
             identifier = int(dp.group(1)); length = int(dp.group(3))
             if identifier > 255 or length > 65535:
                 raise ValueError('dp_metadata')
@@ -11124,6 +11262,96 @@ def parse_owner_refresh_lifecycle(lines):
         for identifier in sorted(metadata)
     ]
     return identity, counts, events, provenance, completed, rows
+
+def owner_outbound_evidence(lines, required_identity):
+    # These are exactly PR47 _handle_command_or_response's same-code responses.
+    automatic = {
+        'FUN_RECEIVE_TIME1_REQ', 'FUN_RECEIVE_TIME2_REQ', 'FUN_RECEIVE_DP',
+        'FUN_RECEIVE_SIGN_DP', 'FUN_RECEIVE_TIME_DP', 'FUN_RECEIVE_SIGN_TIME_DP',
+        'FUN_RECEIVE_DP_V4', 'FUN_RECEIVE_TIME_DP_V4',
+    }
+    forbidden = {
+        'FUN_SENDER_UNBIND', 'FUN_SENDER_DEVICE_RESET', 'FUN_SENDER_OTA_START',
+        'FUN_SENDER_OTA_FILE', 'FUN_SENDER_OTA_OFFSET', 'FUN_SENDER_OTA_UPGRADE',
+        'FUN_SENDER_OTA_OVER',
+    }
+    explicit = {
+        'FUN_SENDER_DEVICE_INFO', 'FUN_SENDER_PAIR', 'FUN_SENDER_DEVICE_STATUS',
+        'FUN_SENDER_DPS', 'FUN_SENDER_DPS_V4',
+    }
+    incoming = set(); totals = {}; inside = False; bound = False
+    session_valid = True; status_count = 0
+    for raw in lines:
+        match = LOG_RE.fullmatch(re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\r\n')))
+        if not match or match.group(1) != required_identity: continue
+        message = match.group(2)
+        if message == 'S1_REFRESH_ACCEPTED': inside = True; continue
+        if not inside: continue
+        if REFRESH_TERMINAL_RE.fullmatch(message): break
+        if REFRESH_BOUND_RE.fullmatch(message):
+            bound = True; incoming.clear(); continue
+        if message.startswith(('Connecting;', 'Connected;', 'Disconnecting', 'Disconnected from device;', 'Scheduling reconnect;', 'Reconnect,')):
+            incoming.clear()
+            if bound: session_valid = False
+        received = re.fullmatch(r'Received: #([0-9]+) ([A-Z0-9_]+)', message)
+        if received and bound and session_valid:
+            incoming.add((received.group(1), received.group(2)))
+        sent = re.fullmatch(r'Sending packet: #[0-9]+ ([A-Z0-9_]+)(?: in response to #([0-9]+))?', message)
+        if not sent: continue
+        code, response_to = sent.groups()
+        if code == 'FUN_SENDER_DEVICE_STATUS' and bound and session_valid and response_to is None:
+            status_count += 1
+        if code in explicit: continue
+        classification = 'UNCLASSIFIED'
+        if code in forbidden:
+            classification = 'FORBIDDEN_CONTROL'
+        elif code in automatic and bound and session_valid and (response_to, code) in incoming:
+            classification = 'MATCHED_AUTOMATIC_RESPONSE'
+            incoming.remove((response_to, code))
+        key = (code, classification)
+        totals[key] = totals.get(key, 0) + 1
+    return [
+        {'code': code, 'classification': classification, 'count': count}
+        for (code, classification), count in sorted(totals.items())
+    ], bool(bound and session_valid and status_count == 1)
+
+def evaluate_owner_refresh_contract(kind, result, lines, dp_entities, connection_id):
+    identity, _counts, _events, _provenance, _completed, _rows = parse_owner_refresh_lifecycle(lines)
+    packets, request_session = owner_outbound_evidence(lines, identity)
+    rows = result['per_dp']; counts = result['counts']
+    expected_types = {8: 'DT_VALUE', 33: 'DT_BOOL', 34: 'DT_ENUM', 36: 'DT_VALUE'}
+    confirmed_ids = [row['dp_id'] for row in rows if row['dp_id'] in expected_types and expected_types[row['dp_id']] in row['types']]
+    # PR47 COMPLETED requires its exact-session request ACK AND generation batch.
+    # Retained entity confirmation is separate and has only second precision.
+    provenance = bool(result['request_completed'] and rows and request_session)
+    valid = all(
+        dp in dp_entities and isinstance(state(dp_entities[dp]).get('attributes'), dict)
+        and state(dp_entities[dp])['attributes'].get('value_source') == 'current_session'
+        for dp in confirmed_ids
+    ) if confirmed_ids else None
+    result['contract_evidence'] = {
+        'version': 2, 'outbound_other': packets,
+        'request_session_provenance': provenance,
+        'retained_confirmation_applicable': bool(confirmed_ids),
+        'confirmed_dp_ids': confirmed_ids, 'retained_confirmation_valid': valid,
+    }
+    result['current_session_provenance'] = provenance
+    result['retained_confirmation_observed'] = valid is True
+    result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
+    expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
+    if counts['datapoint']:
+        result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
+    elif any(row['classification'] == 'FORBIDDEN_CONTROL' for row in packets):
+        result['failure_class'] = 'FORBIDDEN_CONTROL_DETECTED'
+    elif any(row['classification'] == 'UNCLASSIFIED' for row in packets):
+        result['failure_class'] = 'UNCLASSIFIED_OUTBOUND_TRAFFIC'
+    elif result['session_provenance'] != expected:
+        result['failure_class'] = 'PROVENANCE_MISMATCH'
+    elif not provenance or valid is False or (counts['device_info'], counts['pair'], counts['device_status']) != ((1, 1, 1) if kind == 'COLD' else (0, 0, 1)):
+        result['failure_class'] = 'REQUEST_FAILED'
+    elif result['hold_active_after_refresh'] is not True:
+        result['failure_class'] = 'HOLD_NOT_ACTIVE'
+    return result
 
 def resolve_owner_refresh_target(ws):
     display = ws.command('config/entity_registry/list_for_display')
@@ -11399,30 +11627,7 @@ def observe_owner_trial(kind):
         result['request_completed'] = completed
         result['per_dp'] = rows
         result['reported_dp_ids'] = [row['dp_id'] for row in rows]
-        after_dp = {dp: state(entity) for dp, entity in dp_entities.items()}
-        confirmed_ids = sorted(set(result['reported_dp_ids']) & set(dp_entities))
-        result['current_session_provenance'] = (
-            bool(confirmed_ids)
-            and all(
-                isinstance(after_dp[dp].get('attributes'), dict)
-                and after_dp[dp]['attributes'].get('value_source') == 'current_session'
-                for dp in confirmed_ids
-            )
-        ) if completed else None
-        result['retained_confirmation_observed'] = any(
-            stamp(after_dp[dp]) != before_dp[dp] for dp in confirmed_ids
-        )
-        result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
-        expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
-        if counts['datapoint'] or counts['other']:
-            result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
-        elif provenance != expected:
-            result['failure_class'] = 'PROVENANCE_MISMATCH'
-        elif not completed or counts['device_status'] != 1 or not rows or state(last_id).get('state') == before_last or result['current_session_provenance'] is not True:
-            result['failure_class'] = 'REQUEST_FAILED'
-        elif result['hold_active_after_refresh'] is not True:
-            result['failure_class'] = 'HOLD_NOT_ACTIVE'
-        return result
+        return evaluate_owner_refresh_contract(kind, result, lines, dp_entities, connection_id)
     except LogBoundaryNotEstablished:
         result['failure_class'] = 'LOG_BOUNDARY_NOT_ESTABLISHED'; return result
     except ValueError as error:
@@ -11535,29 +11740,7 @@ def complete_armed_owner_trial(kind, result, ws, stream, window, candidates, sel
     result['request_completed'] = completed
     result['per_dp'] = rows
     result['reported_dp_ids'] = [row['dp_id'] for row in rows]
-    after_dp = {dp: state(entity) for dp, entity in dp_entities.items()}
-    confirmed_ids = sorted(set(result['reported_dp_ids']) & set(dp_entities))
-    result['current_session_provenance'] = (
-        bool(confirmed_ids) and all(
-            isinstance(after_dp[dp].get('attributes'), dict)
-            and after_dp[dp]['attributes'].get('value_source') == 'current_session'
-            for dp in confirmed_ids
-        )
-    ) if completed else None
-    result['retained_confirmation_observed'] = any(
-        stamp(after_dp[dp]) != before_dp[dp] for dp in confirmed_ids
-    )
-    result['hold_active_after_refresh'] = state(connection_id).get('state') == 'on'
-    expected = 'NEW_SESSION' if kind == 'COLD' else 'REUSED_SESSION'
-    if counts['datapoint'] or counts['other']:
-        result['failure_class'] = 'PROTOCOL_WRITE_DETECTED'
-    elif provenance != expected:
-        result['failure_class'] = 'PROVENANCE_MISMATCH'
-    elif not completed or counts['device_status'] != 1 or not rows or state(last_id).get('state') == before_last or result['current_session_provenance'] is not True:
-        result['failure_class'] = 'REQUEST_FAILED'
-    elif result['hold_active_after_refresh'] is not True:
-        result['failure_class'] = 'HOLD_NOT_ACTIVE'
-    return result
+    return evaluate_owner_refresh_contract(kind, result, lines, dp_entities, connection_id)
 
 def run_armed_owner_worker(kind, arm_id):
     result = empty_owner_arm(kind); ws = stream = window = None; prior_level = None
@@ -16630,7 +16813,30 @@ class RefreshStatusLiveValidationController:
         if self._journal is not None:
             self._journal.record_owner_context(context)
         self._owner_context = copy.deepcopy(context)
-        self._same_private_target = self.target_bound and result.failure_class is None
+        # A protocol/data failure does not undo a validated owner-event binding.
+        # Preflight/ARM/release keep their explicit per-operation identity proof.
+        if isinstance(result, OwnerRefreshTrialResult):
+            identity_proven = (
+                result.owner_press_observed
+                and result.failure_class
+                not in {
+                    OwnerRefreshFailureClass.OWNERSHIP_NOT_PROVEN,
+                    OwnerRefreshFailureClass.PRECONDITION_NOT_PROVEN,
+                    OwnerRefreshFailureClass.CONTEXT_FAILURE,
+                }
+            )
+        elif isinstance(result, (OwnerRefreshTrialPreflight, OwnerRefreshTrialArm)):
+            identity_proven = result.same_private_target
+        else:
+            # These release outcomes occur only after resolving the bound target.
+            identity_proven = result.failure_class in {
+                None,
+                OwnerRefreshFailureClass.RELEASE_NOT_OBSERVED,
+                OwnerRefreshFailureClass.AUTOMATIC_RECONNECT_OBSERVED,
+                OwnerRefreshFailureClass.LOGGER_CONTROL_UNAVAILABLE,
+                OwnerRefreshFailureClass.LOG_BOUNDARY_NOT_ESTABLISHED,
+            }
+        self._same_private_target = self.target_bound and identity_proven
 
     def _hardware_capability(self) -> _FeatureValidationCapability:
         capability = _FeatureValidationCapability(

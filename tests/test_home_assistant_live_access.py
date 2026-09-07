@@ -1035,6 +1035,7 @@ def _synthetic_r30_source_authorities(
                 "test_r65h_",
                 "test_r66a_",
                 "test_r66c_",
+                "test_r66p_",
             )
         ),
     )
@@ -15008,7 +15009,8 @@ def test_r66a_selected_current_session_provenance_uses_runtime_value_source() ->
     observer = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "observe_owner_trial"
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "evaluate_owner_refresh_contract"
     )
     source = ast.get_source_segment(access._REMOTE_REFRESH_STATUS_PROGRAM, observer)
     assert source is not None
@@ -15025,6 +15027,292 @@ def test_r66a_selected_current_session_provenance_uses_runtime_value_source() ->
         )
     )
     assert "before_last" not in ast.unparse(assignment.value)
+
+
+def _r66p_lines(kind="COLD", extra=(), dps=((69, "DT_RAW", 3),), terminal="COMPLETED"):
+    """Explicitly synthetic PR47-shaped lifecycle; never a retained capture."""
+    messages = ["S1_REFRESH_ACCEPTED"]
+    if kind == "COLD":
+        messages += [
+            "Sending packet: #1 FUN_SENDER_DEVICE_INFO",
+            "Sending packet: #2 FUN_SENDER_PAIR",
+        ]
+    messages += [
+        "S1_REFRESH_SESSION_BOUND_"
+        + ("NEW" if kind == "COLD" else "REUSED")
+        + " session_ordinal=7",
+        "Sending packet: #3 FUN_SENDER_DEVICE_STATUS",
+        "Received: #10 FUN_SENDER_DEVICE_STATUS, response to #3",
+        "Received expected response to #3, result: 0",
+    ]
+    messages.extend(extra)
+    messages.extend(
+        f"Received datapoint update, id: {dp}, type: {dtype}, length: {length}"
+        for dp, dtype, length in dps
+    )
+    messages.append(f"S1_REFRESH_{terminal} session_ordinal=7")
+    return [_r65c_record("tuya-ble-session-" + "n" * 16, item) for item in messages]
+
+
+def _r66p_evaluate(
+    kind="COLD", extra=(), dps=((69, "DT_RAW", 3),), terminal="COMPLETED"
+):
+    ns = _r66c_installation()
+    lines = _r66p_lines(kind, extra, dps, terminal)
+    _, counts, _, provenance, completed, rows = ns["parse_owner_refresh_lifecycle"](
+        lines
+    )
+    result = ns["empty_owner_trial"](kind)
+    result.update(
+        owner_press_observed=True,
+        request_completed=completed,
+        session_provenance=provenance,
+        counts=counts,
+        per_dp=rows,
+        reported_dp_ids=[row["dp_id"] for row in rows],
+        owner_wait_completed=True,
+        worker_cleanup_complete=True,
+    )
+    # Equal visible timestamps are intentional; values are never passed to the observer.
+    ns["state"] = lambda entity: {
+        "state": "on",
+        "last_updated": "2026-01-01T00:00:00Z",
+        "attributes": {"value_source": "current_session"},
+    }
+    return ns["evaluate_owner_refresh_contract"](
+        kind,
+        result,
+        lines,
+        {8: "synthetic8", 33: "synthetic33", 34: "synthetic34", 36: "synthetic36"},
+        "synthetic_connection",
+    )
+
+
+@pytest.mark.parametrize("kind", ["COLD", "RETAINED"])
+def test_r66p_dp69_only_product_contract_and_roundtrip(kind):
+    extra = (
+        "Received: #21 FUN_RECEIVE_TIME1_REQ",
+        "Sending packet: #22 FUN_RECEIVE_TIME1_REQ in response to #21",
+        "Received: #23 FUN_RECEIVE_DP",
+        "Sending packet: #24 FUN_RECEIVE_DP in response to #23",
+    )
+    payload = _r66p_evaluate(kind, extra)
+    result = access._parse_owner_refresh_trial_payload(payload)
+    assert result.failure_class is None and result.zero_write
+    assert result.counts.other == 2  # No packet disappears from the legacy sum.
+    assert sum(asdict(result.counts).values()) == (5 if kind == "COLD" else 3)
+    assert result.current_session_provenance is True
+    assert result.retained_confirmation_observed is False
+    assert result.contract_evidence["retained_confirmation_applicable"] is False
+    assert result.contract_evidence["confirmed_dp_ids"] == []
+    assert result.contract_evidence["retained_confirmation_valid"] is None
+    assert (
+        access._parse_owner_refresh_trial_payload(
+            json.loads(json.dumps(access.owner_refresh_public_json_record(result)))
+        )
+        == result
+    )
+
+
+@pytest.mark.parametrize("code", sorted(access._OWNER_AUTOMATIC_RESPONSE_CODES))
+@pytest.mark.parametrize("matched", [True, False])
+def test_r66p_automatic_reply_requires_exact_prior_message_and_session(code, matched):
+    extra = [f"Received: #21 {code}"] if matched else []
+    extra.append(f"Sending packet: #22 {code} in response to #21")
+    result = access._parse_owner_refresh_trial_payload(_r66p_evaluate(extra=extra))
+    assert result.counts.other == 1
+    assert result.zero_write is matched
+    assert result.failure_class == (
+        None
+        if matched
+        else access.OwnerRefreshFailureClass.UNCLASSIFIED_OUTBOUND_TRAFFIC
+    )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "FUN_SENDER_DPS",
+        "FUN_SENDER_DPS_V4",
+        *sorted(access._OWNER_FORBIDDEN_CONTROL_CODES),
+        "SYNTHETIC_UNKNOWN",
+    ],
+)
+def test_r66p_forbidden_and_unknown_are_distinct(code):
+    payload = _r66p_evaluate(
+        extra=[
+            f"Received: #21 {code}",
+            f"Sending packet: #22 {code} in response to #21",
+        ]
+    )
+    result = access._parse_owner_refresh_trial_payload(payload)
+    expected = (
+        "PROTOCOL_WRITE_DETECTED"
+        if code in {"FUN_SENDER_DPS", "FUN_SENDER_DPS_V4"}
+        else (
+            "FORBIDDEN_CONTROL_DETECTED"
+            if code in access._OWNER_FORBIDDEN_CONTROL_CODES
+            else "UNCLASSIFIED_OUTBOUND_TRAFFIC"
+        )
+    )
+    assert result.failure_class.value == expected
+    assert not result.zero_write
+
+
+def test_r66p_only_correctly_typed_received_retained_values_apply_same_second():
+    payload = _r66p_evaluate(
+        dps=(
+            (8, "DT_VALUE", 4),
+            (33, "DT_BOOL", 1),
+            (34, "DT_BOOL", 1),
+            (69, "DT_RAW", 3),
+        )
+    )
+    result = access._parse_owner_refresh_trial_payload(payload)
+    assert result.failure_class is None
+    assert result.contract_evidence["confirmed_dp_ids"] == [8, 33]
+    assert result.retained_confirmation_observed
+
+
+@pytest.mark.parametrize(
+    "dps,terminal", [((), "COMPLETED"), (((69, "DT_RAW", 3),), "FAILED")]
+)
+def test_r66p_ack_only_or_failed_generation_cannot_pass(dps, terminal):
+    result = access._parse_owner_refresh_trial_payload(
+        _r66p_evaluate(dps=dps, terminal=terminal)
+    )
+    assert result.failure_class is access.OwnerRefreshFailureClass.REQUEST_FAILED
+    assert not result.current_session_provenance
+
+
+def test_r66p_wrong_session_and_reconnect_do_not_authorize_reply():
+    ns = _r66c_installation()
+    lines = _r66p_lines()
+    lines[-1] = lines[-1].replace("ordinal=7", "ordinal=8")
+    with pytest.raises(ValueError, match="refresh_lifecycle"):
+        ns["parse_owner_refresh_lifecycle"](lines)
+    result = access._parse_owner_refresh_trial_payload(
+        _r66p_evaluate(
+            extra=[
+                "Received: #21 FUN_RECEIVE_DP",
+                "Disconnected from device; synthetic",
+                "Sending packet: #22 FUN_RECEIVE_DP in response to #21",
+            ]
+        )
+    )
+    assert (
+        result.failure_class
+        is access.OwnerRefreshFailureClass.UNCLASSIFIED_OUTBOUND_TRAFFIC
+    )
+    assert not result.current_session_provenance
+
+
+def test_r66p_legacy_other_remains_unclassified_not_backfilled():
+    payload = _r66p_evaluate(extra=["Sending packet: #22 SYNTHETIC_UNKNOWN"])
+    payload.pop("contract_evidence")
+    payload["failure_class"] = "PROTOCOL_WRITE_DETECTED"  # Historical classification.
+    result = access._parse_owner_refresh_trial_payload(payload)
+    assert result.contract_evidence is None and not result.zero_write
+    assert (
+        result.failure_class is access.OwnerRefreshFailureClass.PROTOCOL_WRITE_DETECTED
+    )
+
+
+def test_r66p_identity_survives_independent_trial_failure(r65_bundles):
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    try:
+        ns = _r66c_installation()
+        ns["R66_CONTEXT"] = copy.deepcopy(controller._owner_context)
+        ready = ns["preflight_owner_trial"]("COLD")
+        context = ns["R66_CONTEXT"]
+        access.PrivateInteractiveSessionBroker._decode_owner_response(
+            broker,
+            json.dumps({"result": ready, "private_context": context}).encode(),
+            controller._hardware_capability(),
+            "owner_refresh_preflight",
+        )
+        context["bound"] = context["approved"][0]
+        result = access._parse_owner_refresh_trial_payload(
+            _r66p_evaluate(extra=["Sending packet: #22 SYNTHETIC_UNKNOWN"])
+        )
+        controller._accept_owner_context(context, result, "owner_refresh_collect")
+        assert controller.target_bound and controller.same_private_target
+        assert (
+            result.failure_class
+            is access.OwnerRefreshFailureClass.UNCLASSIFIED_OUTBOUND_TRAFFIC
+        )
+        changed = copy.deepcopy(context)
+        changed["bound"] = changed["approved"][1]
+        with pytest.raises(ValueError, match="owner_context"):
+            controller._accept_owner_context(changed, result, "owner_refresh_collect")
+        release = access.OwnerRefreshReleaseResult(
+            False, False, False, access.OwnerRefreshFailureClass.RELEASE_NOT_OBSERVED
+        )
+        controller._accept_owner_context(context, release, "owner_refresh_release")
+        assert controller.same_private_target
+        unproven = replace(
+            release, failure_class=access.OwnerRefreshFailureClass.OWNERSHIP_NOT_PROVEN
+        )
+        controller._accept_owner_context(context, unproven, "owner_refresh_release")
+        assert controller.target_bound and not controller.same_private_target
+    finally:
+        controller.close()
+
+
+def test_r66p_real_parser_results_survive_journal_and_finish(r65_bundles):
+    controller, broker, _r64, _restore = _r65_advance_to_live(r65_bundles)
+    controller.begin_hardware_observation()
+    original = broker._observe_owner_refresh_status_trial
+
+    def observe(kind, *, _capability):
+        original(kind, _capability=_capability)  # Consume the existing test permit.
+        return access._parse_owner_refresh_trial_payload(
+            _r66p_evaluate(
+                kind.value,
+                extra=[
+                    "Received: #21 FUN_RECEIVE_DP",
+                    "Sending packet: #22 FUN_RECEIVE_DP in response to #21",
+                ],
+            )
+        )
+
+    broker._observe_owner_refresh_status_trial = observe
+    try:
+        for index, kind in enumerate(access._R66_TRIAL_SEQUENCE, 1):
+            result = controller.observe_owner_refresh_trial(kind)
+            assert result.failure_class is None and result.counts.other == 1
+            if index in access._R66_RELEASE_AFTER_TRIAL_COUNTS:
+                controller.observe_hardware_release()
+        complete = controller.finish_hardware_observation()
+        assert complete.zero_write_aggregate and len(complete.trials) == 15
+        assert all(not row.retained_confirmation_observed for row in complete.trials)
+    finally:
+        controller.close()
+    replacement = _R65ScriptedBroker()
+    replacement._durable_lifecycle_test = True
+    restored = access.RefreshStatusLiveValidationController(replacement)
+    try:
+        assert restored.hardware_observation == complete
+    finally:
+        restored.close()
+
+
+def test_r66p_forged_packet_totals_and_confirmation_are_rejected():
+    payload = _r66p_evaluate(
+        extra=[
+            "Received: #21 FUN_RECEIVE_DP",
+            "Sending packet: #22 FUN_RECEIVE_DP in response to #21",
+        ]
+    )
+    wrong_total = copy.deepcopy(payload)
+    wrong_total["contract_evidence"]["outbound_other"][0]["count"] = 2
+    with pytest.raises(ValueError, match="owner_contract_evidence"):
+        access._parse_owner_refresh_trial_payload(wrong_total)
+    wrong_confirmation = copy.deepcopy(payload)
+    wrong_confirmation["contract_evidence"]["confirmed_dp_ids"] = [8]
+    with pytest.raises(ValueError, match="owner_contract_evidence"):
+        access._parse_owner_refresh_trial_payload(wrong_confirmation)
 
 
 def test_r66a_release_transition_requires_exact_selected_connection_entity() -> None:
@@ -15359,6 +15647,11 @@ def _r66c_observe(
         ),
         _r65c_record(synthetic_label, "S1_REFRESH_COMPLETED session_ordinal=1"),
     ]
+    if kind == "COLD":
+        lines[1:1] = [
+            _r65c_record(synthetic_label, "Sending packet: #8 FUN_SENDER_DEVICE_INFO"),
+            _r65c_record(synthetic_label, "Sending packet: #9 FUN_SENDER_PAIR"),
+        ]
     # The synthetic DP entity belongs to the selected registry device.
     original_resolve = ns["resolve_owner_refresh_target"]
 
