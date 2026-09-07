@@ -10494,27 +10494,51 @@ def http_json(path, method='GET', data=None, limit=1024 * 1024):
 
 class WebSocket:
     def __init__(self):
+        self._receive_buffer = bytearray()
         self.sock = socket.create_connection(('supervisor', 80), timeout=15)
-        key = base64.b64encode(os.urandom(16)).decode()
-        token = os.environ.get('SUPERVISOR_TOKEN')
-        request = (
-            'GET /core/websocket HTTP/1.1\r\nHost: supervisor\r\nUpgrade: websocket\r\n'
-            'Connection: Upgrade\r\nSec-WebSocket-Key: ' + key + '\r\n'
-            'Sec-WebSocket-Version: 13\r\nAuthorization: Bearer ' + token + '\r\n\r\n'
-        )
-        self.sock.sendall(request.encode('ascii'))
-        response = b''
-        while b'\r\n\r\n' not in response and len(response) <= 16384:
-            response += self.sock.recv(4096)
-        if not response.startswith(b'HTTP/1.1 101'):
-            raise ValueError('websocket')
-        self.next_id = 1
-        first = self.recv()
-        if first.get('type') == 'auth_required':
-            self.send({'type': 'auth', 'access_token': token})
-            first = self.recv()
-        if first.get('type') != 'auth_ok':
-            raise ValueError('websocket_auth')
+        try:
+            deadline = time.monotonic() + 15
+            key = base64.b64encode(os.urandom(16)).decode()
+            token = os.environ.get('SUPERVISOR_TOKEN')
+            request = (
+                'GET /core/websocket HTTP/1.1\r\nHost: supervisor\r\nUpgrade: websocket\r\n'
+                'Connection: Upgrade\r\nSec-WebSocket-Key: ' + key + '\r\n'
+                'Sec-WebSocket-Version: 13\r\nAuthorization: Bearer ' + token + '\r\n\r\n'
+            )
+            self._remaining(deadline)
+            self.sock.sendall(request.encode('ascii'))
+            self._receive_upgrade(deadline)
+            self.next_id = 1
+            first = self.recv(deadline)
+            if first.get('type') == 'auth_required':
+                self._remaining(deadline)
+                self.send({'type': 'auth', 'access_token': token})
+                first = self.recv(deadline)
+            if first.get('type') != 'auth_ok':
+                raise ValueError('websocket_auth')
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def _receive_upgrade(self, deadline):
+        response = bytearray()
+        while True:
+            self._remaining(deadline)
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ValueError('websocket_upgrade_eof')
+            response.extend(chunk)
+            boundary = response.find(b'\r\n\r\n')
+            if boundary >= 0:
+                end = boundary + 4
+                if end > 16384 or not response.startswith(b'HTTP/1.1 101 '):
+                    raise ValueError('websocket_upgrade_invalid')
+                # TCP reads may contain both HTTP headers and WebSocket bytes.
+                # Keep the latter, including incomplete frames, for _read().
+                self._receive_buffer.extend(response[end:])
+                return
+            if len(response) >= 16384:
+                raise ValueError('websocket_upgrade_invalid')
 
     def _remaining(self, deadline):
         remaining = deadline - time.monotonic()
@@ -10525,7 +10549,12 @@ class WebSocket:
         value = b''
         while len(value) < size:
             self._remaining(deadline)
-            part = self.sock.recv(size - len(value))
+            buffered = getattr(self, '_receive_buffer', None)
+            if buffered:
+                part = bytes(buffered[:size - len(value)])
+                del buffered[:len(part)]
+            else:
+                part = self.sock.recv(size - len(value))
             if not part:
                 raise ValueError('websocket_closed')
             value += part
