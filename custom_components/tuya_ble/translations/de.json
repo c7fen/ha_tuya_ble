@@ -44,6 +44,12 @@
         },
         "ble_policy_transition_failed": {
             "message": "Die Bluetooth-Verbindungsrichtlinie konnte nicht sicher geändert werden."
+        },
+        "s1_status_refresh_busy": {
+            "message": "Eine S1-Statusaktualisierung wird bereits ausgeführt."
+        },
+        "s1_status_refresh_failed": {
+            "message": "Die S1-Statusaktualisierung wurde nicht abgeschlossen."
         }
     },
     "entity": {
@@ -82,6 +88,9 @@
             },
             "bluetooth_unlock": {
                 "name": "Entriegeln"
+            },
+            "refresh_status": {
+                "name": "Status aktualisieren"
             }
         },
         "event": {

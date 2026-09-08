@@ -44,6 +44,12 @@
         },
         "ble_policy_transition_failed": {
             "message": "The Bluetooth connection policy could not be changed safely."
+        },
+        "s1_status_refresh_busy": {
+            "message": "An S1 status refresh is already in progress."
+        },
+        "s1_status_refresh_failed": {
+            "message": "The S1 status refresh did not complete."
         }
     },
     "entity": {
@@ -85,6 +91,9 @@
             },
             "bluetooth_unlock": {
                 "name": "Unlock"
+            },
+            "refresh_status": {
+                "name": "Refresh Status"
             }
         },
         "event": {
