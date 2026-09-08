@@ -8,6 +8,42 @@ and this project adheres to
 
 ## Unreleased
 
+## [0.10.0b2](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b2) (prepared, not published)
+
+This is a prerelease candidate with owner-approved limited beta acceptance.
+The complete delta from the previous published beta `v0.10.0b1` comprises:
+
+- S1 last-confirmed Battery, Auto-Lock, Authentication Mode, and Auto-Lock
+  Delay values, with `data_fresh`, `last_confirmed_at`, and `value_source`;
+  stale retention across disconnect and validated Home Assistant restoration.
+- Diagnostic Last Status Update, scoped to those four datapoints, with
+  monotonic timezone-aware UTC second-resolution confirmation timestamps.
+- Passive exact-session Device Status request/ACK/batch chronology, with
+  exact response-code and overlapping-request outcome ownership.
+- S1 Refresh Status: one explicit Device Status request per accepted press,
+  no automatic retry/replay, and normal authenticated-session reuse and hold.
+  Conditionally omitted DPs retain previous values and confirmation times.
+  DP69-only may complete the request without refreshing battery/configuration
+  or advancing Last Status Update. Not every mapped DP is promised.
+
+The runtime is the tested PR #47 commit
+`7cfcf9598941de253a24b7c30b06170a98b4ba86`, with only the manifest version
+changed. The default hold remains 15 seconds. PR #45 research code and PR #46
+observer tooling are not included.
+
+One selected S1 passed one COLD-to-RETAINED-to-RELEASE pair at 105 seconds,
+with session/target continuity, normal release, no observed automatic reconnect,
+and no owner-observed mechanical change. The full repetition matrix is
+incomplete; another owner-reported press has no usable observer association.
+No separate Lock/Unlock follow-up, complete default-15-second retained test,
+long-term, battery-life, or success-rate claim is made. The owner explicitly
+deferred the missing repetition/follow-up evidence for this limited beta only;
+this is not a complete hardware or stable acceptance.
+
+See [release notes and upgrade/return instructions](docs/releases/0.10.0b2.md)
+and the [limited acceptance record](docs/limited-beta-acceptance.md).
+Stable `v0.9.0` remains available. Publication requires separate final approval.
+
 ## [0.10.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b1) (2026-08-26)
 
 This prerelease contains the complete delta from stable `v0.9.0` through the
