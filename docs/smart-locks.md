@@ -157,9 +157,33 @@ at the time it was stored or displayed; use `data_fresh` and
 `last_confirmed_at` when analyzing or automating on it.
 
 This feature introduces neither polling nor a background BLE connection,
-keep-alive, scheduler, or manual refresh. A future explicit refresh belongs to
-[Issue #37](https://github.com/c7fen/ha_tuya_ble/issues/37), and optional
-maximum-age scheduling belongs separately to
+keep-alive, or scheduler. The S1 diagnostic **Refresh Status** button sends one
+explicit, non-actuating Device Status request for each completed user press. It
+does not retry or replay the request after a timeout, disconnect, cancellation,
+or ambiguous transport failure. A second press is rejected while the first is
+still active; a later press after complete cleanup is a new explicit request.
+
+R63U remote evidence observed DP8, DP33, DP34, and DP36 in 7 of 10 cold
+requests and all 5 retained-session requests. A valid cold response may
+therefore omit any of them. Only retained DPs actually received with the
+correct type in the exact current session update their value and confirmation
+time. Missing values retain their previous value and age. A valid batch that
+contains only another datapoint, such as DP69, can complete the protocol
+operation without advancing **Last Status Update**.
+
+DP21 and DP40 were not observed in the 15-request R63U sample and are not
+promised as refreshed. DP47 may be received through the normal inbound path,
+but is not retained and is not evidence of physical motor movement. No new
+entities are inferred from the other research-only datapoints.
+
+After the request completes, the normal configured On-Demand Connection Hold
+Time remains in force. A later operation may reuse that authenticated warm
+session; Refresh Status neither disconnects immediately nor creates its own
+hold timer. This action is separate from the cold-connection latency work in
+[Issue #31](https://github.com/c7fen/ha_tuya_ble/issues/31). Events that occurred
+while Home Assistant was disconnected are not recovered retroactively unless
+the device itself includes them in a later report. Optional maximum-age
+scheduling belongs separately to
 [Issue #38](https://github.com/c7fen/ha_tuya_ble/issues/38).
 
 For a safe upgrade, allow Home Assistant to restore only its standard retained

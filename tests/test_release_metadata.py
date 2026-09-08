@@ -37,19 +37,19 @@ README = ROOT / "README.md"
 CHANGELOG = ROOT / "CHANGELOG.md"
 RELEASE_POLICY = ROOT / "docs" / "releasing.md"
 INTEGRATION = ROOT / "custom_components" / "tuya_ble"
-EXPECTED_RELEASE_VERSION = "0.10.0b1"
-EXPECTED_RELEASE_TAG = "v0.10.0b1"
-EXPECTED_TRACKED_PATH_COUNT = 92
+EXPECTED_RELEASE_VERSION = "0.10.0b2"
+EXPECTED_RELEASE_TAG = "v0.10.0b2"
+EXPECTED_TRACKED_PATH_COUNT = 99
 EXPECTED_TRACKED_PATH_DIGEST = (
-    "3d6d7f432942482ae5186d11877d31418d2e9d213b8acba36ecd88ffd32eb201"
+    "dc1c1ede5c1f2e79875ce50f6d639a5688cfc8901dfa97e29f00447b5cb04e39"
 )
-EXPECTED_INTEGRATION_PATH_COUNT = 36
+EXPECTED_INTEGRATION_PATH_COUNT = 37
 EXPECTED_INTEGRATION_PATH_DIGEST = (
-    "246440f7c64b14c66e9ce62f150bcebf6d700b0ea04a1841c6b104d721c5532b"
+    "664ac17bf33996e82732ef90ebd7a15b33ec14bf7bc8ec69a86a791f4e599822"
 )
-EXPECTED_RUNTIME_PYTHON_PATH_COUNT = 27
+EXPECTED_RUNTIME_PYTHON_PATH_COUNT = 28
 EXPECTED_RUNTIME_PATH_BLOB_DIGEST = (
-    "d66f63107bde813dfdecae565edfe508c362ccbfb73ac7987b898f34c2f2f6bc"
+    "860787f03a208437e6f4fe70c16ae300c49b7609040c44a54816fd4ad71d6de5"
 )
 RELEASE_ATTESTATION_SKIP_REASON = (
     "exact immutable release attestation is performed only for a release branch, "
@@ -146,6 +146,20 @@ def test_readme_links_are_downstream() -> None:
 def test_release_changelog_is_exact(require_release_attestation: None) -> None:
     """Require the immutable published release and historical changelog text."""
     changelog = CHANGELOG.read_text(encoding="utf-8")
+
+    assert (
+        "## [0.10.0b2](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b2)"
+        in changelog
+    )
+    notes = (ROOT / "docs" / "releases" / "0.10.0b2.md").read_text()
+    acceptance = (ROOT / "docs" / "limited-beta-acceptance.md").read_text()
+    assert "Changes since published v0.10.0b1" in notes
+    assert "default hold is still **15 seconds**" in notes
+    assert "full repetition matrix is incomplete" in notes
+    assert "not** a complete hardware PASS" in notes
+    assert "OWNER_PRESS_NOT_OBSERVED" in acceptance
+    assert "7cfcf9598941de253a24b7c30b06170a98b4ba86" in acceptance
+    assert "57357f7ca8c78d82c8b259faa5f05a6bba8c3693" in acceptance
 
     assert (
         "## [0.10.0b1](https://github.com/c7fen/ha_tuya_ble/releases/tag/v0.10.0b1)"

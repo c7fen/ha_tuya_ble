@@ -82,3 +82,25 @@ class TuyaBLEPolicyTransitionError(ServiceValidationError):
             translation_domain=DOMAIN,
             translation_key="ble_policy_transition_failed",
         )
+
+
+class TuyaBLES1StatusRefreshBusyError(ServiceValidationError):
+    """Raised when an S1 manual status refresh is already active."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "An S1 status refresh is already in progress.",
+            translation_domain=DOMAIN,
+            translation_key="s1_status_refresh_busy",
+        )
+
+
+class TuyaBLES1StatusRefreshFailedError(ServiceValidationError):
+    """Raised when an S1 manual status refresh cannot complete safely."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The S1 status refresh did not complete.",
+            translation_domain=DOMAIN,
+            translation_key="s1_status_refresh_failed",
+        )
