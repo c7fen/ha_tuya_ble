@@ -28,6 +28,63 @@ host, use `$WORKTREE_ROOT/ha_tuya_ble/<task>` only when `WORKTREE_ROOT` is
 explicitly configured. That root must remain outside all canonical checkouts
 and outside the parent directory containing canonical project roots.
 
+## Home Assistant live access
+
+- Before ANY live Home Assistant host, Supervisor, deployment, restart, Core
+  check, or live-validation task, read and follow
+  `.agents/skills/home-assistant-live-access/SKILL.md`.
+- On Felix's primary workstation, environment-specific Home Assistant SSH
+  details are stored only in the private, untracked `AGENTS.local.md` in the
+  canonical checkout. Linked worktrees do not inherit that untracked file.
+  Therefore, if `AGENTS.local.md` is absent in the current worktree, agents MUST
+  check the canonical checkout above before claiming that the route is unknown
+  or unavailable.
+- Never commit, publish, or echo the private Home Assistant target, internal
+  address, credentials, SSH-agent material, or Supervisor token from the local
+  instructions.
+- The verified workstation route uses SSH Key Agent authentication that requires
+  an interactive SSH login. Do not substitute a one-shot non-interactive
+  `ssh <target> "<command>"` path for live Home Assistant work when the local
+  instructions specify the interactive route.
+- After interactive login, use the verified login-shell workflow from the skill
+  for Supervisor-backed `ha` commands. A direct non-login command environment
+  is not sufficient evidence that Supervisor context is unavailable.
+- The private wrapper is a target container only. Transcript-retained
+  automation must launch it through the privacy-filtering interactive PTY
+  session broker in `tools/home_assistant_live_access.py`; it must never invoke
+  the raw wrapper directly. The broker privately consumes login banners and
+  local SSH close output, emits only generic readiness, enters `exec bash -li`,
+  and exposes only the fixed, aggregate-only Repairs collector rather than a
+  raw terminal or generic command adapter. It must validate a wrapper `Path`
+  before launch, execute that path with no arguments in a controlling PTY, and
+  use fresh broker-owned challenge frames for each readiness/collection phase.
+- Do not invent a replacement alias, browser fallback, or alternate route
+  merely because the current linked worktree lacks the private local file.
+- Do not invoke or invent a wrapper bootstrap merely because an untracked
+  private file is absent from a linked worktree. First use the established
+  private wrapper and canonical-checkout rules above.
+- A separately authorized local-only wrapper bootstrap MAY consume a
+  literal-only private recipe through the repository-owned
+  `tools/home_assistant_live_access.py` helper. It must not echo its input,
+  target, or wrapper text; it must require an owner-only directory, a regular
+  non-symlink `0700` wrapper, the allowlisted private interactive SSH route,
+  and static command validation. The bootstrap recipe is a separate local-only
+  format; it does not parse or render `AGENTS.local.md`. This helper is not a
+  live-access authority and must never make a network connection.
+- Validate the private wrapper structurally before a live task. Treat an
+  invalid wrapper, an invalid Repairs response, or an unavailable private route
+  as an access/admission or collector outcome, never as an invocation result.
+- Retained/public Repairs evidence is limited to exactly `shape_valid`,
+  `relevant_count`, and `critical_count`; gate and decision metadata stay
+  inside the orchestrator.
+- The singular Repairs transport is `ha resolution info --raw-json`. Its
+  canonical response is the strict Supervisor envelope: string `result ==
+  "ok"`, object `data`, and list `data.issues`. Do not accept the obsolete
+  top-level `issues` shape or substitute an empty list for an invalid response.
+- R24 correctly stopped fail-closed with no source or device mutation. Its
+  known root cause is a collector schema-layer mismatch, not PR #45, a device,
+  BLE, or the interactive invocation contract.
+
 ## Device and behavior changes
 
 - Do not add tests only for a simple device mapping. Add coverage when existing
@@ -52,6 +109,25 @@ and outside the parent directory containing canonical project roots.
   real secret or retained capture.
 - Keep device-scoped security material private, mode-restricted, and fail
   closed; never introduce a product-wide fallback.
+
+## Proportionality and scope
+
+- The lock integrations in this project are used for interior doors within a
+  building.
+- Keep engineering and validation proportional to the requested functionality
+  and the concrete demonstrated defect.
+- Do not automatically expand scoped work into broad hardening, fuzzing,
+  mutation, adversarial, filesystem-race, or theoretical edge-case campaigns.
+- Add analysis or tests beyond the requested scope only when the user explicitly
+  requests them or they are needed to reproduce or close a concrete defect.
+- Preserve established invariants while prioritizing functionality,
+  deterministic regressions, compatibility, state consistency, recovery
+  behavior, and maintainability.
+- A theoretical possibility is not a new blocking requirement unless it
+  violates an explicit project contract or has a concrete reproducer.
+- After the scoped defect and its relevant regressions are resolved, stop rather
+  than automatically opening another assurance cycle.
+- Ask the user before materially expanding scope.
 
 ## Validation and commits
 
