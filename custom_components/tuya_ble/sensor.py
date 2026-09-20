@@ -987,6 +987,37 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
                     ),
                 ),
             ],
+            "zqeaw7pi": [  # Temperature Humidity Sensor (TH05 / BTH01Y)
+                TuyaBLETemperatureMapping(
+                    dp_id=1,
+                    coefficient=10.0,
+                    description=SensorEntityDescription(
+                        key="va_temperature",
+                        device_class=SensorDeviceClass.TEMPERATURE,
+                        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                        state_class=SensorStateClass.MEASUREMENT,
+                    ),
+                ),
+                TuyaBLESensorMapping(
+                    dp_id=2,
+                    description=SensorEntityDescription(
+                        key="va_humidity",
+                        device_class=SensorDeviceClass.HUMIDITY,
+                        native_unit_of_measurement=PERCENTAGE,
+                        state_class=SensorStateClass.MEASUREMENT,
+                    ),
+                ),
+                TuyaBLEBatteryMapping(
+                    dp_id=4,
+                    description=SensorEntityDescription(
+                        key="battery_percentage",
+                        device_class=SensorDeviceClass.BATTERY,
+                        native_unit_of_measurement=PERCENTAGE,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        state_class=SensorStateClass.MEASUREMENT,
+                    ),
+                ),
+            ],
             "6lbesej0": [  # Temperature Humidity Sensor SS302
                 TuyaBLETemperatureMapping(
                     dp_id=1,
