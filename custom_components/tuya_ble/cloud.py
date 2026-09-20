@@ -128,7 +128,16 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
     @staticmethod
     def _get_cache_key(data: dict[str, Any]) -> str:
         data = normalize_app_type_data(data)
-        key_dict = {key: data.get(key) for key in CONF_TUYA_LOGIN_KEYS}
+        # CONF_AUTH_TYPE can hold a tuya_iot AuthType Enum member rather than
+        # its plain value, and json.dumps() cannot serialize an Enum.
+        # _login() coerces it to .value, but only on the normalized copy it
+        # builds for itself, so callers that still hold the original Enum
+        # value would otherwise hit a TypeError here. Coerce Enum values to
+        # their underlying value so both code paths produce the same key.
+        key_dict = {}
+        for key in CONF_TUYA_LOGIN_KEYS:
+            value = data.get(key)
+            key_dict[key] = getattr(value, "value", value)
         return json.dumps(key_dict)
 
     @staticmethod
