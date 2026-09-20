@@ -69,7 +69,11 @@ _TRANSPORT_ERROR_FALLBACK = "Tuya BLE transport error"
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
 
-FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4"})
+# Product IDs that expose the TuyaOS FD50 service and need the FD50 device-info
+# handshake before they will start sending datapoints. A device is only added
+# here once it has been confirmed to present the FD50 write/notify
+# characteristic pair; see _requires_fd50_device_info_handshake().
+FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4", "zqeaw7pi"})
 
 
 # @dataclass
