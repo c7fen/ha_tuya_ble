@@ -119,7 +119,14 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
     def __init__(self, hass: HomeAssistant, data: dict[str, Any]) -> None:
         assert hass is not None
         self._hass = hass
-        self._data = normalize_app_type_data(data)
+        # normalize_app_type_data() returns a copy of `data`, not a view of it.
+        # Callers (config_flow) construct this manager with a dict they still
+        # hold a reference to and populate later via that reference, so the
+        # manager needs to keep seeing updates made to the caller's dict.
+        # Write the normalized keys back into the caller's dict and keep a
+        # live reference to it instead of a detached copy.
+        data.update(normalize_app_type_data(data))
+        self._data = data
 
     @staticmethod
     def _is_login_success(response: dict[Any, Any]) -> bool:
