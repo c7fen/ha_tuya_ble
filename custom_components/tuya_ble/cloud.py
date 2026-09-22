@@ -129,6 +129,9 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
     def _get_cache_key(data: dict[str, Any]) -> str:
         data = normalize_app_type_data(data)
         key_dict = {key: data.get(key) for key in CONF_TUYA_LOGIN_KEYS}
+        auth_type = key_dict.get(CONF_AUTH_TYPE)
+        if isinstance(auth_type, AuthType):
+            key_dict[CONF_AUTH_TYPE] = auth_type.value
         return json.dumps(key_dict)
 
     @staticmethod
@@ -323,8 +326,10 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
             if cache_key:
                 item = _cache.get(cache_key)
 
-            if item is None or force_update:
+            if item is None or len(item.credentials) == 0 or force_update:
                 if self._is_login_success(await self.login(True)):
+                    if cache_key is None:
+                        cache_key = self._get_cache_key(self._data)
                     item = _cache.get(cache_key)
                     if item:
                         await self._fill_cache_item(item)
