@@ -27,6 +27,18 @@ For each release:
 Version changes must never cause a duplicate release or a downgrade. Published
 tag history is immutable.
 
+## Review terms
+
+- **Exact head:** the full commit SHA of a pull-request or release branch head
+  at the time it is reviewed or validated.
+- **Exact-head review:** a review bound to one exact head. Any new or rewritten
+  commit produces a new head that needs a fresh review; do not force-push,
+  rebase, or amend a reviewed head.
+- **Exact tested commit:** the full commit SHA of the code that was deployed or
+  tested. CI, offline, and hardware evidence apply only to that commit. A merge
+  commit or tag containing the same files is a new object and must state how it
+  relates to the tested commit.
+
 ## Release attestation mode
 
 Ordinary feature pull requests run the always-on repository safety checks.
