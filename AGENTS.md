@@ -11,7 +11,9 @@ definitions live in the linked documents.
 - `custom_components/tuya_ble/tuya_ble/`: Bluetooth protocol, session, and
   security transport.
 - `tests/`: pytest suite.
-- `docs/`: safety, privacy, release, and live-validation documentation.
+- `scripts/check.sh`: offline validation profile shared with CI.
+- `docs/`: safety, privacy, release, validation, and live-validation
+  documentation.
 
 ## Branch and release boundaries
 
@@ -98,11 +100,18 @@ and outside the parent directory containing canonical project roots.
 
 ## Validation and commits
 
-- Run Black before committing.
+- Run `scripts/check.sh --python <CI-base interpreter>` before committing. It
+  covers Black, Codespell, full pytest, JSON/YAML, Actionlint, secret scanning,
+  and `git diff --check`. Only exit code 0 on the complete profile passes.
+  Profile, result states, and test environments are defined in
+  [docs/validation.md](docs/validation.md).
+- Never report a NOT RUN check as passed, a partial `--only` run as the
+  complete profile, or a local run of a changed workflow as a CI result. HACS
+  and Hassfest run only in CI.
 - Keep JSON valid, well formatted, and consistent with repository conventions.
 - Use Conventional Commits. A basic mapping normally uses `fix:`.
-- Require relevant focused tests, full pytest, Codespell, JSON/YAML validation,
-  `git diff --check`, HACS, Hassfest, Actionlint, and secret scanning before a
-  release-facing merge.
+- Require relevant focused tests, the complete offline profile, and passing
+  CI (including HACS and Hassfest) on the exact head before a release-facing
+  merge.
 - Documentation must describe the current behavior, safe upgrade path, privacy
   boundary, hardware scope, and release policy before a stable cutover.

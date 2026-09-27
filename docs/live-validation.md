@@ -49,7 +49,7 @@ not run instead.
 ## Before a deployment
 
 - Name the exact commit by its full SHA and record its offline validation
-  result.
+  result from [Validation](validation.md).
 - Resolve the target device only through the owner's private binding and the
   Home Assistant config-entry, device, and entity registries. Never infer it
   from ordering, name similarity, battery value, RSSI, or current state. All
@@ -79,8 +79,9 @@ Record each live or hardware result with:
   relevant connection settings;
 - the UTC time;
 - the scope: product, number of devices, and number of actions; and
-- the result: PASS, FAIL, NOT RUN with reason, or N/A with reason. A check that
-  was not run is never reported as passed.
+- the result: PASS, FAIL, NOT RUN with reason, or N/A with reason, as defined
+  in [Validation](validation.md#results). A check that was not run is never
+  reported as passed.
 
 Evidence applies only to the exact tested commit. A merge commit or tag that
 contains the same runtime files is a new object and must state how it relates

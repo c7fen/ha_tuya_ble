@@ -9,6 +9,9 @@ on:
 env:
   PY_VERSION: "3.13"
   CACHE_VERSION: 1
+  GO_VERSION: "1.25"
+  ACTIONLINT_VERSION: "v1.7.12"
+  GITLEAKS_VERSION: "v8.30.1"
 
 jobs:
   base:
@@ -70,7 +73,7 @@ jobs:
           key: ${{ runner.os }}-pip-dependencies-${{ hashFiles('requirements_test.txt') }}_${{env.CACHE_VERSION}}
 
       - name: "Black codestyle check"
-        run: ${{needs.base.outputs.PY_PATH}}/bin/black --check --diff .
+        run: scripts/check.sh --python "${{needs.base.outputs.PY_PATH}}/bin/python" --only black
 
   codespell:
     name: "Codespell check"
@@ -88,7 +91,7 @@ jobs:
           key: ${{ runner.os }}-pip-dependencies-${{ hashFiles('requirements_test.txt') }}_${{env.CACHE_VERSION}}
 
       - name: "Codespell check"
-        run: ${{needs.base.outputs.PY_PATH}}/bin/codespell
+        run: scripts/check.sh --python "${{needs.base.outputs.PY_PATH}}/bin/python" --only codespell
 
   pytest:
     name: "Pytest"
@@ -106,5 +109,45 @@ jobs:
           key: ${{ runner.os }}-pip-dependencies-${{ hashFiles('requirements_test.txt') }}_${{env.CACHE_VERSION}}
 
       - name: "Pytest"
+        env:
+          # Coverage and output options for the CI pytest run.
+          PYTEST_ADDOPTS: "--cov --disable-warnings -s"
+        run: scripts/check.sh --python "${{needs.base.outputs.PY_PATH}}/bin/python" --only pytest
+
+  repository:
+    name: "Repository checks"
+    runs-on: ubuntu-latest
+    needs: base
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore Python
+        uses: actions/cache/restore@v4.2.0
+        with:
+          path: ${{needs.base.outputs.PY_PATH}}
+          fail-on-cache-miss: true
+          key: ${{ runner.os }}-pip-dependencies-${{ hashFiles('requirements_test.txt') }}_${{env.CACHE_VERSION}}
+
+      - name: "Setup Go"
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{env.GO_VERSION}}
+          cache: false
+
+      - name: "Install actionlint and gitleaks"
         run: |
-          ${{needs.base.outputs.PY_PATH}}/bin/pytest --cov --disable-warnings -s
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          go install -ldflags "-X=github.com/zricethezav/gitleaks/v8/version.Version=${GITLEAKS_VERSION}" \
+            "github.com/zricethezav/gitleaks/v8@${GITLEAKS_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: "JSON, YAML, actionlint, secrets, and diff whitespace"
+        env:
+          # Pull request: base commit; push: previous tip; manual run: empty tree (whole tree).
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before || '4b825dc642cb6eb9a060e54bf8d69288fbee4904' }}
+        run: >-
+          scripts/check.sh --python "${{needs.base.outputs.PY_PATH}}/bin/python"
+          --only json,yaml,actionlint,gitleaks,diff --diff-base "$DIFF_BASE"

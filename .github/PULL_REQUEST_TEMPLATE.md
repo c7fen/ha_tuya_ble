@@ -12,8 +12,8 @@ Describe the single coherent outcome and its evidence.
 ## Validation
 
 - [ ] The branch was created from current `next` and targets `next`.
-- [ ] Black, Codespell, relevant tests, JSON/YAML validation, and `git diff --check` pass.
-- [ ] HACS, Hassfest, Actionlint, and secret scanning pass when applicable.
+- [ ] `scripts/check.sh` passed the complete offline profile (exit 0) on the reviewed head; its header and summary are included below.
+- [ ] HACS and Hassfest pass in CI.
 - [ ] Behavior changes have tests; a simple mapping does not add a mapping-only test.
 - [ ] New user-facing strings are translated.
 - [ ] Unrelated upstream registrations and mappings are unchanged.

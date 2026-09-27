@@ -38,17 +38,16 @@ platform behavior, Bluetooth communication, registry migration, safety logic,
 or another unique behavior changes. Tests must use clearly synthetic
 identifiers and payloads.
 
-Add or update translated strings for new user-facing entities and errors. Run:
+Add or update translated strings for new user-facing entities and errors. Run
+the offline validation profile from any directory:
 
 ```shell
-black --check --diff .
-codespell
-pytest
+scripts/check.sh --python /path/to/python
 ```
 
-Also require valid, consistently formatted JSON, `git diff --check`, HACS and
-Hassfest validation, and the repository security scans. Describe the exact
-environment and results in the pull request.
+[Validation](docs/validation.md) describes the checks, the interpreter
+selection, and the result states. HACS and Hassfest run in CI. Copy the
+summary and header of the run into the pull request.
 
 ## Hardware evidence
 
