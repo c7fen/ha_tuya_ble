@@ -9,7 +9,8 @@ operational upstream.
 Create each contribution from the current `next` branch and open the pull
 request against `next`. Do not develop directly on `main`; it is the controlled
 stable-release branch. Keep one coherent behavioral outcome per pull request,
-and do not force-push after a head has received exact-head review.
+and do not force-push after a head has received exact-head review (see
+[review terms](docs/releasing.md#review-terms)).
 
 Use Conventional Commits titles. A basic device mapping normally uses `fix:`.
 
@@ -23,7 +24,8 @@ registration and platform mapping.
 Do not publish or commit credentials, complete device addresses, Device IDs,
 UUIDs, Local Keys, SecKeys, raw Home Assistant logs, HCI captures, raw
 datapoint payloads, encrypted frames, decrypted frames, or copied lock command
-values. Redact screenshots before attaching them.
+values. Redact screenshots before attaching them. The complete rules are in
+[Logging and privacy](docs/logging-and-privacy.md).
 
 Protocol similarity is not authority for physical control. Do not spray
 datapoints, values, or alternate command formats. A physical-control change
@@ -50,11 +52,10 @@ environment and results in the pull request.
 
 ## Hardware evidence
 
-The contributor, not the integration agent, performs physical actions. Keep the
-door open, retain alternate authorized access, and ensure nobody depends on the
-current state. Record the exact tested commit, one user action per command, the
-number of physical actions, the expected direction, and any ambiguous error.
-Never claim hardware validation for a different commit or untested product.
+The contributor, not the integration agent, performs physical actions. Follow
+[Live validation and hardware evidence](docs/live-validation.md) for the
+safety checklist, the evidence record, and stop conditions. Never claim
+hardware validation for a different commit or untested product.
 
 Registry-domain changes require ownership-safe, collision-safe, idempotent
 migration tests and an upgrade note for affected automations.

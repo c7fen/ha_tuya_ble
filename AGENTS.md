@@ -1,5 +1,18 @@
 # Repository agent policy
 
+This file is the short entry point for agents. Complete procedures and term
+definitions live in the linked documents.
+
+## Project map
+
+- `custom_components/tuya_ble/`: Home Assistant integration: platforms,
+  `config_flow.py`, `manifest.json`, `strings.json`, and `translations/`.
+- `custom_components/tuya_ble/devices.py`: product and datapoint mappings.
+- `custom_components/tuya_ble/tuya_ble/`: Bluetooth protocol, session, and
+  security transport.
+- `tests/`: pytest suite.
+- `docs/`: safety, privacy, release, and live-validation documentation.
+
 ## Branch and release boundaries
 
 - Use `next` as the development base and pull-request target.
@@ -7,7 +20,9 @@
 - Keep release preparation separate from runtime behavior changes.
 - Do not force-push, rebase, or amend a pushed or reviewed head.
 - Release only after documentation, CI, security, exact-head review, and any
-  required hardware gates pass.
+  required hardware gates pass. "Exact head", "exact-head review", and
+  "exact tested commit" are defined in
+  [docs/releasing.md](docs/releasing.md#review-terms).
 
 ## Local linked worktrees
 
@@ -28,6 +43,27 @@ host, use `$WORKTREE_ROOT/ha_tuya_ble/<task>` only when `WORKTREE_ROOT` is
 explicitly configured. That root must remain outside all canonical checkouts
 and outside the parent directory containing canonical project roots.
 
+## Live Home Assistant tasks and approvals
+
+- Offline development and offline checks need no Home Assistant access, no
+  private file, and no live approval.
+- A live task (SSH, Supervisor or `ha` CLI, deployment, restart, Core check,
+  service call, BLE session, or hardware observation) needs an explicit
+  approval that names the action and the target. Access approval is not
+  deployment approval, and neither authorizes a service call or a physical
+  action.
+- An explicit approval that already matches the requested action and target
+  need not be requested again. It never extends to another action, target, or
+  commit.
+- The general SSH route is documented in the maintainer's access runbook,
+  referenced in [docs/live-validation.md](docs/live-validation.md#access-route)
+  together with the Tuya-specific deployment, evidence, and stop conditions.
+  Do not add a second general SSH procedure here, and never commit hosts,
+  addresses, users, credentials, or device bindings.
+- Never read private access files or wrappers into agent tool output.
+- A missing access runbook or approval blocks only that live task, never
+  offline work.
+
 ## Device and behavior changes
 
 - Do not add tests only for a simple device mapping. Add coverage when existing
@@ -37,8 +73,11 @@ and outside the parent directory containing canonical project roots.
 - Preserve unrelated upstream product and platform mappings.
 - Physical-control paths must fail closed. Never infer a lock command from a
   similar product, spray datapoints or values, or replay an ambiguous command.
-- Bind hardware claims to the exact tested commit. Agents must not operate a
-  physical lock.
+- Bind hardware claims to the exact tested commit and follow
+  [docs/live-validation.md](docs/live-validation.md#hardware-evidence).
+- Agents must not operate a physical lock. No prompt, local file, or memory
+  entry creates an exception; changing this rule is a separate, explicitly
+  approved policy change.
 - Entity-domain changes require ownership-safe, collision-safe, idempotent
   registry migration and documented automation impact.
 
@@ -47,7 +86,11 @@ and outside the parent directory containing canonical project roots.
 - Never log or publish credentials, complete identifiers, raw device payloads,
   lock values, packet bytes, or captures.
 - A device log identity must not be a stable persistent address-derived hash.
-  Use only the reviewed process-local opaque-label contract.
+  Use only the process-local opaque label defined in
+  [docs/logging-and-privacy.md](docs/logging-and-privacy.md#production-log-identity).
+- The complete publication rules are in
+  [docs/logging-and-privacy.md](docs/logging-and-privacy.md) and
+  [SECURITY.md](SECURITY.md).
 - Synthetic test material must be visibly synthetic and must not resemble a
   real secret or retained capture.
 - Keep device-scoped security material private, mode-restricted, and fail
