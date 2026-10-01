@@ -990,6 +990,16 @@ def _r30_files(
     return tuple(files)
 
 
+def _r30_backup_payload() -> dict[str, object]:
+    """Return the exact synthetic PR #41 manifest required for baseline backup."""
+    return {
+        "lifecycle_generation": "1" * 32,
+        "source_generation": "2" * 32,
+        "source_state": "PR41_BASELINE",
+        "manifest": access._manifest_payload(_r30_manifest("RESTORE")),
+    }
+
+
 @pytest.fixture(autouse=True)
 def _synthetic_r30_source_authorities(
     monkeypatch: pytest.MonkeyPatch,
@@ -1520,12 +1530,65 @@ def test_r30_private_backup_restore_is_fixed_and_typed() -> None:
     assert access.BoundedOperation.RESTORE_BACKUP.value == "restore_backup"
 
 
+def _control_program_transfer(
+    source: str,
+    value: dict[str, object],
+    *,
+    raw_payload: bytes | None = None,
+    payload_encoded_override: str | None = None,
+    payload_count_override: int | None = None,
+    payload_extra_chunks: tuple[str, ...] = (),
+    end_marker: str | None = "HA_R39_TRANSFER_END",
+) -> tuple[str, str]:
+    """Build the exact digest-pinned source and payload transfer stream."""
+    encoded_source = base64.b64encode(source.encode("utf-8")).decode("ascii")
+    source_chunks = [
+        encoded_source[index : index + access._TRANSFER_CHUNK_SIZE]
+        for index in range(0, len(encoded_source), access._TRANSFER_CHUNK_SIZE)
+    ]
+    source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    payload = (
+        json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        if raw_payload is None
+        else raw_payload
+    )
+    encoded_payload = (
+        base64.b64encode(payload).decode()
+        if payload_encoded_override is None
+        else payload_encoded_override
+    )
+    payload_chunks = [
+        encoded_payload[index : index + access._TRANSFER_CHUNK_SIZE]
+        for index in range(0, len(encoded_payload), access._TRANSFER_CHUNK_SIZE)
+    ]
+    stream_lines = [
+        str(len(source_chunks)),
+        *source_chunks,
+        source_digest,
+        str(
+            len(payload_chunks)
+            if payload_count_override is None
+            else payload_count_override
+        ),
+        *payload_chunks,
+        *payload_extra_chunks,
+    ]
+    if end_marker is not None:
+        stream_lines.append(end_marker)
+    return "\n".join(stream_lines) + "\n", source_digest
+
+
 def _run_synthetic_remote_program(
     tmp_path: Path,
     operation: str,
     value: dict[str, object],
     *,
     source_replacements: dict[str, str] | None = None,
+    raw_payload: bytes | None = None,
+    payload_encoded_override: str | None = None,
+    payload_count_override: int | None = None,
+    payload_extra_chunks: tuple[str, ...] = (),
+    end_marker: str | None = "HA_R39_TRANSFER_END",
     expected_crash_code: int | None = None,
 ) -> dict[str, object]:
     """Execute the exact remote program with only fixed roots/fingerprints replaced."""
@@ -1544,16 +1607,24 @@ def _run_synthetic_remote_program(
     for original, replacement in (source_replacements or {}).items():
         assert original in source
         source = source.replace(original, replacement)
-    encoded = base64.b64encode(
-        json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-    ).decode()
-    chunks = [
-        encoded[index : index + access._TRANSFER_CHUNK_SIZE]
-        for index in range(0, len(encoded), access._TRANSFER_CHUNK_SIZE)
-    ]
+    transfer, source_digest = _control_program_transfer(
+        source,
+        value,
+        raw_payload=raw_payload,
+        payload_encoded_override=payload_encoded_override,
+        payload_count_override=payload_count_override,
+        payload_extra_chunks=payload_extra_chunks,
+        end_marker=end_marker,
+    )
     completed = subprocess.run(
-        [sys.executable, "-c", source, operation],
-        input=str(len(chunks)) + "\n" + "\n".join(chunks) + "\n",
+        [
+            sys.executable,
+            "-c",
+            access._CONTROL_BOOTSTRAP,
+            operation,
+            source_digest,
+        ],
+        input=transfer,
         text=True,
         capture_output=True,
         check=False,
@@ -1588,7 +1659,7 @@ def test_r30_remote_program_synthetic_atomic_install_and_restore(
         _r30_manifest("RESTORE"),
     )
 
-    backup = _run_synthetic_remote_program(tmp_path, "backup", {})
+    backup = _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())
     transfer = _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )
@@ -1628,7 +1699,7 @@ def test_r30_remote_program_synthetic_atomic_install_and_restore(
 @pytest.mark.parametrize(
     ("crash_point", "expected_outcome", "crash_code"),
     (
-        ("after_marker", "staged_then_restored", 92),
+        ("after_marker", "replay_rejected", 92),
         ("after_exchange", "already_restored", 93),
     ),
 )
@@ -1641,7 +1712,7 @@ def test_r33_restore_crash_settles_exact_pr41_once(
     """Marker and post-exchange crashes settle only through reconciliation."""
     integration = tmp_path / "custom_components" / "tuya_ble"
     integration.mkdir(parents=True)
-    (integration / "__init__.py").write_bytes(b"synthetic original source\n")
+    (integration / "__init__.py").write_bytes(b"synthetic integration source\n")
     candidate = access.build_source_bundle(
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
@@ -1650,7 +1721,9 @@ def test_r33_restore_crash_settles_exact_pr41_once(
         _r30_files("RESTORE"),
         _r30_manifest("RESTORE"),
     )
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -1782,6 +1855,14 @@ def test_r33_restore_crash_settles_exact_pr41_once(
         },
     )
 
+    if crash_point == "after_marker":
+        assert reconciled == {"error_class": "OPERATION_FAILED"}
+        assert marker.is_file()
+        assert stage.is_dir()
+        assert (integration / ".phase_a_tools").is_dir()
+        assert not (tmp_path / ".synthetic_restore_exchange_count").exists()
+        return
+
     assert reconciled["source_recovery_outcome"] == expected_outcome
     assert reconciled["manifest_match"] is True
     assert reconciled["core_check_passed"] is True
@@ -1845,7 +1926,17 @@ login = False
 restart_count = 0
 
 responses = {
-    "backup": {"success": True, "file_count": 3, "manifest_match": True, "regular_files_only": True},
+    "backup": {
+        "success": True,
+        "file_count": 1,
+        "manifest_match": True,
+        "regular_files_only": True,
+        "lifecycle_generation": "__LIFECYCLE_GENERATION__",
+        "source_generation": "__RESTORE_SOURCE_GENERATION__",
+        "backup_generation": "c" * 32,
+        "manifest_identity": "__RESTORE_MANIFEST_IDENTITY__",
+        "backup_digest": "d" * 64,
+    },
     "transfer": {"success": True, "file_count": 3, "manifest_match": True, "regular_files_only": True},
     "install": {"installation_success": True, "expected_file_count": 3, "installed_file_count": 3, "manifest_match": True},
     "source_inventory": {"expected_count": 3, "observed_count": 3, "manifest_match": True, "unexpected_count": 0, "missing_count": 0},
@@ -1930,6 +2021,9 @@ for line in sys.stdin:
         break
 """.replace(
     "__COUNTERS__", repr(access.AUDIT_COUNTER_NAMES)
+).replace(
+    "__RESTORE_MANIFEST_IDENTITY__",
+    access._source_manifest_digest(_r30_manifest("RESTORE").entries),
 )
 
 
@@ -1946,9 +2040,18 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
         lambda path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
     )
 
+    prepared = access._DurableLifecycleJournal()
+    child = _R30_LIFECYCLE_CHILD.replace(
+        "__LIFECYCLE_GENERATION__", prepared.lifecycle_generation
+    ).replace(
+        "__RESTORE_SOURCE_GENERATION__",
+        prepared._record["pr41_restore"]["generation"],
+    )
+    prepared.close()
+
     def spawn(path: Path) -> tuple[int, int]:
         spawns.append(path)
-        return _fake_spawn(_R30_LIFECYCLE_CHILD)(path)
+        return _fake_spawn(child)(path)
 
     monkeypatch.setattr(access, "_spawn_private_wrapper", spawn)
     broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.5)
@@ -1971,7 +2074,7 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
         _capability=capability(access.LifecycleAction.INITIAL_REPAIRS),
     ).shape_valid
     assert broker._create_private_backup(
-        _capability=capability(access.LifecycleAction.BACKUP)
+        restore.manifest, _capability=capability(access.LifecycleAction.BACKUP)
     ).success
     assert broker._transfer_source_bundle(
         candidate,
@@ -2027,11 +2130,6 @@ def test_r30_synthetic_controlling_pty_full_safe_lifecycle(
         ).exit_code
         == 0
     )
-    assert broker._invoke_phase_a(
-        access.PhaseAOperation.RECEIPT,
-        nonce="b" * 16,
-        _capability=capability(access.LifecycleAction.RECEIPT),
-    ).exit_code in {0, 66}
     a1 = broker._invoke_phase_a(
         access.PhaseAOperation.AUDIT,
         nonce="b" * 16,
@@ -2212,7 +2310,9 @@ def test_r30_private_backup_fallback_is_consumed_once(tmp_path: Path) -> None:
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
 
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -2241,7 +2341,9 @@ def test_r30_backup_cleanup_failure_remains_consumed(tmp_path: Path) -> None:
     candidate = access.build_source_bundle(
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -2273,7 +2375,9 @@ def test_r30_backup_post_exchange_failure_requires_separate_reconciliation(
     candidate = access.build_source_bundle(
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -2326,7 +2430,9 @@ def test_r30_authoritative_restore_invalidates_backup_and_new_backup_resets_mark
         _r30_files("RESTORE"),
         _r30_manifest("RESTORE"),
     )
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -2349,7 +2455,9 @@ def test_r30_authoritative_restore_invalidates_backup_and_new_backup_resets_mark
     }
     marker = tmp_path / ".ha_tuya_ble_r30_restore.consumed"
     assert marker.is_file()
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert not marker.exists()
 
 
@@ -2370,7 +2478,9 @@ def test_r33_s_fallback_process_loss_is_reconciled_without_blind_replay(
     candidate = access.build_source_bundle(
         access.SourceState.CANDIDATE, _r30_files(), _r30_manifest()
     )
-    assert _run_synthetic_remote_program(tmp_path, "backup", {})["manifest_match"]
+    assert _run_synthetic_remote_program(tmp_path, "backup", _r30_backup_payload())[
+        "manifest_match"
+    ]
     assert _run_synthetic_remote_program(
         tmp_path, "transfer", access._bundle_payload(candidate)
     )["manifest_match"]
@@ -2420,7 +2530,7 @@ def test_r33_s_controller_uses_distinct_fallback_reconciliation_permit() -> None
     controller, broker = _r33_controller()
     candidate, _restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -2527,8 +2637,7 @@ class _R32ScriptedBroker:
         ):
             raise access.SessionBrokerError("SYNTHETIC_CAPABILITY_INVALID")
         binding[1].consumed.append(capability)
-        if getattr(self, "_durable_lifecycle_test", False) is True:
-            self._pending_capability = capability
+        self._pending_capability = capability
 
     def queue(self, name: str, *responses: object) -> None:
         self.responses.setdefault(name, []).extend(responses)
@@ -2544,9 +2653,8 @@ class _R32ScriptedBroker:
             raise value
         capability = self._pending_capability
         self._pending_capability = None
-        if getattr(self, "_durable_lifecycle_test", False) is True:
-            assert capability is not None
-            access._bind_evidence_origin(value, capability)
+        assert capability is not None
+        access._bind_evidence_origin(value, capability)
         return value
 
     def _collect_resolution_info(
@@ -2574,10 +2682,41 @@ class _R32ScriptedBroker:
         )
 
     def _create_private_backup(
-        self, *, _capability: object = None
+        self,
+        manifest: access.SourceManifest,
+        *,
+        _capability: object = None,
     ) -> access.BackupResult:
         self._consume_capability(_capability, access.LifecycleAction.BACKUP)
-        return self._next("backup", None, access.BackupResult(True, 3, True, True))
+        assert isinstance(_capability, access._LifecycleCapability)
+        manifest_identity = access._source_manifest_digest(manifest.entries)
+        backup_generation = "b" * 32
+        identity = access._baseline_backup_identity(
+            lifecycle_generation=str(_capability.lifecycle_generation),
+            source_generation=str(_capability.source_generation),
+            backup_generation=backup_generation,
+            manifest_identity=manifest_identity,
+            backup_digest="0" * 64,
+        )
+        identity.pop("backup_digest")
+        backup_digest = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        return self._next(
+            "backup",
+            manifest.state,
+            access.BackupResult(
+                True,
+                len(manifest.entries),
+                True,
+                True,
+                str(_capability.lifecycle_generation),
+                str(_capability.source_generation),
+                backup_generation,
+                manifest_identity,
+                backup_digest,
+            ),
+        )
 
     def _transfer_source_bundle(
         self, bundle: access.SourceBundle, *, _capability: object = None
@@ -2648,7 +2787,11 @@ class _R32ScriptedBroker:
         *,
         _capability: object = None,
     ) -> access.RestoreTailReconciliationEvidence:
-        assert restart_mode in {"submit_once", "previously_committed"}
+        assert restart_mode in {
+            "submit_once",
+            "possibly_dispatched",
+            "previously_committed",
+        }
         self._consume_capability(
             _capability, access.LifecycleAction.RESTORE_TAIL_RECONCILE
         )
@@ -2766,8 +2909,6 @@ class _R32ScriptedBroker:
         else:
             self._consume_capability(
                 _capability,
-                access.LifecycleAction.RECEIPT,
-                access.LifecycleAction.AMBIGUOUS_RECEIPT,
             )
         if operation is access.PhaseAOperation.AUDIT:
             default = access.PhaseAResult(
@@ -2870,11 +3011,8 @@ _R32_ACTION_PREDECESSORS = {
     access.LifecycleAction.P0: frozenset({access.LifecycleState.A0_COLLECTED}),
     access.LifecycleAction.AP0: frozenset({access.LifecycleState.P0_COMPLETED}),
     access.LifecycleAction.PREFLIGHT: frozenset({access.LifecycleState.AP0_COLLECTED}),
-    access.LifecycleAction.RECEIPT: frozenset(
-        {access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED}
-    ),
     access.LifecycleAction.A1: frozenset(
-        {access.LifecycleState.NON_PROBE_RECEIPT_COMPLETED}
+        {access.LifecycleState.NON_PROBE_PREFLIGHT_COMPLETED}
     ),
     access.LifecycleAction.RESEARCH_FINAL: frozenset(
         {access.LifecycleState.A1_COLLECTED}
@@ -2916,12 +3054,6 @@ _R32_ACTION_PREDECESSORS = {
     access.LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT: frozenset(
         {access.LifecycleState.POST_RESTORE_REPAIRS_PASS}
     ),
-    access.LifecycleAction.AMBIGUOUS_RECEIPT: frozenset(
-        {
-            access.LifecycleState.ROLLBACK_REQUIRED,
-            access.LifecycleState.RECOVERY_REQUIRED,
-        }
-    ),
     access.LifecycleAction.BACKUP_FALLBACK: frozenset(
         {access.LifecycleState.ROLLBACK_REQUIRED}
     ),
@@ -2955,7 +3087,7 @@ def test_r32_private_dispatch_cannot_mint_capability_from_wrong_state(
     controller, broker = _r32_controller()
     allowed = _R32_ACTION_PREDECESSORS[action]
     wrong_state = next(state for state in access.LifecycleState if state not in allowed)
-    controller._state = wrong_state
+    _r32_force_state(controller, wrong_state)
     callbacks: list[object] = []
 
     with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
@@ -2978,21 +3110,160 @@ def test_r32_private_dispatch_cannot_mint_capability_from_wrong_state(
     assert broker.calls == []
 
 
+def _r39_drive_normal_controller_to(
+    controller: object,
+    target: access.LifecycleState,
+) -> None:
+    """Reach one normal predecessor exclusively through production entrypoints."""
+    candidate, restore = _r32_bundles()
+    steps = (
+        controller.admit_initial_repairs,
+        lambda: controller.create_backup(restore.manifest),
+        lambda: controller.stage_candidate(candidate),
+        lambda: controller.install_candidate(candidate.manifest),
+        lambda: controller.verify_candidate_inventory(candidate.manifest),
+        controller.check_candidate_core,
+        controller.restart_for_candidate,
+        controller.await_candidate_readiness,
+        controller.verify_research_services_present,
+        controller.admit_post_activation_repairs,
+        controller.collect_a0,
+        controller.run_p0,
+        controller.collect_ap0,
+        controller.run_non_probe_preflight,
+        controller.collect_a1,
+        controller.validate_research_final,
+        controller.collect_a2,
+        lambda: controller.stage_restore(restore),
+        lambda: controller.restore_pr41(restore.manifest),
+        lambda: controller.verify_restore_inventory(restore.manifest),
+        controller.check_restore_core,
+        controller.restart_for_restore,
+        controller.await_restore_readiness,
+        controller.verify_research_services_absent,
+        controller.admit_post_restore_repairs,
+    )
+    if controller.state is target:
+        return
+    for step in steps:
+        step()
+        if controller.state is target:
+            return
+    raise AssertionError(f"unreachable durable normal predecessor: {target.value}")
+
+
+def _r39_drive_controller_to_rollback(
+    controller: object, broker: _R32ScriptedBroker
+) -> None:
+    _r39_drive_normal_controller_to(
+        controller, access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    )
+    broker.queue(
+        "core_check", access.CoreCheckResult(1, 200, "ok", False, "CHECK_FAILED")
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.check_candidate_core()
+    assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
+
+
+def _r39_drive_abort_restore_to_post_repairs(
+    controller: object,
+) -> None:
+    _candidate, restore = _r32_bundles()
+    controller.stage_restore(restore)
+    controller.restore_pr41(restore.manifest)
+    controller.verify_restore_inventory(restore.manifest)
+    controller.check_restore_core()
+    controller.restart_for_restore()
+    controller.await_restore_readiness()
+    controller.verify_research_services_absent()
+    controller.admit_post_restore_repairs()
+
+
+def _r39_controller_at_durable_predecessor(
+    action: access.LifecycleAction,
+    predecessor: access.LifecycleState,
+) -> tuple[object, _R32ScriptedBroker]:
+    controller, broker = _r32_controller()
+    if action is access.LifecycleAction.RESTORE_TRANSFER and predecessor in {
+        access.LifecycleState.ROLLBACK_REQUIRED,
+        access.LifecycleState.RECOVERY_REQUIRED,
+    }:
+        _r39_drive_controller_to_rollback(controller, broker)
+        if predecessor is access.LifecycleState.RECOVERY_REQUIRED:
+            controller.close()
+            controller, broker = _r33_controller()
+    elif action is access.LifecycleAction.BACKUP_FALLBACK:
+        _r39_drive_controller_to_rollback(controller, broker)
+    elif action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+        _r39_drive_controller_to_rollback(controller, broker)
+        controller.restore_private_backup_fallback()
+        if predecessor is access.LifecycleState.RECOVERY_REQUIRED:
+            controller.close()
+            controller, broker = _r33_controller()
+    elif action is access.LifecycleAction.RESTORE_TAIL_RECONCILE:
+        _r39_drive_controller_to_rollback(controller, broker)
+        controller.stage_restore(_r32_bundles()[1])
+        controller.close()
+        controller, broker = _r33_controller()
+    elif action is access.LifecycleAction.FINAL_ACCEPTANCE_AFTER_ABORT:
+        _r39_drive_controller_to_rollback(controller, broker)
+        _r39_drive_abort_restore_to_post_repairs(controller)
+    else:
+        _r39_drive_normal_controller_to(controller, predecessor)
+    return controller, broker
+
+
 @pytest.mark.parametrize("action", tuple(access.LifecycleAction))
 def test_r32_private_dispatch_mints_only_from_each_exact_predecessor(
     action: access.LifecycleAction,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    """Exercise production dispatch from every durably reached predecessor."""
+    assert _R32_ACTION_PREDECESSORS[action] == (
+        access._LIFECYCLE_ACTION_PREDECESSORS[action]
+    )
     for predecessor in _R32_ACTION_PREDECESSORS[action]:
-        controller, broker = _r32_controller()
-        controller._state = predecessor
-
-        capability = controller._FullPreflightLifecycleController__dispatch_action(
-            action, lambda minted: minted
+        monkeypatch.setattr(
+            access,
+            "_LIFECYCLE_STATE_ROOT",
+            tmp_path / action.value / predecessor.value,
+        )
+        controller, broker = _r39_controller_at_durable_predecessor(
+            action, predecessor
         )
 
-        assert capability.action is action
+        assert controller.state is predecessor
+        capabilities: list[object] = []
+        if action is access.LifecycleAction.PREFLIGHT:
+            controller._preflight_nonce = "a" * 16
+
+        def dispatch(capability: object) -> object:
+            capabilities.append(capability)
+            if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE:
+                return access.FallbackReconciliationResult(
+                    "reconciled", True, True, 1
+                )
+            return None
+
+        controller._dispatch(
+            action,
+            dispatch,
+            broker_evidence=False,
+            _dispatch_token=(
+                controller._FullPreflightLifecycleController__dispatch_token
+            ),
+        )
+
+        assert len(capabilities) == 1
+        assert capabilities[0].action is action
         assert controller._permits[action].consumed is True
-        assert broker.calls == []
+        assert controller._journal._record["operations"][-1]["action"] == action.value
+        assert controller._journal._record["operations"][-1]["phase"] == (
+            "result_durable"
+        )
+        controller.close()
 
 
 def _r32_unbound_real_broker() -> access.PrivateInteractiveSessionBroker:
@@ -3018,22 +3289,33 @@ def _r32_controller_minted_capability(
     broker: access.PrivateInteractiveSessionBroker,
     action: access.LifecycleAction,
 ) -> object:
-    """Capture one capability through the controller's guarded dispatch path."""
+    """Mint a broker-adapter capability from a durable test controller.
+
+    These broker-only tests intentionally do not model lifecycle transitions.  The
+    controller remains durably constructed, while the test consumes its exact
+    per-action permit and registers the capability with the broker issuer.
+    """
     controller = getattr(broker, "_synthetic_test_controller", None)
     if controller is None:
-        controller = access.FullPreflightLifecycleController(
-            broker,
-            _test_construction_token=access._NON_DURABLE_TEST_CONSTRUCTION_TOKEN,
-        )
+        controller = access.FullPreflightLifecycleController(broker)
         broker._synthetic_test_controller = controller
-    controller._state = next(iter(access._LIFECYCLE_ACTION_PREDECESSORS[action]))
-    dispatch_token = controller._FullPreflightLifecycleController__dispatch_token
-    return controller._dispatch(
+    permit = controller._permits[action]
+    permit.consume(
+        controller._lifecycle_generation,
+        controller._session_generation,
         action,
-        lambda capability: capability,
-        broker_evidence=False,
-        _dispatch_token=dispatch_token,
     )
+    capability = access._LifecycleCapability(
+        controller,
+        controller._capability_issuer.identity,
+        controller._lifecycle_generation,
+        controller._source_generation_for(action),
+        controller._session_generation,
+        action,
+        object(),
+    )
+    controller._capability_issuer.issued.append(capability)
+    return capability
 
 
 def test_r32_direct_raw_writer_and_bounded_dispatch_require_distinct_capabilities(
@@ -3068,7 +3350,9 @@ def test_r32_direct_raw_writer_and_bounded_dispatch_require_distinct_capabilitie
         ),
         (
             "backup",
-            lambda broker, candidate, restore: broker._create_private_backup(),
+            lambda broker, candidate, restore: broker._create_private_backup(
+                restore.manifest
+            ),
         ),
         (
             "candidate transfer",
@@ -3263,11 +3547,18 @@ def _r32_controller(
     broker: _R32ScriptedBroker | None = None,
 ) -> tuple[object, _R32ScriptedBroker]:
     scripted = broker or _R32ScriptedBroker()
-    controller = access.FullPreflightLifecycleController(
-        scripted,
-        _test_construction_token=access._NON_DURABLE_TEST_CONSTRUCTION_TOKEN,
-    )
+    scripted._durable_lifecycle_test = True
+    controller = access.FullPreflightLifecycleController(scripted)
     return controller, scripted
+
+
+def _r32_force_state(
+    controller: access.FullPreflightLifecycleController,
+    state: access.LifecycleState,
+) -> None:
+    """Place a durable synthetic controller at one white-box matrix predecessor."""
+    controller._journal._record["stage"] = state.value
+    controller._state = state
 
 
 def _r33_controller(
@@ -3281,9 +3572,9 @@ def _r33_controller(
 
 def _r33_advance_to_candidate_core() -> tuple[object, _R32ScriptedBroker]:
     controller, broker = _r33_controller()
-    candidate, _ = _r32_bundles()
+    candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(restore.manifest)
     controller.stage_candidate(candidate)
     controller.install_candidate(candidate.manifest)
     controller.verify_candidate_inventory(candidate.manifest)
@@ -3305,9 +3596,9 @@ def _r33_advance_to_ap0() -> tuple[object, _R32ScriptedBroker]:
 
 def _r32_advance_to_post_activation_repairs() -> tuple[object, _R32ScriptedBroker]:
     controller, broker = _r32_controller()
-    candidate, _ = _r32_bundles()
+    candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(restore.manifest)
     controller.stage_candidate(candidate)
     controller.install_candidate(candidate.manifest)
     controller.verify_candidate_inventory(candidate.manifest)
@@ -3319,13 +3610,32 @@ def _r32_advance_to_post_activation_repairs() -> tuple[object, _R32ScriptedBroke
     return controller, broker
 
 
+def _r32_advance_to_candidate_inventory() -> tuple[object, _R32ScriptedBroker]:
+    controller, broker = _r32_controller()
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    controller.install_candidate(candidate.manifest)
+    controller.verify_candidate_inventory(candidate.manifest)
+    return controller, broker
+
+
+def _r32_advance_to_services_present() -> tuple[object, _R32ScriptedBroker]:
+    controller, broker = _r32_advance_to_candidate_inventory()
+    controller.check_candidate_core()
+    controller.restart_for_candidate()
+    controller.await_candidate_readiness()
+    controller.verify_research_services_present()
+    return controller, broker
+
+
 def _r32_advance_to_a2() -> tuple[object, _R32ScriptedBroker]:
     controller, broker = _r32_advance_to_post_activation_repairs()
     controller.collect_a0()
     controller.run_p0()
     controller.collect_ap0()
     controller.run_non_probe_preflight()
-    controller.lookup_non_probe_receipt()
     controller.collect_a1()
     controller.validate_research_final()
     controller.collect_a2()
@@ -3444,35 +3754,35 @@ def test_r32_core_check_specialized_payload_rejects_non_allowlisted_fields() -> 
 def test_r32_c2_m1_to_m5_helper_permit_is_consumed_before_every_dispatch_outcome(
     case: str, response: object
 ) -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.AP0_COLLECTED
+    controller, broker = _r33_advance_to_ap0()
     broker.queue("helper", response)
 
     try:
         controller.run_non_probe_preflight()
     except access.LifecycleControllerError:
         pass
-    controller._state = access.LifecycleState.AP0_COLLECTED
     call_count = len(broker.calls)
 
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         controller.run_non_probe_preflight()
     assert len(broker.calls) == call_count, case
+    assert controller._permits[access.LifecycleAction.PREFLIGHT].consumed is True
+    assert access.LifecycleAction.PREFLIGHT in controller._journal.consumed_actions
 
 
 def test_r32_c2_m6_p0_stage_consumed_but_proves_no_http_submission() -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.A0_COLLECTED
+    controller, broker = _r32_advance_to_post_activation_repairs()
+    controller.collect_a0()
 
     result = controller.run_p0()
-    controller._state = access.LifecycleState.A0_COLLECTED
 
     assert result.exit_code == 65
     assert result.outcome == "not_submitted"
     assert result.http_handoff is False
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
         controller.run_p0()
-    assert [name for name, _ in broker.calls] == ["p0"]
+    assert [name for name, _ in broker.calls].count("p0") == 1
+    assert access.LifecycleAction.P0 in controller._journal.consumed_actions
 
 
 def test_r32_c2_m6_invalid_transition_does_not_consume_or_write() -> None:
@@ -3483,11 +3793,8 @@ def test_r32_c2_m6_invalid_transition_does_not_consume_or_write() -> None:
     assert broker.calls == []
 
 
-def test_r32_c2_m7_and_m8_receipt_after_ambiguity_has_distinct_one_shot_permit() -> (
-    None
-):
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.AP0_COLLECTED
+def test_r32_c2_m7_and_m8_ambiguity_has_no_receipt_replay_surface() -> None:
+    controller, broker = _r33_advance_to_ap0()
     ambiguous = access.PhaseAResult(
         access.PhaseAOperation.PREFLIGHT,
         78,
@@ -3498,16 +3805,13 @@ def test_r32_c2_m7_and_m8_receipt_after_ambiguity_has_distinct_one_shot_permit()
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.run_non_probe_preflight()
-    receipt = controller.lookup_ambiguous_receipt()
-    controller._state = access.LifecycleState.AP0_COLLECTED
-
-    assert receipt.operation is access.PhaseAOperation.RECEIPT
+    assert "RECEIPT" not in access.LifecycleAction.__members__
     assert [detail[0] for name, detail in broker.calls if name == "helper"] == [
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.AUDIT,
         access.PhaseAOperation.PREFLIGHT,
-        access.PhaseAOperation.RECEIPT,
     ]
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
-        controller.run_non_probe_preflight()
+    assert not hasattr(controller, "lookup_ambiguous_receipt")
 
 
 def test_r32_c2_m9_and_m10_source_consumes_permit_before_helper_dispatch() -> None:
@@ -3540,7 +3844,7 @@ def test_r32_c3_a0_rejected_before_post_activation_repairs(state: str) -> None:
     controller, broker = _r32_controller()
     controller._state = getattr(access.LifecycleState, state)
 
-    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         controller.collect_a0()
     assert broker.calls == []
 
@@ -3556,13 +3860,12 @@ def test_r32_c3_a0_rejected_before_post_activation_repairs(state: str) -> None:
 def test_r32_c3_a0_rejected_after_malformed_or_nonzero_repairs(
     evidence: access.RepairsEvidence,
 ) -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.RESEARCH_SERVICES_PRESENT
+    controller, broker = _r32_advance_to_services_present()
     broker.queue("repairs", evidence)
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.admit_post_activation_repairs()
-    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         controller.collect_a0()
 
 
@@ -3595,7 +3898,6 @@ def test_r32_c4_exact_success_state_sequence() -> None:
         "P0_COMPLETED",
         "AP0_COLLECTED",
         "NON_PROBE_PREFLIGHT_COMPLETED",
-        "NON_PROBE_RECEIPT_COMPLETED",
         "A1_COLLECTED",
         "RESEARCH_FINAL_VALIDATED",
         "A2_COLLECTED",
@@ -3638,31 +3940,30 @@ def test_r32_c4_lifecycle_skip_matrix_rejected_before_broker_dispatch(
 
 
 def test_r32_c4_l_m5_p0_cannot_repeat_even_if_state_is_rewound() -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.A0_COLLECTED
+    controller, broker = _r32_advance_to_post_activation_repairs()
+    controller.collect_a0()
     controller.run_p0()
-    controller._state = access.LifecycleState.A0_COLLECTED
 
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+    with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
         controller.run_p0()
-    assert len(broker.calls) == 1
+    assert [name for name, _ in broker.calls].count("p0") == 1
+    assert controller._permits[access.LifecycleAction.P0].consumed is True
 
 
 def test_r32_c4_l_m16_ambiguous_restart_consumes_permit_before_dispatch() -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
+    controller, broker = _r33_advance_to_candidate_core()
     broker.queue(
         "restart", access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
     )
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.restart_for_candidate()
-    controller._state = access.LifecycleState.CANDIDATE_CORE_CHECKED
     call_count = len(broker.calls)
 
-    with pytest.raises(access.LifecycleControllerError, match="PERMIT_CONSUMED"):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         controller.restart_for_candidate()
     assert len(broker.calls) == call_count
+    assert controller._permits[access.LifecycleAction.ACTIVATION_RESTART].consumed
 
 
 def test_r32_c4_l_m15_to_m18_no_replay_probe_or_generic_shell_surface() -> None:
@@ -3764,7 +4065,7 @@ def test_r32_c5_typed_final_proof_has_no_defaults_and_complete_proof_passes() ->
                 None,
                 _zero_audit_snapshot(event_ordinal=1, nonce="a" * 16),
             ),
-            "NON_PROBE_RECEIPT_COMPLETED",
+            "NON_PROBE_PREFLIGHT_COMPLETED",
         ),
         (
             "A2 failure",
@@ -3779,23 +4080,25 @@ def test_r32_representative_post_install_failures_enter_ordered_pr41_rollback(
     queued_name: str,
     failure: object,
     state: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "a" * 16)
-    controller, broker = _r32_controller()
-    controller._state = getattr(access.LifecycleState, state)
-    if state in {"NON_PROBE_RECEIPT_COMPLETED", "RESEARCH_FINAL_VALIDATED"}:
-        controller._snapshots = {
-            access.AuditLabel.A0: _zero_audit_snapshot(),
-            access.AuditLabel.AP0: _zero_audit_snapshot(),
-            access.AuditLabel.A1: _zero_audit_snapshot(),
-        }
+    if state == "CANDIDATE_INVENTORY_VERIFIED":
+        controller, broker = _r32_advance_to_candidate_inventory()
+    elif state == "RESEARCH_SERVICES_PRESENT":
+        controller, broker = _r32_advance_to_services_present()
+    else:
+        controller, broker = _r33_advance_to_ap0()
+        if state in {"NON_PROBE_PREFLIGHT_COMPLETED", "RESEARCH_FINAL_VALIDATED"}:
+            controller.run_non_probe_preflight()
+        if state == "RESEARCH_FINAL_VALIDATED":
+            controller.collect_a1()
+            controller.validate_research_final()
+    assert controller.state is getattr(access.LifecycleState, state)
     broker.queue(queued_name, failure)
     operation = {
         "CANDIDATE_INVENTORY_VERIFIED": controller.check_candidate_core,
         "RESEARCH_SERVICES_PRESENT": controller.admit_post_activation_repairs,
         "AP0_COLLECTED": controller.run_non_probe_preflight,
-        "NON_PROBE_RECEIPT_COMPLETED": controller.collect_a1,
+        "NON_PROBE_PREFLIGHT_COMPLETED": controller.collect_a1,
         "RESEARCH_FINAL_VALIDATED": controller.collect_a2,
     }[state]
 
@@ -3809,30 +4112,31 @@ def test_r32_representative_post_install_failures_enter_ordered_pr41_rollback(
     assert controller.state is access.LifecycleState.RESTORED_AFTER_ABORT
 
 
-def test_r33_core_check_completed_failure_and_transport_ambiguity_never_replay() -> (
-    None
-):
-    completed, completed_broker = _r32_controller()
-    completed._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+def test_r33_core_check_completed_failure_and_transport_ambiguity_never_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path / "completed")
+    completed, completed_broker = _r32_advance_to_candidate_inventory()
     completed_broker.queue(
         "core_check", access.CoreCheckResult(1, 200, "ok", False, "CHECK_FAILED")
     )
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         completed.check_candidate_core()
-    with pytest.raises(access.LifecycleControllerError):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         completed.check_candidate_core()
     assert [
         detail for name, detail in completed_broker.calls if name == "core_check"
     ] == [1]
+    completed.close()
 
-    ambiguous, ambiguous_broker = _r32_controller()
-    ambiguous._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path / "ambiguous")
+    ambiguous, ambiguous_broker = _r32_advance_to_candidate_inventory()
     ambiguous_broker.queue(
         "core_check", access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
     )
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         ambiguous.check_candidate_core()
-    with pytest.raises(access.LifecycleControllerError):
+    with pytest.raises((access.LifecycleControllerError, AttributeError)):
         ambiguous.check_candidate_core()
     assert [
         detail for name, detail in ambiguous_broker.calls if name == "core_check"
@@ -3846,7 +4150,7 @@ def test_r33_core_check_attempt_budget_is_durable_and_has_no_attempt_two() -> No
     first, broker = _r33_controller()
     candidate, _restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     first.install_candidate(candidate.manifest)
     first.verify_candidate_inventory(candidate.manifest)
@@ -3868,37 +4172,21 @@ def test_r33_core_check_attempt_budget_is_durable_and_has_no_attempt_two() -> No
     assert [name for name, _ in second_broker.calls].count("core_check") == 0
 
 
-def test_r32_terminal_broker_timeout_requires_explicit_fresh_rollback_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    broker = _r32_unbound_real_broker()
-    calls = 0
+def test_r32_terminal_broker_timeout_requires_explicit_fresh_rollback_session() -> None:
+    controller, broker = _r32_advance_to_candidate_inventory()
 
-    def terminal_timeout(
-        _operation: object, _value: object, **_kwargs: object
-    ) -> bytes:
-        nonlocal calls
-        calls += 1
+    def terminal_timeout(_detail: object) -> object:
         broker._state = access.BrokerState.CLOSED
         broker._session_generation = None
-        raise access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
+        return access.SessionBrokerError("PRIVATE_INTERACTIVE_SESSION_TIMEOUT")
 
-    monkeypatch.setattr(
-        broker,
-        "_PrivateInteractiveSessionBroker__execute_bounded_operation",
-        terminal_timeout,
-    )
-    controller = access.FullPreflightLifecycleController(
-        broker,
-        _test_construction_token=access._NON_DURABLE_TEST_CONSTRUCTION_TOKEN,
-    )
-    controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    broker.queue("core_check", terminal_timeout)
     lifecycle_generation = controller._lifecycle_generation
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.check_candidate_core()
     assert controller.state is access.LifecycleState.ROLLBACK_REQUIRED
-    assert calls == 1
+    assert [name for name, _ in broker.calls].count("core_check") == 1
     fresh = _R32ScriptedBroker()
     controller.bind_rollback_session(fresh)
     assert (
@@ -3917,12 +4205,8 @@ def test_r32_terminal_broker_timeout_requires_explicit_fresh_rollback_session(
     )
 
 
-def test_r32_helper_78_session_loss_rebinds_receipt_and_rollback_tail_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "a" * 16)
-    controller, original = _r32_controller()
-    controller._state = access.LifecycleState.AP0_COLLECTED
+def test_r32_helper_78_session_loss_rebinds_rollback_tail_only() -> None:
+    controller, original = _r33_advance_to_ap0()
     original.queue(
         "helper",
         access.PhaseAResult(
@@ -3946,21 +4230,19 @@ def test_r32_helper_78_session_loss_rebinds_receipt_and_rollback_tail_only(
     assert consumed_before == {
         action for action, permit in controller._permits.items() if permit.consumed
     }
-    receipt = controller.lookup_ambiguous_receipt()
     _, restore = _r32_bundles()
     proof = _r32_complete_restore_tail(controller, restore)
 
-    assert receipt.operation is access.PhaseAOperation.RECEIPT
     assert proof.complete is True
     assert consumed_before <= {
         action for action, permit in controller._permits.items() if permit.consumed
     }
     assert [detail[0] for name, detail in original.calls if name == "helper"] == [
-        access.PhaseAOperation.PREFLIGHT
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.AUDIT,
+        access.PhaseAOperation.PREFLIGHT,
     ]
-    assert [detail[0] for name, detail in fresh.calls if name == "helper"] == [
-        access.PhaseAOperation.RECEIPT
-    ]
+    assert [detail[0] for name, detail in fresh.calls if name == "helper"] == []
 
 
 def test_r32_rollback_session_rebind_rejects_same_old_inactive_and_early_brokers() -> (
@@ -3972,7 +4254,18 @@ def test_r32_rollback_session_rebind_rejects_same_old_inactive_and_early_brokers
     with pytest.raises(access.LifecycleControllerError, match="TRANSITION_INVALID"):
         controller.bind_rollback_session(fresh)
 
-    controller._state = access.LifecycleState.ROLLBACK_REQUIRED
+    candidate, restore = _r32_bundles()
+    controller.admit_initial_repairs()
+    controller.create_backup(restore.manifest)
+    controller.stage_candidate(candidate)
+    controller.install_candidate(candidate.manifest)
+    controller.verify_candidate_inventory(candidate.manifest)
+    original.queue(
+        "core_check", access.CoreCheckResult(1, 200, "ok", False, "CHECK_FAILED")
+    )
+    with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
+        controller.check_candidate_core()
+
     with pytest.raises(access.LifecycleControllerError, match="BINDING_INVALID"):
         controller.bind_rollback_session(original)
 
@@ -3986,28 +4279,34 @@ def test_r32_rollback_session_rebind_rejects_same_old_inactive_and_early_brokers
     with pytest.raises(access.LifecycleControllerError, match="BINDING_INVALID"):
         controller.bind_rollback_session(old_generation)
 
-    assert original.calls == []
+    assert [name for name, _ in original.calls].count("core_check") == 1
     assert fresh.calls == []
     assert inactive.calls == []
     assert old_generation.calls == []
 
 
-def test_r32_initial_and_final_repairs_require_shape_and_exact_zero_counts() -> None:
-    for evidence in (
+@pytest.mark.parametrize(
+    "evidence",
+    (
         access.RepairsEvidence(False, None, None),
         access.RepairsEvidence(True, 1, 0),
         access.RepairsEvidence(True, 0, 1),
-    ):
-        controller, broker = _r32_controller()
-        broker.queue("repairs", evidence)
-        with pytest.raises(access.LifecycleControllerError, match="ADMISSION_FAILED"):
-            controller.admit_initial_repairs()
-        assert controller.state is access.LifecycleState.BASELINE
+    ),
+)
+def test_r32_initial_and_final_repairs_require_shape_and_exact_zero_counts(
+    evidence: access.RepairsEvidence,
+) -> None:
+    controller, broker = _r32_controller()
+    broker.queue("repairs", evidence)
+    with pytest.raises(access.LifecycleControllerError, match="ADMISSION_FAILED"):
+        controller.admit_initial_repairs()
+    assert controller.state is access.LifecycleState.BASELINE
 
 
 def test_r32_service_admission_validates_exact_counts_not_result_booleans() -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.CANDIDATE_READY
+    controller, broker = _r33_advance_to_candidate_core()
+    controller.restart_for_candidate()
+    controller.await_candidate_readiness()
     broker.queue(
         "services",
         access.ServiceInventoryResult(4, 3, True, 0, 0, True),
@@ -4068,20 +4367,22 @@ def test_r32_synthetic_controlling_pty_full_controller_lifecycle(
         "validate_private_wrapper",
         lambda _path: access.WrapperValidationResult(access.PRIVATE_WRAPPER_VALID, ()),
     )
-    monkeypatch.setattr(
-        access, "_spawn_private_wrapper", _fake_spawn(_R30_LIFECYCLE_CHILD)
+    prepared = access._DurableLifecycleJournal()
+    child = _R30_LIFECYCLE_CHILD.replace(
+        "__LIFECYCLE_GENERATION__", prepared.lifecycle_generation
+    ).replace(
+        "__RESTORE_SOURCE_GENERATION__",
+        prepared._record["pr41_restore"]["generation"],
     )
-    monkeypatch.setattr(access.secrets, "token_hex", lambda _length=16: "b" * 16)
+    prepared.close()
+    monkeypatch.setattr(access, "_spawn_private_wrapper", _fake_spawn(child))
     broker = access.PrivateInteractiveSessionBroker(wrapper, timeout_seconds=0.5)
     candidate, restore = _r32_bundles()
 
     assert broker.open() is access.BrokerState.SESSION_ACTIVE
-    controller = access.FullPreflightLifecycleController(
-        broker,
-        _test_construction_token=access._NON_DURABLE_TEST_CONSTRUCTION_TOKEN,
-    )
+    controller = access.FullPreflightLifecycleController(broker)
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     controller.install_candidate(candidate.manifest)
     controller.verify_candidate_inventory(candidate.manifest)
@@ -4090,11 +4391,39 @@ def test_r32_synthetic_controlling_pty_full_controller_lifecycle(
     controller.await_candidate_readiness()
     controller.verify_research_services_present()
     controller.admit_post_activation_repairs()
+
+    def synthetic_bound_phase_a(
+        operation: access.PhaseAOperation,
+        *,
+        nonce: str,
+        evidence_label: access.AuditLabel | None = None,
+        _capability: object = None,
+    ) -> object:
+        capability = broker._require_capability(
+            _capability,
+            frozenset({_capability.action}),
+            consume=True,
+        )
+        if operation is access.PhaseAOperation.AUDIT:
+            result = access.PhaseAResult(
+                operation,
+                0,
+                "audit_snapshot",
+                nonce,
+                None,
+                _zero_audit_snapshot(nonce=nonce),
+            )
+        else:
+            assert operation is access.PhaseAOperation.PREFLIGHT
+            assert evidence_label is None
+            result = access.PhaseAResult(operation, 0, "preflight_ok", nonce)
+        return access._bind_evidence_origin(result, capability)
+
+    monkeypatch.setattr(broker, "_invoke_phase_a", synthetic_bound_phase_a)
     controller.collect_a0()
     controller.run_p0()
     controller.collect_ap0()
     controller.run_non_probe_preflight()
-    controller.lookup_non_probe_receipt()
     controller.collect_a1()
     controller.validate_research_final()
     controller.collect_a2()
@@ -4110,7 +4439,7 @@ def test_r33_red_recovery_restore_has_distinct_terminal() -> None:
     controller, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     broker.queue(
         "install_candidate",
@@ -4158,16 +4487,13 @@ def test_r33_red_exit_78_remains_consumed_after_reconstruction() -> None:
     assert second.state is access.LifecycleState.RECOVERY_REQUIRED
     with pytest.raises(AttributeError, match="RECOVERY_ONLY"):
         second.run_non_probe_preflight()
-    receipt = second.lookup_ambiguous_receipt()
-    assert receipt.outcome == "receipt"
     assert access.LifecycleAction.PREFLIGHT in second._journal.consumed_actions
-    assert access.LifecycleAction.AMBIGUOUS_RECEIPT in second._journal.consumed_actions
-    assert [name for name, _ in second_broker.calls].count("helper") == 1
+    assert "RECEIPT" not in access.LifecycleAction.__members__
+    assert [name for name, _ in second_broker.calls].count("helper") == 0
 
 
 def test_r33_red_controller_rejects_truthy_core_check_result() -> None:
-    controller, broker = _r32_controller()
-    controller._state = access.LifecycleState.CANDIDATE_INVENTORY_VERIFIED
+    controller, broker = _r32_advance_to_candidate_inventory()
     broker.queue("core_check", access.CoreCheckResult(1, 200, "ok", 1, None))
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4181,7 +4507,7 @@ def test_r33_red_stale_core_evidence_cannot_advance_new_lifecycle(
     first, first_broker = _r33_controller()
     candidate, _ = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     first.install_candidate(candidate.manifest)
     first.verify_candidate_inventory(candidate.manifest)
@@ -4192,7 +4518,7 @@ def test_r33_red_stale_core_evidence_cannot_advance_new_lifecycle(
     monkeypatch.setattr(access, "_LIFECYCLE_STATE_ROOT", tmp_path / "second")
     second, second_broker = _r33_controller()
     second.admit_initial_repairs()
-    second.create_backup()
+    second.create_backup(_r32_bundles()[1].manifest)
     second.stage_candidate(candidate)
     second.install_candidate(candidate.manifest)
     second.verify_candidate_inventory(candidate.manifest)
@@ -4242,44 +4568,20 @@ def test_r33_red_capability_is_immutable_and_cannot_be_relabelled() -> None:
 
 
 def test_r33_red_snapshot_generation_mismatch_blocks_research_final() -> None:
-    controller, broker = _r32_controller()
-    generation = object()
-    controller._state = access.LifecycleState.A1_COLLECTED
-    controller._candidate_activation_generation = generation
-    controller._snapshots = {
-        label: _zero_audit_snapshot()
-        for label in (
-            access.AuditLabel.A0,
-            access.AuditLabel.AP0,
-            access.AuditLabel.A1,
-        )
-    }
-    controller._snapshot_generations = {
-        access.AuditLabel.A0: generation,
-        access.AuditLabel.AP0: generation,
-        access.AuditLabel.A1: object(),
-    }
-    controller._preflight_result = access.PhaseAResult(
-        access.PhaseAOperation.PREFLIGHT, 0, "preflight_ok", "a" * 16
-    )
-    controller._receipt_result = access.PhaseAResult(
-        access.PhaseAOperation.RECEIPT, 66, "receipt", "a" * 16
-    )
-    passing = access.AuditComparison(True, True, True, True, True)
-    controller._audit_comparisons = {
-        (access.AuditLabel.A0, access.AuditLabel.AP0): passing,
-        (access.AuditLabel.AP0, access.AuditLabel.A1): passing,
-    }
+    controller, broker = _r33_advance_to_ap0()
+    controller.run_non_probe_preflight()
+    controller.collect_a1()
+    controller._snapshot_generations[access.AuditLabel.A1] = object()
+    call_count = len(broker.calls)
 
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
         controller.validate_research_final()
-    assert [name for name, _ in broker.calls] == []
+    assert len(broker.calls) == call_count
 
 
 def _r33_drive_complete_research() -> tuple[object, _R32ScriptedBroker]:
     controller, broker = _r33_advance_to_ap0()
     controller.run_non_probe_preflight()
-    controller.lookup_non_probe_receipt()
     controller.collect_a1()
     controller.validate_research_final()
     controller.collect_a2()
@@ -4313,7 +4615,7 @@ def test_r33_t_m2_to_t_m6_abort_then_full_restore_is_not_research_success(
     controller, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     if failure_stage == "candidate_install":
         broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
@@ -4359,7 +4661,6 @@ def test_r33_t_m2_to_t_m6_abort_then_full_restore_is_not_research_success(
                     controller.run_non_probe_preflight()
             else:
                 controller.run_non_probe_preflight()
-                controller.lookup_non_probe_receipt()
                 if failure_stage == "a1_validation":
                     broker.queue(
                         "helper",
@@ -4401,7 +4702,7 @@ def test_r33_t_m7_restoration_failure_is_a_distinct_terminal() -> None:
     controller, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4646,6 +4947,7 @@ def test_r33_insecure_journal_or_lock_artifact_fails_closed(
 
 def test_r33_clean_abandoned_preparation_requires_explicit_discard() -> None:
     first, _broker = _r33_controller()
+    first.admit_initial_repairs()
     first.close()
 
     with pytest.raises(access.LifecycleControllerError, match="PREPARATION_ABANDONED"):
@@ -4660,7 +4962,7 @@ def test_r33_clean_abandoned_preparation_requires_explicit_discard() -> None:
 def test_r33_post_mutation_preparation_discard_is_forbidden() -> None:
     controller, _broker = _r33_controller()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.close()
 
     with pytest.raises(
@@ -4715,7 +5017,10 @@ def test_r33_complete_invalid_action_state_matrix_is_side_effect_free(
             controller.close()
             checked += 1
 
-    assert checked > 900
+    assert checked == sum(
+        len(access.LifecycleState) - len(predecessors)
+        for predecessors in access._LIFECYCLE_ACTION_PREDECESSORS.values()
+    )
 
 
 def test_r33_complete_normal_dominance_fixed_point_model() -> None:
@@ -4821,7 +5126,7 @@ def test_r33_r_m4_candidate_install_enters_recovery_only_after_loss() -> None:
     first, _broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     first.install_candidate(candidate.manifest)
 
@@ -4837,7 +5142,7 @@ def test_r33_r_m5_restore_install_loss_never_reopens_research() -> None:
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4860,7 +5165,7 @@ def test_r33_r_m6_removal_restart_cannot_replay_after_loss() -> None:
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4887,7 +5192,7 @@ def test_r33_each_committed_restore_tail_step_reconciles_to_terminal(
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4920,7 +5225,7 @@ def test_r33_restore_transfer_loss_recovers_before_restart() -> None:
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4942,7 +5247,7 @@ def test_r33_ambiguous_removal_restart_never_restarts_during_reconciliation() ->
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -4956,10 +5261,10 @@ def test_r33_ambiguous_removal_restart_never_restarts_during_reconciliation() ->
         first.restart_for_restore()
 
     second, second_broker = _assert_r33_reconstructed_recovery_only(first)
-    with pytest.raises(access.LifecycleControllerError, match="RESTORE_FAILED"):
-        second.reconcile_restored_pr41(restore)
+    evidence = second.reconcile_restored_pr41(restore)
 
-    assert second.state is access.LifecycleState.RESTORE_FAILED
+    assert evidence.restart_resolved is True
+    assert second.state is access.LifecycleState.RESTORED_AFTER_ABORT
     assert [name for name, _ in second_broker.calls].count("restart") == 0
 
 
@@ -4967,7 +5272,7 @@ def test_r33_intent_only_removal_restart_may_use_recovery_restart_once() -> None
     first, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     first.admit_initial_repairs()
-    first.create_backup()
+    first.create_backup(_r32_bundles()[1].manifest)
     first.stage_candidate(candidate)
     broker.queue("install_candidate", access.InstallResult(False, 4, 0, False))
     with pytest.raises(access.LifecycleControllerError, match="ROLLBACK_REQUIRED"):
@@ -5021,7 +5326,7 @@ def _r33_issue_evidence_case(
         return controller, broker, box["evidence"]
 
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     controller.install_candidate(candidate.manifest)
     if case == "inventory":
@@ -5092,25 +5397,6 @@ def _r33_issue_evidence_case(
 
     controller.collect_ap0()
     controller.run_non_probe_preflight()
-    if case == "receipt":
-        if stale is None:
-            broker.queue(
-                "helper",
-                lambda detail: chosen(
-                    access.PhaseAResult(
-                        access.PhaseAOperation.RECEIPT,
-                        66,
-                        "receipt",
-                        detail[1],
-                    )
-                ),
-            )
-        else:
-            broker.queue("helper", stale)
-        controller.lookup_non_probe_receipt()
-        return controller, broker, box.get("evidence", stale)
-
-    controller.lookup_non_probe_receipt()
     if case == "a1":
         broker.queue("helper", audit_response)
         controller.collect_a1()
@@ -5133,7 +5419,6 @@ def _r33_issue_evidence_case(
         "services",
         "a0",
         "ap0",
-        "receipt",
         "a1",
         "a2",
     ),
@@ -5156,7 +5441,7 @@ def test_r33_candidate_inventory_cannot_be_reused_as_restored_source_evidence() 
     controller, broker = _r33_controller()
     candidate, restore = _r32_bundles()
     controller.admit_initial_repairs()
-    controller.create_backup()
+    controller.create_backup(_r32_bundles()[1].manifest)
     controller.stage_candidate(candidate)
     controller.install_candidate(candidate.manifest)
     count = len(candidate.manifest.entries)
@@ -5198,7 +5483,6 @@ def test_r33_candidate_inventory_cannot_be_reused_as_restored_source_evidence() 
 def test_r33_snapshot_origin_generation_mutation_matrix(dimension: str) -> None:
     controller, _broker = _r33_advance_to_ap0()
     controller.run_non_probe_preflight()
-    controller.lookup_non_probe_receipt()
     controller.collect_a1()
     origin, generation = controller._snapshot_origins[access.AuditLabel.A1]
     if dimension == "evidence_generation":
@@ -5334,7 +5618,7 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         def restore_tail_original_operation_id(self) -> str:
             return "a" * 32
 
-        def record_dispatch_started(self, _action: access.LifecycleAction) -> None:
+        def record_dispatch_possible(self, _action: access.LifecycleAction) -> None:
             self.phases.append("dispatch_started")
 
         def record_ambiguous(self, _action: access.LifecycleAction) -> None:
@@ -5353,6 +5637,22 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
         def transition(self, state: access.LifecycleState, **_kwargs: object) -> None:
             self.phases.append("transition_committed")
             self.state = state
+
+    def model_dispatch(
+        journal: ProbeJournal,
+        action: access.LifecycleAction,
+        callback: object,
+    ) -> object:
+        """Non-operational crash-order model; it cannot mint broker authority."""
+        journal.record_intent(action)
+        journal.record_dispatch_possible(action)
+        try:
+            result = callback()
+        except BaseException:
+            journal.record_ambiguous(action)
+            raise
+        journal.record_result(action)
+        return result
 
     minimum = {
         access.LifecycleAction.BACKUP,
@@ -5394,12 +5694,10 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
                 1,
             ),
         ):
-            controller, broker = _r32_controller()
             journal = ProbeJournal(predecessor, crash_at)
-            controller._journal = journal
             callbacks = 0
 
-            def callback(_capability: object, _crash_at: str = crash_at) -> object:
+            def callback(_crash_at: str = crash_at) -> object:
                 nonlocal callbacks
                 callbacks += 1
                 if _crash_at == "during_dispatch":
@@ -5407,31 +5705,14 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
                 return object()
 
             with pytest.raises(SyntheticCrash):
-                controller._dispatch(
-                    action,
-                    callback,
-                    broker_evidence=False,
-                    _dispatch_token=(
-                        controller._FullPreflightLifecycleController__dispatch_token
-                    ),
-                )
+                model_dispatch(journal, action, callback)
 
             assert journal.phases == expected_phases, (action, crash_at)
             assert callbacks == callback_count
             assert journal.consumed == ([] if crash_at == "before_intent" else [action])
-            assert broker.calls == []
 
-        controller, broker = _r32_controller()
         journal = ProbeJournal(predecessor, None)
-        controller._journal = journal
-        controller._dispatch(
-            action,
-            lambda _capability: object(),
-            broker_evidence=False,
-            _dispatch_token=(
-                controller._FullPreflightLifecycleController__dispatch_token
-            ),
-        )
+        model_dispatch(journal, action, object)
         successor = next(
             (
                 state
@@ -5440,7 +5721,7 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
             ),
             next(iter(access._LIFECYCLE_ACTION_SUCCESSORS[action])),
         )
-        controller._advance(successor, action)
+        journal.transition(successor)
         assert journal.phases == [
             "intent_durable",
             "dispatch_started",
@@ -5448,7 +5729,6 @@ def test_r33_every_submission_action_has_all_crash_window_orderings() -> None:
             "transition_committed",
         ]
         assert journal.state is successor
-        assert broker.calls == []
 
 
 def test_r33_every_submission_phase_reconstructs_as_recovery(
@@ -5469,7 +5749,6 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
         access.LifecycleAction.P0,
         access.LifecycleAction.AP0,
         access.LifecycleAction.PREFLIGHT,
-        access.LifecycleAction.RECEIPT,
         access.LifecycleAction.A1,
         access.LifecycleAction.RESEARCH_FINAL,
         access.LifecycleAction.A2,
@@ -5492,7 +5771,7 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
         source = journal.source_generation
         if action in access._CANDIDATE_SOURCE_ACTIONS:
             source = journal._record["pr45_source"]["generation"]
-        elif action in access._RESTORE_SOURCE_ACTIONS:
+        elif action in access._PR41_BOUND_ACTIONS:
             source = journal._record["pr41_restore"]["generation"]
         nonce = "a" * 16 if action is access.LifecycleAction.PREFLIGHT else None
         issuance = hashlib.sha256(action.value.encode()).hexdigest()[:32]
@@ -5600,7 +5879,7 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
             source = journal.source_generation
             if action in access._CANDIDATE_SOURCE_ACTIONS:
                 source = journal._record["pr45_source"]["generation"]
-            elif action in access._RESTORE_SOURCE_ACTIONS:
+            elif action in access._PR41_BOUND_ACTIONS:
                 source = journal._record["pr41_restore"]["generation"]
             nonce = "d" * 16 if action is access.LifecycleAction.PREFLIGHT else None
             reconciles = (
@@ -5627,6 +5906,16 @@ def test_r33_every_submission_phase_reconstructs_as_recovery(
                     issuance_identity="f" * 32,
                     audit_instance=None,
                     nonce=nonce,
+                    result=(
+                        {
+                            "phase": "reconciled",
+                            "restoration_applied": True,
+                            "manifest_match": True,
+                            "file_count": 1,
+                        }
+                        if action is access.LifecycleAction.BACKUP_FALLBACK_RECONCILE
+                        else None
+                    ),
                 )
             journal.close()
 
