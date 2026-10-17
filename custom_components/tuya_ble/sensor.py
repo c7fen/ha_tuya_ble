@@ -536,6 +536,34 @@ mapping: dict[str, TuyaBLECategorySensorMapping] = {
     ),
     "jtmspro": TuyaBLECategorySensorMapping(
         products={
+            "jpfgaykg": [  # LP40 Smart Padlock
+                TuyaBLESensorMapping(
+                    dp_id=9,
+                    description=SensorEntityDescription(
+                        key="battery_state",
+                        name="Battery state",
+                        icon="mdi:battery",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=["high", "medium", "low", "poweroff"],
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_ENUM,
+                ),
+                TuyaBLELastUnlockSensorMapping(
+                    unlock_methods={
+                        12: "fingerprint",
+                        19: "ble",
+                    },
+                    description=SensorEntityDescription(
+                        key="last_unlock_method",
+                        translation_key="s1_last_unlock_method",
+                        icon="mdi:account-lock-open",
+                        device_class=SensorDeviceClass.ENUM,
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                        options=["fingerprint", "ble"],
+                    ),
+                ),
+            ],
             "xqeob8h6": [  # S1-TY-BLE-PRO
                 TuyaBLESensorMapping(
                     dp_id=21,

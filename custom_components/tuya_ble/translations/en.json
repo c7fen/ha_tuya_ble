@@ -94,6 +94,9 @@
             },
             "refresh_status": {
                 "name": "Refresh Status"
+            },
+            "lp40_unlock": {
+                "name": "Unlock"
             }
         },
         "event": {

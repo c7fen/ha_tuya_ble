@@ -14,6 +14,7 @@ from homeassistant.components.button import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -35,6 +36,13 @@ S1_REFRESH_STATUS_DESCRIPTION = ButtonEntityDescription(
     key="refresh_status",
     icon="mdi:refresh",
     entity_category=EntityCategory.DIAGNOSTIC,
+)
+
+LP40_PRODUCT_ID = "jpfgaykg"
+LP40_UNLOCK_BUTTON_DESCRIPTION = ButtonEntityDescription(
+    key="lp40_unlock",
+    translation_key="lp40_unlock",
+    icon="mdi:lock-open-variant",
 )
 
 
@@ -331,6 +339,36 @@ class TuyaBLES1RefreshStatusButton(TuyaBLEEntity, ButtonEntity):
         await self._device.async_refresh_s1_status()
 
 
+class TuyaBLELP40UnlockButton(TuyaBLEEntity, ButtonEntity):
+    """Unlock button for the LP40 padlock (no LockEntity)."""
+
+    platform = Platform.BUTTON
+    _is_command_entity = True
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: DataUpdateCoordinator,
+        device: TuyaBLEDevice,
+        product: TuyaBLEProductInfo,
+        description: ButtonEntityDescription,
+        manager,
+    ) -> None:
+        super().__init__(hass, coordinator, device, product, description)
+        from .lp40 import LP40UnlockHelper
+
+        self._lp40 = LP40UnlockHelper(hass, device, manager)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Release LP40 device callback."""
+        self._lp40.close()
+        await super().async_will_remove_from_hass()
+
+    async def async_press(self) -> None:
+        """Unlock via the shared LP40 helper."""
+        await self._lp40.async_unlock()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -364,6 +402,17 @@ async def async_setup_entry(
                 data.device,
                 data.product,
                 S1_REFRESH_STATUS_DESCRIPTION,
+            )
+        )
+    if data.device.product_id == LP40_PRODUCT_ID:
+        entities.append(
+            TuyaBLELP40UnlockButton(
+                hass,
+                data.coordinator,
+                data.device,
+                data.product,
+                LP40_UNLOCK_BUTTON_DESCRIPTION,
+                data.manager,
             )
         )
     async_add_entities(entities)
