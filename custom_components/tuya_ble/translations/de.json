@@ -91,6 +91,9 @@
             },
             "refresh_status": {
                 "name": "Status aktualisieren"
+            },
+            "lp40_unlock": {
+                "name": "Entriegeln"
             }
         },
         "event": {

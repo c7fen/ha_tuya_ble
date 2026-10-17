@@ -505,6 +505,9 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
             "xqeob8h6": TuyaBLEProductInfo(
                 name="S1-TY-BLE-PRO",
             ),
+            "jpfgaykg": TuyaBLEProductInfo(
+                name="LP40 Smart Padlock",
+            ),
             "y2yaegze": TuyaBLEProductInfo(name="Drawer Lock CTL20H", lock=1),
             "hc7n0urm": TuyaBLEProductInfo(  # device product_id
                 name="A1 Ultra-JM",

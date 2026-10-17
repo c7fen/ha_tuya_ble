@@ -265,6 +265,18 @@ mapping: dict[str, TuyaBLECategoryBinarySensorMapping] = {
     ),
     "jtmspro": TuyaBLECategoryBinarySensorMapping(
         products={
+            "jpfgaykg": [  # LP40 Smart Padlock
+                TuyaBLEBinarySensorMapping(
+                    dp_id=47,
+                    description=BinarySensorEntityDescription(
+                        key="lock_motor_state",
+                        icon="mdi:engine",
+                        entity_category=EntityCategory.DIAGNOSTIC,
+                    ),
+                    dp_type=TuyaBLEDataPointType.DT_BOOL,
+                    getter=motor_state_getter,
+                ),
+            ],
             "xqeob8h6": [  # S1-TY-BLE-PRO
                 TuyaBLEBinarySensorMapping(
                     dp_id=47,

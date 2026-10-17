@@ -113,7 +113,7 @@ def _enter_lease_context(device: object) -> Token[_ConnectionLeaseContext]:
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
 
-FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4"})
+FD50_DEVICE_INFO_PRODUCT_IDS = frozenset({"jntxv3q4", "jpfgaykg"})
 DEVICE_INFO_HANDSHAKE_MAJOR_THREE_PRODUCTS = frozenset({("jtmspro", "xqeob8h6")})
 RECONNECT_STATUS_SYNC_PRODUCTS = frozenset(
     {

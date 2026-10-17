@@ -57,6 +57,28 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Advertised (possibly random) BLE address -> factory MAC.
+_address_aliases: dict[str, str] = {}
+_ADV_SERVICE_UUID_FD50 = "0000fd50-0000-1000-8000-00805f9b34fb"
+_ADV_SERVICE_UUID_A201 = "0000a201-0000-1000-8000-00805f9b34fb"
+_ADV_MANUFACTURER_DATA_ID = 0x07D0
+
+
+def _advertised_tuya_id(service_data: dict[str, bytes]) -> tuple[bool, bytes | None]:
+    """Return (is_tuya, id field) from Tuya A201/FD50 service data."""
+    a201 = service_data.get(_ADV_SERVICE_UUID_A201)
+    if a201 is not None:
+        if len(a201) > 1 and a201[0] == 0:
+            return True, bytes(a201[1:])
+        return True, None
+    fd50 = service_data.get(_ADV_SERVICE_UUID_FD50)
+    if fd50 is not None:
+        # TuyaOS FD50 layout: frame control (2), id type (1), id length (1), id
+        if len(fd50) >= 4 and 0 < fd50[3] <= len(fd50) - 4:
+            return True, bytes(fd50[4 : 4 + fd50[3]])
+        return True, None
+    return False, None
+
 
 @dataclass
 class TuyaCloudCacheItem:
@@ -331,6 +353,8 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
 
             if item:
                 credentials = item.credentials.get(address)
+                if credentials is None and address:
+                    credentials = self._credentials_for_unknown_address(item, address)
 
         if credentials:
             sec_key = credentials.get(CONF_SEC_KEY) or self._data.get(CONF_SEC_KEY)
@@ -360,6 +384,167 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                     self._data[CONF_SEC_KEY] = sec_key
 
         return result
+
+    def _credentials_for_unknown_address(
+        self, item: TuyaCloudCacheItem, address: str
+    ) -> dict[str, Any] | None:
+        """Map an advertised address that is not a factory MAC.
+
+        Some TuyaOS FD50 products (e.g. LP40) advertise a random resolvable
+        private address. Match via encrypted UUID in manufacturer data when
+        possible, otherwise by elimination among unmatched supported devices.
+        """
+        address = address.upper()
+        try:
+            mac = _address_aliases.get(address)
+            if mac is None or mac not in item.credentials:
+                mac = self._match_advertisement(item, address)
+            if mac is None:
+                return None
+            _address_aliases[address] = mac
+            credentials = dict(item.credentials[mac])
+            credentials[CONF_ADDRESS] = address
+            return credentials
+        except Exception:  # noqa: BLE001 - never break the regular lookup
+            _LOGGER.debug("Advertisement based credential lookup failed", exc_info=True)
+            return None
+
+    def _match_advertisement(
+        self, item: TuyaCloudCacheItem, address: str
+    ) -> str | None:
+        import hashlib
+
+        from Crypto.Cipher import AES
+        from homeassistant.components import bluetooth
+
+        from .devices import devices_database
+
+        info = bluetooth.async_last_service_info(self._hass, address, False)
+        if info is None:
+            return None
+        is_tuya, adv_id = _advertised_tuya_id(info.service_data or {})
+        if not is_tuya:
+            return None
+
+        manufacturer_data = (info.manufacturer_data or {}).get(
+            _ADV_MANUFACTURER_DATA_ID
+        )
+        if adv_id and manufacturer_data and len(manufacturer_data) >= 22:
+            key = hashlib.md5(adv_id).digest()
+            raw_uuid = AES.new(key, AES.MODE_CBC, key).decrypt(
+                bytes(manufacturer_data[6:22])
+            )
+            uuid = raw_uuid.decode("utf-8", "ignore")
+            for mac, cred in item.credentials.items():
+                if cred.get(CONF_UUID) == uuid:
+                    _LOGGER.info("Matched Tuya BLE device by advertised uuid")
+                    return mac
+
+        product_filter: str | None = None
+        if adv_id:
+            try:
+                text = adv_id.decode("ascii")
+                if text.isalnum():
+                    product_filter = text
+            except UnicodeDecodeError:
+                pass
+
+        configured: set[str] = set()
+        configured_ids: set[str] = set()
+        for entry in self._hass.config_entries.async_entries(DOMAIN):
+            if entry_address := entry.data.get(CONF_ADDRESS):
+                configured.add(str(entry_address).upper())
+            if device_id := entry.options.get(CONF_DEVICE_ID):
+                configured_ids.add(device_id)
+        candidates: list[str] = []
+        for mac, cred in item.credentials.items():
+            category_info = devices_database.get(cred.get(CONF_CATEGORY))
+            if category_info is None or (
+                cred.get(CONF_PRODUCT_ID) not in category_info.products
+            ):
+                continue
+            if product_filter and cred.get(CONF_PRODUCT_ID) != product_filter:
+                continue
+            if mac in configured or cred.get(CONF_DEVICE_ID) in configured_ids:
+                continue
+            if mac in _address_aliases.values():
+                continue
+            if bluetooth.async_address_present(self._hass, mac, False):
+                continue
+            candidates.append(mac)
+        if len(candidates) == 1:
+            _LOGGER.warning(
+                "Tuya BLE address %s is not a factory MAC; using the only "
+                "unmatched supported cloud device (%s)",
+                address,
+                item.credentials[candidates[0]].get(CONF_DEVICE_NAME),
+            )
+            return candidates[0]
+        _LOGGER.debug(
+            "Advertisement lookup for %s found %d candidates",
+            address,
+            len(candidates),
+        )
+        return None
+
+    async def async_get_device_raw_status(
+        self, device_id: str, codes: tuple[str, ...]
+    ) -> dict[str, bytes]:
+        """Return selected raw DP values from the Tuya cloud device status."""
+        import base64
+
+        cache_key = self._get_cache_key(self._data)
+        item = _cache.get(cache_key)
+        if item is None or item.api is None:
+            if not self._is_login_success(await self._login(self._data, True)):
+                return {}
+            item = _cache.get(self._get_cache_key(self._data))
+            if item is None or item.api is None:
+                return {}
+        response = await self._hass.async_add_executor_job(
+            item.api.get, f"/v1.0/devices/{device_id}/status"
+        )
+        if not self._is_login_success(response):
+            if not self._is_login_success(await self._login(self._data, True)):
+                return {}
+            item = _cache.get(self._get_cache_key(self._data))
+            if item is None or item.api is None:
+                return {}
+            response = await self._hass.async_add_executor_job(
+                item.api.get, f"/v1.0/devices/{device_id}/status"
+            )
+        result: dict[str, bytes] = {}
+        for status in response.get(TUYA_RESPONSE_RESULT) or []:
+            code = status.get("code")
+            value = status.get("value")
+            if code in codes and isinstance(value, str) and value:
+                try:
+                    result[code] = base64.b64decode(value, validate=True)
+                except ValueError:
+                    continue
+        return result
+
+    async def async_get_lock_issued_config(self, device_id: str) -> dict[str, Any]:
+        """GET /v1.0/devices/{id}/door-lock/issued-config (BLE check material)."""
+        cache_key = self._get_cache_key(self._data)
+        item = _cache.get(cache_key)
+        if item is None or item.api is None:
+            if not self._is_login_success(await self._login(self._data, True)):
+                return {}
+            item = _cache.get(self._get_cache_key(self._data))
+            if item is None or item.api is None:
+                return {}
+        path = f"/v1.0/devices/{device_id}/door-lock/issued-config"
+        response = await self._hass.async_add_executor_job(item.api.get, path)
+        if not self._is_login_success(response):
+            if not self._is_login_success(await self._login(self._data, True)):
+                return {}
+            item = _cache.get(self._get_cache_key(self._data))
+            if item is None or item.api is None:
+                return {}
+            response = await self._hass.async_add_executor_job(item.api.get, path)
+        result = response.get(TUYA_RESPONSE_RESULT)
+        return result if isinstance(result, dict) else {}
 
     @property
     def data(self) -> dict[str, Any]:
